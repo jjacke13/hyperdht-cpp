@@ -58,12 +58,23 @@ struct UdxInfo {
 // NoisePayload — the data encrypted inside Noise messages
 // ---------------------------------------------------------------------------
 
+struct RelayInfo {
+    compact::Ipv4Address relay_address;
+    compact::Ipv4Address peer_address;
+};
+
+struct HolepunchInfo {
+    uint32_t id = 0;
+    std::vector<RelayInfo> relays;
+};
+
 struct NoisePayload {
     uint32_t version = 1;
     uint32_t error = ERROR_NONE;
     uint32_t firewall = FIREWALL_UNKNOWN;
 
     // Optional fields
+    std::optional<HolepunchInfo> holepunch;
     std::vector<compact::Ipv4Address> addresses4;
     std::optional<UdxInfo> udx;
     bool has_secret_stream = false;

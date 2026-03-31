@@ -367,6 +367,7 @@ HolepunchMessage decode_holepunch_msg(const uint8_t* data, size_t len) {
 void holepunch_connect(rpc::RpcSocket& socket,
                        const peer_connect::HandshakeResult& hs_result,
                        const compact::Ipv4Address& relay_addr,
+                       const compact::Ipv4Address& peer_addr,
                        uint32_t holepunch_id,
                        OnHolepunchCallback on_done) {
 
@@ -403,11 +404,12 @@ void holepunch_connect(rpc::RpcSocket& socket,
     auto probe_bytes = encode_holepunch_payload(probe);
     auto encrypted_probe = secure->encrypt(probe_bytes.data(), probe_bytes.size());
 
-    // Wrap in PEER_HOLEPUNCH message
+    // Wrap in PEER_HOLEPUNCH message — include peerAddress so relay knows where to forward
     HolepunchMessage hp_msg;
     hp_msg.mode = peer_connect::MODE_FROM_CLIENT;
     hp_msg.id = holepunch_id;
     hp_msg.payload = std::move(encrypted_probe);
+    hp_msg.peer_address = peer_addr;
 
     auto hp_value = encode_holepunch_msg(hp_msg);
 
@@ -427,6 +429,9 @@ void holepunch_connect(rpc::RpcSocket& socket,
     socket.request(req,
         [secure, on_done, &socket, relay_addr, holepunch_id, target, hs_result]
         (const messages::Response& resp) {
+            printf("    [HP] response: value=%d(%zu) closer=%zu err=%u\n",
+                resp.value.has_value(), resp.value.has_value() ? resp.value->size() : 0,
+                resp.closer_nodes.size(), resp.error.value_or(0));
             if (!resp.value.has_value() || resp.value->empty()) {
                 HolepunchResult fail;
                 fail.success = false;

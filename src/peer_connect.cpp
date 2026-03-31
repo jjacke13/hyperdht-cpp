@@ -110,19 +110,20 @@ NoisePayload decode_noise_payload(const uint8_t* data, size_t len) {
 
     if (flags & 1) {
         // holepunchInfo: { id: uint, relays: array of { relayAddress: ipv4, peerAddress: ipv4 } }
-        auto hp_id = static_cast<uint32_t>(Uint::decode(state));
+        HolepunchInfo hp;
+        hp.id = static_cast<uint32_t>(Uint::decode(state));
         if (state.error) return p;
-        // relayInfoArray: count + count * (6 + 6) bytes
         auto relay_count = static_cast<uint32_t>(Uint::decode(state));
         if (state.error) return p;
-        // Skip relay entries: each is 2 x ipv4 (6 bytes each) = 12 bytes
         for (uint32_t i = 0; i < relay_count && !state.error; i++) {
-            Ipv4Addr::decode(state);  // relayAddress
+            RelayInfo ri;
+            ri.relay_address = Ipv4Addr::decode(state);
             if (state.error) return p;
-            Ipv4Addr::decode(state);  // peerAddress
+            ri.peer_address = Ipv4Addr::decode(state);
             if (state.error) return p;
+            hp.relays.push_back(ri);
         }
-        (void)hp_id;
+        p.holepunch = hp;
     }
     if (flags & 2) {
         p.addresses4 = Array<Ipv4Addr, Ipv4Address>::decode(state);

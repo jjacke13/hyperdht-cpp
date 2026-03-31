@@ -189,9 +189,11 @@ HolepunchMessage decode_holepunch_msg(const uint8_t* data, size_t len);
 // relay_addr: the DHT node that relayed the handshake
 // socket: RPC socket for sending PEER_HOLEPUNCH messages
 // on_done: called when holepunch completes or fails
+// peer_addr: the server's address as seen by the relay (from holepunch relays info)
 void holepunch_connect(rpc::RpcSocket& socket,
                        const peer_connect::HandshakeResult& hs_result,
                        const compact::Ipv4Address& relay_addr,
+                       const compact::Ipv4Address& peer_addr,
                        uint32_t holepunch_id,
                        OnHolepunchCallback on_done);
 

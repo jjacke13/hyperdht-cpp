@@ -1,0 +1,141 @@
+cmake_minimum_required(VERSION 3.20)
+project(hyperdht-cpp
+    VERSION 0.1.0
+    LANGUAGES C CXX
+    DESCRIPTION "C++ reimplementation of HyperDHT"
+)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# === Dependencies ===
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium)
+pkg_check_modules(UV REQUIRED IMPORTED_TARGET libuv)
+
+# libudx — C library from git submodule
+add_library(udx STATIC
+    deps/libudx/src/udx.c
+    deps/libudx/src/io_posix.c
+    deps/libudx/src/cirbuf.c
+    deps/libudx/src/queue.c
+    deps/libudx/src/endian.c
+    deps/libudx/src/udx_bbr.c
+    deps/libudx/src/udx_rate.c
+    deps/libudx/src/win_filter.c
+    deps/libudx/src/win_filter_f64.c
+)
+target_include_directories(udx
+    PUBLIC deps/libudx/include
+    PRIVATE deps/libudx/src
+)
+target_link_libraries(udx PUBLIC PkgConfig::UV)
+
+# === Library ===
+
+add_library(hyperdht
+    src/compact.cpp
+    src/udx.cpp
+    src/noise_wrap.cpp
+    src/secret_stream.cpp
+    src/routing_table.cpp
+    src/tokens.cpp
+    src/messages.cpp
+    src/rpc.cpp
+)
+target_include_directories(hyperdht PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(hyperdht PUBLIC
+    udx
+    PkgConfig::SODIUM
+    PkgConfig::UV
+)
+
+# === Tests ===
+
+option(HYPERDHT_BUILD_TESTS "Build tests" ON)
+
+if(HYPERDHT_BUILD_TESTS)
+    include(FetchContent)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG v1.15.2
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    enable_testing()
+
+    add_executable(test_compact test/test_compact.cpp)
+    target_link_libraries(test_compact PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_compact COMMAND test_compact)
+
+    add_executable(test_compact_cross test/test_compact_cross.cpp)
+    target_link_libraries(test_compact_cross PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_compact_cross COMMAND test_compact_cross)
+
+    add_executable(test_udx test/test_udx.cpp)
+    target_link_libraries(test_udx PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_udx COMMAND test_udx)
+
+    add_executable(test_udx_cross test/test_udx_cross.cpp)
+    target_link_libraries(test_udx_cross PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_udx_cross COMMAND test_udx_cross)
+
+    add_executable(test_udx_packet_capture test/test_udx_packet_capture.cpp)
+    target_link_libraries(test_udx_packet_capture PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_udx_packet_capture COMMAND test_udx_packet_capture)
+
+    add_executable(test_noise test/test_noise.cpp)
+    target_link_libraries(test_noise PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_noise COMMAND test_noise)
+
+    add_executable(test_noise_cross test/test_noise_cross.cpp)
+    target_link_libraries(test_noise_cross PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_noise_cross COMMAND test_noise_cross)
+
+    add_executable(test_secret_stream test/test_secret_stream.cpp)
+    target_link_libraries(test_secret_stream PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_secret_stream COMMAND test_secret_stream)
+
+    add_executable(test_routing_table test/test_routing_table.cpp)
+    target_link_libraries(test_routing_table PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_routing_table COMMAND test_routing_table)
+
+    include(GoogleTest)
+    gtest_discover_tests(test_compact)
+    gtest_discover_tests(test_compact_cross)
+    gtest_discover_tests(test_udx)
+    gtest_discover_tests(test_udx_cross)
+    gtest_discover_tests(test_udx_packet_capture)
+    gtest_discover_tests(test_noise)
+    gtest_discover_tests(test_noise_cross)
+    gtest_discover_tests(test_secret_stream)
+    gtest_discover_tests(test_routing_table)
+
+    add_executable(test_tokens test/test_tokens.cpp)
+    target_link_libraries(test_tokens PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_tokens COMMAND test_tokens)
+    gtest_discover_tests(test_tokens)
+
+    add_executable(test_messages test/test_messages.cpp)
+    target_link_libraries(test_messages PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_messages COMMAND test_messages)
+    gtest_discover_tests(test_messages)
+
+    add_executable(test_rpc_ping test/test_rpc_ping.cpp)
+    target_link_libraries(test_rpc_ping PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_rpc_ping COMMAND test_rpc_ping)
+    gtest_discover_tests(test_rpc_ping)
+
+    add_executable(test_rpc_bootstrap test/test_rpc_bootstrap.cpp)
+    target_link_libraries(test_rpc_bootstrap PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_rpc_bootstrap COMMAND test_rpc_bootstrap)
+    gtest_discover_tests(test_rpc_bootstrap)
+endif()

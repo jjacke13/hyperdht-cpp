@@ -1,0 +1,3 @@
+.analysis/
+build/
+compile_commands.json

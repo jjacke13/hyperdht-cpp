@@ -1,0 +1,3 @@
+[submodule "deps/libudx"]
+	path = deps/libudx
+	url = https://github.com/holepunchto/libudx.git

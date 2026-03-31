@@ -1,0 +1,132 @@
+{
+  "varint": [
+    {
+      "value": 0,
+      "hex": "00"
+    },
+    {
+      "value": 1,
+      "hex": "01"
+    },
+    {
+      "value": 42,
+      "hex": "2a"
+    },
+    {
+      "value": 252,
+      "hex": "fc"
+    },
+    {
+      "value": 253,
+      "hex": "fdfd00"
+    },
+    {
+      "value": 255,
+      "hex": "fdff00"
+    },
+    {
+      "value": 256,
+      "hex": "fd0001"
+    },
+    {
+      "value": 4200,
+      "hex": "fd6810"
+    },
+    {
+      "value": 65535,
+      "hex": "fdffff"
+    },
+    {
+      "value": 65536,
+      "hex": "fe00000100"
+    },
+    {
+      "value": 300000,
+      "hex": "fee0930400"
+    },
+    {
+      "value": 4294967295,
+      "hex": "feffffffff"
+    }
+  ],
+  "uint16": [
+    {
+      "value": 0,
+      "hex": "0000"
+    },
+    {
+      "value": 4660,
+      "hex": "3412"
+    },
+    {
+      "value": 65535,
+      "hex": "ffff"
+    }
+  ],
+  "uint32": [
+    {
+      "value": 0,
+      "hex": "00000000"
+    },
+    {
+      "value": 3735928559,
+      "hex": "efbeadde"
+    }
+  ],
+  "bool": [
+    {
+      "value": false,
+      "hex": "00"
+    },
+    {
+      "value": true,
+      "hex": "01"
+    }
+  ],
+  "buffer": [
+    {
+      "value": null,
+      "hex": "00"
+    },
+    {
+      "value": "deadbeef",
+      "hex": "04deadbeef"
+    }
+  ],
+  "ipv4addr": [
+    {
+      "host": "10.20.30.40",
+      "port": 4660,
+      "hex": "0a141e283412"
+    },
+    {
+      "host": "88.99.3.86",
+      "port": 49737,
+      "hex": "5863035649c2"
+    },
+    {
+      "host": "192.168.1.1",
+      "port": 8080,
+      "hex": "c0a80101901f"
+    }
+  ],
+  "ipv4array": [
+    {
+      "addrs": [],
+      "hex": "00"
+    },
+    {
+      "addrs": [
+        {
+          "host": "192.168.1.1",
+          "port": 8080
+        },
+        {
+          "host": "10.0.0.1",
+          "port": 443
+        }
+      ],
+      "hex": "02c0a80101901f0a000001bb01"
+    }
+  ]
+}

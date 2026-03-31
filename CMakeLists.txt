@@ -49,6 +49,7 @@ add_library(hyperdht
     src/announce.cpp
     src/query.cpp
     src/dht_ops.cpp
+    src/peer_connect.cpp
 )
 target_include_directories(hyperdht PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

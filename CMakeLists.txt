@@ -50,6 +50,7 @@ add_library(hyperdht
     src/query.cpp
     src/dht_ops.cpp
     src/peer_connect.cpp
+    src/holepunch.cpp
 )
 target_include_directories(hyperdht PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -163,4 +164,9 @@ if(HYPERDHT_BUILD_TESTS)
     target_link_libraries(test_dht_ops PRIVATE hyperdht GTest::gtest_main)
     add_test(NAME test_dht_ops COMMAND test_dht_ops)
     gtest_discover_tests(test_dht_ops)
+
+    add_executable(test_holepunch test/test_holepunch.cpp)
+    target_link_libraries(test_holepunch PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_holepunch COMMAND test_holepunch)
+    gtest_discover_tests(test_holepunch)
 endif()

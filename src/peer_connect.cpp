@@ -11,6 +11,7 @@ namespace peer_connect {
 using compact::State;
 using compact::Uint;
 using compact::Buffer;
+using compact::Fixed32;
 using compact::Ipv4Addr;
 using compact::Ipv4Address;
 using compact::Array;
@@ -108,12 +109,20 @@ NoisePayload decode_noise_payload(const uint8_t* data, size_t len) {
     if (state.error) return p;
 
     if (flags & 1) {
+        // holepunchInfo: { id: uint, relays: array of { relayAddress: ipv4, peerAddress: ipv4 } }
         auto hp_id = static_cast<uint32_t>(Uint::decode(state));
         if (state.error) return p;
-        auto relays = Array<Ipv4Addr, Ipv4Address>::decode(state);
+        // relayInfoArray: count + count * (6 + 6) bytes
+        auto relay_count = static_cast<uint32_t>(Uint::decode(state));
         if (state.error) return p;
+        // Skip relay entries: each is 2 x ipv4 (6 bytes each) = 12 bytes
+        for (uint32_t i = 0; i < relay_count && !state.error; i++) {
+            Ipv4Addr::decode(state);  // relayAddress
+            if (state.error) return p;
+            Ipv4Addr::decode(state);  // peerAddress
+            if (state.error) return p;
+        }
         (void)hp_id;
-        (void)relays;
     }
     if (flags & 2) {
         p.addresses4 = Array<Ipv4Addr, Ipv4Address>::decode(state);
@@ -142,6 +151,25 @@ NoisePayload decode_noise_payload(const uint8_t* data, size_t len) {
         if (state.error) return p;
         (void)ss_version;
         p.has_secret_stream = true;
+    }
+    if (flags & 32) {
+        // relayThrough: { version, flags, publicKey, token }
+        Uint::decode(state);
+        if (state.error) return p;
+        Uint::decode(state);
+        if (state.error) return p;
+        Fixed32::decode(state);
+        if (state.error) return p;
+        Fixed32::decode(state);
+        if (state.error) return p;
+    }
+    if (flags & 64) {
+        // relayAddresses — append to addresses4 so callers can try them
+        auto relay_addrs = Array<Ipv4Addr, Ipv4Address>::decode(state);
+        if (state.error) return p;
+        for (const auto& a : relay_addrs) {
+            p.addresses4.push_back(a);
+        }
     }
 
     return p;

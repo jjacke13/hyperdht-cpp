@@ -22,6 +22,7 @@
 
 #include "hyperdht/compact.hpp"
 #include "hyperdht/peer_connect.hpp"
+#include "hyperdht/rpc.hpp"
 
 namespace hyperdht {
 namespace holepunch {
@@ -159,6 +160,40 @@ private:
 
     static void on_punch_timer(uv_timer_t* timer);
 };
+
+// ---------------------------------------------------------------------------
+// PEER_HOLEPUNCH RPC message (wraps encrypted HolepunchPayload)
+// ---------------------------------------------------------------------------
+
+struct HolepunchMessage {
+    uint32_t mode = 0;        // FROM_CLIENT=0, FROM_RELAY=1, etc.
+    uint32_t id = 0;          // Holepunch session ID (from PEER_HANDSHAKE response)
+    std::vector<uint8_t> payload;  // Encrypted HolepunchPayload
+    std::optional<compact::Ipv4Address> peer_address;
+};
+
+std::vector<uint8_t> encode_holepunch_msg(const HolepunchMessage& m);
+HolepunchMessage decode_holepunch_msg(const uint8_t* data, size_t len);
+
+// ---------------------------------------------------------------------------
+// holepunch_connect — full relay round-trip to establish a direct connection
+// ---------------------------------------------------------------------------
+
+// Performs the PEER_HOLEPUNCH relay flow:
+// 1. Send probe round (our firewall + addresses) via relay
+// 2. Receive server's firewall + addresses
+// 3. If server is reachable, start UDP probing
+// 4. Call on_done with the result
+//
+// hs_result: completed PEER_HANDSHAKE result
+// relay_addr: the DHT node that relayed the handshake
+// socket: RPC socket for sending PEER_HOLEPUNCH messages
+// on_done: called when holepunch completes or fails
+void holepunch_connect(rpc::RpcSocket& socket,
+                       const peer_connect::HandshakeResult& hs_result,
+                       const compact::Ipv4Address& relay_addr,
+                       uint32_t holepunch_id,
+                       OnHolepunchCallback on_done);
 
 }  // namespace holepunch
 }  // namespace hyperdht

@@ -3,12 +3,14 @@
 #include <sodium.h>
 
 #include <cstring>
+#include <memory>
 
 namespace hyperdht {
 namespace holepunch {
 
 using compact::State;
 using compact::Uint;
+using compact::Buffer;
 using compact::Fixed32;
 using compact::Ipv4Addr;
 using compact::Ipv4Address;
@@ -307,6 +309,185 @@ void Holepuncher::on_punch_timer(uv_timer_t* timer) {
     } else {
         self->consistent_probe();
     }
+}
+
+// ---------------------------------------------------------------------------
+// PEER_HOLEPUNCH message encoding
+// ---------------------------------------------------------------------------
+
+std::vector<uint8_t> encode_holepunch_msg(const HolepunchMessage& m) {
+    State state;
+    uint8_t flags = m.peer_address.has_value() ? 1 : 0;
+    Uint::preencode(state, flags);
+    Uint::preencode(state, m.mode);
+    Uint::preencode(state, m.id);
+    Buffer::preencode(state, m.payload.data(), m.payload.size());
+    if (m.peer_address.has_value()) Ipv4Addr::preencode(state, *m.peer_address);
+
+    std::vector<uint8_t> buf(state.end);
+    state.buffer = buf.data();
+    state.start = 0;
+
+    Uint::encode(state, flags);
+    Uint::encode(state, m.mode);
+    Uint::encode(state, m.id);
+    Buffer::encode(state, m.payload.data(), m.payload.size());
+    if (m.peer_address.has_value()) Ipv4Addr::encode(state, *m.peer_address);
+
+    return buf;
+}
+
+HolepunchMessage decode_holepunch_msg(const uint8_t* data, size_t len) {
+    State state = State::for_decode(data, len);
+    HolepunchMessage m;
+
+    uint8_t flags = static_cast<uint8_t>(Uint::decode(state));
+    if (state.error) return m;
+    m.mode = static_cast<uint32_t>(Uint::decode(state));
+    if (state.error) return m;
+    m.id = static_cast<uint32_t>(Uint::decode(state));
+    if (state.error) return m;
+
+    auto payload_result = Buffer::decode(state);
+    if (state.error) return m;
+    if (!payload_result.is_null()) {
+        m.payload.assign(payload_result.data, payload_result.data + payload_result.len);
+    }
+
+    if (flags & 1) {
+        m.peer_address = Ipv4Addr::decode(state);
+    }
+    return m;
+}
+
+// ---------------------------------------------------------------------------
+// holepunch_connect — full relay round-trip
+// ---------------------------------------------------------------------------
+
+void holepunch_connect(rpc::RpcSocket& socket,
+                       const peer_connect::HandshakeResult& hs_result,
+                       const compact::Ipv4Address& relay_addr,
+                       uint32_t holepunch_id,
+                       OnHolepunchCallback on_done) {
+
+    // Derive holepunchSecret from handshake hash
+    // holepunchSecret = BLAKE2b-256(NS_PEER_HOLEPUNCH, handshake_hash)
+    // NS_PEER_HOLEPUNCH = namespace('hyperswarm/dht', [4,5,6,0,1])[4]
+    uint8_t ns_hash[32];
+    const char* name = "hyperswarm/dht";
+    crypto_generichash(ns_hash, 32,
+                       reinterpret_cast<const uint8_t*>(name), std::strlen(name),
+                       nullptr, 0);
+    uint8_t ns_input[33];
+    std::memcpy(ns_input, ns_hash, 32);
+    ns_input[32] = 1;  // PEER_HOLEPUNCH command = 1
+    std::array<uint8_t, 32> ns_peer_holepunch{};
+    crypto_generichash(ns_peer_holepunch.data(), 32, ns_input, 33, nullptr, 0);
+
+    std::array<uint8_t, 32> holepunch_secret{};
+    crypto_generichash(holepunch_secret.data(), 32,
+                       ns_peer_holepunch.data(), 32,
+                       hs_result.handshake_hash.data(), 64);
+
+    auto secure = std::make_shared<SecurePayload>(holepunch_secret);
+
+    // Build probe round payload
+    HolepunchPayload probe;
+    probe.error = peer_connect::ERROR_NONE;
+    probe.firewall = peer_connect::FIREWALL_UNKNOWN;
+    probe.round = 0;
+    probe.connected = false;
+    probe.punching = false;
+    // We don't know our addresses yet — send empty
+
+    auto probe_bytes = encode_holepunch_payload(probe);
+    auto encrypted_probe = secure->encrypt(probe_bytes.data(), probe_bytes.size());
+
+    // Wrap in PEER_HOLEPUNCH message
+    HolepunchMessage hp_msg;
+    hp_msg.mode = peer_connect::MODE_FROM_CLIENT;
+    hp_msg.id = holepunch_id;
+    hp_msg.payload = std::move(encrypted_probe);
+
+    auto hp_value = encode_holepunch_msg(hp_msg);
+
+    // Compute target hash
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32,
+                       hs_result.remote_public_key.data(), 32,
+                       nullptr, 0);
+
+    // Send PEER_HOLEPUNCH via relay
+    messages::Request req;
+    req.to.addr = relay_addr;
+    req.command = messages::CMD_PEER_HOLEPUNCH;
+    req.target = target;
+    req.value = std::move(hp_value);
+
+    socket.request(req,
+        [secure, on_done, &socket, relay_addr, holepunch_id, target, hs_result]
+        (const messages::Response& resp) {
+            if (!resp.value.has_value() || resp.value->empty()) {
+                HolepunchResult fail;
+                fail.success = false;
+                on_done(fail);
+                return;
+            }
+
+            // Decode PEER_HOLEPUNCH response
+            auto hp_resp = decode_holepunch_msg(resp.value->data(), resp.value->size());
+            if (hp_resp.payload.empty()) {
+                HolepunchResult fail;
+                on_done(fail);
+                return;
+            }
+
+            // Decrypt the holepunch payload
+            auto decrypted = secure->decrypt(hp_resp.payload.data(), hp_resp.payload.size());
+            if (!decrypted) {
+                HolepunchResult fail;
+                on_done(fail);
+                return;
+            }
+
+            auto server_probe = decode_holepunch_payload(decrypted->data(), decrypted->size());
+
+            // Check server's response
+            if (server_probe.error != peer_connect::ERROR_NONE) {
+                HolepunchResult fail;
+                on_done(fail);
+                return;
+            }
+
+            // If server has addresses, try to connect directly
+            if (!server_probe.addresses.empty()) {
+                HolepunchResult result;
+                result.success = true;
+                result.firewall = server_probe.firewall;
+                // Pick the first address (could be smarter about this)
+                result.address = server_probe.addresses[0];
+                on_done(result);
+                return;
+            }
+
+            // If we got a peerAddress from the relay, use that
+            if (hp_resp.peer_address.has_value()) {
+                HolepunchResult result;
+                result.success = true;
+                result.firewall = server_probe.firewall;
+                result.address = *hp_resp.peer_address;
+                on_done(result);
+                return;
+            }
+
+            // No address found
+            HolepunchResult fail;
+            on_done(fail);
+        },
+        [on_done](uint16_t) {
+            HolepunchResult fail;
+            on_done(fail);
+        });
 }
 
 }  // namespace holepunch

@@ -141,7 +141,12 @@ std::array<uint8_t, DHLEN> dh(const Keypair& local, const PubKey& remote) {
     scalar[31] |= 64;
 
     std::array<uint8_t, DHLEN> out{};
-    (void)crypto_scalarmult_ed25519_noclamp(out.data(), scalar, remote.data());
+    if (crypto_scalarmult_ed25519_noclamp(out.data(), scalar, remote.data()) != 0) {
+        // Low-order point attack — DH result would be zero
+        sodium_memzero(scalar, sizeof(scalar));
+        sodium_memzero(out.data(), DHLEN);
+        return out;  // Return zeroed output; callers must check
+    }
 
     sodium_memzero(scalar, sizeof(scalar));
     return out;
@@ -328,7 +333,7 @@ NoiseIK::NoiseIK(bool initiator, const Keypair& static_kp,
 }
 
 std::vector<uint8_t> NoiseIK::send(const uint8_t* payload, size_t payload_len) {
-    if (complete_) return {};  // Handshake already done
+    if (complete_ || corrupt_) return {};  // Handshake done or corrupted
     // Validate send order: initiator sends msg0, responder sends msg1
     if (message_index_ == 0 && !initiator_) return {};
     if (message_index_ == 1 && initiator_) return {};
@@ -398,7 +403,7 @@ std::vector<uint8_t> NoiseIK::send(const uint8_t* payload, size_t payload_len) {
 }
 
 std::optional<std::vector<uint8_t>> NoiseIK::recv(const uint8_t* msg, size_t msg_len) {
-    if (complete_) return std::nullopt;  // Handshake already done
+    if (complete_ || corrupt_) return std::nullopt;  // Handshake done or corrupted
     // Validate recv order: responder receives msg0, initiator receives msg1
     if (message_index_ == 0 && initiator_) return std::nullopt;
     if (message_index_ == 1 && !initiator_) return std::nullopt;
@@ -457,7 +462,10 @@ std::optional<std::vector<uint8_t>> NoiseIK::recv(const uint8_t* msg, size_t msg
     // Decrypt payload (remaining bytes)
     size_t remaining = msg_len - offset;
     auto payload = symmetric_.decrypt_and_hash(msg + offset, remaining);
-    if (!payload) return std::nullopt;
+    if (!payload) {
+        corrupt_ = true;  // digest was modified by mix_hash; state is now inconsistent
+        return std::nullopt;
+    }
 
     message_index_++;
 

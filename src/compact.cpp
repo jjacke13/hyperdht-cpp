@@ -151,7 +151,7 @@ uint16_t Uint16::decode(State& s) {
 void Uint32::preencode(State& s, uint32_t) { s.end += 4; }
 
 void Uint32::encode(State& s, uint32_t v) {
-    if (s.error || !has_bytes(s, 4)) { s.error = true; return; }
+    if (s.error || !s.buffer || !has_bytes(s, 4)) { s.error = true; return; }
     write_le32(s.buffer + s.start, v);
     s.start += 4;
 }
@@ -170,7 +170,7 @@ uint32_t Uint32::decode(State& s) {
 void Uint64::preencode(State& s, uint64_t) { s.end += 8; }
 
 void Uint64::encode(State& s, uint64_t v) {
-    if (s.error || !has_bytes(s, 8)) { s.error = true; return; }
+    if (s.error || !s.buffer || !has_bytes(s, 8)) { s.error = true; return; }
     write_le64(s.buffer + s.start, v);
     s.start += 8;
 }

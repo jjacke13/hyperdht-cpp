@@ -197,6 +197,7 @@ private:
 
     SymmetricState symmetric_;
 
+    bool corrupt_ = false;  // Set after decrypt failure — state is inconsistent
     Key tx_{};
     Key rx_{};
     Hash hash_{};

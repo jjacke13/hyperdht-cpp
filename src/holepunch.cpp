@@ -117,20 +117,27 @@ HolepunchPayload decode_holepunch_payload(const uint8_t* data, size_t len) {
     p.connected = (flags & 1) != 0;
     p.punching = (flags & 2) != 0;
     p.error = static_cast<uint32_t>(Uint::decode(state));
+    if (state.error) return p;
     p.firewall = static_cast<uint32_t>(Uint::decode(state));
+    if (state.error) return p;
     p.round = static_cast<uint32_t>(Uint::decode(state));
+    if (state.error) return p;
 
     if (flags & 4) {
         p.addresses = Array<Ipv4Addr, Ipv4Address>::decode(state);
+        if (state.error) return p;
     }
     if (flags & 8) {
         p.remote_address = Ipv4Addr::decode(state);
+        if (state.error) return p;
     }
     if (flags & 16) {
         p.token = Fixed32::decode(state);
+        if (state.error) return p;
     }
     if (flags & 32) {
         p.remote_token = Fixed32::decode(state);
+        if (state.error) return p;
     }
 
     return p;

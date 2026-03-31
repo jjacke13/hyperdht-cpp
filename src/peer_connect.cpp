@@ -95,7 +95,10 @@ NoisePayload decode_noise_payload(const uint8_t* data, size_t len) {
     NoisePayload p;
 
     p.version = static_cast<uint32_t>(Uint::decode(state));
-    if (state.error || p.version != 1) return p;
+    if (state.error || p.version != 1) {
+        p.error = ERROR_VERSION_MISMATCH;
+        return p;
+    }
 
     uint32_t flags = static_cast<uint32_t>(Uint::decode(state));
     if (state.error) return p;

@@ -115,7 +115,7 @@ std::vector<uint8_t> SecretStream::encrypt(const uint8_t* data, size_t len) {
     if (!is_ready()) return {};  // Runtime guard (assert stripped in release)
 
     // uint24_le max = 0xFFFFFF = 16777215
-    if (len + ABYTES > 0xFFFFFF) return {};  // Exceeds uint24_le frame limit
+    if (len > 0xFFFFFF - ABYTES) return {};  // Guard overflow before comparison
 
     // Encrypted payload: tag(1) + ciphertext + mac(16) = len + ABYTES
     size_t enc_len = len + ABYTES;
@@ -127,13 +127,17 @@ std::vector<uint8_t> SecretStream::encrypt(const uint8_t* data, size_t len) {
     // Encrypt
     auto* push = reinterpret_cast<crypto_secretstream_xchacha20poly1305_state*>(push_state_);
     unsigned long long out_len = 0;
-    crypto_secretstream_xchacha20poly1305_push(
+    int rc = crypto_secretstream_xchacha20poly1305_push(
         push,
         msg.data() + 3, &out_len,
         data, len,
         nullptr, 0,  // no additional data
         crypto_secretstream_xchacha20poly1305_TAG_MESSAGE);
+    if (rc != 0) return {};
 
+    // Correct size in case out_len differs from expected
+    msg.resize(3 + static_cast<size_t>(out_len));
+    write_uint24_le(msg.data(), static_cast<uint32_t>(out_len));
     return msg;
 }
 

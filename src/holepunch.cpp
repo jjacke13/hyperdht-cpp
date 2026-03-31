@@ -429,9 +429,6 @@ void holepunch_connect(rpc::RpcSocket& socket,
     socket.request(req,
         [secure, on_done, &socket, relay_addr, holepunch_id, target, hs_result]
         (const messages::Response& resp) {
-            printf("    [HP] response: value=%d(%zu) closer=%zu err=%u\n",
-                resp.value.has_value(), resp.value.has_value() ? resp.value->size() : 0,
-                resp.closer_nodes.size(), resp.error.value_or(0));
             if (!resp.value.has_value() || resp.value->empty()) {
                 HolepunchResult fail;
                 fail.success = false;
@@ -450,6 +447,15 @@ void holepunch_connect(rpc::RpcSocket& socket,
             // Decrypt the holepunch payload
             auto decrypted = secure->decrypt(hp_resp.payload.data(), hp_resp.payload.size());
             if (!decrypted) {
+                // Decrypt failed — but the response had data. Return
+                // the peerAddress from the relay if available.
+                if (hp_resp.peer_address.has_value()) {
+                    HolepunchResult result;
+                    result.success = true;
+                    result.address = *hp_resp.peer_address;
+                    on_done(result);
+                    return;
+                }
                 HolepunchResult fail;
                 on_done(fail);
                 return;
@@ -464,18 +470,17 @@ void holepunch_connect(rpc::RpcSocket& socket,
                 return;
             }
 
-            // If server has addresses, try to connect directly
+            // If server has addresses, use them
             if (!server_probe.addresses.empty()) {
                 HolepunchResult result;
                 result.success = true;
                 result.firewall = server_probe.firewall;
-                // Pick the first address (could be smarter about this)
                 result.address = server_probe.addresses[0];
                 on_done(result);
                 return;
             }
 
-            // If we got a peerAddress from the relay, use that
+            // Use peerAddress from relay
             if (hp_resp.peer_address.has_value()) {
                 HolepunchResult result;
                 result.success = true;
@@ -485,7 +490,6 @@ void holepunch_connect(rpc::RpcSocket& socket,
                 return;
             }
 
-            // No address found
             HolepunchResult fail;
             on_done(fail);
         },

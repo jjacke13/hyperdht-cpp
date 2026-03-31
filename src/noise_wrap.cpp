@@ -72,6 +72,7 @@ Hash hmac_blake2b(const uint8_t* key, size_t key_len,
         crypto_generichash_update(&state, msgs[i], msg_lens[i]);
     }
     crypto_generichash_final(&state, inner_hash.data(), HASHLEN);
+    sodium_memzero(&state, sizeof(state));
     sodium_memzero(inner_pad, BLOCKLEN);
 
     // Outer hash: BLAKE2b(OuterKeyPad || inner_hash)
@@ -80,6 +81,7 @@ Hash hmac_blake2b(const uint8_t* key, size_t key_len,
     crypto_generichash_update(&state, outer_pad, BLOCKLEN);
     crypto_generichash_update(&state, inner_hash.data(), HASHLEN);
     crypto_generichash_final(&state, out.data(), HASHLEN);
+    sodium_memzero(&state, sizeof(state));
     sodium_memzero(outer_pad, BLOCKLEN);
 
     return out;
@@ -249,6 +251,7 @@ void SymmetricState::mix_hash(const uint8_t* data, size_t len) {
     crypto_generichash_update(&state, digest.data(), HASHLEN);
     crypto_generichash_update(&state, data, len);
     crypto_generichash_final(&state, digest.data(), HASHLEN);
+    sodium_memzero(&state, sizeof(state));
 }
 
 void SymmetricState::mix_key(const PubKey& remote_key, const Keypair& local_key) {
@@ -269,7 +272,7 @@ std::vector<uint8_t> SymmetricState::encrypt_and_hash(const uint8_t* pt, size_t 
 
 std::optional<std::vector<uint8_t>> SymmetricState::decrypt_and_hash(const uint8_t* ct, size_t ct_len) {
     auto pt = cipher_.decrypt_with_ad(digest.data(), HASHLEN, ct, ct_len);
-    // Always mix the ciphertext into hash, even if decrypt succeeded
+    // Per Noise spec: always mix ciphertext into h, even on auth failure
     mix_hash(ct, ct_len);
     return pt;
 }
@@ -325,6 +328,11 @@ NoiseIK::NoiseIK(bool initiator, const Keypair& static_kp,
 }
 
 std::vector<uint8_t> NoiseIK::send(const uint8_t* payload, size_t payload_len) {
+    if (complete_) return {};  // Handshake already done
+    // Validate send order: initiator sends msg0, responder sends msg1
+    if (message_index_ == 0 && !initiator_) return {};
+    if (message_index_ == 1 && initiator_) return {};
+
     std::vector<uint8_t> out;
 
     if (message_index_ == 0 && initiator_) {
@@ -390,6 +398,11 @@ std::vector<uint8_t> NoiseIK::send(const uint8_t* payload, size_t payload_len) {
 }
 
 std::optional<std::vector<uint8_t>> NoiseIK::recv(const uint8_t* msg, size_t msg_len) {
+    if (complete_) return std::nullopt;  // Handshake already done
+    // Validate recv order: responder receives msg0, initiator receives msg1
+    if (message_index_ == 0 && initiator_) return std::nullopt;
+    if (message_index_ == 1 && !initiator_) return std::nullopt;
+
     size_t offset = 0;
 
     auto shift = [&](size_t n) -> const uint8_t* {

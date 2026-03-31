@@ -31,13 +31,14 @@ TokenStore::TokenStore() {
 
 void TokenStore::rotate() {
     // JS: swap secrets, then hash the old one to create new current
-    // tmp = secrets[0]; secrets[0] = secrets[1]; secrets[1] = tmp;
-    // crypto_generichash(tmp, tmp)  ← hash in-place
     std::swap(current_, previous_);
-    // Hash the (now current, previously the old "previous") secret in-place
-    crypto_generichash(current_.data(), SECRET_LEN,
+    // Hash into temp buffer to avoid in-place aliasing
+    Secret temp{};
+    crypto_generichash(temp.data(), SECRET_LEN,
                        current_.data(), SECRET_LEN,
                        nullptr, 0);
+    current_ = temp;
+    sodium_memzero(temp.data(), SECRET_LEN);
 }
 
 Token TokenStore::create(const std::string& host) const {

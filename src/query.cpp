@@ -231,11 +231,12 @@ void Query::do_commit() {
         if (!reply.token.has_value()) continue;
 
         commit_inflight_++;
-        on_commit_(reply, [this](const messages::Response&) {
-            commit_inflight_--;
-            if (commit_inflight_ == 0) {
-                done_ = true;
-                if (on_done_) on_done_(closest_replies_);
+        auto self = shared_from_this();
+        on_commit_(reply, [self](const messages::Response&) {
+            self->commit_inflight_--;
+            if (self->commit_inflight_ == 0) {
+                self->done_ = true;
+                if (self->on_done_) self->on_done_(self->closest_replies_);
             }
         });
     }

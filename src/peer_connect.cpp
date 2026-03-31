@@ -98,40 +98,48 @@ NoisePayload decode_noise_payload(const uint8_t* data, size_t len) {
     if (state.error || p.version != 1) return p;
 
     uint32_t flags = static_cast<uint32_t>(Uint::decode(state));
+    if (state.error) return p;
     p.error = static_cast<uint32_t>(Uint::decode(state));
+    if (state.error) return p;
     p.firewall = static_cast<uint32_t>(Uint::decode(state));
+    if (state.error) return p;
 
     if (flags & 1) {
-        // holepunch info — skip for now (read id + relays)
         auto hp_id = static_cast<uint32_t>(Uint::decode(state));
-        auto relays = Array<Ipv4Addr, Ipv4Address>::decode(state);  // relayInfo is 2x ipv4
+        if (state.error) return p;
+        auto relays = Array<Ipv4Addr, Ipv4Address>::decode(state);
+        if (state.error) return p;
         (void)hp_id;
         (void)relays;
     }
     if (flags & 2) {
         p.addresses4 = Array<Ipv4Addr, Ipv4Address>::decode(state);
+        if (state.error) return p;
     }
     if (flags & 4) {
-        // addresses6 — skip
         auto addrs6 = Array<Ipv4Addr, Ipv4Address>::decode(state);
+        if (state.error) return p;
         (void)addrs6;
     }
     if (flags & 8) {
         UdxInfo info;
         info.version = static_cast<uint32_t>(Uint::decode(state));
+        if (state.error) return p;
         uint32_t features = static_cast<uint32_t>(Uint::decode(state));
+        if (state.error) return p;
         info.reusable_socket = (features & 1) != 0;
         info.id = static_cast<uint32_t>(Uint::decode(state));
+        if (state.error) return p;
         info.seq = static_cast<uint32_t>(Uint::decode(state));
+        if (state.error) return p;
         p.udx = info;
     }
     if (flags & 16) {
         auto ss_version = static_cast<uint32_t>(Uint::decode(state));
+        if (state.error) return p;
         (void)ss_version;
         p.has_secret_stream = true;
     }
-    // flags & 32: relayThrough — skip
-    // flags & 64: relayAddresses — skip
 
     return p;
 }
@@ -171,18 +179,23 @@ HandshakeMessage decode_handshake_msg(const uint8_t* data, size_t len) {
     HandshakeMessage m;
 
     uint8_t flags = static_cast<uint8_t>(Uint::decode(state));
+    if (state.error) return m;
     m.mode = static_cast<uint32_t>(Uint::decode(state));
+    if (state.error) return m;
 
     auto noise_result = Buffer::decode(state);
+    if (state.error) return m;
     if (!noise_result.is_null()) {
         m.noise.assign(noise_result.data, noise_result.data + noise_result.len);
     }
 
     if (flags & 1) {
         m.peer_address = Ipv4Addr::decode(state);
+        if (state.error) return m;
     }
     if (flags & 2) {
         m.relay_address = Ipv4Addr::decode(state);
+        if (state.error) return m;
     }
 
     return m;

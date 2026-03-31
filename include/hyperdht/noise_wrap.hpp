@@ -197,9 +197,9 @@ private:
 
     SymmetricState symmetric_;
 
-    Key tx_;
-    Key rx_;
-    Hash hash_;
+    Key tx_{};
+    Key rx_{};
+    Hash hash_{};
 };
 
 }  // namespace noise

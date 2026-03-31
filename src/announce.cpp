@@ -49,15 +49,10 @@ bool AnnounceStore::remove(const TargetKey& target, const compact::Ipv4Address& 
     return true;
 }
 
-std::vector<const PeerAnnouncement*> AnnounceStore::get(const TargetKey& target) const {
-    std::vector<const PeerAnnouncement*> result;
+std::vector<PeerAnnouncement> AnnounceStore::get(const TargetKey& target) const {
     auto it = store_.find(target);
-    if (it == store_.end()) return result;
-
-    for (const auto& ann : it->second) {
-        result.push_back(&ann);
-    }
-    return result;
+    if (it == store_.end()) return {};
+    return it->second;
 }
 
 void AnnounceStore::gc(uint64_t now_ms) {
@@ -66,6 +61,7 @@ void AnnounceStore::gc(uint64_t now_ms) {
         peers.erase(
             std::remove_if(peers.begin(), peers.end(),
                 [now_ms](const PeerAnnouncement& a) {
+                    if (now_ms < a.created_at) return false;  // Guard underflow
                     return now_ms - a.created_at > a.ttl;
                 }),
             peers.end());

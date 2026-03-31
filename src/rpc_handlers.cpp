@@ -35,11 +35,11 @@ void RpcHandlers::handle(const messages::Request& req) {
 void RpcHandlers::handle_ping(const messages::Request& req) {
     messages::Response resp;
     resp.tid = req.tid;
-    resp.from.addr = req.to.addr;  // Reply to sender's address
+    resp.from.addr = req.from.addr;  // Reply to sender's address
     resp.id = socket_.table().id();
 
     // Include a token for the sender
-    resp.token = socket_.token_store().create(req.to.addr.host_string());
+    resp.token = socket_.token_store().create(req.from.addr.host_string());
 
     socket_.reply(resp);
 }
@@ -51,11 +51,11 @@ void RpcHandlers::handle_ping(const messages::Request& req) {
 void RpcHandlers::handle_find_node(const messages::Request& req) {
     messages::Response resp;
     resp.tid = req.tid;
-    resp.from.addr = req.to.addr;
+    resp.from.addr = req.from.addr;
     resp.id = socket_.table().id();
 
     // Include a token for the sender
-    resp.token = socket_.token_store().create(req.to.addr.host_string());
+    resp.token = socket_.token_store().create(req.from.addr.host_string());
 
     // Find closest nodes to the target
     if (req.target.has_value()) {

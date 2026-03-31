@@ -115,8 +115,9 @@ std::vector<uint8_t> encode_response(const Response& resp) {
 bool decode_request(const uint8_t* data, size_t len, Request& req) {
     State state = State::for_decode(data, len);
 
-    req.flags = static_cast<uint8_t>(Uint::decode(state));
-    if (state.error) return false;
+    auto flags_raw = Uint::decode(state);
+    if (state.error || flags_raw > 0xFF) return false;
+    req.flags = static_cast<uint8_t>(flags_raw);
 
     req.tid = Uint16::decode(state);
     if (state.error) return false;
@@ -164,8 +165,9 @@ bool decode_request(const uint8_t* data, size_t len, Request& req) {
 bool decode_response(const uint8_t* data, size_t len, Response& resp) {
     State state = State::for_decode(data, len);
 
-    resp.flags = static_cast<uint8_t>(Uint::decode(state));
-    if (state.error) return false;
+    auto resp_flags_raw = Uint::decode(state);
+    if (state.error || resp_flags_raw > 0xFF) return false;
+    resp.flags = static_cast<uint8_t>(resp_flags_raw);
 
     resp.tid = Uint16::decode(state);
     if (state.error) return false;

@@ -12,6 +12,11 @@ static inline bool has_bytes(const State& s, size_t n) {
     return s.start + n <= s.end;
 }
 
+// Check buffer is writable and has space (for encode paths)
+static inline bool can_write(const State& s, size_t n) {
+    return s.buffer != nullptr && s.start + n <= s.end;
+}
+
 static inline void write_le16(uint8_t* p, uint16_t v) {
     p[0] = static_cast<uint8_t>(v);
     p[1] = static_cast<uint8_t>(v >> 8);
@@ -59,7 +64,7 @@ void Uint::preencode(State& s, uint64_t v) {
 }
 
 void Uint::encode(State& s, uint64_t v) {
-    if (s.error) return;
+    if (s.error || s.buffer == nullptr) { s.error = true; return; }
     if (v <= 0xFC) {
         if (!has_bytes(s, 1)) { s.error = true; return; }
         s.buffer[s.start++] = static_cast<uint8_t>(v);
@@ -83,23 +88,23 @@ void Uint::encode(State& s, uint64_t v) {
 
 uint64_t Uint::decode(State& s) {
     if (s.error || !has_bytes(s, 1)) { s.error = true; return 0; }
-    uint8_t first = s.buffer[s.start++];
+    uint8_t first = s.data()[s.start++];
     if (first <= 0xFC) return first;
     if (first == 0xFD) {
         if (!has_bytes(s, 2)) { s.error = true; return 0; }
-        uint16_t v = read_le16(s.buffer + s.start);
+        uint16_t v = read_le16(s.data() + s.start);
         s.start += 2;
         return v;
     }
     if (first == 0xFE) {
         if (!has_bytes(s, 4)) { s.error = true; return 0; }
-        uint32_t v = read_le32(s.buffer + s.start);
+        uint32_t v = read_le32(s.data() + s.start);
         s.start += 4;
         return v;
     }
     // 0xFF
     if (!has_bytes(s, 8)) { s.error = true; return 0; }
-    uint64_t v = read_le64(s.buffer + s.start);
+    uint64_t v = read_le64(s.data() + s.start);
     s.start += 8;
     return v;
 }
@@ -111,13 +116,13 @@ uint64_t Uint::decode(State& s) {
 void Uint8::preencode(State& s, uint8_t) { s.end += 1; }
 
 void Uint8::encode(State& s, uint8_t v) {
-    if (s.error || !has_bytes(s, 1)) { s.error = true; return; }
+    if (s.error || !s.buffer || !has_bytes(s, 1)) { s.error = true; return; }
     s.buffer[s.start++] = v;
 }
 
 uint8_t Uint8::decode(State& s) {
     if (s.error || !has_bytes(s, 1)) { s.error = true; return 0; }
-    return s.buffer[s.start++];
+    return s.data()[s.start++];
 }
 
 // ---------------------------------------------------------------------------
@@ -127,14 +132,14 @@ uint8_t Uint8::decode(State& s) {
 void Uint16::preencode(State& s, uint16_t) { s.end += 2; }
 
 void Uint16::encode(State& s, uint16_t v) {
-    if (s.error || !has_bytes(s, 2)) { s.error = true; return; }
+    if (s.error || !s.buffer || !has_bytes(s, 2)) { s.error = true; return; }
     write_le16(s.buffer + s.start, v);
     s.start += 2;
 }
 
 uint16_t Uint16::decode(State& s) {
     if (s.error || !has_bytes(s, 2)) { s.error = true; return 0; }
-    uint16_t v = read_le16(s.buffer + s.start);
+    uint16_t v = read_le16(s.data() + s.start);
     s.start += 2;
     return v;
 }
@@ -153,7 +158,7 @@ void Uint32::encode(State& s, uint32_t v) {
 
 uint32_t Uint32::decode(State& s) {
     if (s.error || !has_bytes(s, 4)) { s.error = true; return 0; }
-    uint32_t v = read_le32(s.buffer + s.start);
+    uint32_t v = read_le32(s.data() + s.start);
     s.start += 4;
     return v;
 }
@@ -172,7 +177,7 @@ void Uint64::encode(State& s, uint64_t v) {
 
 uint64_t Uint64::decode(State& s) {
     if (s.error || !has_bytes(s, 8)) { s.error = true; return 0; }
-    uint64_t v = read_le64(s.buffer + s.start);
+    uint64_t v = read_le64(s.data() + s.start);
     s.start += 8;
     return v;
 }
@@ -184,6 +189,7 @@ uint64_t Uint64::decode(State& s) {
 void Bool::preencode(State& s, bool) { s.end += 1; }
 
 void Bool::encode(State& s, bool v) {
+    if (s.error || !s.buffer) { s.error = true; return; }
     Uint8::encode(s, v ? 1 : 0);
 }
 
@@ -207,7 +213,7 @@ void Buffer::preencode(State& s, const uint8_t* data, size_t len) {
 void Buffer::preencode_null(State& s) { s.end += 1; }
 
 void Buffer::encode(State& s, const uint8_t* data, size_t len) {
-    if (s.error) return;
+    if (s.error || !s.buffer) { s.error = true; return; }
     if (data == nullptr || len == 0) {
         Uint8::encode(s, 0);
     } else {
@@ -225,7 +231,7 @@ Buffer::DecodeResult Buffer::decode(State& s) {
     if (s.error) return {};
     if (len == 0) return {};  // null
     if (!has_bytes(s, static_cast<size_t>(len))) { s.error = true; return {}; }
-    const uint8_t* ptr = s.buffer + s.start;
+    const uint8_t* ptr = s.data() + s.start;
     s.start += static_cast<size_t>(len);
     return {ptr, static_cast<size_t>(len)};
 }
@@ -247,7 +253,7 @@ void Raw::encode(State& s, const uint8_t* data, size_t len) {
 Raw::DecodeResult Raw::decode(State& s) {
     if (s.error) return {};
     size_t remaining = s.end - s.start;
-    const uint8_t* ptr = s.buffer + s.start;
+    const uint8_t* ptr = s.data() + s.start;
     s.start = s.end;
     return {ptr, remaining};
 }
@@ -267,7 +273,7 @@ void Fixed32::encode(State& s, const Value& v) {
 Fixed32::Value Fixed32::decode(State& s) {
     Value v{};
     if (s.error || !has_bytes(s, SIZE)) { s.error = true; return v; }
-    std::memcpy(v.data(), s.buffer + s.start, SIZE);
+    std::memcpy(v.data(), s.data() + s.start, SIZE);
     s.start += SIZE;
     return v;
 }
@@ -287,7 +293,7 @@ void Fixed64::encode(State& s, const Value& v) {
 Fixed64::Value Fixed64::decode(State& s) {
     Value v{};
     if (s.error || !has_bytes(s, SIZE)) { s.error = true; return v; }
-    std::memcpy(v.data(), s.buffer + s.start, SIZE);
+    std::memcpy(v.data(), s.data() + s.start, SIZE);
     s.start += SIZE;
     return v;
 }
@@ -315,9 +321,12 @@ Ipv4Address Ipv4Address::from_string(const std::string& host_str, uint16_t port)
     for (int i = 0; i < 4 && pos <= host_str.size(); ++i) {
         size_t dot = host_str.find('.', pos);
         if (dot == std::string::npos) dot = host_str.size();
-        uint8_t octet = 0;
-        std::from_chars(host_str.data() + pos, host_str.data() + dot, octet);
-        addr.host[i] = octet;
+        unsigned int octet_val = 0;
+        auto [p, ec] = std::from_chars(host_str.data() + pos, host_str.data() + dot, octet_val);
+        if (ec != std::errc{} || octet_val > 255) {
+            return Ipv4Address{};  // Parse error — return zeroed address
+        }
+        addr.host[i] = static_cast<uint8_t>(octet_val);
         pos = dot + 1;
     }
     return addr;
@@ -342,9 +351,9 @@ void Ipv4Addr::encode(State& s, const Ipv4Address& v) {
 Ipv4Address Ipv4Addr::decode(State& s) {
     Ipv4Address addr;
     if (s.error || !has_bytes(s, SIZE)) { s.error = true; return addr; }
-    std::memcpy(addr.host.data(), s.buffer + s.start, 4);
+    std::memcpy(addr.host.data(), s.data() + s.start, 4);
     s.start += 4;
-    addr.port = read_le16(s.buffer + s.start);
+    addr.port = read_le16(s.data() + s.start);
     s.start += 2;
     return addr;
 }

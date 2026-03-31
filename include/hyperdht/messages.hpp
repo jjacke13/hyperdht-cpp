@@ -39,13 +39,13 @@ constexpr uint8_t RESP_FLAG_HAS_CLOSER = 4;
 constexpr uint8_t RESP_FLAG_HAS_ERROR = 8;
 constexpr uint8_t RESP_FLAG_HAS_VALUE = 16;
 
-// dht-rpc base commands
+// dht-rpc base commands (FLAG_INTERNAL set — distinguished from HyperDHT by internal flag)
 constexpr uint32_t CMD_PING = 0;
 constexpr uint32_t CMD_PING_NAT = 1;
 constexpr uint32_t CMD_FIND_NODE = 2;
 constexpr uint32_t CMD_DOWN_HINT = 3;
 
-// HyperDHT commands
+// HyperDHT commands (FLAG_INTERNAL clear — same command IDs, different namespace)
 constexpr uint32_t CMD_PEER_HANDSHAKE = 0;
 constexpr uint32_t CMD_PEER_HOLEPUNCH = 1;
 constexpr uint32_t CMD_FIND_PEER = 2;
@@ -68,7 +68,8 @@ struct Address {
 struct Request {
     uint8_t flags = 0;
     uint16_t tid = 0;
-    Address to;
+    Address to;                                        // Wire-encoded destination address
+    Address from;                                      // Actual sender (set by receive path)
 
     // Optional fields (present based on flags)
     std::optional<std::array<uint8_t, 32>> id;       // FLAG_HAS_ID

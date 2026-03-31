@@ -169,6 +169,9 @@ Holepuncher::Holepuncher(uv_loop_t* loop, bool is_initiator)
 
 Holepuncher::~Holepuncher() {
     stop();
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&punch_timer_))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(&punch_timer_), nullptr);
+    }
 }
 
 bool Holepuncher::punch() {
@@ -228,12 +231,14 @@ void Holepuncher::on_message(const compact::Ipv4Address& from) {
     punching_ = false;
     uv_timer_stop(&punch_timer_);
 
-    if (on_connect_) {
+    // Move-and-call: prevent reentrancy if callback destroys us
+    auto cb = std::move(on_connect_);
+    if (cb) {
         HolepunchResult result;
         result.success = true;
         result.address = from;
         result.firewall = remote_firewall_;
-        on_connect_(result);
+        cb(result);
     }
 }
 
@@ -266,10 +271,9 @@ void Holepuncher::consistent_probe() {
 // ---------------------------------------------------------------------------
 
 void Holepuncher::random_probes() {
-    if (!punching_ || connected_ || random_probes_left_ <= 0) {
-        if (punching_ && !connected_) {
-            punching_ = false;
-        }
+    if (!punching_ || connected_) return;
+    if (random_probes_left_ <= 0) {
+        punching_ = false;  // Exhausted — stop, don't fall through to consistent_probe
         return;
     }
 
@@ -277,7 +281,7 @@ void Holepuncher::random_probes() {
     if (!remote_addresses_.empty()) {
         auto addr = remote_addresses_[0];
         // Random port between 1000-65535
-        uint16_t random_port = static_cast<uint16_t>(1000 + (randombytes_random() % 64536));
+        uint16_t random_port = static_cast<uint16_t>(1000 + randombytes_uniform(64536));
         auto probe_addr = Ipv4Address::from_string(addr.host_string(), random_port);
         send_probe(probe_addr);
     }

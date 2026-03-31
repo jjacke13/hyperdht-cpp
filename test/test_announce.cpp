@@ -28,7 +28,7 @@ TEST(AnnounceStore, PutAndGet) {
 
     auto peers = store.get(target);
     EXPECT_EQ(peers.size(), 1u);
-    EXPECT_EQ(peers[0]->from.port, 3000u);
+    EXPECT_EQ(peers[0].from.port, 3000u);
     EXPECT_EQ(store.size(), 1u);
 }
 
@@ -58,7 +58,7 @@ TEST(AnnounceStore, ReplaceSameAddress) {
 
     auto peers = store.get(target);
     EXPECT_EQ(peers.size(), 1u);
-    EXPECT_EQ(peers[0]->value[0], 0x02);  // Updated
+    EXPECT_EQ(peers[0].value[0], 0x02);  // Updated
 }
 
 TEST(AnnounceStore, Remove) {
@@ -97,7 +97,7 @@ TEST(AnnounceStore, GarbageCollection) {
     store.gc(7000);
     auto peers = store.get(target);
     EXPECT_EQ(peers.size(), 1u);
-    EXPECT_EQ(peers[0]->from.port, 3001u);
+    EXPECT_EQ(peers[0].from.port, 3001u);
 
     // At time 9000: both expired
     store.gc(9000);

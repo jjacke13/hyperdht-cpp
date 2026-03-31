@@ -21,12 +21,11 @@ std::array<uint8_t, 32> hash_public_key(const uint8_t* pubkey, size_t len) {
 // Bootstrap helper — adds the 3 public bootstrap nodes to a query
 // ---------------------------------------------------------------------------
 
-static void add_default_bootstrap(query::Query* q, const rpc::RpcSocket& socket) {
-    // If routing table is empty, add public bootstrap nodes
+static void add_default_bootstrap(query::Query& q, const rpc::RpcSocket& socket) {
     if (socket.table().size() == 0) {
-        q->add_bootstrap(compact::Ipv4Address::from_string("88.99.3.86", 49737));
-        q->add_bootstrap(compact::Ipv4Address::from_string("142.93.90.113", 49737));
-        q->add_bootstrap(compact::Ipv4Address::from_string("138.68.147.8", 49737));
+        q.add_bootstrap(compact::Ipv4Address::from_string("88.99.3.86", 49737));
+        q.add_bootstrap(compact::Ipv4Address::from_string("142.93.90.113", 49737));
+        q.add_bootstrap(compact::Ipv4Address::from_string("138.68.147.8", 49737));
     }
 }
 
@@ -45,7 +44,7 @@ std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
     auto q = query::Query::create(socket, target_id, messages::CMD_FIND_PEER);
     q->on_reply(std::move(on_reply));
     q->on_done(std::move(on_done));
-    add_default_bootstrap(q.get(), socket);
+    add_default_bootstrap(*q, socket);
     q->start();
     return q;
 }
@@ -69,7 +68,7 @@ std::shared_ptr<query::Query> lookup(rpc::RpcSocket& socket,
     auto q = query::Query::create(socket, target, messages::CMD_LOOKUP);
     q->on_reply(std::move(on_reply));
     q->on_done(std::move(on_done));
-    add_default_bootstrap(q.get(), socket);
+    add_default_bootstrap(*q, socket);
     q->start();
     return q;
 }
@@ -100,7 +99,7 @@ std::shared_ptr<query::Query> announce(rpc::RpcSocket& socket,
         socket_ptr->request(req, std::move(commit_done));
     });
 
-    add_default_bootstrap(q.get(), socket);
+    add_default_bootstrap(*q, socket);
     q->start();
     return q;
 }

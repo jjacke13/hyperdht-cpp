@@ -38,10 +38,12 @@ struct PeerAnnouncement {
 
 struct KeyHash {
     size_t operator()(const TargetKey& k) const {
-        // Use first 8 bytes as hash (already random/hashed data)
-        size_t h = 0;
-        for (size_t i = 0; i < 8; i++) {
-            h = (h << 8) | k[i];
+        // FNV-1a over all 32 bytes (keys are already hashed, but full coverage
+        // avoids collisions when only trailing bytes differ)
+        size_t h = 14695981039346656037ULL;  // FNV offset basis
+        for (auto b : k) {
+            h ^= static_cast<size_t>(b);
+            h *= 1099511628211ULL;  // FNV prime
         }
         return h;
     }
@@ -56,8 +58,8 @@ public:
     // Remove a peer announcement from a target key (by sender address).
     bool remove(const TargetKey& target, const compact::Ipv4Address& from);
 
-    // Get all announcements for a target key.
-    std::vector<const PeerAnnouncement*> get(const TargetKey& target) const;
+    // Get all announcements for a target key (returned by value for safety).
+    std::vector<PeerAnnouncement> get(const TargetKey& target) const;
 
     // Remove expired announcements. Call periodically.
     // now_ms: current timestamp in milliseconds

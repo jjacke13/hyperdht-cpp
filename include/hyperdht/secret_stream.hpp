@@ -15,6 +15,8 @@
 #include <optional>
 #include <vector>
 
+#include <sodium.h>
+
 #include "hyperdht/noise_wrap.hpp"
 
 namespace hyperdht {
@@ -94,8 +96,8 @@ public:
     const StreamId& local_id() const { return local_id_; }
     const StreamId& remote_id() const { return remote_id_; }
 
-    // Buffer size for opaque libsodium state (verified via static_assert)
-    static constexpr size_t STATE_BUF_SIZE = 64;
+    // Buffer size matches actual libsodium state
+    static constexpr size_t STATE_BUF_SIZE = sizeof(crypto_secretstream_xchacha20poly1305_state);
 
 private:
     bool is_initiator_;

@@ -31,6 +31,7 @@ void CongestionWindow::recv() {
 void CongestionWindow::drain() {
     i_ = (i_ + 1) & 3;          // Rotate to next bucket
     total_ -= window_[i_];       // Remove oldest bucket's count
+    if (total_ < 0) total_ = 0;  // Clamp — guard against underflow from mismatched recv
     window_[i_] = 0;             // Clear it
 }
 
@@ -61,10 +62,9 @@ RpcSocket::RpcSocket(uv_loop_t* loop, const routing::NodeId& local_id)
 }
 
 RpcSocket::~RpcSocket() {
-    // Ensure close() was called — if not, close now to prevent dangling timers
-    if (!closing_) {
-        close();
-    }
+    // Caller MUST call close() and run the event loop to drain before destroying.
+    // Calling close() here would schedule uv_close but the object would be freed
+    // before the callbacks fire — causing use-after-free in libuv.
 }
 
 int RpcSocket::bind(uint16_t port) {
@@ -125,22 +125,27 @@ void RpcSocket::destroy_request(InflightRequest* req) {
     congestion_.recv();
 }
 
-void RpcSocket::udp_send(const std::vector<uint8_t>& buf, const compact::Ipv4Address& to) {
-    auto* send_req = static_cast<udx_socket_send_t*>(malloc(sizeof(udx_socket_send_t)));
-    auto* send_buf = new std::vector<uint8_t>(buf);
-    send_req->data = send_buf;
+// Single allocation holding both the send request and the data buffer
+struct SendContext {
+    udx_socket_send_t req;
+    std::vector<uint8_t> buf;
+};
 
-    uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(send_buf->data()),
-                                    static_cast<unsigned int>(send_buf->size()));
+void RpcSocket::udp_send(const std::vector<uint8_t>& buf, const compact::Ipv4Address& to) {
+    auto* ctx = new SendContext;
+    ctx->buf = buf;
+    ctx->req.data = ctx;
+
+    uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(ctx->buf.data()),
+                                    static_cast<unsigned int>(ctx->buf.size()));
 
     struct sockaddr_in dest{};
     uv_ip4_addr(to.host_string().c_str(), to.port, &dest);
 
-    udx_socket_send(send_req, &socket_, &uv_buf, 1,
+    udx_socket_send(&ctx->req, &socket_, &uv_buf, 1,
                     reinterpret_cast<const struct sockaddr*>(&dest),
                     [](udx_socket_send_t* req, int) {
-                        delete static_cast<std::vector<uint8_t>*>(req->data);
-                        free(req);
+                        delete static_cast<SendContext*>(req->data);
                     });
 }
 
@@ -161,7 +166,7 @@ void RpcSocket::send_now(InflightRequest* req) {
 void RpcSocket::drain_pending() {
     while (!congestion_.is_full() && !pending_.empty()) {
         auto* req = pending_.front();
-        pending_.erase(pending_.begin());
+        pending_.pop_front();
 
         if (!req->destroyed) {
             inflight_.push_back(req);
@@ -304,7 +309,7 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
     if (type == messages::REQUEST_ID) {
         char host[INET_ADDRSTRLEN];
         uv_ip4_name(addr, host, sizeof(host));
-        req.to.addr = compact::Ipv4Address::from_string(host, ntohs(addr->sin_port));
+        req.from.addr = compact::Ipv4Address::from_string(host, ntohs(addr->sin_port));
 
         if (on_request_) {
             on_request_(req);

@@ -20,15 +20,21 @@ namespace hyperdht::compact {
 struct State {
     size_t start = 0;
     size_t end = 0;
-    uint8_t* buffer = nullptr;
+    uint8_t* buffer = nullptr;  // For encode (mutable write access)
     bool error = false;
+
+    // Read-only access — safe for both encode and decode states
+    const uint8_t* data() const { return read_buffer_ ? read_buffer_ : buffer; }
 
     static State for_decode(const uint8_t* buf, size_t len) {
         State s;
-        s.buffer = const_cast<uint8_t*>(buf);
+        s.read_buffer_ = buf;
         s.end = len;
         return s;
     }
+
+private:
+    const uint8_t* read_buffer_ = nullptr;  // For decode (read-only)
 };
 
 // ---------------------------------------------------------------------------

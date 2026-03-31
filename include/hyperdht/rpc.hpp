@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <vector>
 
@@ -138,8 +139,9 @@ private:
     CongestionWindow congestion_;
 
     uint16_t next_tid_ = 0;
+    // Raw pointers: ownership transferred to uv_close callback in destroy_request
     std::vector<InflightRequest*> inflight_;
-    std::vector<InflightRequest*> pending_;  // Queued when congestion full
+    std::deque<InflightRequest*> pending_;   // Queued when congestion full (O(1) pop_front)
 
     // Drain timer (750ms interval)
     uv_timer_t drain_timer_;

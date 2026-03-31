@@ -1,6 +1,7 @@
 #include "hyperdht/routing_table.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <random>
 
@@ -16,8 +17,7 @@ size_t bucket_index(const NodeId& local_id, const NodeId& remote_id) {
     for (size_t i = 0; i < ID_LEN; i++) {
         uint8_t xor_byte = local_id[i] ^ remote_id[i];
         if (xor_byte != 0) {
-            // Count leading zeros in the XOR byte
-            int clz = __builtin_clz(static_cast<unsigned int>(xor_byte)) - 24;
+            int clz = std::countl_zero(xor_byte);
             return i * 8 + static_cast<size_t>(clz);
         }
     }
@@ -161,11 +161,9 @@ std::vector<const Node*> RoutingTable::closest(const NodeId& target, size_t coun
     }
 
     // Then go up (farther buckets) if we need more
-    if (d > 0) {
-        for (size_t i = d - 1; result.size() < count; i--) {
-            collect_from(i);
-            if (i == 0) break;
-        }
+    for (size_t i = d; i > 0 && result.size() < count; ) {
+        --i;
+        collect_from(i);
     }
 
     // Sort by XOR distance to target

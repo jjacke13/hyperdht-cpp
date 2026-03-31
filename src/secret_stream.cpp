@@ -8,8 +8,7 @@
 namespace hyperdht {
 namespace secret_stream {
 
-static_assert(sizeof(crypto_secretstream_xchacha20poly1305_state) <= SecretStream::STATE_BUF_SIZE,
-              "Libsodium secretstream state exceeds buffer size — increase STATE_BUF_SIZE");
+// STATE_BUF_SIZE now uses sizeof directly — no assertion needed
 
 // Namespace values: crypto.namespace('hyperswarm/secret-stream', 3)
 // Computed as: BLAKE2b-256(BLAKE2b-256("hyperswarm/secret-stream") || index_byte)
@@ -113,7 +112,10 @@ bool SecretStream::is_ready() const {
 }
 
 std::vector<uint8_t> SecretStream::encrypt(const uint8_t* data, size_t len) {
-    assert(is_ready());
+    if (!is_ready()) return {};  // Runtime guard (assert stripped in release)
+
+    // uint24_le max = 0xFFFFFF = 16777215
+    if (len + ABYTES > 0xFFFFFF) return {};  // Exceeds uint24_le frame limit
 
     // Encrypted payload: tag(1) + ciphertext + mac(16) = len + ABYTES
     size_t enc_len = len + ABYTES;
@@ -136,7 +138,7 @@ std::vector<uint8_t> SecretStream::encrypt(const uint8_t* data, size_t len) {
 }
 
 std::optional<std::vector<uint8_t>> SecretStream::decrypt(const uint8_t* data, size_t len) {
-    assert(is_ready());
+    if (!is_ready()) return std::nullopt;  // Runtime guard (assert stripped in release)
 
     if (len < ABYTES) return std::nullopt;
 

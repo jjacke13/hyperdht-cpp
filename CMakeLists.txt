@@ -45,6 +45,10 @@ add_library(hyperdht
     src/tokens.cpp
     src/messages.cpp
     src/rpc.cpp
+    src/rpc_handlers.cpp
+    src/announce.cpp
+    src/query.cpp
+    src/dht_ops.cpp
 )
 target_include_directories(hyperdht PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -138,4 +142,24 @@ if(HYPERDHT_BUILD_TESTS)
     target_link_libraries(test_rpc_bootstrap PRIVATE hyperdht GTest::gtest_main)
     add_test(NAME test_rpc_bootstrap COMMAND test_rpc_bootstrap)
     gtest_discover_tests(test_rpc_bootstrap)
+
+    add_executable(test_rpc_handlers test/test_rpc_handlers.cpp)
+    target_link_libraries(test_rpc_handlers PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_rpc_handlers COMMAND test_rpc_handlers)
+    gtest_discover_tests(test_rpc_handlers)
+
+    add_executable(test_announce test/test_announce.cpp)
+    target_link_libraries(test_announce PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_announce COMMAND test_announce)
+    gtest_discover_tests(test_announce)
+
+    add_executable(test_query test/test_query.cpp)
+    target_link_libraries(test_query PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_query COMMAND test_query)
+    gtest_discover_tests(test_query)
+
+    add_executable(test_dht_ops test/test_dht_ops.cpp)
+    target_link_libraries(test_dht_ops PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_dht_ops COMMAND test_dht_ops)
+    gtest_discover_tests(test_dht_ops)
 endif()

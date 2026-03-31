@@ -7,6 +7,40 @@ namespace hyperdht {
 namespace rpc {
 
 // ---------------------------------------------------------------------------
+// CongestionWindow
+// ---------------------------------------------------------------------------
+
+CongestionWindow::CongestionWindow(int max_window) : max_window_(max_window) {}
+
+bool CongestionWindow::is_full() const {
+    return total_ >= 2 * max_window_ || window_[i_] >= max_window_;
+}
+
+void CongestionWindow::send() {
+    total_++;
+    window_[i_]++;
+}
+
+void CongestionWindow::recv() {
+    if (window_[i_] > 0) {
+        window_[i_]--;
+        total_--;
+    }
+}
+
+void CongestionWindow::drain() {
+    i_ = (i_ + 1) & 3;          // Rotate to next bucket
+    total_ -= window_[i_];       // Remove oldest bucket's count
+    window_[i_] = 0;             // Clear it
+}
+
+void CongestionWindow::clear() {
+    i_ = 0;
+    total_ = 0;
+    std::memset(window_, 0, sizeof(window_));
+}
+
+// ---------------------------------------------------------------------------
 // RpcSocket
 // ---------------------------------------------------------------------------
 
@@ -17,12 +51,24 @@ RpcSocket::RpcSocket(uv_loop_t* loop, const routing::NodeId& local_id)
     udx_socket_init(&udx_, &socket_, nullptr);
     socket_.data = this;
 
+    // Drain timer
+    uv_timer_init(loop_, &drain_timer_);
+    drain_timer_.data = this;
+
     // Random initial tid
     std::random_device rd;
     next_tid_ = static_cast<uint16_t>(rd() & 0xFFFF);
 }
 
-RpcSocket::~RpcSocket() = default;
+RpcSocket::~RpcSocket() {
+    // Clean up any remaining inflight requests
+    for (auto* req : inflight_) {
+        delete req;
+    }
+    for (auto* req : pending_) {
+        delete req;
+    }
+}
 
 int RpcSocket::bind(uint16_t port) {
     struct sockaddr_in addr{};
@@ -30,8 +76,10 @@ int RpcSocket::bind(uint16_t port) {
     int rc = udx_socket_bind(&socket_, reinterpret_cast<const struct sockaddr*>(&addr), 0);
     if (rc == 0) {
         socket_bound_ = true;
-        // Start receiving
         udx_socket_recv_start(&socket_, on_recv);
+
+        // Start drain timer
+        uv_timer_start(&drain_timer_, on_drain_tick, DRAIN_INTERVAL_MS, DRAIN_INTERVAL_MS);
     }
     return rc;
 }
@@ -46,24 +94,83 @@ uint16_t RpcSocket::port() const {
 
 uint16_t RpcSocket::alloc_tid() {
     uint16_t tid = next_tid_++;
-    if (next_tid_ == 0) next_tid_ = 1;  // Skip 0
+    if (next_tid_ == 0) next_tid_ = 1;
     return tid;
 }
 
 InflightRequest* RpcSocket::find_inflight(uint16_t tid) {
-    for (auto& req : inflight_) {
-        if (req.tid == tid) return &req;
+    for (auto* req : inflight_) {
+        if (req->tid == tid) return req;
     }
     return nullptr;
 }
 
-void RpcSocket::remove_inflight(uint16_t tid) {
+void RpcSocket::destroy_request(InflightRequest* req) {
+    if (req->destroyed) return;
+    req->destroyed = true;
+
+    // Stop per-request timer
+    uv_timer_stop(&req->timer);
+    uv_close(reinterpret_cast<uv_handle_t*>(&req->timer), [](uv_handle_t* h) {
+        auto* r = static_cast<InflightRequest*>(h->data);
+        delete r;
+    });
+
+    // Remove from inflight list (O(1) swap-and-pop)
     for (size_t i = 0; i < inflight_.size(); i++) {
-        if (inflight_[i].tid == tid) {
-            // Swap with last and pop (O(1) removal)
-            inflight_[i] = std::move(inflight_.back());
+        if (inflight_[i] == req) {
+            inflight_[i] = inflight_.back();
             inflight_.pop_back();
-            return;
+            break;
+        }
+    }
+
+    congestion_.recv();
+}
+
+void RpcSocket::udp_send(const std::vector<uint8_t>& buf, const compact::Ipv4Address& to) {
+    auto* send_req = static_cast<udx_socket_send_t*>(malloc(sizeof(udx_socket_send_t)));
+    auto* send_buf = new std::vector<uint8_t>(buf);
+    send_req->data = send_buf;
+
+    uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(send_buf->data()),
+                                    static_cast<unsigned int>(send_buf->size()));
+
+    struct sockaddr_in dest{};
+    uv_ip4_addr(to.host_string().c_str(), to.port, &dest);
+
+    udx_socket_send(send_req, &socket_, &uv_buf, 1,
+                    reinterpret_cast<const struct sockaddr*>(&dest),
+                    [](udx_socket_send_t* req, int) {
+                        delete static_cast<std::vector<uint8_t>*>(req->data);
+                        free(req);
+                    });
+}
+
+void RpcSocket::send_now(InflightRequest* req) {
+    if (req->destroyed || closing_) return;
+
+    req->sent++;
+    congestion_.send();
+
+    // Send the cached buffer
+    udp_send(req->buffer, req->to);
+
+    // Start/restart per-request timeout timer
+    uv_timer_stop(&req->timer);
+    uv_timer_start(&req->timer, on_request_timeout, DEFAULT_TIMEOUT_MS, 0);
+}
+
+void RpcSocket::drain_pending() {
+    while (!congestion_.is_full() && !pending_.empty()) {
+        auto* req = pending_.front();
+        pending_.erase(pending_.begin());
+
+        if (!req->destroyed) {
+            inflight_.push_back(req);
+            send_now(req);
+        } else {
+            delete req;
         }
     }
 }
@@ -71,70 +178,108 @@ void RpcSocket::remove_inflight(uint16_t tid) {
 uint16_t RpcSocket::request(const messages::Request& req,
                             OnResponseCallback on_response,
                             OnTimeoutCallback on_timeout) {
+    if (closing_) return 0;
+
     // Build request with our tid
     messages::Request msg = req;
     msg.tid = alloc_tid();
 
-    // Encode
-    auto buf = messages::encode_request(msg);
+    // Create inflight entry
+    auto* inflight = new InflightRequest;
+    inflight->owner = this;
+    inflight->tid = msg.tid;
+    inflight->command = msg.command;
+    inflight->on_response = std::move(on_response);
+    inflight->on_timeout = std::move(on_timeout);
+    inflight->to = msg.to.addr;
+    inflight->buffer = messages::encode_request(msg);
 
-    // Send UDP
-    auto* send_req = static_cast<udx_socket_send_t*>(
-        malloc(sizeof(udx_socket_send_t)));
-    send_req->data = nullptr;
+    // Init per-request timer
+    uv_timer_init(loop_, &inflight->timer);
+    inflight->timer.data = inflight;
 
-    // Copy buffer for send (libuv needs it alive until send completes)
-    auto* send_buf = new std::vector<uint8_t>(std::move(buf));
-    uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(send_buf->data()),
-                                    static_cast<unsigned int>(send_buf->size()));
+    // Check congestion window
+    if (congestion_.is_full()) {
+        pending_.push_back(inflight);
+        return msg.tid;
+    }
 
-    struct sockaddr_in dest{};
-    uv_ip4_addr(msg.to.addr.host_string().c_str(), msg.to.addr.port, &dest);
-
-    udx_socket_send(send_req, &socket_, &uv_buf, 1,
-                    reinterpret_cast<const struct sockaddr*>(&dest),
-                    [](udx_socket_send_t* req, int) {
-                        delete static_cast<std::vector<uint8_t>*>(req->data);
-                        free(req);
-                    });
-    send_req->data = send_buf;
-
-    // Track inflight
-    InflightRequest inflight;
-    inflight.tid = msg.tid;
-    inflight.command = msg.command;
-    inflight.on_response = std::move(on_response);
-    inflight.on_timeout = std::move(on_timeout);
-    inflight.to = msg.to.addr;
-    inflight_.push_back(std::move(inflight));
-
+    inflight_.push_back(inflight);
+    send_now(inflight);
     return msg.tid;
 }
 
 void RpcSocket::reply(const messages::Response& resp) {
+    if (closing_) return;
     auto buf = messages::encode_response(resp);
-
-    auto* send_req = static_cast<udx_socket_send_t*>(
-        malloc(sizeof(udx_socket_send_t)));
-
-    auto* send_buf = new std::vector<uint8_t>(std::move(buf));
-    uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(send_buf->data()),
-                                    static_cast<unsigned int>(send_buf->size()));
-
-    struct sockaddr_in dest{};
-    uv_ip4_addr(resp.from.addr.host_string().c_str(), resp.from.addr.port, &dest);
-
-    udx_socket_send(send_req, &socket_, &uv_buf, 1,
-                    reinterpret_cast<const struct sockaddr*>(&dest),
-                    [](udx_socket_send_t* req, int) {
-                        delete static_cast<std::vector<uint8_t>*>(req->data);
-                        free(req);
-                    });
-    send_req->data = send_buf;
+    udp_send(buf, resp.from.addr);
 }
 
 void RpcSocket::close() {
+    if (closing_) return;
+    closing_ = true;
+
+    uv_timer_stop(&drain_timer_);
+    uv_close(reinterpret_cast<uv_handle_t*>(&drain_timer_), nullptr);
+
+    // Destroy all inflight requests
+    auto inflight_copy = inflight_;  // Copy since destroy_request modifies the vector
+    for (auto* req : inflight_copy) {
+        destroy_request(req);
+    }
+
+    // Clean pending
+    for (auto* req : pending_) {
+        uv_close(reinterpret_cast<uv_handle_t*>(&req->timer), [](uv_handle_t* h) {
+            delete static_cast<InflightRequest*>(h->data);
+        });
+    }
+    pending_.clear();
+
     udx_socket_close(&socket_);
+}
+
+// ---------------------------------------------------------------------------
+// Timer callbacks
+// ---------------------------------------------------------------------------
+
+void RpcSocket::on_drain_tick(uv_timer_t* timer) {
+    auto* self = static_cast<RpcSocket*>(timer->data);
+    if (self->closing_) return;
+
+    // Token rotation
+    if (--self->rotate_counter_ == 0) {
+        self->rotate_counter_ = TOKEN_ROTATE_TICKS;
+        self->tokens_.rotate();
+    }
+
+    // Congestion window rotation
+    self->congestion_.drain();
+
+    // Send queued requests
+    self->drain_pending();
+}
+
+void RpcSocket::on_request_timeout(uv_timer_t* timer) {
+    auto* req = static_cast<InflightRequest*>(timer->data);
+    if (req->destroyed) return;
+
+    auto* self = req->owner;
+    if (self->closing_) return;
+
+    if (req->sent > req->retries) {
+        // Exhausted retries — final timeout
+        auto on_timeout = std::move(req->on_timeout);
+        uint16_t tid = req->tid;
+        self->destroy_request(req);
+
+        if (on_timeout) {
+            on_timeout(tid);
+        }
+    } else {
+        // Retry: resend the same buffer
+        self->send_now(req);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,14 +298,13 @@ void RpcSocket::on_recv(udx_socket_t* socket, ssize_t nread, const uv_buf_t* buf
 
 void RpcSocket::handle_message(const uint8_t* data, size_t len,
                                const struct sockaddr_in* addr) {
-    if (len < 2) return;
+    if (len < 2 || closing_) return;
 
     messages::Request req;
     messages::Response resp;
     uint8_t type = messages::decode_message(data, len, req, resp);
 
     if (type == messages::REQUEST_ID) {
-        // Fill in sender address
         char host[INET_ADDRSTRLEN];
         uv_ip4_name(addr, host, sizeof(host));
         req.to.addr = compact::Ipv4Address::from_string(host, ntohs(addr->sin_port));
@@ -169,11 +313,14 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
             on_request_(req);
         }
     } else if (type == messages::RESPONSE_ID) {
-        // Match to inflight request
         auto* inflight = find_inflight(resp.tid);
-        if (inflight && inflight->on_response) {
-            inflight->on_response(resp);
-            remove_inflight(resp.tid);
+        if (inflight && !inflight->destroyed) {
+            auto on_response = std::move(inflight->on_response);
+            destroy_request(inflight);
+
+            if (on_response) {
+                on_response(resp);
+            }
         }
     }
 }

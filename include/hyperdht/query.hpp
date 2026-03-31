@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -60,8 +61,14 @@ using OnCommitCallback = std::function<void(const QueryReply& node,
 // Query — iterative DHT walk
 // ---------------------------------------------------------------------------
 
-class Query {
+class Query : public std::enable_shared_from_this<Query> {
 public:
+    // Use Query::create() instead of constructing directly
+    static std::shared_ptr<Query> create(rpc::RpcSocket& socket,
+                                          const routing::NodeId& target,
+                                          uint32_t command,
+                                          const std::vector<uint8_t>* value = nullptr);
+
     Query(rpc::RpcSocket& socket, const routing::NodeId& target,
           uint32_t command, const std::vector<uint8_t>* value = nullptr);
 

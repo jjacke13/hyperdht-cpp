@@ -61,12 +61,9 @@ RpcSocket::RpcSocket(uv_loop_t* loop, const routing::NodeId& local_id)
 }
 
 RpcSocket::~RpcSocket() {
-    // Clean up any remaining inflight requests
-    for (auto* req : inflight_) {
-        delete req;
-    }
-    for (auto* req : pending_) {
-        delete req;
+    // Ensure close() was called — if not, close now to prevent dangling timers
+    if (!closing_) {
+        close();
     }
 }
 

@@ -124,19 +124,24 @@ HkdfPair hkdf(const uint8_t* salt, size_t salt_len,
 // ---------------------------------------------------------------------------
 
 std::array<uint8_t, DHLEN> dh(const Keypair& local, const PubKey& remote) {
-    // Extract scalar from secret key: SHA512(seed), then clamp
-    uint8_t sk_hash[64];
-    crypto_hash_sha512(sk_hash, local.secret_key.data(), SEEDLEN);
+    // Extract scalar: SHA512(seed) → take lower 32 bytes → clamp
+    uint8_t sk_full[64];
+    crypto_hash_sha512(sk_full, local.secret_key.data(), SEEDLEN);
+
+    // Only the lower 32 bytes are the scalar (Ed25519 convention)
+    uint8_t scalar[32];
+    std::memcpy(scalar, sk_full, 32);
+    sodium_memzero(sk_full, sizeof(sk_full));
 
     // Clamp (same as JS noise-curve-ed)
-    sk_hash[0] &= 248;
-    sk_hash[31] &= 127;
-    sk_hash[31] |= 64;
+    scalar[0] &= 248;
+    scalar[31] &= 127;
+    scalar[31] |= 64;
 
     std::array<uint8_t, DHLEN> out{};
-    (void)crypto_scalarmult_ed25519_noclamp(out.data(), sk_hash, remote.data());
+    (void)crypto_scalarmult_ed25519_noclamp(out.data(), scalar, remote.data());
 
-    sodium_memzero(sk_hash, sizeof(sk_hash));
+    sodium_memzero(scalar, sizeof(scalar));
     return out;
 }
 
@@ -224,7 +229,7 @@ std::optional<std::vector<uint8_t>> CipherState::decrypt_with_ad(const uint8_t* 
         return std::vector<uint8_t>(ct, ct + ct_len);
     }
     auto pt = noise::decrypt(*key_, nonce_, ad, ad_len, ct, ct_len);
-    nonce_++;
+    if (pt) nonce_++;  // Only advance on successful decryption
     return pt;
 }
 

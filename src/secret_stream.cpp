@@ -8,6 +8,9 @@
 namespace hyperdht {
 namespace secret_stream {
 
+static_assert(sizeof(crypto_secretstream_xchacha20poly1305_state) <= SecretStream::STATE_BUF_SIZE,
+              "Libsodium secretstream state exceeds buffer size — increase STATE_BUF_SIZE");
+
 // Namespace values: crypto.namespace('hyperswarm/secret-stream', 3)
 // Computed as: BLAKE2b-256(BLAKE2b-256("hyperswarm/secret-stream") || index_byte)
 static const uint8_t NS_INITIATOR[32] = {

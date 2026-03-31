@@ -63,7 +63,7 @@ TEST(DhtOps, FindPeerRandomKey) {
     size_t replies = 0;
     size_t values_found = 0;
 
-    auto* q = find_peer(rpc, random_pk,
+    auto q = find_peer(rpc, random_pk,
         [&](const QueryReply& reply) {
             replies++;
             if (reply.value.has_value() && !reply.value->empty()) {
@@ -93,6 +93,6 @@ TEST(DhtOps, FindPeerRandomKey) {
         GTEST_SKIP() << "Network unreachable";
     }
 
-    delete q;
+    // q is a shared_ptr, automatically cleaned up
     uv_loop_close(&loop);
 }

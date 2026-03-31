@@ -3,6 +3,7 @@
 #include <sodium.h>
 
 #include <cstring>
+#include <memory>
 
 namespace hyperdht {
 namespace peer_connect {
@@ -199,9 +200,9 @@ void peer_handshake(rpc::RpcSocket& socket,
                     OnHandshakeCallback on_done) {
 
     // Create Noise IK initiator with real prologue
-    auto* noise_ik = new noise::NoiseIK(true, our_keypair,
-                                         PROLOGUE.data(), PROLOGUE.size(),
-                                         &remote_pubkey);
+    auto noise_ik = std::make_shared<noise::NoiseIK>(true, our_keypair,
+                                                      PROLOGUE.data(), PROLOGUE.size(),
+                                                      &remote_pubkey);
 
     // Build noisePayload for msg1
     NoisePayload payload;
@@ -241,29 +242,23 @@ void peer_handshake(rpc::RpcSocket& socket,
             if (!resp.value.has_value() || resp.value->empty()) {
                 result.success = false;
                 on_done(result);
-                delete noise_ik;
                 return;
             }
 
-            // Decode handshake message wrapper
             auto hs_resp = decode_handshake_msg(resp.value->data(), resp.value->size());
             if (hs_resp.noise.empty()) {
                 result.success = false;
                 on_done(result);
-                delete noise_ik;
                 return;
             }
 
-            // Process Noise msg2
             auto decrypted = noise_ik->recv(hs_resp.noise.data(), hs_resp.noise.size());
             if (!decrypted.has_value() || !noise_ik->is_complete()) {
                 result.success = false;
                 on_done(result);
-                delete noise_ik;
                 return;
             }
 
-            // Decode the noisePayload from msg2
             result.remote_payload = decode_noise_payload(
                 decrypted->data(), decrypted->size());
 
@@ -272,18 +267,13 @@ void peer_handshake(rpc::RpcSocket& socket,
             result.rx_key = noise_ik->rx_key();
             result.handshake_hash = noise_ik->handshake_hash();
 
-            // Remote public key is the one we connected to
-            // (we already know it since IK pattern pre-shares it)
-            // but we could also extract from noise_ik->rs if needed
-
             on_done(result);
-            delete noise_ik;
+            // noise_ik shared_ptr released automatically when both lambdas are destroyed
         },
         [noise_ik, on_done](uint16_t) {
             HandshakeResult result;
             result.success = false;
             on_done(result);
-            delete noise_ik;
         });
 }
 

@@ -5,6 +5,14 @@
 namespace hyperdht {
 namespace query {
 
+std::shared_ptr<Query> Query::create(rpc::RpcSocket& socket,
+                                      const routing::NodeId& target,
+                                      uint32_t command,
+                                      const std::vector<uint8_t>* value) {
+    auto q = std::shared_ptr<Query>(new Query(socket, target, command, value));
+    return q;
+}
+
 Query::Query(rpc::RpcSocket& socket, const routing::NodeId& target,
              uint32_t command, const std::vector<uint8_t>* value)
     : socket_(socket), target_(target), command_(command) {
@@ -86,17 +94,18 @@ void Query::visit(const PendingNode& node) {
         req.value = *value_;
     }
 
-    // Capture node by value for callbacks
+    // Capture shared_ptr to prevent use-after-free if Query is released early
+    auto self = shared_from_this();
     auto captured_node = node;
 
     socket_.request(req,
-        [this, captured_node](const messages::Response& resp) {
-            inflight_--;
-            on_visit_response(captured_node, resp);
+        [self, captured_node](const messages::Response& resp) {
+            self->inflight_--;
+            self->on_visit_response(captured_node, resp);
         },
-        [this, captured_node](uint16_t) {
-            inflight_--;
-            on_visit_timeout(captured_node);
+        [self, captured_node](uint16_t) {
+            self->inflight_--;
+            self->on_visit_timeout(captured_node);
         });
 }
 

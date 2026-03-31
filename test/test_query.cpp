@@ -72,23 +72,22 @@ TEST(Query, LoopbackFindNode) {
     size_t replies_count = 0;
     std::vector<QueryReply> final_closest;
 
-    Query q(client, target, CMD_FIND_NODE);
-    q.set_internal(true);
-    q.add_bootstrap(Ipv4Address::from_string("127.0.0.1", server.port()));
+    auto q = Query::create(client, target, CMD_FIND_NODE);
+    q->set_internal(true);
+    q->add_bootstrap(Ipv4Address::from_string("127.0.0.1", server.port()));
 
-    q.on_reply([&](const QueryReply&) {
+    q->on_reply([&](const QueryReply&) {
         replies_count++;
     });
 
-    q.on_done([&](const std::vector<QueryReply>& closest) {
+    q->on_done([&](const std::vector<QueryReply>& closest) {
         query_done = true;
         final_closest = closest;
-        // Cleanup
         server.close();
         client.close();
     });
 
-    q.start();
+    q->start();
 
     // Timeout
     uv_timer_t timer;
@@ -133,27 +132,27 @@ TEST(Query, LiveBootstrapFindNode) {
     size_t total_closer_nodes = 0;
     std::vector<QueryReply> final_closest;
 
-    Query q(rpc, target, CMD_FIND_NODE);
-    q.set_internal(true);
-    q.set_concurrency(5);
+    auto q = Query::create(rpc, target, CMD_FIND_NODE);
+    q->set_internal(true);
+    q->set_concurrency(5);
 
     // Seed with all 3 bootstrap nodes
-    q.add_bootstrap(Ipv4Address::from_string("88.99.3.86", 49737));
-    q.add_bootstrap(Ipv4Address::from_string("142.93.90.113", 49737));
-    q.add_bootstrap(Ipv4Address::from_string("138.68.147.8", 49737));
+    q->add_bootstrap(Ipv4Address::from_string("88.99.3.86", 49737));
+    q->add_bootstrap(Ipv4Address::from_string("142.93.90.113", 49737));
+    q->add_bootstrap(Ipv4Address::from_string("138.68.147.8", 49737));
 
-    q.on_reply([&](const QueryReply& reply) {
+    q->on_reply([&](const QueryReply& reply) {
         replies_count++;
         total_closer_nodes += reply.closer_nodes.size();
     });
 
-    q.on_done([&](const std::vector<QueryReply>& closest) {
+    q->on_done([&](const std::vector<QueryReply>& closest) {
         query_done = true;
         final_closest = closest;
         rpc.close();
     });
 
-    q.start();
+    q->start();
 
     uv_timer_t timer;
     uv_timer_init(&loop, &timer);

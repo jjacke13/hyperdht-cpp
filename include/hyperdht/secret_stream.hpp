@@ -94,6 +94,9 @@ public:
     const StreamId& local_id() const { return local_id_; }
     const StreamId& remote_id() const { return remote_id_; }
 
+    // Buffer size for opaque libsodium state (verified via static_assert)
+    static constexpr size_t STATE_BUF_SIZE = 64;
+
 private:
     bool is_initiator_;
     bool header_sent_ = false;
@@ -102,10 +105,8 @@ private:
     StreamId local_id_;
     StreamId remote_id_;
 
-    // Opaque libsodium secretstream state
-    // Stored as raw bytes to avoid including sodium.h in the header
-    alignas(8) uint8_t push_state_[256];  // crypto_secretstream_xchacha20poly1305_state
-    alignas(8) uint8_t pull_state_[256];
+    alignas(8) uint8_t push_state_[STATE_BUF_SIZE];
+    alignas(8) uint8_t pull_state_[STATE_BUF_SIZE];
 
     Key tx_key_;
     Key rx_key_;

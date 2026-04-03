@@ -120,6 +120,10 @@ if(HYPERDHT_BUILD_TESTS)
     target_link_libraries(test_secret_stream PRIVATE hyperdht GTest::gtest_main)
     add_test(NAME test_secret_stream COMMAND test_secret_stream)
 
+    add_executable(test_crypto_verify test/test_crypto_verify.cpp)
+    target_link_libraries(test_crypto_verify PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_crypto_verify COMMAND test_crypto_verify)
+
     add_executable(test_routing_table test/test_routing_table.cpp)
     target_link_libraries(test_routing_table PRIVATE hyperdht GTest::gtest_main)
     add_test(NAME test_routing_table COMMAND test_routing_table)
@@ -133,6 +137,7 @@ if(HYPERDHT_BUILD_TESTS)
     gtest_discover_tests(test_noise)
     gtest_discover_tests(test_noise_cross)
     gtest_discover_tests(test_secret_stream)
+    gtest_discover_tests(test_crypto_verify)
     gtest_discover_tests(test_routing_table)
 
     add_executable(test_tokens test/test_tokens.cpp)

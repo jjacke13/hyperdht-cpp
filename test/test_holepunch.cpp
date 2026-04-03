@@ -188,11 +188,8 @@ TEST(Holepuncher, ConsistentConsistent) {
 
     EXPECT_TRUE(hp.punch());
     EXPECT_TRUE(hp.is_punching());
-    hp.stop();
 
-    uv_run(&loop, UV_RUN_NOWAIT);
-    // Clean up timer handle
-    uv_close(reinterpret_cast<uv_handle_t*>(&hp.punch_timer_), nullptr);
+    hp.close();
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }
@@ -208,7 +205,7 @@ TEST(Holepuncher, RandomRandomFails) {
     EXPECT_FALSE(hp.punch()) << "RANDOM+RANDOM should fail";
     EXPECT_FALSE(hp.is_punching());
 
-    uv_close(reinterpret_cast<uv_handle_t*>(&hp.punch_timer_), nullptr);
+    hp.close();
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }
@@ -239,7 +236,47 @@ TEST(Holepuncher, OnMessageConnect) {
     EXPECT_FALSE(hp.is_punching());
     EXPECT_EQ(connected_addr.port, 3000u);
 
-    uv_close(reinterpret_cast<uv_handle_t*>(&hp.punch_timer_), nullptr);
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// SendProbeFn wiring
+// ---------------------------------------------------------------------------
+
+TEST(Holepuncher, SendProbeCallsSendFn) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, true);
+
+    std::vector<Ipv4Address> probed_addrs;
+    hp.set_send_fn([&](const Ipv4Address& addr) {
+        probed_addrs.push_back(addr);
+    });
+
+    auto target = Ipv4Address::from_string("10.0.0.1", 5000);
+    hp.send_probe(target);
+    hp.send_probe(target);
+
+    EXPECT_EQ(probed_addrs.size(), 2u);
+    EXPECT_EQ(probed_addrs[0].port, 5000u);
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(Holepuncher, SendProbeNoop) {
+    // Without set_send_fn, send_probe should not crash
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, true);
+    hp.send_probe(Ipv4Address::from_string("10.0.0.1", 5000));  // No crash
+
+    hp.close();
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }

@@ -100,6 +100,9 @@ bool try_direct_connect(const peer_connect::HandshakeResult& hs,
 // Holepuncher — the UDP probe engine
 // ---------------------------------------------------------------------------
 
+// Callback for sending a UDP probe to an address
+using SendProbeFn = std::function<void(const compact::Ipv4Address& addr)>;
+
 class Holepuncher {
 public:
     Holepuncher(uv_loop_t* loop, bool is_initiator);
@@ -107,6 +110,9 @@ public:
 
     Holepuncher(const Holepuncher&) = delete;
     Holepuncher& operator=(const Holepuncher&) = delete;
+
+    // Set the function used to send UDP probes (typically RpcSocket::send_probe)
+    void set_send_fn(SendProbeFn fn) { send_fn_ = std::move(fn); }
 
     // Set our firewall type and the remote's
     void set_local_firewall(uint32_t fw) { local_firewall_ = fw; }
@@ -133,17 +139,19 @@ public:
     // Handle incoming UDP from a peer (success detection)
     void on_message(const compact::Ipv4Address& from);
 
+    // Close the timer handle. Must be called before destruction if the event
+    // loop is still running. Calls on_closed when the handle is fully closed.
+    void close(std::function<void()> on_closed = nullptr);
+
     bool is_connected() const { return connected_; }
     bool is_punching() const { return punching_; }
-
-    // Exposed for test cleanup (libuv requires explicit handle close)
-    uv_timer_t punch_timer_;
 
 private:
     uv_loop_t* loop_;
     bool is_initiator_;
     bool connected_ = false;
     bool punching_ = false;
+    bool closing_ = false;
     uint32_t local_firewall_ = peer_connect::FIREWALL_UNKNOWN;
     uint32_t remote_firewall_ = peer_connect::FIREWALL_UNKNOWN;
 
@@ -151,7 +159,11 @@ private:
     int punch_round_ = 0;
     int random_probes_left_ = 0;
 
+    SendProbeFn send_fn_;
     OnHolepunchCallback on_connect_;
+
+    // Heap-allocated so libuv can outlive this object during async close
+    uv_timer_t* punch_timer_;
 
     // Strategy implementations
     void consistent_probe();   // CONSISTENT+CONSISTENT
@@ -190,11 +202,15 @@ HolepunchMessage decode_holepunch_msg(const uint8_t* data, size_t len);
 // socket: RPC socket for sending PEER_HOLEPUNCH messages
 // on_done: called when holepunch completes or fails
 // peer_addr: the server's address as seen by the relay (from holepunch relays info)
+// local_firewall: our firewall type from NAT sampling (or FIREWALL_UNKNOWN)
+// local_addresses: our detected public addresses (from NAT sampler)
 void holepunch_connect(rpc::RpcSocket& socket,
                        const peer_connect::HandshakeResult& hs_result,
                        const compact::Ipv4Address& relay_addr,
                        const compact::Ipv4Address& peer_addr,
                        uint32_t holepunch_id,
+                       uint32_t local_firewall,
+                       const std::vector<compact::Ipv4Address>& local_addresses,
                        OnHolepunchCallback on_done);
 
 }  // namespace holepunch

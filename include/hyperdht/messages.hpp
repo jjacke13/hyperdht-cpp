@@ -52,6 +52,10 @@ constexpr uint32_t CMD_FIND_PEER = 2;
 constexpr uint32_t CMD_LOOKUP = 3;
 constexpr uint32_t CMD_ANNOUNCE = 4;
 constexpr uint32_t CMD_UNANNOUNCE = 5;
+constexpr uint32_t CMD_MUTABLE_PUT = 6;
+constexpr uint32_t CMD_MUTABLE_GET = 7;
+constexpr uint32_t CMD_IMMUTABLE_PUT = 8;
+constexpr uint32_t CMD_IMMUTABLE_GET = 9;
 
 // ---------------------------------------------------------------------------
 // Address — IPv4 host:port

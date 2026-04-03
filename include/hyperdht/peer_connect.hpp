@@ -24,12 +24,12 @@ namespace peer_connect {
 // Constants
 // ---------------------------------------------------------------------------
 
-// Handshake message modes (from router.js)
+// Handshake/holepunch message modes (from router.js)
 constexpr uint32_t MODE_FROM_CLIENT = 0;
-constexpr uint32_t MODE_FROM_RELAY = 1;
+constexpr uint32_t MODE_FROM_SERVER = 1;
+constexpr uint32_t MODE_FROM_RELAY = 2;
 constexpr uint32_t MODE_FROM_SECOND_RELAY = 3;
 constexpr uint32_t MODE_REPLY = 4;
-constexpr uint32_t MODE_FROM_SERVER = 5;
 
 // Firewall status
 constexpr uint32_t FIREWALL_UNKNOWN = 0;

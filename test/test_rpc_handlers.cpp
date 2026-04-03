@@ -65,6 +65,7 @@ TEST(RpcHandlers, PingReply) {
     Request req;
     req.to.addr = Ipv4Address::from_string("127.0.0.1", server.port());
     req.command = CMD_PING;
+    req.internal = true;
 
     client.request(req,
         [&ctx, &server_id](const Response& resp) {
@@ -132,6 +133,7 @@ TEST(RpcHandlers, FindNodeReply) {
     Request req;
     req.to.addr = Ipv4Address::from_string("127.0.0.1", server.port());
     req.command = CMD_FIND_NODE;
+    req.internal = true;
     std::array<uint8_t, 32> target{};
     target.fill(0x00);
     target[0] = 0x03;  // Close to nodes we added

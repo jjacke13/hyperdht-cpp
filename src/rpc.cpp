@@ -1,5 +1,6 @@
 #include "hyperdht/rpc.hpp"
 
+#include <cassert>
 #include <cstring>
 #include <random>
 
@@ -56,6 +57,10 @@ RpcSocket::RpcSocket(uv_loop_t* loop, const routing::NodeId& local_id)
     uv_timer_init(loop_, &drain_timer_);
     drain_timer_.data = this;
 
+    // Background tick timer
+    uv_timer_init(loop_, &bg_timer_);
+    bg_timer_.data = this;
+
     // Random initial tid
     std::random_device rd;
     next_tid_ = static_cast<uint16_t>(rd() & 0xFFFF);
@@ -65,6 +70,7 @@ RpcSocket::~RpcSocket() {
     // Caller MUST call close() and run the event loop to drain before destroying.
     // Calling close() here would schedule uv_close but the object would be freed
     // before the callbacks fire — causing use-after-free in libuv.
+    assert(!socket_bound_ || closing_);
 }
 
 int RpcSocket::bind(uint16_t port) {
@@ -77,6 +83,9 @@ int RpcSocket::bind(uint16_t port) {
 
         // Start drain timer
         uv_timer_start(&drain_timer_, on_drain_tick, DRAIN_INTERVAL_MS, DRAIN_INTERVAL_MS);
+
+        // Start background tick timer
+        uv_timer_start(&bg_timer_, on_bg_tick, BG_TICK_MS, BG_TICK_MS);
     }
     return rc;
 }
@@ -153,14 +162,16 @@ void RpcSocket::send_now(InflightRequest* req) {
     if (req->destroyed || closing_) return;
 
     req->sent++;
+    req->sent_at = uv_now(loop_);
     congestion_.send();
 
     // Send the cached buffer
     udp_send(req->buffer, req->to);
 
-    // Start/restart per-request timeout timer
+    // Start/restart per-request timeout timer (adaptive or default)
+    uint64_t timeout = timeout_for(req->to);
     uv_timer_stop(&req->timer);
-    uv_timer_start(&req->timer, on_request_timeout, DEFAULT_TIMEOUT_MS, 0);
+    uv_timer_start(&req->timer, on_request_timeout, timeout, 0);
 }
 
 void RpcSocket::drain_pending() {
@@ -172,7 +183,10 @@ void RpcSocket::drain_pending() {
             inflight_.push_back(req);
             send_now(req);
         } else {
-            delete req;
+            // Timer was uv_timer_init'd — must uv_close before freeing
+            uv_close(reinterpret_cast<uv_handle_t*>(&req->timer), [](uv_handle_t* h) {
+                delete static_cast<InflightRequest*>(h->data);
+            });
         }
     }
 }
@@ -224,6 +238,9 @@ void RpcSocket::close() {
     uv_timer_stop(&drain_timer_);
     uv_close(reinterpret_cast<uv_handle_t*>(&drain_timer_), nullptr);
 
+    uv_timer_stop(&bg_timer_);
+    uv_close(reinterpret_cast<uv_handle_t*>(&bg_timer_), nullptr);
+
     // Destroy all inflight requests
     auto inflight_copy = inflight_;  // Copy since destroy_request modifies the vector
     for (auto* req : inflight_copy) {
@@ -271,6 +288,7 @@ void RpcSocket::on_request_timeout(uv_timer_t* timer) {
 
     if (req->sent > req->retries) {
         // Exhausted retries — final timeout
+        self->tick_timeouts_++;
         auto on_timeout = std::move(req->on_timeout);
         uint16_t tid = req->tid;
         self->destroy_request(req);
@@ -298,9 +316,27 @@ void RpcSocket::on_recv(udx_socket_t* socket, ssize_t nread, const uv_buf_t* buf
                          static_cast<size_t>(nread), addr_in);
 }
 
+void RpcSocket::send_probe(const compact::Ipv4Address& to) {
+    static const std::vector<uint8_t> probe_byte = {0x00};
+    udp_send(probe_byte, to);
+}
+
 void RpcSocket::handle_message(const uint8_t* data, size_t len,
                                const struct sockaddr_in* addr) {
-    if (len < 2 || closing_) return;
+    if (closing_) return;
+
+    // Holepunch probe: single byte 0x00
+    if (len == 1 && data[0] == 0x00) {
+        if (on_probe_) {
+            char host[INET_ADDRSTRLEN];
+            uv_ip4_name(addr, host, sizeof(host));
+            auto from = compact::Ipv4Address::from_string(host, ntohs(addr->sin_port));
+            on_probe_(from);
+        }
+        return;
+    }
+
+    if (len < 2) return;
 
     messages::Request req;
     messages::Response resp;
@@ -315,8 +351,24 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
             on_request_(req);
         }
     } else if (type == messages::RESPONSE_ID) {
+        // Feed NAT sampler: resp.from.addr is the wire `to` field — how
+        // the remote sees us. The UDP source (addr) is the remote node.
+        char remote_host[INET_ADDRSTRLEN];
+        uv_ip4_name(addr, remote_host, sizeof(remote_host));
+        auto remote_addr = compact::Ipv4Address::from_string(
+            remote_host, ntohs(addr->sin_port));
+        nat_sampler_.add(resp.from.addr, remote_addr);
+
         auto* inflight = find_inflight(resp.tid);
         if (inflight && !inflight->destroyed) {
+            tick_responses_++;
+
+            // Record RTT for adaptive timeout (only first 2 attempts)
+            if (inflight->sent <= 2 && inflight->sent_at > 0) {
+                uint64_t rtt = uv_now(loop_) - inflight->sent_at;
+                record_rtt(inflight->to, rtt);
+            }
+
             auto on_response = std::move(inflight->on_response);
             destroy_request(inflight);
 
@@ -325,6 +377,88 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Background tick (5s) — health, refresh, ephemeral/persistent
+// ---------------------------------------------------------------------------
+
+void RpcSocket::on_bg_tick(uv_timer_t* timer) {
+    auto* self = static_cast<RpcSocket*>(timer->data);
+    if (self->closing_) return;
+    self->background_tick();
+}
+
+void RpcSocket::background_tick() {
+    // 1. Health monitoring
+    health_.update(tick_responses_, tick_timeouts_);
+    tick_responses_ = 0;
+    tick_timeouts_ = 0;
+
+    // 2. Routing table refresh
+    if (--refresh_ticks_ <= 0) {
+        refresh_ticks_ = REFRESH_TICKS;
+        if (on_refresh_) on_refresh_();
+    }
+
+    // 3. Ephemeral → persistent transition
+    if (ephemeral_ && --stable_ticks_ <= 0) {
+        check_persistent();
+    }
+}
+
+void RpcSocket::check_persistent() {
+    auto current_host = nat_sampler_.host();
+
+    if (current_host.empty() || nat_sampler_.port() == 0) {
+        stable_ticks_ = STABLE_TICKS_MORE;
+        return;
+    }
+
+    stable_ticks_ = STABLE_TICKS_MORE;
+    last_nat_host_ = current_host;
+
+    // If NAT sampler has determined we're consistent or open → become persistent
+    uint32_t fw = nat_sampler_.firewall();
+    if (fw == 2 /* FIREWALL_CONSISTENT */ || fw == 1 /* FIREWALL_OPEN */) {
+        ephemeral_ = false;
+        firewalled_ = (fw != 1);
+        if (on_persistent_) on_persistent_();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive timeout — per-peer RTT tracking
+// ---------------------------------------------------------------------------
+
+void RpcSocket::record_rtt(const compact::Ipv4Address& peer, uint64_t rtt_ms) {
+    constexpr size_t MAX_PEER_RTT_ENTRIES = 1024;
+
+    auto key = peer.host_string() + ":" + std::to_string(peer.port);
+    auto it = peer_rtt_.find(key);
+    if (it == peer_rtt_.end()) {
+        // Evict a random entry if at capacity
+        if (peer_rtt_.size() >= MAX_PEER_RTT_ENTRIES) {
+            peer_rtt_.erase(peer_rtt_.begin());
+        }
+        peer_rtt_[key] = rtt_ms;
+    } else {
+        // Exponential moving average: new = 0.75 * old + 0.25 * sample
+        // +2 before /4 for rounding to nearest instead of truncation
+        it->second = (it->second * 3 + rtt_ms + 2) / 4;
+    }
+}
+
+uint64_t RpcSocket::timeout_for(const compact::Ipv4Address& peer) const {
+    auto key = peer.host_string() + ":" + std::to_string(peer.port);
+    auto it = peer_rtt_.find(key);
+    if (it == peer_rtt_.end()) return DEFAULT_TIMEOUT_MS;
+
+    // Timeout = 2x smoothed RTT, clamped to [200ms, 5000ms]
+    uint64_t timeout = it->second * 2;
+    if (timeout < 200) timeout = 200;
+    if (timeout > 5000) timeout = 5000;
+    return timeout;
 }
 
 }  // namespace rpc

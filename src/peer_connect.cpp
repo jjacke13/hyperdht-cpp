@@ -45,6 +45,7 @@ std::vector<uint8_t> encode_noise_payload(const NoisePayload& p) {
     // version + flags + error + firewall (4 varints, typically 4 bytes)
     Uint::preencode(state, p.version);
     uint32_t flags = 0;
+    if (p.holepunch.has_value()) flags |= 1;
     if (!p.addresses4.empty()) flags |= 2;
     if (p.udx.has_value()) flags |= 8;
     if (p.has_secret_stream) flags |= 16;
@@ -52,18 +53,25 @@ std::vector<uint8_t> encode_noise_payload(const NoisePayload& p) {
     Uint::preencode(state, p.error);
     Uint::preencode(state, p.firewall);
 
+    if (p.holepunch.has_value()) {
+        Uint::preencode(state, p.holepunch->id);
+        Uint::preencode(state, static_cast<uint64_t>(p.holepunch->relays.size()));
+        for (const auto& ri : p.holepunch->relays) {
+            Ipv4Addr::preencode(state, ri.relay_address);
+            Ipv4Addr::preencode(state, ri.peer_address);
+        }
+    }
     if (!p.addresses4.empty()) {
         Array<Ipv4Addr, Ipv4Address>::preencode(state, p.addresses4);
     }
     if (p.udx.has_value()) {
-        // udxInfo: version(uint) + features(uint) + id(uint) + seq(uint)
         Uint::preencode(state, p.udx->version);
         Uint::preencode(state, p.udx->reusable_socket ? 1u : 0u);
         Uint::preencode(state, p.udx->id);
         Uint::preencode(state, p.udx->seq);
     }
     if (p.has_secret_stream) {
-        Uint::preencode(state, 1u);  // secretStream version
+        Uint::preencode(state, 1u);
     }
 
     std::vector<uint8_t> buf(state.end);
@@ -75,6 +83,14 @@ std::vector<uint8_t> encode_noise_payload(const NoisePayload& p) {
     Uint::encode(state, p.error);
     Uint::encode(state, p.firewall);
 
+    if (p.holepunch.has_value()) {
+        Uint::encode(state, p.holepunch->id);
+        Uint::encode(state, static_cast<uint64_t>(p.holepunch->relays.size()));
+        for (const auto& ri : p.holepunch->relays) {
+            Ipv4Addr::encode(state, ri.relay_address);
+            Ipv4Addr::encode(state, ri.peer_address);
+        }
+    }
     if (!p.addresses4.empty()) {
         Array<Ipv4Addr, Ipv4Address>::encode(state, p.addresses4);
     }
@@ -281,7 +297,7 @@ void peer_handshake(rpc::RpcSocket& socket,
     req.value = std::move(hs_value);
 
     socket.request(req,
-        [noise_ik, on_done](const messages::Response& resp) {
+        [noise_ik, on_done, remote_pubkey](const messages::Response& resp) {
             HandshakeResult result;
 
             if (!resp.value.has_value() || resp.value->empty()) {
@@ -311,6 +327,7 @@ void peer_handshake(rpc::RpcSocket& socket,
             result.tx_key = noise_ik->tx_key();
             result.rx_key = noise_ik->rx_key();
             result.handshake_hash = noise_ik->handshake_hash();
+            result.remote_public_key = remote_pubkey;
 
             on_done(result);
             // noise_ik shared_ptr released automatically when both lambdas are destroyed

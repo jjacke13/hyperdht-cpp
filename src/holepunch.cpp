@@ -1,7 +1,9 @@
 #include "hyperdht/holepunch.hpp"
+#include "hyperdht/dht_messages.hpp"
 
 #include <sodium.h>
 
+#include <cstdio>
 #include <cstring>
 #include <memory>
 
@@ -172,15 +174,43 @@ bool try_direct_connect(const peer_connect::HandshakeResult& hs,
 
 Holepuncher::Holepuncher(uv_loop_t* loop, bool is_initiator)
     : loop_(loop), is_initiator_(is_initiator) {
-    uv_timer_init(loop, &punch_timer_);
-    punch_timer_.data = this;
+    punch_timer_ = new uv_timer_t;
+    uv_timer_init(loop, punch_timer_);
+    punch_timer_->data = this;
 }
 
 Holepuncher::~Holepuncher() {
     stop();
-    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&punch_timer_))) {
-        uv_close(reinterpret_cast<uv_handle_t*>(&punch_timer_), nullptr);
+    if (punch_timer_ && !uv_is_closing(reinterpret_cast<uv_handle_t*>(punch_timer_))) {
+        // Timer outlives us — null the back-pointer so callbacks don't dereference
+        punch_timer_->data = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(punch_timer_),
+                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+        punch_timer_ = nullptr;
     }
+}
+
+void Holepuncher::close(std::function<void()> on_closed) {
+    stop();
+    closing_ = true;
+    if (!punch_timer_ || uv_is_closing(reinterpret_cast<uv_handle_t*>(punch_timer_))) {
+        if (on_closed) on_closed();
+        return;
+    }
+
+    struct CloseCtx { std::function<void()> cb; };
+    auto* ctx = new CloseCtx{std::move(on_closed)};
+    punch_timer_->data = ctx;
+
+    uv_close(reinterpret_cast<uv_handle_t*>(punch_timer_), [](uv_handle_t* h) {
+        auto* ctx = static_cast<CloseCtx*>(reinterpret_cast<uv_timer_t*>(h)->data);
+        if (ctx) {
+            if (ctx->cb) ctx->cb();
+            delete ctx;
+        }
+        delete reinterpret_cast<uv_timer_t*>(h);
+    });
+    punch_timer_ = nullptr;
 }
 
 bool Holepuncher::punch() {
@@ -188,9 +218,11 @@ bool Holepuncher::punch() {
 
     if (connected_) return true;
 
-    // Determine strategy based on firewall combo
-    bool local_consistent = (local_firewall_ == FIREWALL_CONSISTENT || local_firewall_ == FIREWALL_OPEN);
-    bool remote_consistent = (remote_firewall_ == FIREWALL_CONSISTENT || remote_firewall_ == FIREWALL_OPEN);
+    // Determine strategy based on firewall combo.
+    // Treat UNKNOWN as CONSISTENT — we don't know our NAT type yet, but
+    // the standard 10-round probe is the safest default.
+    bool local_consistent = (local_firewall_ != FIREWALL_RANDOM);
+    bool remote_consistent = (remote_firewall_ != FIREWALL_RANDOM);
 
     if (local_consistent && remote_consistent) {
         // CONSISTENT+CONSISTENT or OPEN+CONSISTENT: 10 rounds, 1s apart
@@ -223,22 +255,29 @@ bool Holepuncher::punch() {
 
 void Holepuncher::stop() {
     punching_ = false;
-    uv_timer_stop(&punch_timer_);
+    if (punch_timer_ && !uv_is_closing(reinterpret_cast<uv_handle_t*>(punch_timer_))) {
+        uv_timer_stop(punch_timer_);
+    }
 }
 
 void Holepuncher::send_probe(const compact::Ipv4Address& addr) {
-    // The actual UDP send would need a socket — for now this is a placeholder.
-    // In the full implementation, this sends 1 byte [0x00] via udx_socket_send.
-    // The caller (RpcSocket or a dedicated punch socket) handles the actual send.
-    (void)addr;
+    if (send_fn_) {
+        fprintf(stderr, "  [hp] Sending probe to %s:%u\n",
+                addr.host_string().c_str(), addr.port);
+        send_fn_(addr);
+    }
 }
 
 void Holepuncher::on_message(const compact::Ipv4Address& from) {
+    fprintf(stderr, "  [hp] PROBE RECEIVED from %s:%u!\n",
+            from.host_string().c_str(), from.port);
     if (connected_) return;
 
     connected_ = true;
     punching_ = false;
-    uv_timer_stop(&punch_timer_);
+    if (punch_timer_ && !uv_is_closing(reinterpret_cast<uv_handle_t*>(punch_timer_))) {
+        uv_timer_stop(punch_timer_);
+    }
 
     // Move-and-call: prevent reentrancy if callback destroys us
     auto cb = std::move(on_connect_);
@@ -272,7 +311,7 @@ void Holepuncher::consistent_probe() {
     punch_round_++;
 
     // Schedule next round in 1 second
-    uv_timer_start(&punch_timer_, on_punch_timer, 1000, 0);
+    uv_timer_start(punch_timer_, on_punch_timer, 1000, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -298,11 +337,12 @@ void Holepuncher::random_probes() {
     random_probes_left_--;
 
     // Schedule next probe in 20ms
-    uv_timer_start(&punch_timer_, on_punch_timer, 20, 0);
+    uv_timer_start(punch_timer_, on_punch_timer, 20, 0);
 }
 
 void Holepuncher::on_punch_timer(uv_timer_t* timer) {
     auto* self = static_cast<Holepuncher*>(timer->data);
+    if (!self) return;
 
     if (self->random_probes_left_ > 0) {
         self->random_probes();
@@ -361,7 +401,49 @@ HolepunchMessage decode_holepunch_msg(const uint8_t* data, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
-// holepunch_connect — full relay round-trip
+// PunchState — shared state for the async holepunch flow
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr uint64_t HOLEPUNCH_TIMEOUT_MS = 15000;  // 15 seconds overall
+
+struct PunchState {
+    std::shared_ptr<SecurePayload> secure;
+    std::shared_ptr<Holepuncher> puncher;
+    OnHolepunchCallback on_done;
+    rpc::RpcSocket* socket = nullptr;
+    uv_timer_t* timeout = nullptr;
+    bool completed = false;
+
+    void complete(const HolepunchResult& result) {
+        if (completed) return;
+        completed = true;
+
+        // Stop probing
+        if (puncher) puncher->stop();
+
+        // Clear probe listener
+        if (socket) socket->on_holepunch_probe(nullptr);
+
+        // Stop and close timeout timer
+        if (timeout && !uv_is_closing(reinterpret_cast<uv_handle_t*>(timeout))) {
+            uv_timer_stop(timeout);
+            timeout->data = nullptr;
+            uv_close(reinterpret_cast<uv_handle_t*>(timeout),
+                     [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+            timeout = nullptr;
+        }
+
+        auto cb = std::move(on_done);
+        if (cb) cb(result);
+    }
+};
+
+}  // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// holepunch_connect — full 2-round relay + UDP probe flow
 // ---------------------------------------------------------------------------
 
 void holepunch_connect(rpc::RpcSocket& socket,
@@ -369,133 +451,286 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        const compact::Ipv4Address& relay_addr,
                        const compact::Ipv4Address& peer_addr,
                        uint32_t holepunch_id,
+                       uint32_t local_firewall,
+                       const std::vector<compact::Ipv4Address>& local_addresses,
                        OnHolepunchCallback on_done) {
 
     // Derive holepunchSecret from handshake hash
-    // holepunchSecret = BLAKE2b-256(NS_PEER_HOLEPUNCH, handshake_hash)
-    // NS_PEER_HOLEPUNCH = namespace('hyperswarm/dht', [4,5,6,0,1])[4]
-    uint8_t ns_hash[32];
-    const char* name = "hyperswarm/dht";
-    crypto_generichash(ns_hash, 32,
-                       reinterpret_cast<const uint8_t*>(name), std::strlen(name),
-                       nullptr, 0);
-    uint8_t ns_input[33];
-    std::memcpy(ns_input, ns_hash, 32);
-    ns_input[32] = 1;  // PEER_HOLEPUNCH command = 1
-    std::array<uint8_t, 32> ns_peer_holepunch{};
-    crypto_generichash(ns_peer_holepunch.data(), 32, ns_input, 33, nullptr, 0);
-
+    // holepunchSecret = BLAKE2b-256(NS_PEER_HOLEPUNCH, key=handshake_hash)
+    const auto& ns_hp = dht_messages::ns_peer_holepunch();
     std::array<uint8_t, 32> holepunch_secret{};
     crypto_generichash(holepunch_secret.data(), 32,
-                       ns_peer_holepunch.data(), 32,
+                       ns_hp.data(), 32,
                        hs_result.handshake_hash.data(), 64);
 
-    auto secure = std::make_shared<SecurePayload>(holepunch_secret);
+    auto state = std::make_shared<PunchState>();
+    state->secure = std::make_shared<SecurePayload>(holepunch_secret);
+    state->on_done = std::move(on_done);
+    state->socket = &socket;
 
-    // Build probe round payload
+    // Compute target hash (reused for both rounds)
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32,
+                       hs_result.remote_public_key.data(), 32,
+                       nullptr, 0);
+
+    // -----------------------------------------------------------------------
+    // Round 1: probe exchange — send our firewall info, get server's
+    // -----------------------------------------------------------------------
+    // Get our public address from the RPC socket's perspective.
+    // This is the address DHT nodes see us as (from response `to` field).
+    // Without NAT sampling, we use the socket's local address as a placeholder —
+    // the relay will provide our real address to the server via peerAddress.
     HolepunchPayload probe;
     probe.error = peer_connect::ERROR_NONE;
-    probe.firewall = peer_connect::FIREWALL_UNKNOWN;
+    probe.firewall = local_firewall;
     probe.round = 0;
-    probe.connected = false;
-    probe.punching = false;
-    // We don't know our addresses yet — send empty
+    probe.addresses = local_addresses;
 
     auto probe_bytes = encode_holepunch_payload(probe);
-    auto encrypted_probe = secure->encrypt(probe_bytes.data(), probe_bytes.size());
+    auto encrypted_probe = state->secure->encrypt(probe_bytes.data(), probe_bytes.size());
 
-    // Wrap in PEER_HOLEPUNCH message — include peerAddress so relay knows where to forward
     HolepunchMessage hp_msg;
     hp_msg.mode = peer_connect::MODE_FROM_CLIENT;
     hp_msg.id = holepunch_id;
     hp_msg.payload = std::move(encrypted_probe);
     hp_msg.peer_address = peer_addr;
 
-    auto hp_value = encode_holepunch_msg(hp_msg);
-
-    // Compute target hash
-    std::array<uint8_t, 32> target{};
-    crypto_generichash(target.data(), 32,
-                       hs_result.remote_public_key.data(), 32,
-                       nullptr, 0);
-
-    // Send PEER_HOLEPUNCH via relay
     messages::Request req;
     req.to.addr = relay_addr;
     req.command = messages::CMD_PEER_HOLEPUNCH;
     req.target = target;
-    req.value = std::move(hp_value);
+    req.value = encode_holepunch_msg(hp_msg);
+
+    fprintf(stderr, "  [hp] Sending round 1 to relay %s:%u (id=%u, peer=%s:%u)\n",
+            relay_addr.host_string().c_str(), relay_addr.port,
+            holepunch_id,
+            peer_addr.host_string().c_str(), peer_addr.port);
 
     socket.request(req,
-        [secure, on_done, &socket, relay_addr, holepunch_id, target, hs_result]
+        [state, &socket, relay_addr, peer_addr, holepunch_id, target, local_firewall]
         (const messages::Response& resp) {
+            if (state->completed) return;
+
             if (!resp.value.has_value() || resp.value->empty()) {
-                HolepunchResult fail;
-                fail.success = false;
-                on_done(fail);
+                fprintf(stderr, "  [hp] Round 1: no response value\n");
+                state->complete({});
                 return;
             }
+            fprintf(stderr, "  [hp] Round 1: got response (%zu bytes)\n",
+                    resp.value->size());
 
-            // Decode PEER_HOLEPUNCH response
             auto hp_resp = decode_holepunch_msg(resp.value->data(), resp.value->size());
             if (hp_resp.payload.empty()) {
-                HolepunchResult fail;
-                on_done(fail);
+                fprintf(stderr, "  [hp] Round 1: empty payload in decoded msg\n");
+                state->complete({});
                 return;
             }
+            fprintf(stderr, "  [hp] Round 1: payload %zu bytes, peerAddr=%s\n",
+                    hp_resp.payload.size(),
+                    hp_resp.peer_address.has_value()
+                        ? (hp_resp.peer_address->host_string() + ":" +
+                           std::to_string(hp_resp.peer_address->port)).c_str()
+                        : "none");
 
-            // Decrypt the holepunch payload
-            auto decrypted = secure->decrypt(hp_resp.payload.data(), hp_resp.payload.size());
+            // Decrypt server's round 1 response
+            auto decrypted = state->secure->decrypt(
+                hp_resp.payload.data(), hp_resp.payload.size());
             if (!decrypted) {
-                // Decrypt failed — but the response had data. Return
-                // the peerAddress from the relay if available.
+                fprintf(stderr, "  [hp] Round 1: decrypt FAILED\n");
+                // Decrypt failed — use peerAddress from relay as fallback
                 if (hp_resp.peer_address.has_value()) {
                     HolepunchResult result;
                     result.success = true;
                     result.address = *hp_resp.peer_address;
-                    on_done(result);
-                    return;
+                    state->complete(result);
+                }  else {
+                    state->complete({});
                 }
-                HolepunchResult fail;
-                on_done(fail);
                 return;
             }
 
-            auto server_probe = decode_holepunch_payload(decrypted->data(), decrypted->size());
+            auto server_r1 = decode_holepunch_payload(decrypted->data(), decrypted->size());
+            fprintf(stderr, "  [hp] Round 1 server: fw=%u err=%u round=%u "
+                    "addrs=%zu punching=%d connected=%d token=%s\n",
+                    server_r1.firewall, server_r1.error, server_r1.round,
+                    server_r1.addresses.size(),
+                    server_r1.punching ? 1 : 0, server_r1.connected ? 1 : 0,
+                    server_r1.token.has_value() ? "yes" : "no");
 
-            // Check server's response
-            if (server_probe.error != peer_connect::ERROR_NONE) {
-                HolepunchResult fail;
-                on_done(fail);
+            if (server_r1.error != peer_connect::ERROR_NONE) {
+                fprintf(stderr, "  [hp] Round 1: server error %u\n", server_r1.error);
+                state->complete({});
                 return;
             }
 
-            // If server has addresses, use them
-            if (!server_probe.addresses.empty()) {
-                HolepunchResult result;
-                result.success = true;
-                result.firewall = server_probe.firewall;
-                result.address = server_probe.addresses[0];
-                on_done(result);
-                return;
-            }
-
-            // Use peerAddress from relay
+            // Collect server's addresses (from payload + relay peerAddress)
+            std::vector<Ipv4Address> server_addrs = server_r1.addresses;
             if (hp_resp.peer_address.has_value()) {
-                HolepunchResult result;
-                result.success = true;
-                result.firewall = server_probe.firewall;
-                result.address = *hp_resp.peer_address;
-                on_done(result);
+                server_addrs.push_back(*hp_resp.peer_address);
+            }
+            if (server_addrs.empty()) {
+                state->complete({});
                 return;
             }
 
-            HolepunchResult fail;
-            on_done(fail);
+            // If server is OPEN, direct connect — no probing needed
+            if (server_r1.firewall == peer_connect::FIREWALL_OPEN) {
+                HolepunchResult result;
+                result.success = true;
+                result.firewall = peer_connect::FIREWALL_OPEN;
+                result.address = server_addrs[0];
+                state->complete(result);
+                return;
+            }
+
+            // -------------------------------------------------------------------
+            // Set up the Holepuncher
+            // -------------------------------------------------------------------
+            auto puncher = std::make_shared<Holepuncher>(socket.loop(), true);
+            puncher->set_local_firewall(local_firewall);
+            puncher->set_remote_firewall(server_r1.firewall);
+            puncher->set_remote_addresses(server_addrs);
+
+            // Wire probe sending through the SAME RpcSocket
+            puncher->set_send_fn([&socket](const Ipv4Address& addr) {
+                socket.send_probe(addr);
+            });
+
+            // When we detect an incoming probe → success
+            puncher->on_connect([state](const HolepunchResult& result) {
+                state->complete(result);
+            });
+
+            state->puncher = puncher;
+
+            // Register probe listener on the RPC socket (same socket as RPC traffic)
+            socket.on_holepunch_probe([state](const Ipv4Address& from) {
+                if (state->puncher) {
+                    state->puncher->on_message(from);
+                }
+            });
+
+            // Start overall timeout
+            auto* timer = new uv_timer_t;
+            uv_timer_init(socket.loop(), timer);
+            auto timeout_state = state;  // prevent shared_ptr from dying
+            timer->data = new std::shared_ptr<PunchState>(timeout_state);
+            state->timeout = timer;
+
+            uv_timer_start(timer, [](uv_timer_t* t) {
+                auto* sp = static_cast<std::shared_ptr<PunchState>*>(t->data);
+                if (sp && *sp) {
+                    (*sp)->complete({});  // Timeout — fail
+                }
+                delete sp;
+                t->data = nullptr;
+            }, HOLEPUNCH_TIMEOUT_MS, 0);
+
+            // -------------------------------------------------------------------
+            // Round 2: punch exchange — tell server to start probing
+            // -------------------------------------------------------------------
+
+            // Our public address: the relay response `to` field tells us how
+            // the relay sees us. The server needs this to know WHERE to probe.
+            Ipv4Address our_addr = resp.from.addr;
+            fprintf(stderr, "  [hp] Our address (from relay): %s:%u\n",
+                    our_addr.host_string().c_str(), our_addr.port);
+
+            HolepunchPayload punch;
+            punch.error = peer_connect::ERROR_NONE;
+            punch.firewall = local_firewall;
+            punch.round = 1;
+            punch.punching = true;
+            punch.addresses.push_back(our_addr);
+
+            // Generate our token for address verification
+            punch.token = state->secure->token(server_addrs[0].host_string());
+            // Echo back the server's token
+            if (server_r1.token.has_value()) {
+                punch.remote_token = server_r1.token;
+            }
+
+            auto punch_bytes = encode_holepunch_payload(punch);
+            auto encrypted_punch = state->secure->encrypt(
+                punch_bytes.data(), punch_bytes.size());
+
+            HolepunchMessage hp_msg2;
+            hp_msg2.mode = peer_connect::MODE_FROM_CLIENT;
+            hp_msg2.id = holepunch_id;
+            hp_msg2.payload = std::move(encrypted_punch);
+            hp_msg2.peer_address = peer_addr;
+
+            messages::Request req2;
+            req2.to.addr = relay_addr;
+            req2.command = messages::CMD_PEER_HOLEPUNCH;
+            req2.target = target;
+            req2.value = encode_holepunch_msg(hp_msg2);
+
+            fprintf(stderr, "  [hp] Sending round 2 (punching=true) to %s:%u\n",
+                    relay_addr.host_string().c_str(), relay_addr.port);
+
+            socket.request(req2,
+                [state, puncher, server_addrs](const messages::Response& r2resp) {
+                    if (state->completed) return;
+
+                    // Decode round 2 response to check for errors
+                    bool server_punching = false;
+                    if (r2resp.value.has_value() && !r2resp.value->empty()) {
+                        auto r2_msg = decode_holepunch_msg(
+                            r2resp.value->data(), r2resp.value->size());
+                        if (!r2_msg.payload.empty()) {
+                            auto r2_dec = state->secure->decrypt(
+                                r2_msg.payload.data(), r2_msg.payload.size());
+                            if (r2_dec) {
+                                auto r2_pay = decode_holepunch_payload(
+                                    r2_dec->data(), r2_dec->size());
+                                fprintf(stderr,
+                                    "  [hp] Round 2 server: fw=%u err=%u "
+                                    "punching=%d connected=%d addrs=%zu\n",
+                                    r2_pay.firewall, r2_pay.error,
+                                    r2_pay.punching ? 1 : 0,
+                                    r2_pay.connected ? 1 : 0,
+                                    r2_pay.addresses.size());
+
+                                if (r2_pay.error != peer_connect::ERROR_NONE) {
+                                    state->complete({});
+                                    return;
+                                }
+                                server_punching = r2_pay.punching;
+                            }
+                        }
+                    }
+
+                    // Start our probing (opens NAT holes for the server)
+                    puncher->punch();
+
+                    // Report success immediately — the caller should connect
+                    // the UDX stream now. UDX SYN retries + our probes will
+                    // open the NAT from both sides. We don't wait for a [0x00]
+                    // probe back because the server may connect its stream
+                    // (and stop probing) before we detect one.
+                    HolepunchResult result;
+                    result.success = true;
+                    result.firewall = server_addrs.empty() ? 0 : 0;
+                    result.address = server_addrs[0];
+                    state->complete(result);
+                },
+                [state, puncher, server_addrs](uint16_t) {
+                    fprintf(stderr, "  [hp] Round 2: TIMEOUT\n");
+                    // Round 2 timeout — still try probing and report address
+                    if (!state->completed) {
+                        puncher->punch();
+                        HolepunchResult result;
+                        result.success = true;
+                        result.address = server_addrs[0];
+                        state->complete(result);
+                    }
+                });
         },
-        [on_done](uint16_t) {
-            HolepunchResult fail;
-            on_done(fail);
+        [state](uint16_t) {
+            fprintf(stderr, "  [hp] Round 1: TIMEOUT (no response from relay)\n");
+            state->complete({});
         });
 }
 

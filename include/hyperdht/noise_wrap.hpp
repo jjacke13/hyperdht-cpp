@@ -175,6 +175,7 @@ public:
     Key tx_key() const;
     Key rx_key() const;
     Hash handshake_hash() const;
+    PubKey remote_public_key() const { return rs_; }
 
     // Test-only: inject a fixed ephemeral keypair for deterministic vectors
     void set_ephemeral(const Keypair& ephemeral);

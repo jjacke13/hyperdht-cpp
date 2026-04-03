@@ -51,6 +51,16 @@ add_library(hyperdht
     src/dht_ops.cpp
     src/peer_connect.cpp
     src/holepunch.cpp
+    src/nat_sampler.cpp
+    src/health.cpp
+    src/protomux.cpp
+    src/dht_messages.cpp
+    src/announce_sig.cpp
+    src/router.cpp
+    src/server_connection.cpp
+    src/announcer.cpp
+    src/server.cpp
+    src/dht.cpp
 )
 target_include_directories(hyperdht PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -169,4 +179,69 @@ if(HYPERDHT_BUILD_TESTS)
     target_link_libraries(test_holepunch PRIVATE hyperdht GTest::gtest_main)
     add_test(NAME test_holepunch COMMAND test_holepunch)
     gtest_discover_tests(test_holepunch)
+
+    add_executable(test_server_live test/test_server_live.cpp)
+    target_link_libraries(test_server_live PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_server_live COMMAND test_server_live)
+    gtest_discover_tests(test_server_live)
+
+    add_executable(test_hyperdht test/test_hyperdht.cpp)
+    target_link_libraries(test_hyperdht PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_hyperdht COMMAND test_hyperdht)
+    gtest_discover_tests(test_hyperdht)
+
+    add_executable(test_server test/test_server.cpp)
+    target_link_libraries(test_server PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_server COMMAND test_server)
+    gtest_discover_tests(test_server)
+
+    add_executable(test_announcer test/test_announcer.cpp)
+    target_link_libraries(test_announcer PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_announcer COMMAND test_announcer)
+    gtest_discover_tests(test_announcer)
+
+    add_executable(test_server_holepunch test/test_server_holepunch.cpp)
+    target_link_libraries(test_server_holepunch PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_server_holepunch COMMAND test_server_holepunch)
+    gtest_discover_tests(test_server_holepunch)
+
+    add_executable(test_server_handshake test/test_server_handshake.cpp)
+    target_link_libraries(test_server_handshake PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_server_handshake COMMAND test_server_handshake)
+    gtest_discover_tests(test_server_handshake)
+
+    add_executable(test_router test/test_router.cpp)
+    target_link_libraries(test_router PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_router COMMAND test_router)
+    gtest_discover_tests(test_router)
+
+    add_executable(test_announce_sig test/test_announce_sig.cpp)
+    target_link_libraries(test_announce_sig PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_announce_sig COMMAND test_announce_sig)
+    gtest_discover_tests(test_announce_sig)
+
+    add_executable(test_dht_messages test/test_dht_messages.cpp)
+    target_link_libraries(test_dht_messages PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_dht_messages COMMAND test_dht_messages)
+    gtest_discover_tests(test_dht_messages)
+
+    add_executable(test_protomux test/test_protomux.cpp)
+    target_link_libraries(test_protomux PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_protomux COMMAND test_protomux)
+    gtest_discover_tests(test_protomux)
+
+    add_executable(test_health test/test_health.cpp)
+    target_link_libraries(test_health PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_health COMMAND test_health)
+    gtest_discover_tests(test_health)
+
+    add_executable(test_nat_sampler test/test_nat_sampler.cpp)
+    target_link_libraries(test_nat_sampler PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_nat_sampler COMMAND test_nat_sampler)
+    gtest_discover_tests(test_nat_sampler)
+
+    add_executable(test_live_connect test/test_live_connect.cpp)
+    target_link_libraries(test_live_connect PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_live_connect COMMAND test_live_connect)
+    gtest_discover_tests(test_live_connect)
 endif()

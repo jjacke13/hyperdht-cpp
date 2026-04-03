@@ -115,6 +115,10 @@ When ON: reduced routing table (64 buckets), smaller congestion window (16), no 
    - Fix: add a refresh timer that re-announces/re-puts values we care about
    - Lower priority than #1 (only matters for long-lived data)
 
+## Missing NAT Strategy
+
+- **RANDOM+CONSISTENT (birthday paradox)**: Open 256 UDP sockets, each with a random port. High probability one matches the remote's consistent mapping. JS does this with `udx.createSocket()` in a loop. ~100 lines using existing UDX wrapper. This completes 4/4 punchable NAT combos (RANDOM+RANDOM is not punchable and requires blind relay, which JS also doesn't fully support).
+
 ## Deferred Items (from code reviews)
 
 - FROM_SECOND_RELAY sends to wrong node (needs relayAddress routing)

@@ -64,6 +64,7 @@ add_library(hyperdht
     src/announcer.cpp
     src/server.cpp
     src/dht.cpp
+    src/hyperdht_api.cpp
 )
 target_include_directories(hyperdht PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -154,6 +155,11 @@ if(HYPERDHT_BUILD_TESTS)
     target_link_libraries(test_edge_cases PRIVATE hyperdht GTest::gtest_main)
     add_test(NAME test_edge_cases COMMAND test_edge_cases)
     gtest_discover_tests(test_edge_cases)
+
+    add_executable(test_c_api test/test_c_api.cpp)
+    target_link_libraries(test_c_api PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_c_api COMMAND test_c_api)
+    gtest_discover_tests(test_c_api)
     gtest_discover_tests(test_routing_table)
 
     add_executable(test_tokens test/test_tokens.cpp)

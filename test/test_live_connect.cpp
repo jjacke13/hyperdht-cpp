@@ -92,8 +92,10 @@ struct PipelineState {
 // ---------------------------------------------------------------------------
 
 TEST(LiveConnect, FullPipeline) {
+    // Use SERVER_KEY env var if set, otherwise default
+    const char* key_env = std::getenv("SERVER_KEY");
     const auto server_pk = hex_to_key(
-        "a6f03a2523211223325a092c3c172fcc8d395341a9092162b040adefa908149e");
+        key_env ? key_env : "a6f03a2523211223325a092c3c172fcc8d395341a9092162b040adefa908149e");
 
     noise::Seed seed{};
     seed.fill(0x42);

@@ -9,7 +9,8 @@ namespace hyperdht::compact {
 // ---------------------------------------------------------------------------
 
 static inline bool has_bytes(const State& s, size_t n) {
-    return s.start + n <= s.end;
+    // Use subtraction to avoid size_t overflow: start + n could wrap around
+    return s.start <= s.end && n <= s.end - s.start;
 }
 
 // Check buffer is writable and has space (for encode paths)

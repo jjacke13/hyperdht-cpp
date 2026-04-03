@@ -80,8 +80,15 @@ static void on_proxy_alloc(uv_handle_t*, size_t suggested, uv_buf_t* buf) {
     buf->len = static_cast<unsigned int>(suggested);
 }
 
+struct ProxySend {
+    uv_udp_send_t req;
+    char* buf;
+};
+
 static void on_proxy_send_done(uv_udp_send_t* req, int) {
-    delete req;
+    auto* ps = reinterpret_cast<ProxySend*>(req);
+    delete[] ps->buf;
+    delete ps;
 }
 
 static void on_proxy_recv(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
@@ -107,9 +114,13 @@ static void on_proxy_recv(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
         }
 
         if (dest) {
-            auto* send_req = new uv_udp_send_t;
-            uv_buf_t fwd_buf = uv_buf_init(buf->base, static_cast<unsigned int>(nread));
-            uv_udp_send(send_req, handle, &fwd_buf, 1, dest, on_proxy_send_done);
+            // Copy the buffer — uv_udp_send does NOT copy, and on_proxy_recv
+            // returns before the send completes. ProxySend owns the copy.
+            auto* ps = new ProxySend;
+            ps->buf = new char[nread];
+            memcpy(ps->buf, buf->base, static_cast<size_t>(nread));
+            uv_buf_t fwd_buf = uv_buf_init(ps->buf, static_cast<unsigned int>(nread));
+            uv_udp_send(&ps->req, handle, &fwd_buf, 1, dest, on_proxy_send_done);
         }
     }
 

@@ -34,21 +34,20 @@ TEST(UdxInit, SocketBindAndClose) {
     uv_loop_t loop;
     uv_loop_init(&loop);
 
-    {
-        Udx udx(&loop);
-        UdxSocket sock(udx);
+    Udx udx(&loop);
+    UdxSocket sock(udx);
 
-        auto addr = loopback_addr(0);
-        int rc = sock.bind(reinterpret_cast<const struct sockaddr*>(&addr));
-        ASSERT_EQ(rc, 0);
+    auto addr = loopback_addr(0);
+    int rc = sock.bind(reinterpret_cast<const struct sockaddr*>(&addr));
+    ASSERT_EQ(rc, 0);
 
-        auto bound = get_bound_addr(sock);
-        EXPECT_NE(ntohs(bound.sin_port), 0);
-        EXPECT_EQ(bound.sin_family, AF_INET);
+    auto bound = get_bound_addr(sock);
+    EXPECT_NE(ntohs(bound.sin_port), 0);
+    EXPECT_EQ(bound.sin_family, AF_INET);
 
-        sock.close();
-    }
+    sock.close();
 
+    // Run the loop to drain close callbacks while udx/sock are still alive
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }

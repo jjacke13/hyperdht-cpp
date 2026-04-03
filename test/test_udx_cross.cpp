@@ -86,8 +86,9 @@ static void on_pipe_read(uv_stream_t* pipe, ssize_t nread, const uv_buf_t* buf) 
                     const_cast<char*>(ctx->payload.data()),
                     static_cast<unsigned int>(ctx->payload.size()));
                 auto* write_req = static_cast<udx_stream_write_t*>(
-                    malloc(static_cast<size_t>(udx_stream_write_sizeof(1))));
-                udx_stream_write_end(write_req, ctx->stream->handle(), &wbuf, 1, nullptr);
+                    calloc(1, static_cast<size_t>(udx_stream_write_sizeof(1))));
+                udx_stream_write_end(write_req, ctx->stream->handle(), &wbuf, 1,
+                    [](udx_stream_write_t* req, int, int) { free(req); });
             }
         }
     }
@@ -302,8 +303,9 @@ static void mm_on_pipe_read(uv_stream_t* pipe, ssize_t nread, const uv_buf_t* bu
                 uv_buf_t wbuf = uv_buf_init(const_cast<char*>(msg.data()),
                     static_cast<unsigned int>(msg.size()));
                 auto* wr = static_cast<udx_stream_write_t*>(
-                    malloc(static_cast<size_t>(udx_stream_write_sizeof(1))));
-                udx_stream_write_end(wr, ctx->stream->handle(), &wbuf, 1, nullptr);
+                    calloc(1, static_cast<size_t>(udx_stream_write_sizeof(1))));
+                udx_stream_write_end(wr, ctx->stream->handle(), &wbuf, 1,
+                    [](udx_stream_write_t* req, int, int) { free(req); });
 
                 // Start the 2s cleanup timer — the mismatched connection
                 // won't close cleanly, so we force-stop the loop

@@ -20,6 +20,7 @@
               pkgs.ninja
               pkgs.pkg-config
               pkgs.gcc14
+              pkgs.llvmPackages.clang
               pkgs.git
             ];
 

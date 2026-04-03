@@ -14,20 +14,19 @@ TEST(HyperDHT, CreateAndDestroy) {
     uv_loop_t loop;
     uv_loop_init(&loop);
 
-    {
-        HyperDHT dht(&loop);
-        EXPECT_FALSE(dht.is_bound());
-        EXPECT_FALSE(dht.is_destroyed());
+    HyperDHT dht(&loop);
+    EXPECT_FALSE(dht.is_bound());
+    EXPECT_FALSE(dht.is_destroyed());
 
-        int rc = dht.bind();
-        EXPECT_EQ(rc, 0);
-        EXPECT_TRUE(dht.is_bound());
-        EXPECT_GT(dht.port(), 0u);
+    int rc = dht.bind();
+    EXPECT_EQ(rc, 0);
+    EXPECT_TRUE(dht.is_bound());
+    EXPECT_GT(dht.port(), 0u);
 
-        dht.destroy();
-        EXPECT_TRUE(dht.is_destroyed());
-    }
+    dht.destroy();
+    EXPECT_TRUE(dht.is_destroyed());
 
+    // Run the loop to drain close callbacks while dht is still alive
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }

@@ -142,8 +142,12 @@ TEST(Protomux, ChannelClose) {
     ch_b->open();
     EXPECT_TRUE(ch_a->is_open());
 
+    // close() sends CLOSE message to remote, then calls destroy() which
+    // frees the channel via remove_channel. After this call, ch_a is a
+    // dangling pointer — do not dereference it.
     ch_a->close();
-    EXPECT_TRUE(ch_a->is_closed());
+
+    // The remote side (ch_b) should have received the CLOSE and fired its callback.
     EXPECT_TRUE(b_closed);
 }
 

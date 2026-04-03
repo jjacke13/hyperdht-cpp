@@ -97,6 +97,9 @@ TEST(RpcBootstrap, PingNode1) {
 
     uv_run(&loop, UV_RUN_DEFAULT);
 
+    // Close the loop before any early returns (GTEST_SKIP returns from test)
+    uv_loop_close(&loop);
+
     if (ctx.response_received) {
         printf("  Bootstrap node responded!\n");
         if (ctx.has_id) {
@@ -105,11 +108,8 @@ TEST(RpcBootstrap, PingNode1) {
         EXPECT_TRUE(ctx.has_id) << "Bootstrap should include its node ID";
     } else {
         printf("  Bootstrap node did not respond (network issue?)\n");
-        // Don't fail the test if the bootstrap is unreachable
         GTEST_SKIP() << "Bootstrap node unreachable — skipping";
     }
-
-    uv_loop_close(&loop);
 }
 
 // ---------------------------------------------------------------------------

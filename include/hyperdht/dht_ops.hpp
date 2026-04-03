@@ -10,6 +10,7 @@
 #include <memory>
 #include <vector>
 
+#include "hyperdht/noise_wrap.hpp"
 #include "hyperdht/query.hpp"
 #include "hyperdht/rpc.hpp"
 
@@ -54,6 +55,56 @@ std::shared_ptr<query::Query> announce(rpc::RpcSocket& socket,
                                         const routing::NodeId& target,
                                         const std::vector<uint8_t>& value,
                                         query::OnDoneCallback on_done);
+
+// ---------------------------------------------------------------------------
+// immutablePut — store a value at target = BLAKE2b(value)
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<query::Query> immutable_put(rpc::RpcSocket& socket,
+                                             const std::vector<uint8_t>& value,
+                                             query::OnDoneCallback on_done);
+
+// ---------------------------------------------------------------------------
+// immutableGet — retrieve a value by its content hash
+// ---------------------------------------------------------------------------
+
+// on_result is called for each verified result (hash matches target).
+// The caller can stop the query early if desired.
+using OnValueCallback = std::function<void(const std::vector<uint8_t>& value)>;
+
+std::shared_ptr<query::Query> immutable_get(rpc::RpcSocket& socket,
+                                             const std::array<uint8_t, 32>& target,
+                                             OnValueCallback on_result,
+                                             query::OnDoneCallback on_done);
+
+// ---------------------------------------------------------------------------
+// mutablePut — store a signed value at target = BLAKE2b(publicKey)
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<query::Query> mutable_put(rpc::RpcSocket& socket,
+                                           const noise::Keypair& keypair,
+                                           const std::vector<uint8_t>& value,
+                                           uint64_t seq,
+                                           query::OnDoneCallback on_done);
+
+// ---------------------------------------------------------------------------
+// mutableGet — retrieve the latest signed value for a public key
+// ---------------------------------------------------------------------------
+
+struct MutableResult {
+    uint64_t seq = 0;
+    std::vector<uint8_t> value;
+    std::array<uint8_t, 64> signature{};
+};
+
+// on_result is called for each verified result (valid signature, seq >= min_seq).
+using OnMutableCallback = std::function<void(const MutableResult& result)>;
+
+std::shared_ptr<query::Query> mutable_get(rpc::RpcSocket& socket,
+                                           const std::array<uint8_t, 32>& public_key,
+                                           uint64_t min_seq,
+                                           OnMutableCallback on_result,
+                                           query::OnDoneCallback on_done);
 
 }  // namespace dht_ops
 }  // namespace hyperdht

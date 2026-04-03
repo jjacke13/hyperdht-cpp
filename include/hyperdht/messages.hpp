@@ -57,6 +57,11 @@ constexpr uint32_t CMD_MUTABLE_GET = 7;
 constexpr uint32_t CMD_IMMUTABLE_PUT = 8;
 constexpr uint32_t CMD_IMMUTABLE_GET = 9;
 
+// HyperDHT error codes (used in response error field)
+constexpr uint32_t ERR_NONE = 0;
+constexpr uint32_t ERR_SEQ_REUSED = 16;    // Mutable: same seq, different value
+constexpr uint32_t ERR_SEQ_TOO_LOW = 17;   // Mutable: seq goes backwards
+
 // ---------------------------------------------------------------------------
 // Address — IPv4 host:port
 // ---------------------------------------------------------------------------

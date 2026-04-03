@@ -2,6 +2,8 @@
 
 #include <cassert>
 
+#include <sodium.h>
+
 #include "hyperdht/announce_sig.hpp"
 #include "hyperdht/dht_messages.hpp"
 
@@ -56,10 +58,14 @@ void RpcHandlers::handle(const messages::Request& req) {
                         });
                 }
                 break;
-            case messages::CMD_FIND_PEER:  handle_find_peer(req); break;
-            case messages::CMD_LOOKUP:     handle_lookup(req); break;
-            case messages::CMD_ANNOUNCE:   handle_announce(req); break;
-            case messages::CMD_UNANNOUNCE: handle_unannounce(req); break;
+            case messages::CMD_FIND_PEER:     handle_find_peer(req); break;
+            case messages::CMD_LOOKUP:        handle_lookup(req); break;
+            case messages::CMD_ANNOUNCE:      handle_announce(req); break;
+            case messages::CMD_UNANNOUNCE:    handle_unannounce(req); break;
+            case messages::CMD_MUTABLE_PUT:   handle_mutable_put(req); break;
+            case messages::CMD_MUTABLE_GET:   handle_mutable_get(req); break;
+            case messages::CMD_IMMUTABLE_PUT: handle_immutable_put(req); break;
+            case messages::CMD_IMMUTABLE_GET: handle_immutable_get(req); break;
             default: break;
         }
     }
@@ -329,6 +335,168 @@ void RpcHandlers::handle_unannounce(const messages::Request& req) {
     resp.tid = req.tid;
     resp.from.addr = req.from.addr;
     resp.id = socket_.table().id();
+
+    socket_.reply(resp);
+}
+
+// ---------------------------------------------------------------------------
+// MUTABLE_PUT — signed key-value storage with seq ordering
+// ---------------------------------------------------------------------------
+
+void RpcHandlers::handle_mutable_put(const messages::Request& req) {
+    if (!req.target.has_value()) return;
+    if (!req.token.has_value()) return;
+    if (!req.value.has_value()) return;
+
+    // Validate token
+    if (!socket_.token_store().validate(
+            req.from.addr.host_string(), *req.token)) {
+        return;
+    }
+
+    // Decode the mutable put request
+    auto put = dht_messages::decode_mutable_put(
+        req.value->data(), req.value->size());
+
+    // Verify target = BLAKE2b(publicKey)
+    std::array<uint8_t, 32> expected_target{};
+    crypto_generichash(expected_target.data(), 32,
+                       put.public_key.data(), 32,
+                       nullptr, 0);
+    if (expected_target != *req.target) return;
+
+    // Verify value is non-empty
+    if (put.value.empty()) return;
+
+    // Verify Ed25519 signature over NS_MUTABLE_PUT + BLAKE2b(seq || value)
+    if (!announce_sig::verify_mutable(
+            put.signature, put.seq,
+            put.value.data(), put.value.size(),
+            put.public_key)) {
+        return;
+    }
+
+    auto key = to_hex_key(*req.target);
+
+    // Check seq ordering against existing record
+    auto it = mutables_.find(key);
+    if (it != mutables_.end()) {
+        auto existing = dht_messages::decode_mutable_get_resp(
+            it->second.data(), it->second.size());
+
+        // Same seq but different value → error
+        if (existing.seq == put.seq && existing.value != put.value) {
+            messages::Response resp;
+            resp.tid = req.tid;
+            resp.from.addr = req.from.addr;
+            resp.error = messages::ERR_SEQ_REUSED;
+            socket_.reply(resp);
+            return;
+        }
+
+        // New seq is lower → error
+        if (put.seq < existing.seq) {
+            messages::Response resp;
+            resp.tid = req.tid;
+            resp.from.addr = req.from.addr;
+            resp.error = messages::ERR_SEQ_TOO_LOW;
+            socket_.reply(resp);
+            return;
+        }
+    }
+
+    // Store as encoded MutableGetResponse
+    dht_messages::MutableGetResponse stored;
+    stored.seq = put.seq;
+    stored.value = put.value;
+    stored.signature = put.signature;
+    mutables_[key] = dht_messages::encode_mutable_get_resp(stored);
+
+    // Reply with no value (success)
+    messages::Response resp;
+    resp.tid = req.tid;
+    resp.from.addr = req.from.addr;
+    socket_.reply(resp);
+}
+
+// ---------------------------------------------------------------------------
+// MUTABLE_GET — return stored mutable value if seq >= requested
+// ---------------------------------------------------------------------------
+
+void RpcHandlers::handle_mutable_get(const messages::Request& req) {
+    if (!req.target.has_value()) return;
+    if (!req.value.has_value()) return;  // JS: silently drops if no value field
+
+    // Decode requested seq from value (compact-encoded uint)
+    uint64_t requested_seq = 0;
+    if (!req.value->empty()) {
+        compact::State s = compact::State::for_decode(
+            req.value->data(), req.value->size());
+        requested_seq = compact::Uint::decode(s);
+    }
+
+    auto resp = make_query_response(req);
+
+    auto key = to_hex_key(*req.target);
+    auto it = mutables_.find(key);
+    if (it != mutables_.end()) {
+        // Check if local seq >= requested seq
+        auto local = dht_messages::decode_mutable_get_resp(
+            it->second.data(), it->second.size());
+        if (local.seq >= requested_seq) {
+            resp.value = it->second;  // Return the encoded MutableGetResponse
+        }
+    }
+
+    socket_.reply(resp);
+}
+
+// ---------------------------------------------------------------------------
+// IMMUTABLE_PUT — content-addressed storage (target = BLAKE2b(value))
+// ---------------------------------------------------------------------------
+
+void RpcHandlers::handle_immutable_put(const messages::Request& req) {
+    if (!req.target.has_value()) return;
+    if (!req.token.has_value()) return;
+    if (!req.value.has_value() || req.value->empty()) return;
+
+    // Validate token
+    if (!socket_.token_store().validate(
+            req.from.addr.host_string(), *req.token)) {
+        return;
+    }
+
+    // Verify target = BLAKE2b(value)
+    std::array<uint8_t, 32> expected_target{};
+    crypto_generichash(expected_target.data(), 32,
+                       req.value->data(), req.value->size(),
+                       nullptr, 0);
+    if (expected_target != *req.target) return;
+
+    auto key = to_hex_key(*req.target);
+    immutables_[key] = *req.value;
+
+    // Reply with no value (success)
+    messages::Response resp;
+    resp.tid = req.tid;
+    resp.from.addr = req.from.addr;
+    socket_.reply(resp);
+}
+
+// ---------------------------------------------------------------------------
+// IMMUTABLE_GET — return stored value by content hash
+// ---------------------------------------------------------------------------
+
+void RpcHandlers::handle_immutable_get(const messages::Request& req) {
+    if (!req.target.has_value()) return;
+
+    auto resp = make_query_response(req);
+
+    auto key = to_hex_key(*req.target);
+    auto it = immutables_.find(key);
+    if (it != immutables_.end()) {
+        resp.value = it->second;
+    }
 
     socket_.reply(resp);
 }

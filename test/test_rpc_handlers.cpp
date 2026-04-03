@@ -502,3 +502,306 @@ TEST(RpcHandlers, UnannounceValidSignatureAccepted) {
     EXPECT_TRUE(ctx.announce_done);
     EXPECT_TRUE(ctx.announce_accepted) << "Valid unannounce signature should be accepted";
 }
+
+// ============================================================================
+// Mutable/Immutable storage tests
+// ============================================================================
+
+// Helper context for mutable/immutable tests (similar to AnnounceCtx)
+struct StorageCtx {
+    RpcSocket* server = nullptr;
+    RpcSocket* client = nullptr;
+    RpcHandlers* handlers = nullptr;
+    bool ping_done = false;
+    bool op_done = false;
+    bool op_accepted = false;
+    std::array<uint8_t, 32> token{};
+    std::array<uint8_t, 32> server_id{};
+    std::optional<uint32_t> error_code;
+    std::optional<std::vector<uint8_t>> response_value;
+    bool cleaning_up = false;
+    uv_timer_t* timer = nullptr;
+};
+
+static void stor_cleanup(StorageCtx* ctx) {
+    if (ctx->cleaning_up) return;
+    ctx->cleaning_up = true;
+    ctx->server->close();
+    ctx->client->close();
+    if (ctx->timer) {
+        uv_close(reinterpret_cast<uv_handle_t*>(ctx->timer), on_close);
+        ctx->timer = nullptr;
+    }
+}
+
+static void send_storage_req(StorageCtx* ctx, uint32_t cmd,
+                              const std::array<uint8_t, 32>& target,
+                              const std::vector<uint8_t>& value,
+                              bool need_token = true) {
+    Request req;
+    req.to.addr = Ipv4Address::from_string("127.0.0.1", ctx->server->port());
+    req.command = cmd;
+    req.internal = false;
+    req.target = target;
+    if (need_token) req.token = ctx->token;
+    if (!value.empty()) req.value = value;
+
+    ctx->client->request(req,
+        [ctx](const Response& resp) {
+            ctx->op_done = true;
+            ctx->op_accepted = !resp.error.has_value();
+            ctx->error_code = resp.error;
+            ctx->response_value = resp.value;
+            stor_cleanup(ctx);
+        },
+        [ctx](uint16_t) {
+            ctx->op_done = true;
+            ctx->op_accepted = false;
+            stor_cleanup(ctx);
+        });
+}
+
+static void run_storage_test(StorageCtx& ctx, uv_loop_t& loop,
+                              std::function<void(StorageCtx*)> on_token) {
+    Request ping;
+    ping.to.addr = Ipv4Address::from_string("127.0.0.1", ctx.server->port());
+    ping.command = CMD_PING;
+    ping.internal = true;
+
+    ctx.client->request(ping,
+        [&ctx, on_token](const Response& resp) {
+            if (resp.token.has_value() && resp.id.has_value()) {
+                ctx.token = *resp.token;
+                ctx.server_id = *resp.id;
+                ctx.ping_done = true;
+                on_token(&ctx);
+            } else {
+                stor_cleanup(&ctx);
+            }
+        },
+        [&ctx](uint16_t) { stor_cleanup(&ctx); });
+
+    uv_timer_t timer;
+    uv_timer_init(&loop, &timer);
+    timer.data = &ctx;
+    ctx.timer = &timer;
+    uv_timer_start(&timer, [](uv_timer_t* t) {
+        auto* c = static_cast<StorageCtx*>(t->data);
+        c->timer = nullptr;
+        stor_cleanup(c);
+    }, 2000, 0);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// Helper: create server + client + handlers
+struct TestEnv {
+    uv_loop_t loop;
+    NodeId server_id;
+    std::unique_ptr<RpcSocket> server;
+    std::unique_ptr<RpcHandlers> handlers;
+    NodeId client_id;
+    std::unique_ptr<RpcSocket> client;
+    StorageCtx ctx;
+
+    TestEnv() {
+        uv_loop_init(&loop);
+        server_id.fill(0x11);
+        server = std::make_unique<RpcSocket>(&loop, server_id);
+        server->bind(0);
+        handlers = std::make_unique<RpcHandlers>(*server);
+        handlers->install();
+        client_id.fill(0x22);
+        client = std::make_unique<RpcSocket>(&loop, client_id);
+        client->bind(0);
+        ctx.server = server.get();
+        ctx.client = client.get();
+        ctx.handlers = handlers.get();
+    }
+};
+
+// ---- Immutable tests ----
+
+TEST(RpcHandlers, ImmutablePutGetRoundTrip) {
+    TestEnv env;
+    std::vector<uint8_t> stored_value = {'h', 'e', 'l', 'l', 'o'};
+
+    // Compute target = BLAKE2b(value)
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32,
+                       stored_value.data(), stored_value.size(),
+                       nullptr, 0);
+
+    // Phase 1: PUT
+    run_storage_test(env.ctx, env.loop, [&](StorageCtx* c) {
+        send_storage_req(c, CMD_IMMUTABLE_PUT, target, stored_value);
+    });
+
+    EXPECT_TRUE(env.ctx.op_done);
+    EXPECT_TRUE(env.ctx.op_accepted) << "Immutable PUT should succeed";
+
+    // Phase 2: GET (new loop + sockets since the old ones are closed)
+    TestEnv env2;
+    // Manually put the value into the new handler's storage
+    env2.handlers->immutables_put(target, stored_value);
+
+    run_storage_test(env2.ctx, env2.loop, [&target](StorageCtx* c) {
+        send_storage_req(c, CMD_IMMUTABLE_GET, target, {}, /*need_token=*/false);
+    });
+
+    EXPECT_TRUE(env2.ctx.op_done);
+    EXPECT_TRUE(env2.ctx.op_accepted);
+    ASSERT_TRUE(env2.ctx.response_value.has_value());
+    EXPECT_EQ(*env2.ctx.response_value, stored_value);
+}
+
+TEST(RpcHandlers, ImmutablePutWrongHashRejected) {
+    TestEnv env;
+    std::vector<uint8_t> value = {'t', 'e', 's', 't'};
+
+    // Use wrong target (not the hash of value)
+    std::array<uint8_t, 32> wrong_target{};
+    wrong_target.fill(0xFF);
+
+    run_storage_test(env.ctx, env.loop, [&](StorageCtx* c) {
+        send_storage_req(c, CMD_IMMUTABLE_PUT, wrong_target, value);
+    });
+
+    EXPECT_TRUE(env.ctx.op_done);
+    EXPECT_FALSE(env.ctx.op_accepted) << "Wrong hash should be rejected";
+}
+
+// ---- Mutable tests ----
+
+TEST(RpcHandlers, MutablePutGetRoundTrip) {
+    TestEnv env;
+
+    hyperdht::noise::Seed seed{};
+    seed.fill(0x42);
+    auto kp = hyperdht::noise::generate_keypair(seed);
+
+    // target = BLAKE2b(publicKey)
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32, kp.public_key.data(), 32, nullptr, 0);
+
+    std::vector<uint8_t> value = {'w', 'o', 'r', 'l', 'd'};
+    uint64_t seq = 1;
+
+    // Sign
+    auto sig = hyperdht::announce_sig::sign_mutable(
+        seq, value.data(), value.size(), kp);
+
+    // Build mutable put request
+    hyperdht::dht_messages::MutablePutRequest put;
+    put.public_key = kp.public_key;
+    put.seq = seq;
+    put.value = value;
+    put.signature = sig;
+    auto encoded = hyperdht::dht_messages::encode_mutable_put(put);
+
+    run_storage_test(env.ctx, env.loop, [&](StorageCtx* c) {
+        send_storage_req(c, CMD_MUTABLE_PUT, target, encoded);
+    });
+
+    EXPECT_TRUE(env.ctx.op_done);
+    EXPECT_TRUE(env.ctx.op_accepted) << "Mutable PUT should succeed";
+
+    // Phase 2: GET
+    TestEnv env2;
+    // Manually store the value
+    hyperdht::dht_messages::MutableGetResponse stored;
+    stored.seq = seq;
+    stored.value = value;
+    stored.signature = sig;
+    env2.handlers->mutables_put(target, hyperdht::dht_messages::encode_mutable_get_resp(stored));
+
+    // Request seq=0 (get any version)
+    hyperdht::compact::State s;
+    hyperdht::compact::Uint::preencode(s, 0);
+    std::vector<uint8_t> seq_buf(s.end);
+    s.buffer = seq_buf.data();
+    s.start = 0;
+    hyperdht::compact::Uint::encode(s, 0);
+
+    run_storage_test(env2.ctx, env2.loop, [&target, &seq_buf](StorageCtx* c) {
+        send_storage_req(c, CMD_MUTABLE_GET, target, seq_buf, /*need_token=*/false);
+    });
+
+    EXPECT_TRUE(env2.ctx.op_done);
+    EXPECT_TRUE(env2.ctx.op_accepted);
+    ASSERT_TRUE(env2.ctx.response_value.has_value());
+
+    // Decode the response
+    auto resp = hyperdht::dht_messages::decode_mutable_get_resp(
+        env2.ctx.response_value->data(), env2.ctx.response_value->size());
+    EXPECT_EQ(resp.seq, seq);
+    EXPECT_EQ(resp.value, value);
+}
+
+TEST(RpcHandlers, MutablePutInvalidSignatureRejected) {
+    TestEnv env;
+
+    hyperdht::noise::Seed seed{};
+    seed.fill(0x42);
+    auto kp = hyperdht::noise::generate_keypair(seed);
+
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32, kp.public_key.data(), 32, nullptr, 0);
+
+    std::vector<uint8_t> value = {'b', 'a', 'd'};
+    hyperdht::dht_messages::MutablePutRequest put;
+    put.public_key = kp.public_key;
+    put.seq = 1;
+    put.value = value;
+    put.signature.fill(0xDE);  // Garbage signature
+    auto encoded = hyperdht::dht_messages::encode_mutable_put(put);
+
+    run_storage_test(env.ctx, env.loop, [&](StorageCtx* c) {
+        send_storage_req(c, CMD_MUTABLE_PUT, target, encoded);
+    });
+
+    EXPECT_TRUE(env.ctx.op_done);
+    EXPECT_FALSE(env.ctx.op_accepted) << "Invalid signature should be rejected";
+}
+
+TEST(RpcHandlers, MutablePutSeqTooLowRejected) {
+    TestEnv env;
+
+    hyperdht::noise::Seed seed{};
+    seed.fill(0x42);
+    auto kp = hyperdht::noise::generate_keypair(seed);
+
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32, kp.public_key.data(), 32, nullptr, 0);
+
+    // Pre-store a record at seq=5
+    std::vector<uint8_t> old_val = {'o', 'l', 'd'};
+    auto old_sig = hyperdht::announce_sig::sign_mutable(
+        5, old_val.data(), old_val.size(), kp);
+    hyperdht::dht_messages::MutableGetResponse stored;
+    stored.seq = 5;
+    stored.value = old_val;
+    stored.signature = old_sig;
+    env.handlers->mutables_put(target, hyperdht::dht_messages::encode_mutable_get_resp(stored));
+
+    // Try to PUT at seq=3 (lower)
+    std::vector<uint8_t> new_val = {'n', 'e', 'w'};
+    auto new_sig = hyperdht::announce_sig::sign_mutable(
+        3, new_val.data(), new_val.size(), kp);
+    hyperdht::dht_messages::MutablePutRequest put;
+    put.public_key = kp.public_key;
+    put.seq = 3;
+    put.value = new_val;
+    put.signature = new_sig;
+    auto encoded = hyperdht::dht_messages::encode_mutable_put(put);
+
+    run_storage_test(env.ctx, env.loop, [&](StorageCtx* c) {
+        send_storage_req(c, CMD_MUTABLE_PUT, target, encoded);
+    });
+
+    EXPECT_TRUE(env.ctx.op_done);
+    EXPECT_FALSE(env.ctx.op_accepted) << "SEQ_TOO_LOW should return an error";
+    ASSERT_TRUE(env.ctx.error_code.has_value());
+    EXPECT_EQ(*env.ctx.error_code, ERR_SEQ_TOO_LOW);
+}

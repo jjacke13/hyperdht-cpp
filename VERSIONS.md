@@ -21,7 +21,7 @@ and against which all cross-tests pass. Source copies in `.analysis/js/` (gitign
 | sodium-secretstream | 1.2.0 | Secretstream primitive |
 | udx-native | 1.19.2 | Reliable UDP (BBR congestion) |
 | protomux | 3.10.1 | Channel multiplexer |
-| blind-relay | 1.4.0 | Relay protocol |
+| blind-relay | 1.4.0 | Relay protocol (reference only — not implemented in C++) |
 | kademlia-routing-table | 1.0.6 | Routing table (k=20, 256 buckets) |
 | nat-sampler | 1.0.1 | NAT type detection |
 

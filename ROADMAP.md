@@ -11,21 +11,43 @@
 
 ### Phase A: Hardening & Security Testing
 
-| # | Task | Purpose |
-|---|------|---------|
-| A1 | Run full suite under ASan + UBSan | Catch use-after-free, buffer overflows, undefined behavior |
-| A2 | Run full suite under LeakSanitizer / Valgrind | libuv/libudx async close patterns are leak-prone |
-| A3 | Fuzz compact decoders with libFuzzer | Compact encoding parses untrusted network input |
-| A4 | Fuzz message decoders (Request, Response) | Message parsing is attack surface |
-| A5 | Fuzz Noise recv + handshake msg decoder | Cryptographic input parsing |
-| A6 | Edge case tests: zero-length buffers, max varints, truncated messages | Protocol boundary conditions |
-| A7 | Edge case tests: duplicate TIDs, expired tokens, full routing table | State machine edge cases |
-| A8 | Stress test: rapid connect/disconnect, 100 concurrent connections | Real-world load patterns |
-| A9 | Lifecycle tests: destroy mid-handshake, mid-holepunch, mid-announce | Verify no crashes/leaks on teardown |
-| A10 | Crypto review: replay/reorder rejection, nonce uniqueness | Cryptographic correctness |
-| A11 | Wire compat cross-tests: C++ encode -> JS decode for every message type | Regression guard |
+| # | Task | Status |
+|---|------|--------|
+| A1 | Run full suite under ASan + UBSan | **Done** — 6 test bugs fixed, library clean |
+| A2 | Run full suite under LeakSanitizer / Valgrind | **Done** — bundled with ASan |
+| A3 | Fuzz compact decoders with libFuzzer | **Done** — 9.8M runs, 0 crashes |
+| A4 | Fuzz message decoders (Request, Response) | **Done** — 7.2M runs, 1 bug found+fixed (has_bytes overflow) |
+| A5 | Fuzz Noise recv + handshake/holepunch/noise payload decoders | **Done** — 19.6M runs, 2 crashes (same root cause) |
+| A6 | Edge case tests: zero-length buffers, max varints, truncated messages | **Done** — 15 tests |
+| A7 | Edge case tests: expired tokens, full routing table, duplicate nodes | **Done** — 8 tests |
+| A8 | Stress test: rapid connect/disconnect, concurrent connections | **Manual** — to be done as live testing sessions |
+| A9 | Lifecycle tests: destroy mid-handshake, mid-holepunch, mid-announce | **Manual** — to be done as live testing sessions |
+| A10 | Crypto review: replay/reorder rejection, nonce uniqueness, state machine | **Done** — 7 tests |
+| A11 | Wire compat cross-tests: round-trip for all message types | **Done** — 13 tests |
+| A12 | Extended fuzzing: longer runs (hours), new targets as code evolves | **Ongoing** — run periodically before releases |
+
+**A12 (Extended fuzzing):** The initial fuzz runs were 30 seconds each (~36M total iterations). Longer runs find deeper bugs. Before any release or major change, run each fuzzer for at least 1 hour:
+```bash
+cmake -S fuzz -B build-fuzz -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -G Ninja
+ninja -C build-fuzz
+./build-fuzz/fuzz_compact -max_total_time=3600
+./build-fuzz/fuzz_messages -max_total_time=3600
+./build-fuzz/fuzz_handshake_msg -max_total_time=3600
+./build-fuzz/fuzz_holepunch_msg -max_total_time=3600
+./build-fuzz/fuzz_noise_payload -max_total_time=3600
+```
+Add new fuzz targets when new decoders are added (e.g., for the C API input validation).
 
 ### Phase B: Complete DHT Features (Plan Steps 9-10)
+
+| # | Task | Status |
+|---|------|--------|
+| B1 | Enhanced ANNOUNCE handlers — verify Ed25519 signatures | **Done** |
+| B2 | Mutable Put/Get — signed key-value storage with seq ordering | **Done** |
+| B3 | Immutable Put/Get — content-addressed storage | **Done** |
+| B4 | Tests for B1-B3 + cross-tests with JS | **Done** — live cross-tested both directions |
+
+### Phase C: Library Packaging (Plan Step 11-13)
 
 | # | Task | Lines est. |
 |---|------|------------|
@@ -87,6 +109,20 @@ option(HYPERDHT_EMBEDDED "Smaller buffers, no mutable/immutable storage" OFF)
 ```
 
 When ON: reduced routing table (64 buckets), smaller congestion window (16), no mutable/immutable codecs.
+
+## Storage Hardening (must-fix before production)
+
+1. **TTL + size cap on mutable/immutable storage maps** (PRIORITY)
+   - JS uses xache: 32K max entries, 48h TTL, LRU eviction
+   - Our `unordered_map` has no limit — a long-running node will OOM
+   - Fix: add a simple LRU cache with max entries (e.g. 32K) and TTL eviction on a background timer
+   - Affects: `mutables_` and `immutables_` in `rpc_handlers.hpp`
+
+2. **Background refresh for stored values**
+   - JS peers re-PUT periodically to keep data alive across the network
+   - Our client-side put is one-shot — data disappears when the storing nodes evict it
+   - Fix: add a refresh timer that re-announces/re-puts values we care about
+   - Lower priority than #1 (only matters for long-lived data)
 
 ## Deferred Items (from code reviews)
 

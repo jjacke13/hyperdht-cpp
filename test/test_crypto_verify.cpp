@@ -359,3 +359,150 @@ TEST(CryptoVerify, HolepunchPayloadEncrypted) {
                                      ciphertext.size(), nonce, key);
     EXPECT_NE(rc, 0) << "Tampered ciphertext should be rejected";
 }
+
+// ============================================================================
+// A10: Crypto review — replay, reorder, state machine
+// ============================================================================
+
+// Test 9: SecretStream rejects replayed messages
+TEST(CryptoVerify, SecretStreamReplayRejected) {
+    auto pair = EncryptedPair::create();
+
+    std::string msg = "replay me";
+    auto ct = pair.sender->encrypt(
+        reinterpret_cast<const uint8_t*>(msg.data()), msg.size());
+
+    // First decrypt succeeds
+    uint32_t len = frame_len(ct.data());
+    auto dec1 = pair.receiver->decrypt(ct.data() + 3, len);
+    ASSERT_TRUE(dec1.has_value()) << "First decrypt should succeed";
+
+    // Replay the same ciphertext — must fail
+    // (secretstream uses an internal counter; replaying advances out of sync)
+    auto dec2 = pair.receiver->decrypt(ct.data() + 3, len);
+    EXPECT_FALSE(dec2.has_value())
+        << "Replayed message must be rejected (counter out of sync)";
+}
+
+// Test 10: SecretStream rejects reordered messages
+TEST(CryptoVerify, SecretStreamReorderRejected) {
+    auto pair = EncryptedPair::create();
+
+    std::string msg1 = "message one";
+    std::string msg2 = "message two";
+
+    auto ct1 = pair.sender->encrypt(
+        reinterpret_cast<const uint8_t*>(msg1.data()), msg1.size());
+    auto ct2 = pair.sender->encrypt(
+        reinterpret_cast<const uint8_t*>(msg2.data()), msg2.size());
+
+    // Decrypt msg2 first (out of order) — must fail
+    uint32_t len2 = frame_len(ct2.data());
+    auto dec2 = pair.receiver->decrypt(ct2.data() + 3, len2);
+    EXPECT_FALSE(dec2.has_value())
+        << "Out-of-order message must be rejected (counter mismatch)";
+}
+
+// Test 11: Noise state machine — recv before send fails for initiator
+TEST(CryptoVerify, NoiseInitiatorCannotRecvFirst) {
+    Seed i_seed{};
+    i_seed.fill(0x01);
+    Seed r_seed{};
+    r_seed.fill(0x02);
+    auto i_kp = generate_keypair(i_seed);
+    auto r_kp = generate_keypair(r_seed);
+
+    uint8_t prologue[] = {0x00};
+    NoiseIK initiator(true, i_kp, prologue, 1, &r_kp.public_key);
+
+    // Initiator should send msg1 first, not recv
+    uint8_t garbage[64] = {};
+    auto result = initiator.recv(garbage, sizeof(garbage));
+    EXPECT_FALSE(result.has_value())
+        << "Initiator should not accept recv before sending msg1";
+}
+
+// Test 12: Noise state machine — responder cannot send first
+TEST(CryptoVerify, NoiseResponderCannotSendFirst) {
+    Seed r_seed{};
+    r_seed.fill(0x02);
+    auto r_kp = generate_keypair(r_seed);
+
+    uint8_t prologue[] = {0x00};
+    NoiseIK responder(false, r_kp, prologue, 1, nullptr);
+
+    // Responder should recv msg1 first, not send
+    auto msg = responder.send();
+    EXPECT_TRUE(msg.empty())
+        << "Responder should not produce output before receiving msg1";
+}
+
+// Test 13: Noise — double send fails
+TEST(CryptoVerify, NoiseDoubleSendFails) {
+    Seed i_seed{};
+    i_seed.fill(0x01);
+    Seed r_seed{};
+    r_seed.fill(0x02);
+    auto i_kp = generate_keypair(i_seed);
+    auto r_kp = generate_keypair(r_seed);
+
+    uint8_t prologue[] = {0x00};
+    NoiseIK initiator(true, i_kp, prologue, 1, &r_kp.public_key);
+
+    auto msg1 = initiator.send();
+    EXPECT_FALSE(msg1.empty());
+
+    // Second send without recv should fail (state already advanced)
+    auto msg1b = initiator.send();
+    EXPECT_TRUE(msg1b.empty())
+        << "Double send should fail — initiator must recv msg2 before sending again";
+}
+
+// Test 14: Noise — completed handshake rejects further messages
+TEST(CryptoVerify, NoiseCompletedRejectsMore) {
+    Seed i_seed{};
+    i_seed.fill(0x01);
+    Seed r_seed{};
+    r_seed.fill(0x02);
+    auto i_kp = generate_keypair(i_seed);
+    auto r_kp = generate_keypair(r_seed);
+
+    uint8_t prologue[] = {0x00};
+    NoiseIK initiator(true, i_kp, prologue, 1, &r_kp.public_key);
+    NoiseIK responder(false, r_kp, prologue, 1, nullptr);
+
+    auto msg1 = initiator.send();
+    responder.recv(msg1.data(), msg1.size());
+    auto msg2 = responder.send();
+    initiator.recv(msg2.data(), msg2.size());
+
+    EXPECT_TRUE(initiator.is_complete());
+    EXPECT_TRUE(responder.is_complete());
+
+    // Both sides should reject further messages
+    auto extra_send = initiator.send();
+    EXPECT_TRUE(extra_send.empty())
+        << "Completed handshake should not produce more messages";
+
+    auto extra_recv = responder.recv(msg1.data(), msg1.size());
+    EXPECT_FALSE(extra_recv.has_value())
+        << "Completed handshake should reject incoming messages";
+}
+
+// Test 15: SecretStream — large message integrity
+TEST(CryptoVerify, LargeMessageIntegrity) {
+    auto pair = EncryptedPair::create();
+
+    // 64KB message — tests chunking and counter advancement
+    std::vector<uint8_t> large(65536);
+    for (size_t i = 0; i < large.size(); i++) {
+        large[i] = static_cast<uint8_t>(i & 0xFF);
+    }
+
+    auto ct = pair.sender->encrypt(large.data(), large.size());
+    uint32_t len = frame_len(ct.data());
+    auto dec = pair.receiver->decrypt(ct.data() + 3, len);
+
+    ASSERT_TRUE(dec.has_value()) << "Large message decryption failed";
+    EXPECT_EQ(*dec, large) << "Large message content mismatch";
+}

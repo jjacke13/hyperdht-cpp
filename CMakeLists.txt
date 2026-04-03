@@ -144,6 +144,16 @@ if(HYPERDHT_BUILD_TESTS)
     gtest_discover_tests(test_noise_cross)
     gtest_discover_tests(test_secret_stream)
     gtest_discover_tests(test_crypto_verify)
+
+    add_executable(test_wire_compat test/test_wire_compat.cpp)
+    target_link_libraries(test_wire_compat PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_wire_compat COMMAND test_wire_compat)
+    gtest_discover_tests(test_wire_compat)
+
+    add_executable(test_edge_cases test/test_edge_cases.cpp)
+    target_link_libraries(test_edge_cases PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_edge_cases COMMAND test_edge_cases)
+    gtest_discover_tests(test_edge_cases)
     gtest_discover_tests(test_routing_table)
 
     add_executable(test_tokens test/test_tokens.cpp)

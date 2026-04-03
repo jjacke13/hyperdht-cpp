@@ -2,6 +2,9 @@
 
 #include <cassert>
 
+#include "hyperdht/announce_sig.hpp"
+#include "hyperdht/dht_messages.hpp"
+
 namespace hyperdht {
 namespace rpc {
 
@@ -220,23 +223,60 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
     // Validate token: must match what we issued for this sender
     if (!socket_.token_store().validate(
             req.from.addr.host_string(), *req.token)) {
-        return;  // Silently reject invalid token
+        return;
     }
+
+    // Decode the announce message
+    if (!req.value.has_value()) return;
+    auto ann = dht_messages::decode_announce_msg(
+        req.value->data(), req.value->size());
+
+    // Refresh-only (no peer) — skip signature check (JS: _onrefresh)
+    if (!ann.peer.has_value()) {
+        if (!ann.refresh.has_value()) return;
+        // TODO: implement full refresh token handling (_onrefresh)
+        // For now, reply so the client doesn't time out
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = req.from.addr;
+        resp.id = socket_.table().id();
+        socket_.reply(resp);
+        return;
+    }
+
+    // Cap relay addresses at 3 (matches JS persistent.js)
+    if (ann.peer->relay_addresses.size() > 3) {
+        ann.peer->relay_addresses.resize(3);
+    }
+
+    // Signature is required when peer is present
+    if (!ann.signature.has_value()) return;
+
+    // Verify Ed25519 signature: signable = NS_ANNOUNCE + BLAKE2b(target || nodeId || token || peer || refresh)
+    auto node_id = socket_.table().id();
+    bool valid = announce_sig::verify_announce(
+        dht_messages::ns_announce(),
+        *req.target, node_id,
+        req.token->data(), req.token->size(),
+        ann, *ann.signature,
+        ann.peer->public_key);
+
+    if (!valid) return;  // Silently drop invalid signatures
 
     announce::TargetKey target{};
     std::copy(req.target->begin(), req.target->end(), target.begin());
 
     // Store the announcement
     assert(socket_.loop() != nullptr);
-    announce::PeerAnnouncement ann;
-    ann.from = req.from.addr;
-    ann.value = req.value.value_or(std::vector<uint8_t>{});
-    ann.created_at = uv_now(socket_.loop());
-    ann.ttl = announce::DEFAULT_TTL_MS;
+    announce::PeerAnnouncement stored;
+    stored.from = req.from.addr;
+    stored.value = *req.value;
+    stored.created_at = uv_now(socket_.loop());
+    stored.ttl = announce::DEFAULT_TTL_MS;
 
-    store_.put(target, ann);
+    store_.put(target, stored);
 
-    // Reply with no closer nodes (JS: { token: false, closerNodes: false })
+    // Reply (JS: { token: false, closerNodes: false })
     messages::Response resp;
     resp.tid = req.tid;
     resp.from.addr = req.from.addr;
@@ -258,6 +298,26 @@ void RpcHandlers::handle_unannounce(const messages::Request& req) {
             req.from.addr.host_string(), *req.token)) {
         return;
     }
+
+    // Decode the announce message (UNANNOUNCE uses same codec)
+    if (!req.value.has_value()) return;
+    auto ann = dht_messages::decode_announce_msg(
+        req.value->data(), req.value->size());
+
+    // Both peer and signature required for unannounce
+    if (!ann.peer.has_value()) return;
+    if (!ann.signature.has_value()) return;
+
+    // Verify signature with NS_UNANNOUNCE namespace
+    auto node_id = socket_.table().id();
+    bool valid = announce_sig::verify_announce(
+        dht_messages::ns_unannounce(),
+        *req.target, node_id,
+        req.token->data(), req.token->size(),
+        ann, *ann.signature,
+        ann.peer->public_key);
+
+    if (!valid) return;  // Silently drop
 
     announce::TargetKey target{};
     std::copy(req.target->begin(), req.target->end(), target.begin());

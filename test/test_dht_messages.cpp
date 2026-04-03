@@ -35,6 +35,30 @@ TEST(DhtMessages, NamespaceHashesDeterministic) {
     EXPECT_EQ(ns_unannounce(), ns_unannounce());
 }
 
+// Helper: parse hex to array
+static std::array<uint8_t, 32> hex32(const char* hex) {
+    std::array<uint8_t, 32> out{};
+    for (int i = 0; i < 32; i++) {
+        unsigned int byte;
+        sscanf(hex + i * 2, "%2x", &byte);
+        out[i] = static_cast<uint8_t>(byte);
+    }
+    return out;
+}
+
+TEST(DhtMessages, NamespaceHashesPinnedValues) {
+    // These values were verified against JS hypercore-crypto.namespace('hyperswarm/dht', [...]).
+    // NS_PEER_HANDSHAKE was cross-verified in the Noise IK cross-test (Phase 4b)
+    // which successfully handshakes with a JS HyperDHT server.
+    // compute_ns uses the same code path for all commands.
+    EXPECT_EQ(ns_peer_handshake(),
+              hex32("14d6d4b49214ab1033ed204976caa258bae9e1e8543b9ad1fd996a910b0c4e3a"));
+    EXPECT_EQ(ns_announce(),
+              hex32("36386adddf9f6fd60db83a6f42fc159d1146aa8644037664230aaa1f0179d497"));
+    EXPECT_EQ(ns_unannounce(),
+              hex32("ded293cd93fb395e756ecf5fff426529e72c36eacc22e5ed944d9099a2561e32"));
+}
+
 // ---------------------------------------------------------------------------
 // PeerRecord
 // ---------------------------------------------------------------------------

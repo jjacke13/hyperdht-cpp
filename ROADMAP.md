@@ -115,9 +115,19 @@ When ON: reduced routing table (64 buckets), smaller congestion window (16), no 
    - Fix: add a refresh timer that re-announces/re-puts values we care about
    - Lower priority than #1 (only matters for long-lived data)
 
-## Missing NAT Strategy
+## Missing NAT Strategies (required for full JS parity)
 
-- **RANDOM+CONSISTENT (birthday paradox)**: Open 256 UDP sockets, each with a random port. High probability one matches the remote's consistent mapping. JS does this with `udx.createSocket()` in a loop. ~100 lines using existing UDX wrapper. This completes 4/4 punchable NAT combos (RANDOM+RANDOM is not punchable and requires blind relay, which JS also doesn't fully support).
+1. **RANDOM+CONSISTENT (birthday paradox)** — ~100 lines
+   - Open 256 UDP sockets with random ports. High probability one matches the remote's consistent mapping.
+   - JS does this with `udx.createSocket()` in a loop.
+   - Uses existing UDX wrapper. Currently returns failure in our code.
+
+2. **RANDOM+RANDOM (blind relay fallback)** — ~500 lines
+   - When holepunching is impossible, traffic routes permanently through a relay node.
+   - The public HyperDHT network has blind relay nodes running (`blind-relay` v1.4.0).
+   - JS HyperDHT falls back to this automatically when punch fails.
+   - Essential for mobile users behind carrier-grade NAT (symmetric/symmetric).
+   - Requires implementing the blind-relay protocol: relay handshake, Protomux channel over relay, encrypted stream tunneling.
 
 ## Deferred Items (from code reviews)
 

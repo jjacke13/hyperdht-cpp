@@ -32,7 +32,9 @@ add_library(udx STATIC
     deps/libudx/src/win_filter_f64.c
 )
 target_include_directories(udx
-    PUBLIC deps/libudx/include
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/deps/libudx/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE deps/libudx/src
 )
 target_link_libraries(udx PUBLIC PkgConfig::UV)
@@ -79,6 +81,50 @@ if(HYPERDHT_DEBUG)
     target_compile_definitions(hyperdht PUBLIC HYPERDHT_DEBUG=1)
 endif()
 
+# Position-independent code (needed if static lib is linked into a .so)
+set_target_properties(hyperdht PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# === Install rules ===
+
+include(GNUInstallDirs)
+
+# Install the library and libudx
+install(TARGETS hyperdht udx
+    EXPORT hyperdht-targets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+# Install public headers
+install(DIRECTORY include/hyperdht
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
+)
+
+# Install libudx headers (dependency)
+install(DIRECTORY deps/libudx/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.h"
+)
+
+# Install CMake package config (for find_package(hyperdht))
+install(EXPORT hyperdht-targets
+    FILE hyperdht-config.cmake
+    NAMESPACE hyperdht::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hyperdht
+)
+
+# Generate pkg-config file
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/hyperdht.pc.in
+    ${CMAKE_CURRENT_BINARY_DIR}/hyperdht.pc
+    @ONLY
+)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/hyperdht.pc
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+)
+
 # === Tests ===
 
 option(HYPERDHT_BUILD_TESTS "Build tests" ON)
@@ -91,6 +137,7 @@ if(HYPERDHT_BUILD_TESTS)
         GIT_TAG v1.15.2
     )
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
 
     enable_testing()

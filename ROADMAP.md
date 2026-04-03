@@ -51,15 +51,6 @@ Add new fuzz targets when new decoders are added (e.g., for the C API input vali
 
 | # | Task | Lines est. |
 |---|------|------------|
-| B1 | Enhanced ANNOUNCE handlers — verify Ed25519 signatures on announce/unannounce | ~150 |
-| B2 | Mutable Put/Get — signed key-value storage with seq ordering | ~150 |
-| B3 | Immutable Put/Get — content-addressed storage (BLAKE2b-256(value) == target) | ~100 |
-| B4 | Tests for B1-B3 + cross-tests with JS | ~200 |
-
-### Phase C: Library Packaging (Plan Step 11-13)
-
-| # | Task | Lines est. |
-|---|------|------------|
 | C1 | C API header (`hyperdht.h`) — opaque pointers, callbacks, void* userdata | ~150 |
 | C2 | C API implementation (`hyperdht_api.cpp`) — thin shim to C++ objects | ~300 |
 | C3 | C API tests (`test_c_api.cpp`) — create/destroy, connect, server through C | ~150 |

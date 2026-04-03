@@ -4,6 +4,8 @@
 
 #include <cstdio>
 
+#include "hyperdht/debug.hpp"
+
 namespace hyperdht {
 namespace announcer {
 
@@ -121,12 +123,12 @@ void Announcer::update() {
 
 void Announcer::commit(const query::QueryReply& node) {
     if (!node.token.has_value()) {
-        fprintf(stderr, "  [announcer] skip %s:%u (no token)\n",
+        DHT_LOG( "  [announcer] skip %s:%u (no token)\n",
                 node.from_addr.host_string().c_str(), node.from_addr.port);
         return;
     }
 
-    fprintf(stderr, "  [announcer] commit to %s:%u (id=%02x%02x...)\n",
+    DHT_LOG( "  [announcer] commit to %s:%u (id=%02x%02x...)\n",
             node.from_addr.host_string().c_str(), node.from_addr.port,
             node.from_id[0], node.from_id[1]);
 
@@ -162,7 +164,7 @@ void Announcer::commit(const query::QueryReply& node) {
     socket_.request(req,
         [this, node](const messages::Response& resp) {
             if (!running_) return;
-            fprintf(stderr, "  [announcer] ANNOUNCE accepted by %s:%u\n",
+            DHT_LOG( "  [announcer] ANNOUNCE accepted by %s:%u\n",
                     node.from_addr.host_string().c_str(), node.from_addr.port);
 
             // Success — track this node as a relay
@@ -188,7 +190,7 @@ void Announcer::commit(const query::QueryReply& node) {
             }
         },
         [node](uint16_t) {
-            fprintf(stderr, "  [announcer] ANNOUNCE timeout from %s:%u\n",
+            DHT_LOG( "  [announcer] ANNOUNCE timeout from %s:%u\n",
                     node.from_addr.host_string().c_str(), node.from_addr.port);
         });
 }
@@ -252,16 +254,16 @@ void Announcer::build_relays() {
     }
     record_ = dht_messages::encode_peer_record(peer);
 
-    fprintf(stderr, "  [announcer] Built relay list: %zu relays\n", relays_.size());
+    DHT_LOG( "  [announcer] Built relay list: %zu relays\n", relays_.size());
     for (const auto& ri : relays_) {
-        fprintf(stderr, "    relay: %s:%u\n",
+        DHT_LOG( "    relay: %s:%u\n",
                 ri.relay_address.host_string().c_str(), ri.relay_address.port);
     }
 
     // If we have relays, immediately re-announce with the updated record
     // so findPeer returns our relay addresses
     if (!relays_.empty() && running_) {
-        fprintf(stderr, "  [announcer] Re-announcing with %zu relay addresses\n",
+        DHT_LOG( "  [announcer] Re-announcing with %zu relay addresses\n",
                 relays_.size());
         update();
     }

@@ -4,6 +4,8 @@
 
 #include <cstdio>
 
+#include "hyperdht/debug.hpp"
+
 namespace hyperdht {
 namespace server {
 
@@ -62,7 +64,7 @@ void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection)
     entry.record = announcer_->record();
     router_.set(target_, std::move(entry));
 
-    fprintf(stderr, "  [server] Listening on %s\n",
+    DHT_LOG( "  [server] Listening on %s\n",
             to_hex(keypair_.public_key.data(), 8).c_str());
 }
 
@@ -110,7 +112,7 @@ const std::vector<peer_connect::RelayInfo>& Server::relay_addresses() const {
 void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
                                 const compact::Ipv4Address& peer_address,
                                 std::function<void(std::vector<uint8_t>)> reply_fn) {
-    fprintf(stderr, "  [server] on_peer_handshake: noise=%zu bytes, from=%s:%u\n",
+    DHT_LOG( "  [server] on_peer_handshake: noise=%zu bytes, from=%s:%u\n",
             noise.size(), peer_address.host_string().c_str(), peer_address.port);
     if (closed_) return;
 
@@ -137,15 +139,15 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         our_addrs, relay_infos, fw_cb);
 
     if (!result.has_value()) {
-        fprintf(stderr, "  [server] Noise handshake FAILED (recv or send error)\n");
+        DHT_LOG( "  [server] Noise handshake FAILED (recv or send error)\n");
         return;
     }
-    fprintf(stderr, "  [server] Noise handshake OK, error=%u\n", result->error_code);
+    DHT_LOG( "  [server] Noise handshake OK, error=%u\n", result->error_code);
 
     auto& conn = *result;
 
     // Send the Noise msg2 reply
-    fprintf(stderr, "  [server] Sending reply: %zu noise bytes\n", conn.reply_noise.size());
+    DHT_LOG( "  [server] Sending reply: %zu noise bytes\n", conn.reply_noise.size());
     auto reply_noise = conn.reply_noise;
     reply_fn(std::move(reply_noise));
 
@@ -168,7 +170,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     // Store connection for holepunch phase
     connections_[hp_id] = std::move(conn_ptr);
 
-    fprintf(stderr, "  [server] Handshake complete (id=%d), waiting for holepunch\n", hp_id);
+    DHT_LOG( "  [server] Handshake complete (id=%d), waiting for holepunch\n", hp_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +212,7 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     // client establishes the UDX stream (detected by the RpcSocket's probe
     // listener or UDX stream firewall callback).
     if (reply.should_punch) {
-        fprintf(stderr, "  [server] Client punching (id=%d, fw=%u, %zu addrs)\n",
+        DHT_LOG( "  [server] Client punching (id=%d, fw=%u, %zu addrs)\n",
                 hp_msg.id, reply.remote_firewall,
                 reply.remote_addresses.size());
 
@@ -251,7 +253,7 @@ void Server::on_socket(server_connection::ServerConnection& conn,
         info.remote_udx_id = conn.remote_payload.udx->id;
     }
 
-    fprintf(stderr, "  [server] Connection from %s (udx: us=%u them=%u)\n",
+    DHT_LOG( "  [server] Connection from %s (udx: us=%u them=%u)\n",
             to_hex(conn.remote_public_key.data(), 8).c_str(),
             info.local_udx_id, info.remote_udx_id);
 

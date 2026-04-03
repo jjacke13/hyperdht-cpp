@@ -1,4 +1,6 @@
 #include "hyperdht/holepunch.hpp"
+
+#include "hyperdht/debug.hpp"
 #include "hyperdht/dht_messages.hpp"
 
 #include <sodium.h>
@@ -262,14 +264,14 @@ void Holepuncher::stop() {
 
 void Holepuncher::send_probe(const compact::Ipv4Address& addr) {
     if (send_fn_) {
-        fprintf(stderr, "  [hp] Sending probe to %s:%u\n",
+        DHT_LOG( "  [hp] Sending probe to %s:%u\n",
                 addr.host_string().c_str(), addr.port);
         send_fn_(addr);
     }
 }
 
 void Holepuncher::on_message(const compact::Ipv4Address& from) {
-    fprintf(stderr, "  [hp] PROBE RECEIVED from %s:%u!\n",
+    DHT_LOG( "  [hp] PROBE RECEIVED from %s:%u!\n",
             from.host_string().c_str(), from.port);
     if (connected_) return;
 
@@ -502,7 +504,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
     req.target = target;
     req.value = encode_holepunch_msg(hp_msg);
 
-    fprintf(stderr, "  [hp] Sending round 1 to relay %s:%u (id=%u, peer=%s:%u)\n",
+    DHT_LOG( "  [hp] Sending round 1 to relay %s:%u (id=%u, peer=%s:%u)\n",
             relay_addr.host_string().c_str(), relay_addr.port,
             holepunch_id,
             peer_addr.host_string().c_str(), peer_addr.port);
@@ -513,20 +515,20 @@ void holepunch_connect(rpc::RpcSocket& socket,
             if (state->completed) return;
 
             if (!resp.value.has_value() || resp.value->empty()) {
-                fprintf(stderr, "  [hp] Round 1: no response value\n");
+                DHT_LOG( "  [hp] Round 1: no response value\n");
                 state->complete({});
                 return;
             }
-            fprintf(stderr, "  [hp] Round 1: got response (%zu bytes)\n",
+            DHT_LOG( "  [hp] Round 1: got response (%zu bytes)\n",
                     resp.value->size());
 
             auto hp_resp = decode_holepunch_msg(resp.value->data(), resp.value->size());
             if (hp_resp.payload.empty()) {
-                fprintf(stderr, "  [hp] Round 1: empty payload in decoded msg\n");
+                DHT_LOG( "  [hp] Round 1: empty payload in decoded msg\n");
                 state->complete({});
                 return;
             }
-            fprintf(stderr, "  [hp] Round 1: payload %zu bytes, peerAddr=%s\n",
+            DHT_LOG( "  [hp] Round 1: payload %zu bytes, peerAddr=%s\n",
                     hp_resp.payload.size(),
                     hp_resp.peer_address.has_value()
                         ? (hp_resp.peer_address->host_string() + ":" +
@@ -537,7 +539,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
             auto decrypted = state->secure->decrypt(
                 hp_resp.payload.data(), hp_resp.payload.size());
             if (!decrypted) {
-                fprintf(stderr, "  [hp] Round 1: decrypt FAILED\n");
+                DHT_LOG( "  [hp] Round 1: decrypt FAILED\n");
                 // Decrypt failed — use peerAddress from relay as fallback
                 if (hp_resp.peer_address.has_value()) {
                     HolepunchResult result;
@@ -551,7 +553,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
             }
 
             auto server_r1 = decode_holepunch_payload(decrypted->data(), decrypted->size());
-            fprintf(stderr, "  [hp] Round 1 server: fw=%u err=%u round=%u "
+            DHT_LOG( "  [hp] Round 1 server: fw=%u err=%u round=%u "
                     "addrs=%zu punching=%d connected=%d token=%s\n",
                     server_r1.firewall, server_r1.error, server_r1.round,
                     server_r1.addresses.size(),
@@ -559,7 +561,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
                     server_r1.token.has_value() ? "yes" : "no");
 
             if (server_r1.error != peer_connect::ERROR_NONE) {
-                fprintf(stderr, "  [hp] Round 1: server error %u\n", server_r1.error);
+                DHT_LOG( "  [hp] Round 1: server error %u\n", server_r1.error);
                 state->complete({});
                 return;
             }
@@ -634,7 +636,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
             // Our public address: the relay response `to` field tells us how
             // the relay sees us. The server needs this to know WHERE to probe.
             Ipv4Address our_addr = resp.from.addr;
-            fprintf(stderr, "  [hp] Our address (from relay): %s:%u\n",
+            DHT_LOG( "  [hp] Our address (from relay): %s:%u\n",
                     our_addr.host_string().c_str(), our_addr.port);
 
             HolepunchPayload punch;
@@ -667,7 +669,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
             req2.target = target;
             req2.value = encode_holepunch_msg(hp_msg2);
 
-            fprintf(stderr, "  [hp] Sending round 2 (punching=true) to %s:%u\n",
+            DHT_LOG( "  [hp] Sending round 2 (punching=true) to %s:%u\n",
                     relay_addr.host_string().c_str(), relay_addr.port);
 
             socket.request(req2,
@@ -685,7 +687,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
                             if (r2_dec) {
                                 auto r2_pay = decode_holepunch_payload(
                                     r2_dec->data(), r2_dec->size());
-                                fprintf(stderr,
+                                DHT_LOG(
                                     "  [hp] Round 2 server: fw=%u err=%u "
                                     "punching=%d connected=%d addrs=%zu\n",
                                     r2_pay.firewall, r2_pay.error,
@@ -717,7 +719,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
                     state->complete(result);
                 },
                 [state, puncher, server_addrs](uint16_t) {
-                    fprintf(stderr, "  [hp] Round 2: TIMEOUT\n");
+                    DHT_LOG( "  [hp] Round 2: TIMEOUT\n");
                     // Round 2 timeout — still try probing and report address
                     if (!state->completed) {
                         puncher->punch();
@@ -729,7 +731,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
                 });
         },
         [state](uint16_t) {
-            fprintf(stderr, "  [hp] Round 1: TIMEOUT (no response from relay)\n");
+            DHT_LOG( "  [hp] Round 1: TIMEOUT (no response from relay)\n");
             state->complete({});
         });
 }

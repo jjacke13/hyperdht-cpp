@@ -5,6 +5,7 @@
 #include <sodium.h>
 
 #include "hyperdht/announce_sig.hpp"
+#include "hyperdht/debug.hpp"
 #include "hyperdht/dht_messages.hpp"
 
 namespace hyperdht {
@@ -22,7 +23,7 @@ void RpcHandlers::install() {
 void RpcHandlers::handle(const messages::Request& req) {
     static int req_count = 0;
     if (++req_count <= 5 || !req.internal) {
-        fprintf(stderr, "  [handlers] req #%d: int=%d cmd=%u from %s:%u\n",
+        DHT_LOG( "  [handlers] req #%d: int=%d cmd=%u from %s:%u\n",
                 req_count, req.internal ? 1 : 0, req.command,
                 req.from.addr.host_string().c_str(), req.from.addr.port);
     }
@@ -35,7 +36,7 @@ void RpcHandlers::handle(const messages::Request& req) {
             default: break;
         }
     } else {
-        fprintf(stderr, "  [handlers] ext cmd=%u from %s:%u\n",
+        DHT_LOG( "  [handlers] ext cmd=%u from %s:%u\n",
                 req.command, req.from.addr.host_string().c_str(), req.from.addr.port);
         switch (req.command) {
             case messages::CMD_PEER_HANDSHAKE:

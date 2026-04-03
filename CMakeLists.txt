@@ -10,6 +10,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# === Options ===
+option(HYPERDHT_DEBUG "Enable debug logging to stderr" OFF)
+
 # === Dependencies ===
 
 find_package(PkgConfig REQUIRED)
@@ -71,6 +74,9 @@ target_link_libraries(hyperdht PUBLIC
     PkgConfig::SODIUM
     PkgConfig::UV
 )
+if(HYPERDHT_DEBUG)
+    target_compile_definitions(hyperdht PUBLIC HYPERDHT_DEBUG=1)
+endif()
 
 # === Tests ===
 

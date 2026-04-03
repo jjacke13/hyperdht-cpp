@@ -2,6 +2,7 @@
 
 #include <cstring>
 
+#include "hyperdht/debug.hpp"
 #include "hyperdht/holepunch.hpp"
 
 namespace hyperdht {
@@ -43,7 +44,7 @@ void Router::clear() {
 bool Router::handle_peer_handshake(const messages::Request& req,
                                    ReplyFn reply, RelayFn relay) {
     if (!req.target.has_value() || !req.value.has_value()) {
-        fprintf(stderr, "  [router] HS: missing target=%d value=%d\n",
+        DHT_LOG( "  [router] HS: missing target=%d value=%d\n",
                 req.target.has_value() ? 1 : 0, req.value.has_value() ? 1 : 0);
         return false;
     }
@@ -53,7 +54,7 @@ bool Router::handle_peer_handshake(const messages::Request& req,
 
     auto* entry = get(target);
     if (!entry || !entry->on_peer_handshake) {
-        fprintf(stderr, "  [router] HS: target %02x%02x... not in router (size=%zu)\n",
+        DHT_LOG( "  [router] HS: target %02x%02x... not in router (size=%zu)\n",
                 target[0], target[1], forwards_.size());
         return false;
     }
@@ -61,7 +62,7 @@ bool Router::handle_peer_handshake(const messages::Request& req,
     auto hs_msg = peer_connect::decode_handshake_msg(
         req.value->data(), req.value->size());
 
-    fprintf(stderr, "  [router] HS: target FOUND, noise=%zu bytes, mode=%u\n",
+    DHT_LOG( "  [router] HS: target FOUND, noise=%zu bytes, mode=%u\n",
             hs_msg.noise.size(), hs_msg.mode);
 
     // Validate: noise bytes must be non-empty
@@ -86,7 +87,7 @@ bool Router::handle_peer_handshake(const messages::Request& req,
         hs_msg.noise, client_addr,
         [req_tid, req_from, req_command, req_target,
          reply, relay, client_addr, incoming_mode](std::vector<uint8_t> reply_noise) {
-            fprintf(stderr, "  [router] reply_fn called, noise=%zu bytes, incoming_mode=%u\n",
+            DHT_LOG( "  [router] reply_fn called, noise=%zu bytes, incoming_mode=%u\n",
                     reply_noise.size(), incoming_mode);
 
             if (incoming_mode == peer_connect::MODE_FROM_CLIENT) {

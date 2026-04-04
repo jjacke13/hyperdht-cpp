@@ -371,6 +371,7 @@ static void stream_on_read(udx_stream_t* raw, ssize_t nread, const uv_buf_t* buf
         if (nread < 0 && !s->closed) {
             s->closed = true;
             if (s->on_close) s->on_close(s->userdata);
+            udx_stream_destroy(raw);  // Triggers stream_on_close_cb → frees stream
         }
         return;
     }
@@ -413,10 +414,15 @@ static void stream_on_read(udx_stream_t* raw, ssize_t nread, const uv_buf_t* buf
 
 static void stream_on_close_cb(udx_stream_t* raw, int) {
     auto* s = static_cast<hyperdht_stream_s*>(raw->data);
-    if (s && !s->closed) {
+    if (!s) return;
+    if (!s->closed) {
         s->closed = true;
         if (s->on_close) s->on_close(s->userdata);
     }
+    // Free resources — the UDX stream is fully closed at this point
+    raw->data = nullptr;
+    delete s->ss;
+    delete s;
 }
 
 hyperdht_stream_t* hyperdht_stream_open(
@@ -528,10 +534,14 @@ void hyperdht_stream_close(hyperdht_stream_t* stream) {
     if (!stream || stream->closed) return;
     stream->closed = true;
 
+    // Send end-of-stream, then destroy. The on_close callback fires
+    // from stream_on_close_cb which frees the stream.
     auto* wreq = static_cast<udx_stream_write_t*>(
         calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
     udx_stream_write_end(wreq, &stream->raw_stream, nullptr, 0,
         [](udx_stream_write_t* req, int, int) { free(req); });
+
+    udx_stream_destroy(&stream->raw_stream);
 }
 
 int hyperdht_stream_is_open(const hyperdht_stream_t* stream) {

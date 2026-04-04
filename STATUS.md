@@ -144,11 +144,13 @@ First wire-compatible non-JS HyperDHT implementation. C++20, single-threaded lib
 | 10 | `DEVELOPMENT.md` — journey document (phases, gotchas, bugs) |
 | 11 | Nix/ESP-IDF integration guides |
 
-### Code Quality (from reviews, non-blocking)
+### Code Quality (from reviews, non-blocking, no security impact)
 
-- Holepunch callback API asymmetry (encoded msg vs raw bytes)
-- Raw Node* from closest() → return by value
-- Relay sends bypass congestion window
+1. **Holepunch callback API asymmetry** — C++ design choice. The holepunch handler callback returns a fully-encoded `HolepunchMessage`, which the router then decodes and re-encodes with a different mode. The handshake handler returns raw bytes. JS doesn't have this issue — dynamic objects pass through without decode/re-encode. Style/performance only, no protocol impact.
+
+2. **Raw Node* from closest()** — `routing_table.closest()` returns raw pointers into internal storage. JS does the same (returns references to internal objects) but is inherently safe due to garbage collection. In our single-threaded libuv model, the table cannot mutate while we're using the pointers, so this is safe in practice. A ~40 line refactor to return by value would be more idiomatic C++.
+
+3. **Relay sends bypass congestion window** — Identical gap in JS. The JS `router.js` has the same TODO: *"we should add a bunch of rate limits everywhere, especially including here to avoid bad users using a DHT node to relay traffic indiscriminately."* Relay sends are 1 per handshake — negligible volume. A known inherited gap, not a C++-specific issue.
 
 ---
 

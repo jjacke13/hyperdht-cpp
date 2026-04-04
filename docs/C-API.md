@@ -179,6 +179,20 @@ int main() {
 }
 ```
 
+### Encrypted Streams
+
+#### `hyperdht_stream_open(dht, conn, on_open, on_data, on_close, userdata) → hyperdht_stream_t*`
+Create an encrypted read/write stream from an established connection. Handles UDX stream setup and SecretStream header exchange automatically. `on_open` fires when the stream is ready. `on_data` fires for each received (decrypted) message. Returns `NULL` on failure.
+
+#### `hyperdht_stream_write(stream, data, len) → int`
+Encrypt data with SecretStream (XChaCha20-Poly1305) and send over UDX. Returns 0 on success. Only call after `on_open` has fired.
+
+#### `hyperdht_stream_close(stream)`
+Send end-of-stream and close. Triggers the `on_close` callback.
+
+#### `hyperdht_stream_is_open(stream) → int`
+Returns 1 if the header exchange is complete and the stream is ready for read/write.
+
 ## Error Handling
 
 All functions that return `int` use: 0 = success, negative = error. Functions that return pointers use: non-NULL = success, NULL = failure.
@@ -188,3 +202,29 @@ Error codes in `hyperdht_connection_t` callbacks: 0 = success, negative = connec
 Mutable storage error codes (in `hyperdht_done_cb`):
 - `16` (`ERR_SEQ_REUSED`) — Same sequence number with different value
 - `17` (`ERR_SEQ_TOO_LOW`) — Sequence number lower than stored value
+
+## API Surface Summary
+
+### Currently exposed (22 functions)
+
+| Category | Functions |
+|----------|----------|
+| Keypair | `keypair_generate`, `keypair_from_seed` |
+| Lifecycle | `create`, `bind`, `port`, `is_destroyed`, `destroy`, `free`, `default_keypair` |
+| Client | `connect` |
+| Server | `server_create`, `server_listen`, `server_set_firewall`, `server_close`, `server_refresh` |
+| Storage | `immutable_put`, `immutable_get`, `mutable_put`, `mutable_get` |
+| Streams | `stream_open`, `stream_write`, `stream_close`, `stream_is_open` |
+
+### Future additions (when needed)
+
+These C++ features exist but are not yet exposed through the C API. Each would be ~10-20 lines to add:
+
+| Function | What it enables |
+|----------|----------------|
+| `hyperdht_find_peer()` | Raw DHT peer discovery |
+| `hyperdht_lookup()` | Generic DHT query |
+| `hyperdht_announce()` | Manual announcement (without server) |
+| `hyperdht_get_public_address()` | Get our NAT-mapped public IP |
+| `hyperdht_set_bootstrap()` | Custom bootstrap nodes |
+| `hyperdht_stats()` | Routing table size, connections, uptime |

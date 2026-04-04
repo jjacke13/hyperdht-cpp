@@ -229,18 +229,31 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                 hp_msg.id, reply.remote_firewall,
                 reply.remote_addresses.size());
 
-        // Start sending probes to the client's addresses
+        // Filter out invalid addresses (port 0 from RANDOM firewalls)
+        // and send probes to valid ones
+        compact::Ipv4Address valid_peer_addr;
+        bool have_valid = false;
+
         for (const auto& addr : reply.remote_addresses) {
+            if (addr.port == 0) continue;  // Can't send to port 0
             socket_.send_probe(addr);
+            if (!have_valid) {
+                valid_peer_addr = addr;
+                have_valid = true;
+            }
         }
 
-        // Report connection — erase from map BEFORE calling on_socket
-        // to avoid use-after-free if the callback triggers close()
-        if (!reply.remote_addresses.empty()) {
-            auto peer_addr = reply.remote_addresses[0];
-            auto conn_ptr = std::move(it->second);  // Take ownership
+        // Fall back to the relay-reported client address if no valid
+        // addresses from the holepunch payload
+        if (!have_valid) {
+            valid_peer_addr = peer_address;
+            have_valid = peer_address.port != 0;
+        }
+
+        if (have_valid) {
+            auto conn_ptr = std::move(it->second);
             connections_.erase(it);
-            on_socket(*conn_ptr, peer_addr);
+            on_socket(*conn_ptr, valid_peer_addr);
         }
     }
 }

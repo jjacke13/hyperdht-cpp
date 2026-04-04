@@ -454,6 +454,11 @@ hyperdht_stream_t* hyperdht_stream_open(
     s->raw_stream.data = s;
 
     // Connect to peer through the holepunched address
+    if (conn->peer_port == 0) {
+        delete s->ss;
+        delete s;
+        return nullptr;  // Can't connect to port 0
+    }
     struct sockaddr_in dest{};
     uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
     udx_stream_connect(&s->raw_stream, dht->dht->socket().socket_handle(),

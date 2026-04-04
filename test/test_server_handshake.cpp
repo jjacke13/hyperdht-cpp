@@ -202,7 +202,7 @@ TEST(ServerHandshake, HolepunchInfoWhenNotOpen) {
     EXPECT_EQ(resp.holepunch->relays[0].relay_address.host_string(), "1.2.3.4");
 }
 
-TEST(ServerHandshake, OpenFirewallNoHolepunch) {
+TEST(ServerHandshake, ConsistentFirewallWithHolepunch) {
     noise::Seed server_seed{};
     server_seed.fill(0x11);
     auto server_kp = noise::generate_keypair(server_seed);
@@ -213,14 +213,17 @@ TEST(ServerHandshake, OpenFirewallNoHolepunch) {
 
     auto client = make_client_msg1(client_kp, server_kp.public_key, 1);
 
-    // Server has an address → OPEN → no holepunch info
+    // Server has addresses → reports CONSISTENT (not OPEN) to force
+    // holepunch path. Direct-connect (OPEN) needs UDX rawStream firewall.
     std::vector<compact::Ipv4Address> addrs = {
         compact::Ipv4Address::from_string("1.2.3.4", 49737)
     };
+    peer_connect::RelayInfo relay;
+    relay.relay_address = compact::Ipv4Address::from_string("9.8.7.6", 49737);
 
     auto result = handle_handshake(server_kp, client.noise_msg1,
         compact::Ipv4Address::from_string("10.0.0.1", 5000), 0,
-        addrs, {});
+        addrs, {relay});
     ASSERT_TRUE(result.has_value());
 
     auto resp_bytes = client.noise_ik->recv(
@@ -228,8 +231,9 @@ TEST(ServerHandshake, OpenFirewallNoHolepunch) {
     auto resp = peer_connect::decode_noise_payload(
         resp_bytes->data(), resp_bytes->size());
 
-    EXPECT_EQ(resp.firewall, peer_connect::FIREWALL_OPEN);
-    EXPECT_FALSE(resp.holepunch.has_value());
+    EXPECT_EQ(resp.firewall, peer_connect::FIREWALL_CONSISTENT);
+    ASSERT_TRUE(resp.holepunch.has_value());
+    EXPECT_EQ(resp.holepunch->id, 0u);
 }
 
 TEST(ServerHandshake, InvalidNoiseFails) {

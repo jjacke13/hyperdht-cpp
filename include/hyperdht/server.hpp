@@ -104,6 +104,13 @@ private:
     uint32_t next_hp_id_ = 0;
     std::unordered_map<uint32_t, std::unique_ptr<server_connection::ServerConnection>> connections_;
 
+    // Stale holepunch cleanup (JS: HANDSHAKE_CLEAR_WAIT = 10s)
+    static constexpr uint64_t HP_CLEANUP_MS = 30000;  // 30s
+    uv_timer_t* cleanup_timer_ = nullptr;
+    void start_cleanup_timer();
+    void cleanup_stale_connections();
+    static void on_cleanup_timer(uv_timer_t* timer);
+
     // Router callbacks
     void on_peer_handshake(const std::vector<uint8_t>& noise,
                            const compact::Ipv4Address& peer_address,

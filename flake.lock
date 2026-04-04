@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "libudx": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1774156281,
+        "narHash": "sha256-YFCkXEEYK0lda3Q7M53HPc9RqjU9B/tbVFDYx+zqYJM=",
+        "owner": "holepunchto",
+        "repo": "libudx",
+        "rev": "0420f6267110e919d3fcefb8d5de4385912eb353",
+        "type": "github"
+      },
+      "original": {
+        "owner": "holepunchto",
+        "repo": "libudx",
+        "rev": "0420f6267110e919d3fcefb8d5de4385912eb353",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1774388614,
@@ -18,6 +35,7 @@
     },
     "root": {
       "inputs": {
+        "libudx": "libudx",
         "nixpkgs": "nixpkgs"
       }
     }

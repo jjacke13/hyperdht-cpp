@@ -59,8 +59,12 @@
       );
 
       devShells = forAllSystems (system:
-        let pkgs = pkgsFor system; in
+        let
+          pkgs = pkgsFor system;
+          sharedLib = mkHyperdht pkgs { shared = true; };
+        in
         {
+          # C++ development shell
           default = pkgs.mkShell {
             nativeBuildInputs = [
               pkgs.cmake
@@ -78,6 +82,31 @@
 
             shellHook = ''
               echo "hyperdht-cpp dev shell — cmake $(cmake --version | head -1 | awk '{print $3}')"
+            '';
+          };
+
+          # Python demo shell — includes libhyperdht.so + python3
+          python = pkgs.mkShell {
+            buildInputs = [
+              sharedLib
+              pkgs.python3
+              pkgs.libuv
+            ];
+
+            shellHook = ''
+              export LD_LIBRARY_PATH="${sharedLib}/lib:${pkgs.libuv}/lib:$LD_LIBRARY_PATH"
+              export HYPERDHT_LIB="${sharedLib}/lib/libhyperdht.so"
+              echo "hyperdht-cpp Python shell"
+              echo "  libhyperdht.so: ${sharedLib}/lib/libhyperdht.so"
+              echo "  python3: $(python3 --version)"
+              echo ""
+              echo "  Run the holesail demo:"
+              echo "    cd wrappers/python"
+              echo "    python3 holesail_server.py 8080"
+              echo ""
+              echo "  Or import directly:"
+              echo "    cd wrappers/python"
+              echo "    python3 -c 'from hyperdht import KeyPair; print(KeyPair.generate())'"
             '';
           };
         }

@@ -70,9 +70,12 @@ std::optional<ServerConnection> handle_handshake(
     conn.local_udx_id = udx_id;
 
     // Step 6: Determine our firewall status
+    // Report CONSISTENT (not OPEN) to force the holepunch path.
+    // OPEN tells the JS client to connect directly via UDX, but we don't
+    // have a UDX rawStream firewall callback to detect that (TODO).
     conn.our_firewall = our_addresses.empty()
         ? peer_connect::FIREWALL_UNKNOWN
-        : peer_connect::FIREWALL_OPEN;
+        : peer_connect::FIREWALL_CONSISTENT;
 
     // Step 7: Build our response NoisePayload
     peer_connect::NoisePayload response;

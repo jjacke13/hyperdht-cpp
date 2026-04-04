@@ -64,6 +64,9 @@ void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection)
     entry.record = announcer_->record();
     router_.set(target_, std::move(entry));
 
+    // Cleanup timer for stale holepunch sessions
+    start_cleanup_timer();
+
     DHT_LOG( "  [server] Listening on %s\n",
             to_hex(keypair_.public_key.data(), 8).c_str());
 }
@@ -79,6 +82,15 @@ void Server::close(std::function<void()> on_done) {
     }
     closed_ = true;
     listening_ = false;
+
+    // Stop cleanup timer
+    if (cleanup_timer_) {
+        uv_timer_stop(cleanup_timer_);
+        cleanup_timer_->data = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(cleanup_timer_),
+                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+        cleanup_timer_ = nullptr;
+    }
 
     // Stop announcer
     if (announcer_) {
@@ -168,6 +180,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     }
 
     // Store connection for holepunch phase
+    conn_ptr->created_at = uv_now(socket_.loop());
     connections_[hp_id] = std::move(conn_ptr);
 
     DHT_LOG( "  [server] Handshake complete (id=%d), waiting for holepunch\n", hp_id);
@@ -258,6 +271,45 @@ void Server::on_socket(server_connection::ServerConnection& conn,
             info.local_udx_id, info.remote_udx_id);
 
     on_connection_(info);
+}
+
+// ---------------------------------------------------------------------------
+// Stale holepunch cleanup
+// ---------------------------------------------------------------------------
+
+void Server::start_cleanup_timer() {
+    cleanup_timer_ = new uv_timer_t;
+    uv_timer_init(socket_.loop(), cleanup_timer_);
+    cleanup_timer_->data = this;
+    uv_timer_start(cleanup_timer_, on_cleanup_timer, HP_CLEANUP_MS, HP_CLEANUP_MS);
+    // Unref so cleanup timer doesn't keep the event loop alive by itself
+    uv_unref(reinterpret_cast<uv_handle_t*>(cleanup_timer_));
+}
+
+void Server::on_cleanup_timer(uv_timer_t* timer) {
+    auto* self = static_cast<Server*>(timer->data);
+    if (!self || self->closed_) return;
+    self->cleanup_stale_connections();
+}
+
+void Server::cleanup_stale_connections() {
+    if (connections_.empty()) return;
+
+    // Remove connections that haven't completed holepunch within HP_CLEANUP_MS.
+    // JS server uses HANDSHAKE_CLEAR_WAIT (10s). We use 30s for tolerance.
+    auto now = uv_now(socket_.loop());
+    std::vector<uint32_t> stale;
+
+    for (const auto& [id, conn] : connections_) {
+        if (conn && conn->created_at > 0 && (now - conn->created_at) > HP_CLEANUP_MS) {
+            stale.push_back(id);
+        }
+    }
+
+    for (auto id : stale) {
+        DHT_LOG("  [server] Cleaning up stale holepunch session id=%u\n", id);
+        connections_.erase(id);
+    }
 }
 
 }  // namespace server

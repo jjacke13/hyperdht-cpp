@@ -51,6 +51,9 @@ struct ServerConnection {
     bool firewalled = false;   // Rejected by firewall callback
     bool has_error = false;
     uint32_t error_code = peer_connect::ERROR_NONE;
+
+    // Timestamp for stale cleanup (uv_now millis)
+    uint64_t created_at = 0;
 };
 
 // ---------------------------------------------------------------------------

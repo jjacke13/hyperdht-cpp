@@ -7,21 +7,21 @@ First wire-compatible non-JS HyperDHT implementation. C++20, single-threaded lib
 | Metric | Value |
 |--------|-------|
 | Source files | 25 `.cpp` |
-| Headers | 26 `.hpp`/`.h` |
-| Test files | 33 `test_*.cpp` + 1 `test_ffi.py` + 7 JS scripts |
-| Total C++ lines | ~10,600 |
-| Offline tests | 321 passing |
+| Headers | 27 `.hpp`/`.h` |
+| Test files | 34 `test_*.cpp` + 1 `test_ffi.py` + 7 JS scripts |
+| Total C++ lines | ~10,800 |
+| Offline tests | 330 passing |
+| ASan/UBSan tests | 332 passing (zero memory errors) |
 | Fuzz targets | 5 (36M+ runs, zero crashes) |
-| Sanitizer status | ASan + UBSan + LeakSanitizer clean |
-| Commits | 29 |
-| Bugs found/fixed | 69 found, 60 fixed, 9 deferred |
+| Commits | 35 |
+| Bugs found/fixed | 72 found, 63 fixed, 9 deferred |
 | Python FFI | Proven working (ctypes → libhyperdht.so) |
 
 ---
 
 ## What's Done
 
-### Implementation Phases (0-7)
+### Implementation Phases (0-7) — ALL COMPLETE
 
 | Phase | Component | Tests | Status |
 |-------|-----------|-------|--------|
@@ -34,7 +34,7 @@ First wire-compatible non-JS HyperDHT implementation. C++20, single-threaded lib
 | 6 | Protomux | 14 | Done |
 | 7 | Full HyperDHT API (all 11 steps) | ~100 | Done |
 
-### All 10 HyperDHT Commands
+### All 10 HyperDHT Commands — ALL COMPLETE
 
 | Command | Client | Server | Cross-tested |
 |---------|:------:|:------:|:------------:|
@@ -59,32 +59,48 @@ First wire-compatible non-JS HyperDHT implementation. C++20, single-threaded lib
 | RANDOM + CONSISTENT | Stub (~100 lines to implement) |
 | RANDOM + RANDOM | Not started (~500 lines, blind relay) |
 
-### Hardening (Phase A)
+### Hardening (Phase A) — COMPLETE
 
 | Task | Status |
 |------|--------|
-| ASan + UBSan + LeakSanitizer | Done — 6 test bugs fixed, library clean |
+| ASan + UBSan + LeakSanitizer | Done — library clean, 332 tests pass |
 | Fuzz 5 decoders (libFuzzer) | Done — 36M+ runs, 1 security bug found+fixed |
 | Edge case tests (decoders, tokens, routing) | Done — 23 tests |
 | Crypto review (replay, reorder, state machine) | Done — 7 tests |
-| Wire compat (round-trip all message types) | Done — 13 tests |
 | Crypto verification (entropy, tamper, keys) | Done — 15 tests |
-| Stress/lifecycle tests | Deferred to manual live sessions |
+| Wire compat (round-trip all message types) | Done — 13 tests |
+| Stress/lifecycle tests | Manual — to be done as live sessions |
 | Extended fuzzing (1h+ runs) | Ongoing — before releases |
 
-### Library Packaging (Phase C)
+### Production Bugs — ALL FIXED
+
+| Bug | Fix | Status |
+|-----|-----|--------|
+| OOM on storage maps | LRU cache (32K max, 48h TTL, GC timer) | Done |
+| Timer use-after-free | Heap-allocate drain_timer_ / bg_timer_ | Done |
+| Socket dangling pointer | weak_ptr in commit lambdas | Done |
+
+### Library Packaging (Phase C) — MOSTLY COMPLETE
 
 | Task | Status |
 |------|--------|
-| C API header (`hyperdht.h`) | Done — 230 lines, all functions |
-| C API implementation (`hyperdht_api.cpp`) | Done — 260 lines |
+| C API header (`hyperdht.h`) | Done — all functions with HYPERDHT_API visibility |
+| C API implementation (`hyperdht_api.cpp`) | Done — thin shims, reviewed |
 | C API tests | Done — 9 tests |
 | CMake install + pkg-config | Done — `find_package(hyperdht)` works |
 | Shared library (`BUILD_SHARED_LIBS=ON`) | Done — Python FFI proven |
-| Nix package | Not started |
+| Nix package (static + shared) | Done — `nix build .#static` / `nix build .#shared` |
 | ESP-IDF component | Not started |
 
-### Live Cross-Tests (all passing)
+### Other Completed Items
+
+| Item | Status |
+|------|--------|
+| Debug logging (DHT_LOG macro, `-DHYPERDHT_DEBUG=ON`) | Done |
+| Hardcoded keys removed from live tests | Done |
+| Version pinning (VERSIONS.md + 4-level checklist) | Done |
+
+### Live Cross-Tests (all passing after every change)
 
 | Test | Result |
 |------|--------|
@@ -100,30 +116,21 @@ First wire-compatible non-JS HyperDHT implementation. C++20, single-threaded lib
 
 ## What's Remaining
 
-### Must-Fix Before Production
-
-| # | Item | Risk | Effort |
-|---|------|------|--------|
-| 1 | TTL + size cap on storage maps | OOM on long-running node | ~80 lines |
-| 2 | drain_timer_ / punch_timer_ heap-allocate | Crash on early destruction | ~30 lines |
-| 3 | announce commit raw socket pointer | Dangling pointer if socket freed | ~20 lines |
-
-### Should-Do for Full JS Parity
+### For Full JS Parity
 
 | # | Item | Effort |
 |---|------|--------|
-| 4 | RANDOM+CONSISTENT NAT (birthday paradox) | ~100 lines |
-| 5 | RANDOM+RANDOM NAT (blind relay fallback) | ~500 lines |
-| 6 | FROM_SECOND_RELAY fix (relayAddress routing) | ~20 lines |
-| 7 | Background refresh for stored values | ~100 lines |
-| 8 | Relay congestion tracking | ~10 lines |
+| 1 | RANDOM+CONSISTENT NAT (birthday paradox — 256 sockets) | ~100 lines |
+| 2 | RANDOM+RANDOM NAT (blind relay fallback) | ~500 lines |
+| 3 | FROM_SECOND_RELAY fix (relayAddress routing) | ~20 lines |
+| 4 | Background refresh for stored values | ~100 lines |
+| 5 | Relay congestion tracking | ~10 lines |
 
-### Packaging & Distribution
+### Packaging
 
 | # | Item | Effort |
 |---|------|--------|
-| 9 | Nix package (`packages.default` in flake.nix) | ~50 lines |
-| 10 | ESP-IDF component wrapper + `HYPERDHT_EMBEDDED` compile flag | ~50 lines |
+| 6 | ESP-IDF component wrapper + `HYPERDHT_EMBEDDED` flag | ~50 lines |
 
 `HYPERDHT_EMBEDDED=ON` would: reduce routing table (256→64 buckets), shrink congestion window (80→16), strip mutable/immutable storage codecs, lower buffer sizes. Targets ESP32-S3 with 8MB PSRAM.
 
@@ -131,25 +138,24 @@ First wire-compatible non-JS HyperDHT implementation. C++20, single-threaded lib
 
 | # | Item |
 |---|------|
-| 11 | README.md rewrite (quick start, build, examples) |
-| 12 | C API reference |
-| 13 | C++ API reference |
-| 14 | `DEVELOPMENT.md` — journey document (phases, gotchas, bugs) |
-| 15 | Nix/ESP-IDF integration guides |
+| 7 | README.md rewrite (quick start, build, examples) |
+| 8 | C API reference |
+| 9 | C++ API reference |
+| 10 | `DEVELOPMENT.md` — journey document (phases, gotchas, bugs) |
+| 11 | Nix/ESP-IDF integration guides |
 
 ### Code Quality (from reviews, non-blocking)
 
 - Holepunch callback API asymmetry (encoded msg vs raw bytes)
 - Raw Node* from closest() → return by value
 - Relay sends bypass congestion window
-- Remove `static int req_count` debug counter
 
 ---
 
 ## Architecture
 
 ```
-include/hyperdht/     26 headers
+include/hyperdht/     27 headers
 ├── hyperdht.h        C API (extern "C") — the FFI surface
 ├── dht.hpp           HyperDHT main class
 ├── server.hpp        Server (listen/accept)
@@ -164,12 +170,35 @@ include/hyperdht/     26 headers
 ├── protomux.hpp      Channel multiplexer
 ├── compact.hpp       Compact encoding (wire format)
 ├── messages.hpp      DHT message encode/decode
+├── lru_cache.hpp     LRU cache with TTL (storage eviction)
 ├── debug.hpp         DHT_LOG macro (silent by default)
 └── ...               routing_table, tokens, query, etc.
 
-src/                  25 source files (~8,000 lines)
-test/                 33 test files + 8 scripts (~2,600 lines)
+src/                  25 source files (~8,200 lines)
+test/                 34 test files + 8 scripts (~2,600 lines)
 fuzz/                 5 libFuzzer targets
+```
+
+## Build Options
+
+```bash
+# Default: static library
+cmake .. -DCMAKE_BUILD_TYPE=Release -G Ninja
+
+# Shared library (for Python/Go/Rust/Swift/Kotlin FFI)
+cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -G Ninja
+
+# Debug logging enabled
+cmake .. -DHYPERDHT_DEBUG=ON -G Ninja
+
+# Tests disabled (library only, faster build)
+cmake .. -DHYPERDHT_BUILD_TESTS=OFF -G Ninja
+
+# Nix builds
+nix build            # static (default)
+nix build .#static   # static
+nix build .#shared   # shared (.so)
+nix develop          # dev shell with all tools
 ```
 
 ## Dependencies
@@ -180,7 +209,7 @@ fuzz/                 5 libFuzzer targets
 | libsodium | 1.0.20 | All crypto |
 | libuv | 1.51.0 | Event loop |
 
-Pinned via `flake.lock` (nixpkgs commit `1073dad2`). See `VERSIONS.md` for full version matrix and 4-level verification checklist.
+Pinned via `flake.lock` (nixpkgs commit `1073dad2`) and libudx flake input. See `VERSIONS.md` for full version matrix and 4-level verification checklist.
 
 ## Timeline
 
@@ -191,10 +220,11 @@ Pinned via `flake.lock` (nixpkgs commit `1073dad2`). See `VERSIONS.md` for full 
 | 2026-04-01 | Phase 3 complete + Phase 6 + Phase 7 Steps 1-8 |
 | 2026-04-01 | C++ client → JS server: WORKING |
 | 2026-04-03 | JS client → C++ server: WORKING (relay bug fixed) |
-| 2026-04-03 | Hardening: ASan/UBSan, 5 fuzzers, crypto review |
-| 2026-04-03 | Steps 9-10: signature verification + mutable/immutable |
-| 2026-04-03 | All 10 commands complete, live cross-tested |
+| 2026-04-03 | Hardening: ASan/UBSan, 5 fuzzers, crypto review, edge cases |
+| 2026-04-03 | Steps 9-10: signature verification + mutable/immutable storage |
 | 2026-04-03 | Step 11: C API + CMake install + shared lib + Python FFI |
+| 2026-04-04 | Production bug fixes (LRU cache, timer UAF, socket lifetime) |
+| 2026-04-04 | Nix package (static + shared), security cleanup |
 
 ## Key Protocol Discoveries
 
@@ -206,10 +236,10 @@ Pinned via `flake.lock` (nixpkgs commit `1073dad2`). See `VERSIONS.md` for full 
 
 ## For Consumers
 
-**nospoon (P2P VPN):** Items 1-3 from must-fix. `connect()` and `createServer()` are working.
+**nospoon (P2P VPN):** `connect()` and `createServer()` are working. Production-ready for CONSISTENT NAT.
 
-**Language bindings (Python/Go/Rust/Swift/Kotlin):** Link `libhyperdht.so`, include `hyperdht.h`. Proven with Python ctypes.
+**Language bindings (Python/Go/Rust/Swift/Kotlin):** `nix build .#shared` → link `libhyperdht.so`, include `hyperdht.h`. Proven with Python ctypes.
 
-**ESP32 (mimiclaw):** Items 1-3, then items 9-10. `HYPERDHT_EMBEDDED` flag for reduced footprint.
+**ESP32 (mimiclaw):** Needs ESP-IDF component wrapper (item 6). `HYPERDHT_EMBEDDED` flag for reduced footprint.
 
-**Public release:** Items 1-8, then documentation (items 11-15).
+**Public release:** Implement items 1-2 (NAT strategies), then documentation (items 7-11).

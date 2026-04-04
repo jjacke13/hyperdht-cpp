@@ -32,6 +32,8 @@ This demo shows the HyperDHT connection establishment — the hardest part.
 The actual data forwarding would be ~50 more lines using the stream APIs.
 """
 
+import hashlib
+import os
 import sys
 import signal
 sys.path.insert(0, ".")
@@ -46,8 +48,12 @@ def main():
     dht = HyperDHT()
     dht.bind()
 
-    # Generate identity
-    kp = KeyPair.generate()
+    # Generate holesail-compatible connection key
+    # holesail format: hs://[s000|0000]<64-hex-char-key>
+    # The seed for the DHT keypair is SHA256(key)
+    connection_key = os.urandom(32).hex()
+    seed = hashlib.sha256(connection_key.encode()).digest()
+    kp = KeyPair.from_seed(seed)
 
     # Create server
     server = dht.create_server()
@@ -65,33 +71,31 @@ def main():
 
     server.listen(kp, on_connection)
 
-    # Print connection info (like holesail does)
+    # Print connection info (holesail-compatible)
+    hs_link = f"hs://0000{connection_key}"
     pk_hex = kp.public_key.hex()
     print(f"""
-  ╔══════════════════════════════════════════════════════════╗
-  ║  holesail-py — P2P tunnel powered by hyperdht-cpp       ║
-  ╠══════════════════════════════════════════════════════════╣
-  ║                                                          ║
-  ║  Local port:  {port:<42} ║
-  ║  DHT port:    {dht.port:<42} ║
-  ║                                                          ║
-  ║  Connection string:                                      ║
-  ║  {pk_hex[:55]} ║
-  ║  {pk_hex[55:]:<55} ║
-  ║                                                          ║
-  ║  Share this key with peers. They can connect with:       ║
-  ║    holesail --connect {pk_hex[:32]}...    ║
-  ║                                                          ║
-  ║  Or from Python:                                         ║
-  ║    dht.connect(bytes.fromhex("{pk_hex[:24]}..."))  ║
-  ║                                                          ║
-  ║  Or from C++:                                            ║
-  ║    dht.connect(pk, callback);                            ║
-  ║                                                          ║
-  ║  Or from ANY language with our C API.                    ║
-  ║                                                          ║
-  ║  Ctrl+C to stop                                          ║
-  ╚══════════════════════════════════════════════════════════╝
+  ╔══════════════════════════════════════════════════════════════════════════╗
+  ║  holesail-py — P2P tunnel powered by hyperdht-cpp                      ║
+  ╠══════════════════════════════════════════════════════════════════════════╣
+  ║                                                                        ║
+  ║  Local port:  {port:<56} ║
+  ║  DHT port:    {dht.port:<56} ║
+  ║  Public key:  {pk_hex[:56]} ║
+  ║                                                                        ║
+  ║  Connection string (holesail-compatible):                               ║
+  ║  {hs_link:<70} ║
+  ║                                                                        ║
+  ║  Connect with JS holesail:                                              ║
+  ║    holesail --connect {hs_link:<49} ║
+  ║                                                                        ║
+  ║  Connect with Python:                                                   ║
+  ║    dht.connect(bytes.fromhex("{pk_hex[:24]}..."))                ║
+  ║                                                                        ║
+  ║  Connect with C++ / Go / Rust / Swift / Kotlin via C API.              ║
+  ║                                                                        ║
+  ║  Ctrl+C to stop                                                         ║
+  ╚══════════════════════════════════════════════════════════════════════════╝
 """)
 
     # Handle Ctrl+C

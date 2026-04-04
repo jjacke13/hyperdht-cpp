@@ -218,6 +218,11 @@ if(HYPERDHT_BUILD_TESTS)
     add_test(NAME test_edge_cases COMMAND test_edge_cases)
     gtest_discover_tests(test_edge_cases)
 
+    add_executable(test_lru_cache test/test_lru_cache.cpp)
+    target_link_libraries(test_lru_cache PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_lru_cache COMMAND test_lru_cache)
+    gtest_discover_tests(test_lru_cache)
+
     add_executable(test_c_api test/test_c_api.cpp)
     target_link_libraries(test_c_api PRIVATE hyperdht GTest::gtest_main)
     add_test(NAME test_c_api COMMAND test_c_api)

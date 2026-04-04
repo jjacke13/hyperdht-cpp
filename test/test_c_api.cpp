@@ -72,11 +72,11 @@ TEST(CAPI, CreateAndDestroy) {
     hyperdht_destroy(dht, [](void* ud) {
         *static_cast<bool*>(ud) = true;
     }, &destroyed);
+    EXPECT_TRUE(destroyed);
 
     uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
     uv_loop_close(&loop);
-
-    EXPECT_TRUE(destroyed);
 }
 
 TEST(CAPI, CreateWithOptions) {
@@ -95,6 +95,7 @@ TEST(CAPI, CreateWithOptions) {
 
     hyperdht_destroy(dht, NULL, NULL);
     uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
     uv_loop_close(&loop);
 }
 
@@ -114,6 +115,7 @@ TEST(CAPI, DefaultKeypair) {
 
     hyperdht_destroy(dht, NULL, NULL);
     uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
     uv_loop_close(&loop);
 }
 
@@ -157,6 +159,7 @@ TEST(CAPI, ServerCreateAndClose) {
 
     hyperdht_destroy(dht, NULL, NULL);
     uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
     uv_loop_close(&loop);
 
     EXPECT_TRUE(closed);
@@ -183,5 +186,6 @@ TEST(CAPI, ServerListen) {
     hyperdht_server_close(srv, NULL, NULL);
     hyperdht_destroy(dht, NULL, NULL);
     uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
     uv_loop_close(&loop);
 }

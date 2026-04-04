@@ -12,7 +12,38 @@ namespace hyperdht {
 namespace rpc {
 
 RpcHandlers::RpcHandlers(RpcSocket& socket, router::Router* router)
-    : socket_(socket), router_(router) {}
+    : socket_(socket), router_(router) {
+    start_gc_timer();
+}
+
+RpcHandlers::~RpcHandlers() {
+    if (gc_timer_) {
+        uv_timer_stop(gc_timer_);
+        gc_timer_->data = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(gc_timer_),
+                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+        gc_timer_ = nullptr;
+    }
+}
+
+void RpcHandlers::start_gc_timer() {
+    if (!socket_.loop()) return;
+    gc_timer_ = new uv_timer_t;
+    uv_timer_init(socket_.loop(), gc_timer_);
+    gc_timer_->data = this;
+    uv_timer_start(gc_timer_, on_gc_tick, GC_INTERVAL_MS, GC_INTERVAL_MS);
+    // Unref so the GC timer doesn't keep the event loop alive by itself
+    uv_unref(reinterpret_cast<uv_handle_t*>(gc_timer_));
+}
+
+void RpcHandlers::on_gc_tick(uv_timer_t* timer) {
+    auto* self = static_cast<RpcHandlers*>(timer->data);
+    if (!self) return;
+    auto now = uv_now(self->socket_.loop());
+    self->mutables_.gc(now, STORAGE_TTL_MS);
+    self->immutables_.gc(now, STORAGE_TTL_MS);
+    self->store_.gc(now);
+}
 
 void RpcHandlers::install() {
     socket_.on_request([this](const messages::Request& req) {
@@ -380,10 +411,10 @@ void RpcHandlers::handle_mutable_put(const messages::Request& req) {
     auto key = to_hex_key(*req.target);
 
     // Check seq ordering against existing record
-    auto it = mutables_.find(key);
-    if (it != mutables_.end()) {
+    auto* existing_ptr = mutables_.get(key);
+    if (existing_ptr) {
         auto existing = dht_messages::decode_mutable_get_resp(
-            it->second.data(), it->second.size());
+            existing_ptr->data(), existing_ptr->size());
 
         // Same seq but different value → error
         if (existing.seq == put.seq && existing.value != put.value) {
@@ -411,7 +442,8 @@ void RpcHandlers::handle_mutable_put(const messages::Request& req) {
     stored.seq = put.seq;
     stored.value = put.value;
     stored.signature = put.signature;
-    mutables_[key] = dht_messages::encode_mutable_get_resp(stored);
+    mutables_.put(key, dht_messages::encode_mutable_get_resp(stored),
+                  uv_now(socket_.loop()));
 
     // Reply with no value (success)
     messages::Response resp;
@@ -439,13 +471,12 @@ void RpcHandlers::handle_mutable_get(const messages::Request& req) {
     auto resp = make_query_response(req);
 
     auto key = to_hex_key(*req.target);
-    auto it = mutables_.find(key);
-    if (it != mutables_.end()) {
-        // Check if local seq >= requested seq
+    auto* stored = mutables_.get(key);
+    if (stored) {
         auto local = dht_messages::decode_mutable_get_resp(
-            it->second.data(), it->second.size());
+            stored->data(), stored->size());
         if (local.seq >= requested_seq) {
-            resp.value = it->second;  // Return the encoded MutableGetResponse
+            resp.value = *stored;
         }
     }
 
@@ -475,7 +506,7 @@ void RpcHandlers::handle_immutable_put(const messages::Request& req) {
     if (expected_target != *req.target) return;
 
     auto key = to_hex_key(*req.target);
-    immutables_[key] = *req.value;
+    immutables_.put(key, *req.value, uv_now(socket_.loop()));
 
     // Reply with no value (success)
     messages::Response resp;
@@ -494,9 +525,9 @@ void RpcHandlers::handle_immutable_get(const messages::Request& req) {
     auto resp = make_query_response(req);
 
     auto key = to_hex_key(*req.target);
-    auto it = immutables_.find(key);
-    if (it != immutables_.end()) {
-        resp.value = it->second;
+    auto* stored = immutables_.get(key);
+    if (stored) {
+        resp.value = *stored;
     }
 
     socket_.reply(resp);

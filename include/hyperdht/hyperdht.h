@@ -153,11 +153,19 @@ HYPERDHT_API int hyperdht_is_destroyed(const hyperdht_t* dht);
 
 /**
  * Destroy the instance. All servers and connections are closed.
- * Call uv_run() after this to drain pending close callbacks.
- * @param cb      optional callback when destruction is complete
+ * After calling this, you MUST:
+ *   1. Call uv_run() to drain pending close callbacks
+ *   2. Call hyperdht_free() to release memory
+ * @param cb      optional callback when destruction starts
  * @param userdata passed to cb
  */
 HYPERDHT_API void hyperdht_destroy(hyperdht_t* dht, hyperdht_close_cb cb, void* userdata);
+
+/**
+ * Free the handle memory. Call ONLY after uv_run() has drained all
+ * pending close callbacks (after hyperdht_destroy).
+ */
+HYPERDHT_API void hyperdht_free(hyperdht_t* dht);
 
 /** Get the default keypair (auto-generated on creation). */
 HYPERDHT_API void hyperdht_default_keypair(const hyperdht_t* dht, hyperdht_keypair_t* out);

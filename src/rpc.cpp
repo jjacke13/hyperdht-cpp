@@ -53,13 +53,15 @@ RpcSocket::RpcSocket(uv_loop_t* loop, const routing::NodeId& local_id)
     udx_socket_init(&udx_, &socket_, nullptr);
     socket_.data = this;
 
-    // Drain timer
-    uv_timer_init(loop_, &drain_timer_);
-    drain_timer_.data = this;
+    // Drain timer (heap-allocated to outlive RpcSocket on close)
+    drain_timer_ = new uv_timer_t;
+    uv_timer_init(loop_, drain_timer_);
+    drain_timer_->data = this;
 
-    // Background tick timer
-    uv_timer_init(loop_, &bg_timer_);
-    bg_timer_.data = this;
+    // Background tick timer (same pattern)
+    bg_timer_ = new uv_timer_t;
+    uv_timer_init(loop_, bg_timer_);
+    bg_timer_->data = this;
 
     // Random initial tid
     std::random_device rd;
@@ -67,10 +69,10 @@ RpcSocket::RpcSocket(uv_loop_t* loop, const routing::NodeId& local_id)
 }
 
 RpcSocket::~RpcSocket() {
-    // Caller MUST call close() and run the event loop to drain before destroying.
-    // Calling close() here would schedule uv_close but the object would be freed
-    // before the callbacks fire — causing use-after-free in libuv.
     assert(!socket_bound_ || closing_);
+    // Safety: if destroyed without close(), detach timers so callbacks don't use 'this'
+    if (drain_timer_) drain_timer_->data = nullptr;
+    if (bg_timer_) bg_timer_->data = nullptr;
 }
 
 int RpcSocket::bind(uint16_t port) {
@@ -82,10 +84,10 @@ int RpcSocket::bind(uint16_t port) {
         udx_socket_recv_start(&socket_, on_recv);
 
         // Start drain timer
-        uv_timer_start(&drain_timer_, on_drain_tick, DRAIN_INTERVAL_MS, DRAIN_INTERVAL_MS);
+        uv_timer_start(drain_timer_, on_drain_tick, DRAIN_INTERVAL_MS, DRAIN_INTERVAL_MS);
 
         // Start background tick timer
-        uv_timer_start(&bg_timer_, on_bg_tick, BG_TICK_MS, BG_TICK_MS);
+        uv_timer_start(bg_timer_, on_bg_tick, BG_TICK_MS, BG_TICK_MS);
     }
     return rc;
 }
@@ -235,11 +237,23 @@ void RpcSocket::close() {
     if (closing_) return;
     closing_ = true;
 
-    uv_timer_stop(&drain_timer_);
-    uv_close(reinterpret_cast<uv_handle_t*>(&drain_timer_), nullptr);
+    auto free_timer = [](uv_handle_t* h) {
+        delete reinterpret_cast<uv_timer_t*>(h);
+    };
 
-    uv_timer_stop(&bg_timer_);
-    uv_close(reinterpret_cast<uv_handle_t*>(&bg_timer_), nullptr);
+    if (drain_timer_) {
+        uv_timer_stop(drain_timer_);
+        drain_timer_->data = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(drain_timer_), free_timer);
+        drain_timer_ = nullptr;
+    }
+
+    if (bg_timer_) {
+        uv_timer_stop(bg_timer_);
+        bg_timer_->data = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(bg_timer_), free_timer);
+        bg_timer_ = nullptr;
+    }
 
     // Destroy all inflight requests
     auto inflight_copy = inflight_;  // Copy since destroy_request modifies the vector
@@ -264,7 +278,7 @@ void RpcSocket::close() {
 
 void RpcSocket::on_drain_tick(uv_timer_t* timer) {
     auto* self = static_cast<RpcSocket*>(timer->data);
-    if (self->closing_) return;
+    if (!self || self->closing_) return;
 
     // Token rotation
     if (--self->rotate_counter_ == 0) {
@@ -385,7 +399,7 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
 
 void RpcSocket::on_bg_tick(uv_timer_t* timer) {
     auto* self = static_cast<RpcSocket*>(timer->data);
-    if (self->closing_) return;
+    if (!self || self->closing_) return;
     self->background_tick();
 }
 

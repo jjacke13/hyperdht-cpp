@@ -90,6 +90,9 @@ public:
     // Access results
     const std::vector<QueryReply>& closest_replies() const { return closest_replies_; }
 
+    // Socket accessor (for commit lambdas that need lifetime-safe access)
+    rpc::RpcSocket& socket() { return socket_; }
+
 private:
     rpc::RpcSocket& socket_;
     // Private constructor — use Query::create()

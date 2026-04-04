@@ -119,15 +119,21 @@ void hyperdht_destroy(hyperdht_t* dht, hyperdht_close_cb cb, void* userdata) {
         return;
     }
     if (!dht->dht) {
-        delete dht;  // HIGH-1 fix: free the shell even if inner is NULL
+        delete dht;
         if (cb) cb(userdata);
         return;
     }
 
-    dht->dht->destroy([dht, cb, userdata]() {
-        delete dht;
-        if (cb) cb(userdata);
-    });
+    // Schedule close. The caller MUST:
+    // 1. Call uv_run() to drain pending close callbacks
+    // 2. Then call hyperdht_free() to release memory
+    // The callback fires synchronously to signal destruction started.
+    dht->dht->destroy();
+    if (cb) cb(userdata);
+}
+
+void hyperdht_free(hyperdht_t* dht) {
+    delete dht;
 }
 
 void hyperdht_default_keypair(const hyperdht_t* dht, hyperdht_keypair_t* out) {

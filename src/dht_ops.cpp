@@ -87,10 +87,13 @@ std::shared_ptr<query::Query> announce(rpc::RpcSocket& socket,
     auto q = query::Query::create(socket, target, messages::CMD_ANNOUNCE, &value);
     q->on_done(std::move(on_done));
 
-    // Commit phase: capture socket as pointer (must outlive query)
-    q->set_commit([socket_ptr = &socket, target, value](
+    // Commit phase: use weak_ptr to Query for lifetime-safe socket access
+    auto q_weak = std::weak_ptr<query::Query>(q);
+    q->set_commit([q_weak, target, value](
             const query::QueryReply& node,
             rpc::OnResponseCallback commit_done) {
+        auto q_locked = q_weak.lock();
+        if (!q_locked) return;
         messages::Request req;
         req.to.addr = node.from_addr;
         req.command = messages::CMD_ANNOUNCE;
@@ -99,7 +102,7 @@ std::shared_ptr<query::Query> announce(rpc::RpcSocket& socket,
             req.token = *node.token;
         }
         req.value = value;
-        socket_ptr->request(req, std::move(commit_done));
+        q_locked->socket().request(req, std::move(commit_done));
     });
 
     add_default_bootstrap(*q, socket);
@@ -123,16 +126,19 @@ std::shared_ptr<query::Query> immutable_put(rpc::RpcSocket& socket,
     q->on_done(std::move(on_done));
 
     // Commit phase: IMMUTABLE_PUT to each closest node
-    q->set_commit([socket_ptr = &socket, target_id, value](
+    auto q_weak = std::weak_ptr<query::Query>(q);
+    q->set_commit([q_weak, target_id, value](
             const query::QueryReply& node,
             rpc::OnResponseCallback commit_done) {
+        auto q_locked = q_weak.lock();
+        if (!q_locked) return;
         messages::Request req;
         req.to.addr = node.from_addr;
         req.command = messages::CMD_IMMUTABLE_PUT;
         req.target = target_id;
         if (node.token.has_value()) req.token = *node.token;
         req.value = value;
-        socket_ptr->request(req, std::move(commit_done));
+        q_locked->socket().request(req, std::move(commit_done));
     });
 
     add_default_bootstrap(*q, socket);
@@ -210,16 +216,19 @@ std::shared_ptr<query::Query> mutable_put(rpc::RpcSocket& socket,
     q->on_done(std::move(on_done));
 
     // Commit phase: MUTABLE_PUT to each closest node
-    q->set_commit([socket_ptr = &socket, target_id, encoded](
+    auto q_weak = std::weak_ptr<query::Query>(q);
+    q->set_commit([q_weak, target_id, encoded](
             const query::QueryReply& node,
             rpc::OnResponseCallback commit_done) {
+        auto q_locked = q_weak.lock();
+        if (!q_locked) return;
         messages::Request req;
         req.to.addr = node.from_addr;
         req.command = messages::CMD_MUTABLE_PUT;
         req.target = target_id;
         if (node.token.has_value()) req.token = *node.token;
         req.value = encoded;
-        socket_ptr->request(req, std::move(commit_done));
+        q_locked->socket().request(req, std::move(commit_done));
     });
 
     add_default_bootstrap(*q, socket);

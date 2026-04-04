@@ -189,12 +189,12 @@ private:
     std::vector<InflightRequest*> inflight_;
     std::deque<InflightRequest*> pending_;   // Queued when congestion full (O(1) pop_front)
 
-    // Drain timer (750ms interval)
-    uv_timer_t drain_timer_;
+    // Drain timer (750ms interval) — heap-allocated to outlive RpcSocket on close
+    uv_timer_t* drain_timer_ = nullptr;
     int rotate_counter_ = TOKEN_ROTATE_TICKS;
 
-    // Background tick timer (5s interval)
-    uv_timer_t bg_timer_;
+    // Background tick timer (5s interval) — heap-allocated for same reason
+    uv_timer_t* bg_timer_ = nullptr;
     health::HealthMonitor health_;
     int refresh_ticks_ = REFRESH_TICKS;
     bool ephemeral_ = true;

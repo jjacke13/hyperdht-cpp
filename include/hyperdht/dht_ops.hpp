@@ -49,6 +49,11 @@ std::shared_ptr<query::Query> lookup(rpc::RpcSocket& socket,
 
 // ---------------------------------------------------------------------------
 // announce — announce at a target, then commit to k closest
+//
+// LIFETIME: The caller must ensure `socket` outlives the returned Query.
+// The Query holds a reference to the socket for the iterative walk and
+// commit phase. This contract applies to all functions below that return
+// a shared_ptr<Query>.
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<query::Query> announce(rpc::RpcSocket& socket,

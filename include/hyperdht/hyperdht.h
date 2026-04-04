@@ -45,6 +45,15 @@
 struct uv_loop_s;
 typedef struct uv_loop_s uv_loop_t;
 
+/* Symbol visibility for shared library builds */
+#if defined(HYPERDHT_SHARED) && defined(__GNUC__)
+#define HYPERDHT_API __attribute__((visibility("default")))
+#elif defined(HYPERDHT_SHARED) && defined(_MSC_VER)
+#define HYPERDHT_API __declspec(dllexport)
+#else
+#define HYPERDHT_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -112,10 +121,10 @@ typedef int (*hyperdht_firewall_cb)(const uint8_t remote_pk[32],
  * ========================================================================= */
 
 /** Generate a random Ed25519 keypair. */
-void hyperdht_keypair_generate(hyperdht_keypair_t* out);
+HYPERDHT_API void hyperdht_keypair_generate(hyperdht_keypair_t* out);
 
 /** Generate a keypair from a 32-byte seed (deterministic). */
-void hyperdht_keypair_from_seed(hyperdht_keypair_t* out, const uint8_t seed[32]);
+HYPERDHT_API void hyperdht_keypair_from_seed(hyperdht_keypair_t* out, const uint8_t seed[32]);
 
 /* =========================================================================
  * Lifecycle
@@ -127,20 +136,20 @@ void hyperdht_keypair_from_seed(hyperdht_keypair_t* out, const uint8_t seed[32])
  * @param opts    options (NULL for defaults: ephemeral, port=0)
  * @return        new instance, or NULL on failure
  */
-hyperdht_t* hyperdht_create(uv_loop_t* loop, const hyperdht_opts_t* opts);
+HYPERDHT_API hyperdht_t* hyperdht_create(uv_loop_t* loop, const hyperdht_opts_t* opts);
 
 /**
  * Bind the UDP socket. Called automatically by connect/listen if needed.
  * @param port    bind port (0 = ephemeral)
  * @return        0 on success, negative on error
  */
-int hyperdht_bind(hyperdht_t* dht, uint16_t port);
+HYPERDHT_API int hyperdht_bind(hyperdht_t* dht, uint16_t port);
 
 /** Get the bound port (0 if not bound). */
-uint16_t hyperdht_port(const hyperdht_t* dht);
+HYPERDHT_API uint16_t hyperdht_port(const hyperdht_t* dht);
 
 /** Check if the instance has been destroyed. */
-int hyperdht_is_destroyed(const hyperdht_t* dht);
+HYPERDHT_API int hyperdht_is_destroyed(const hyperdht_t* dht);
 
 /**
  * Destroy the instance. All servers and connections are closed.
@@ -148,10 +157,10 @@ int hyperdht_is_destroyed(const hyperdht_t* dht);
  * @param cb      optional callback when destruction is complete
  * @param userdata passed to cb
  */
-void hyperdht_destroy(hyperdht_t* dht, hyperdht_close_cb cb, void* userdata);
+HYPERDHT_API void hyperdht_destroy(hyperdht_t* dht, hyperdht_close_cb cb, void* userdata);
 
 /** Get the default keypair (auto-generated on creation). */
-void hyperdht_default_keypair(const hyperdht_t* dht, hyperdht_keypair_t* out);
+HYPERDHT_API void hyperdht_default_keypair(const hyperdht_t* dht, hyperdht_keypair_t* out);
 
 /* =========================================================================
  * Client: connect
@@ -165,7 +174,7 @@ void hyperdht_default_keypair(const hyperdht_t* dht, hyperdht_keypair_t* out);
  * @param userdata    passed to cb
  * @return            0 on success (async), negative on error
  */
-int hyperdht_connect(hyperdht_t* dht,
+HYPERDHT_API int hyperdht_connect(hyperdht_t* dht,
                      const uint8_t remote_pk[32],
                      hyperdht_connect_cb cb,
                      void* userdata);
@@ -175,7 +184,7 @@ int hyperdht_connect(hyperdht_t* dht,
  * ========================================================================= */
 
 /** Create a server instance. Owned by the HyperDHT instance. */
-hyperdht_server_t* hyperdht_server_create(hyperdht_t* dht);
+HYPERDHT_API hyperdht_server_t* hyperdht_server_create(hyperdht_t* dht);
 
 /**
  * Start listening for connections.
@@ -185,7 +194,7 @@ hyperdht_server_t* hyperdht_server_create(hyperdht_t* dht);
  * @param userdata passed to cb
  * @return         0 on success, negative on error
  */
-int hyperdht_server_listen(hyperdht_server_t* srv,
+HYPERDHT_API int hyperdht_server_listen(hyperdht_server_t* srv,
                            const hyperdht_keypair_t* kp,
                            hyperdht_connection_cb cb,
                            void* userdata);
@@ -194,17 +203,17 @@ int hyperdht_server_listen(hyperdht_server_t* srv,
  * Set a firewall callback to accept/reject connections.
  * Called before the Noise handshake completes.
  */
-void hyperdht_server_set_firewall(hyperdht_server_t* srv,
+HYPERDHT_API void hyperdht_server_set_firewall(hyperdht_server_t* srv,
                                    hyperdht_firewall_cb cb,
                                    void* userdata);
 
 /** Stop listening and unannounce. */
-void hyperdht_server_close(hyperdht_server_t* srv,
+HYPERDHT_API void hyperdht_server_close(hyperdht_server_t* srv,
                            hyperdht_close_cb cb,
                            void* userdata);
 
 /** Trigger a re-announcement (useful after network changes). */
-void hyperdht_server_refresh(hyperdht_server_t* srv);
+HYPERDHT_API void hyperdht_server_refresh(hyperdht_server_t* srv);
 
 /* =========================================================================
  * DHT operations: mutable/immutable storage
@@ -227,7 +236,7 @@ typedef void (*hyperdht_done_cb)(int error, void* userdata);
  * Store an immutable value on the DHT (target = BLAKE2b(value)).
  * @return 0 on success (async), negative on error
  */
-int hyperdht_immutable_put(hyperdht_t* dht,
+HYPERDHT_API int hyperdht_immutable_put(hyperdht_t* dht,
                            const uint8_t* value, size_t len,
                            hyperdht_done_cb cb, void* userdata);
 
@@ -238,7 +247,7 @@ int hyperdht_immutable_put(hyperdht_t* dht,
  * @param done_cb  called when query completes
  * @return 0 on success (async), negative on error
  */
-int hyperdht_immutable_get(hyperdht_t* dht,
+HYPERDHT_API int hyperdht_immutable_get(hyperdht_t* dht,
                            const uint8_t target[32],
                            hyperdht_value_cb cb,
                            hyperdht_done_cb done_cb,
@@ -251,7 +260,7 @@ int hyperdht_immutable_get(hyperdht_t* dht,
  * @param seq     sequence number (must increase for updates)
  * @return 0 on success (async), negative on error
  */
-int hyperdht_mutable_put(hyperdht_t* dht,
+HYPERDHT_API int hyperdht_mutable_put(hyperdht_t* dht,
                          const hyperdht_keypair_t* kp,
                          const uint8_t* value, size_t len,
                          uint64_t seq,
@@ -265,7 +274,7 @@ int hyperdht_mutable_put(hyperdht_t* dht,
  * @param done_cb     called when query completes
  * @return 0 on success (async), negative on error
  */
-int hyperdht_mutable_get(hyperdht_t* dht,
+HYPERDHT_API int hyperdht_mutable_get(hyperdht_t* dht,
                          const uint8_t public_key[32],
                          uint64_t min_seq,
                          hyperdht_mutable_cb cb,

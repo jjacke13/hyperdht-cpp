@@ -20,6 +20,7 @@ pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium)
 pkg_check_modules(UV REQUIRED IMPORTED_TARGET libuv)
 
 # libudx — C library from git submodule
+# libudx is always static (internal dependency, compiled into libhyperdht)
 add_library(udx STATIC
     deps/libudx/src/udx.c
     deps/libudx/src/io_posix.c
@@ -81,8 +82,22 @@ if(HYPERDHT_DEBUG)
     target_compile_definitions(hyperdht PUBLIC HYPERDHT_DEBUG=1)
 endif()
 
-# Position-independent code (needed if static lib is linked into a .so)
+# Position-independent code (needed for shared lib and when static is linked into a .so)
 set_target_properties(hyperdht PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(udx PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# When building as shared library in Release mode, export only HYPERDHT_API functions.
+# In Debug mode, all symbols are visible (needed for tests that use C++ internals).
+if(BUILD_SHARED_LIBS)
+    target_compile_definitions(hyperdht PRIVATE HYPERDHT_SHARED=1)
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        set_target_properties(hyperdht PROPERTIES
+            C_VISIBILITY_PRESET hidden
+            CXX_VISIBILITY_PRESET hidden
+            VISIBILITY_INLINES_HIDDEN ON
+        )
+    endif()
+endif()
 
 # === Install rules ===
 

@@ -92,14 +92,14 @@ struct PipelineState {
 // ---------------------------------------------------------------------------
 
 TEST(LiveConnect, FullPipeline) {
-    // Use SERVER_KEY env var if set, otherwise default
+    // Server key must be provided via SERVER_KEY env var
     const char* key_env = std::getenv("SERVER_KEY");
-    const auto server_pk = hex_to_key(
-        key_env ? key_env : "a6f03a2523211223325a092c3c172fcc8d395341a9092162b040adefa908149e");
+    if (!key_env || strlen(key_env) != 64) {
+        GTEST_SKIP() << "Set SERVER_KEY=<64-hex-chars> to run this test";
+    }
+    const auto server_pk = hex_to_key(key_env);
 
-    noise::Seed seed{};
-    seed.fill(0x42);
-    auto kp = noise::generate_keypair(seed);
+    auto kp = noise::generate_keypair();  // Random keypair for each run
     printf("  Our pubkey: %s\n", to_hex(kp.public_key.data(), 32).c_str());
 
     uv_loop_t loop;

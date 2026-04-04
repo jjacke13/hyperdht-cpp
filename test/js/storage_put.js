@@ -25,7 +25,7 @@ async function main () {
   }
 
   // --- Mutable Put ---
-  const keyPair = HyperDHT.keyPair(Buffer.alloc(32, 0x99))
+  const keyPair = HyperDHT.keyPair()  // Random keypair for each run
   const mutableValue = Buffer.from('mutable hello from JS')
   const { seq, signature } = await dht.mutablePut(keyPair, mutableValue, { seq: 1 })
   console.log('Mutable PUT done')

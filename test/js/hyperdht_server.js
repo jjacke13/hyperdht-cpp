@@ -22,7 +22,7 @@ async function main () {
   // No firewall — accept everything
   server.on('connection', () => {})
 
-  const keyPair = DHT.keyPair(Buffer.alloc(32, 0xBB))
+  const keyPair = DHT.keyPair()  // Random keypair for each run
   await server.listen(keyPair)
 
   const addr = dht.address()

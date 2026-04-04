@@ -1,5 +1,5 @@
 // Live server test — listens for an incoming connection from a JS client.
-// Uses seed 0x42*32 → pubkey 2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12
+// Generates a random keypair each run. Prints the pubkey for the JS client.
 // Exits after first connection or 120s timeout.
 
 #include <gtest/gtest.h>
@@ -14,9 +14,7 @@
 using namespace hyperdht;
 
 TEST(LiveServer, WaitForConnection) {
-    noise::Seed seed{};
-    seed.fill(0x42);
-    auto kp = noise::generate_keypair(seed);
+    auto kp = noise::generate_keypair();  // Random keypair for each run
 
     printf("  Server public key: ");
     for (int i = 0; i < 32; i++) printf("%02x", kp.public_key[i]);

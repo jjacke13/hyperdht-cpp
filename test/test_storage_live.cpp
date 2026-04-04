@@ -80,9 +80,7 @@ TEST(StorageLive, CppPut) {
         [&](const std::vector<query::QueryReply>&) { imm_done = true; });
 
     // --- Mutable Put ---
-    noise::Seed seed{};
-    seed.fill(0x77);
-    auto kp = noise::generate_keypair(seed);
+    auto kp = noise::generate_keypair();  // Random keypair for each run
 
     std::vector<uint8_t> mut_value = {'m', 'u', 't', 'a', 'b', 'l', 'e', ' ',
                                        'f', 'r', 'o', 'm', ' ', 'C', '+', '+'};

@@ -103,7 +103,9 @@ endif()
 
 include(GNUInstallDirs)
 
-# Install the library and libudx
+# Install the library and libudx (both must be in the export set).
+# For shared builds, libudx is compiled into libhyperdht.so so its
+# .a is not needed by consumers — but CMake requires it in the export.
 install(TARGETS hyperdht udx
     EXPORT hyperdht-targets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -131,6 +133,11 @@ install(EXPORT hyperdht-targets
 )
 
 # Generate pkg-config file
+if(NOT BUILD_SHARED_LIBS)
+    set(HYPERDHT_PC_EXTRA_LIBS "-ludx")
+else()
+    set(HYPERDHT_PC_EXTRA_LIBS "")
+endif()
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/hyperdht.pc.in
     ${CMAKE_CURRENT_BINARY_DIR}/hyperdht.pc

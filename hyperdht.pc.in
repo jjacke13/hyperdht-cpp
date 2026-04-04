@@ -7,5 +7,5 @@ Description: C++ HyperDHT implementation — wire-compatible with JS HyperDHT
 Version: @PROJECT_VERSION@
 URL: https://github.com/jjacke13/hyperdht-cpp
 Requires: libsodium libuv
-Libs: -L${libdir} -lhyperdht -ludx
+Libs: -L${libdir} -lhyperdht @HYPERDHT_PC_EXTRA_LIBS@
 Cflags: -I${includedir}

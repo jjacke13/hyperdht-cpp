@@ -29,7 +29,8 @@ from hyperdht._bindings import (
     KeyPair,
     Server,
     Connection,
+    Stream,
 )
 
-__all__ = ["HyperDHT", "KeyPair", "Server", "Connection"]
+__all__ = ["HyperDHT", "KeyPair", "Server", "Connection", "Stream"]
 __version__ = "0.1.0"

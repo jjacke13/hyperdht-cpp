@@ -289,6 +289,55 @@ HYPERDHT_API int hyperdht_mutable_get(hyperdht_t* dht,
                          hyperdht_done_cb done_cb,
                          void* userdata);
 
+/* =========================================================================
+ * Encrypted streams — read/write over established connections
+ * ========================================================================= */
+
+typedef struct hyperdht_stream_s hyperdht_stream_t;
+
+/** Called when data is received on the stream. */
+typedef void (*hyperdht_data_cb)(const uint8_t* data, size_t len, void* userdata);
+
+/**
+ * Create an encrypted stream from an established connection.
+ * Handles UDX stream setup + SecretStream header exchange automatically.
+ * The stream is ready for read/write after on_open fires.
+ *
+ * @param dht     the HyperDHT instance that owns the connection
+ * @param conn    connection info from connect or server callback
+ * @param on_open called when the stream is ready (header exchange complete)
+ * @param on_data called when encrypted data is received
+ * @param on_close called when the stream closes
+ * @param userdata passed to all callbacks
+ * @return stream handle, or NULL on failure
+ */
+HYPERDHT_API hyperdht_stream_t* hyperdht_stream_open(
+    hyperdht_t* dht,
+    const hyperdht_connection_t* conn,
+    hyperdht_close_cb on_open,
+    hyperdht_data_cb on_data,
+    hyperdht_close_cb on_close,
+    void* userdata);
+
+/**
+ * Write data to the encrypted stream. Data is encrypted with SecretStream
+ * (XChaCha20-Poly1305) before sending over UDX.
+ *
+ * @return 0 on success, negative on error
+ */
+HYPERDHT_API int hyperdht_stream_write(hyperdht_stream_t* stream,
+                          const uint8_t* data, size_t len);
+
+/**
+ * Close the stream. Sends end-of-stream and triggers on_close.
+ */
+HYPERDHT_API void hyperdht_stream_close(hyperdht_stream_t* stream);
+
+/**
+ * Check if the stream has completed the header exchange and is ready.
+ */
+HYPERDHT_API int hyperdht_stream_is_open(const hyperdht_stream_t* stream);
+
 #ifdef __cplusplus
 }
 #endif

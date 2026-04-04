@@ -173,6 +173,25 @@ _lib.hyperdht_mutable_get.argtypes = [
     _MUTABLE_CB, _DONE_CB, ctypes.c_void_p]
 _lib.hyperdht_mutable_get.restype = ctypes.c_int
 
+# Stream
+_DATA_CB = ctypes.CFUNCTYPE(
+    None, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_void_p)
+
+_lib.hyperdht_stream_open.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(_Connection),
+    _CLOSE_CB, _DATA_CB, _CLOSE_CB, ctypes.c_void_p]
+_lib.hyperdht_stream_open.restype = ctypes.c_void_p
+
+_lib.hyperdht_stream_write.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+_lib.hyperdht_stream_write.restype = ctypes.c_int
+
+_lib.hyperdht_stream_close.argtypes = [ctypes.c_void_p]
+_lib.hyperdht_stream_close.restype = None
+
+_lib.hyperdht_stream_is_open.argtypes = [ctypes.c_void_p]
+_lib.hyperdht_stream_is_open.restype = ctypes.c_int
+
 # libuv
 _uv.uv_loop_init.argtypes = [ctypes.c_void_p]
 _uv.uv_loop_init.restype = ctypes.c_int
@@ -199,6 +218,9 @@ class Connection:
     """Represents an established encrypted connection."""
 
     def __init__(self, c_conn):
+        self._c_conn = _Connection()
+        ctypes.memmove(ctypes.byref(self._c_conn), ctypes.byref(c_conn),
+                       ctypes.sizeof(_Connection))
         self.remote_key = bytes(c_conn.remote_public_key)
         self.tx_key = bytes(c_conn.tx_key)
         self.rx_key = bytes(c_conn.rx_key)
@@ -212,6 +234,39 @@ class Connection:
     def __repr__(self):
         return (f"Connection(peer={self.peer_host}:{self.peer_port}, "
                 f"key={self.remote_key[:8].hex()}...)")
+
+
+class Stream:
+    """Encrypted read/write stream over an established connection."""
+
+    def __init__(self, handle, dht):
+        self._handle = handle
+        self._dht = dht
+        self._callbacks = []
+        self._on_data = None
+        self._on_close = None
+        self._on_open = None
+
+    @property
+    def is_open(self):
+        if not self._handle:
+            return False
+        return bool(_lib.hyperdht_stream_is_open(self._handle))
+
+    def write(self, data: bytes):
+        """Write data to the encrypted stream."""
+        if not self._handle:
+            raise RuntimeError("Stream is closed")
+        buf = (ctypes.c_uint8 * len(data))(*data)
+        rc = _lib.hyperdht_stream_write(self._handle, buf, len(data))
+        if rc != 0:
+            raise RuntimeError(f"stream_write failed: {rc}")
+
+    def close(self):
+        """Close the stream."""
+        if self._handle:
+            _lib.hyperdht_stream_close(self._handle)
+            self._handle = None
 
 
 class KeyPair:
@@ -388,6 +443,45 @@ class HyperDHT:
         if not handle:
             raise RuntimeError("Failed to create server")
         return Server(handle, self)
+
+    def open_stream(self, connection: Connection, on_open=None,
+                    on_data=None, on_close=None) -> Stream:
+        """
+        Open an encrypted read/write stream over a connection.
+
+        Args:
+            connection: Connection from connect() or server listen callback
+            on_open: callable() — stream is ready for read/write
+            on_data: callable(data: bytes) — received decrypted data
+            on_close: callable() — stream closed
+        """
+        @_CLOSE_CB
+        def open_cb(ud):
+            if on_open:
+                on_open()
+
+        @_DATA_CB
+        def data_cb(data_ptr, length, ud):
+            if on_data and data_ptr and length > 0:
+                on_data(bytes(data_ptr[:length]))
+
+        @_CLOSE_CB
+        def close_cb(ud):
+            if on_close:
+                on_close()
+
+        handle = _lib.hyperdht_stream_open(
+            self._handle, ctypes.byref(connection._c_conn),
+            open_cb, data_cb, close_cb, None)
+
+        if not handle:
+            raise RuntimeError("Failed to open stream")
+
+        stream = Stream(handle, self)
+        stream._on_open = open_cb      # prevent GC
+        stream._on_data = data_cb
+        stream._on_close = close_cb
+        return stream
 
     def immutable_put(self, value: bytes, on_done=None):
         """Store an immutable value (target = BLAKE2b(value))."""

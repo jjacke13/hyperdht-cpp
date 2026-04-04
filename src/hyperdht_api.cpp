@@ -13,7 +13,10 @@
 #include "hyperdht/dht.hpp"
 #include "hyperdht/dht_ops.hpp"
 #include "hyperdht/noise_wrap.hpp"
+#include "hyperdht/secret_stream.hpp"
 #include "hyperdht/server.hpp"
+
+#include <udx.h>
 
 // ---------------------------------------------------------------------------
 // Internal: wrapper structs for opaque pointers
@@ -331,4 +334,202 @@ int hyperdht_mutable_get(hyperdht_t* dht,
             if (done_cb) done_cb(0, userdata);
         });
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Encrypted streams — UDX + SecretStream over an established connection
+// ---------------------------------------------------------------------------
+
+struct hyperdht_stream_s {
+    udx_stream_t raw_stream{};
+    hyperdht::secret_stream::SecretStream* ss = nullptr;
+    hyperdht_t* dht = nullptr;
+
+    hyperdht_close_cb on_open = nullptr;
+    hyperdht_data_cb on_data = nullptr;
+    hyperdht_close_cb on_close = nullptr;
+    void* userdata = nullptr;
+
+    std::vector<uint8_t> recv_buf;
+    bool header_sent = false;
+    bool header_received = false;
+    bool open = false;
+    bool closed = false;
+
+    void check_open() {
+        if (!open && header_sent && header_received) {
+            open = true;
+            if (on_open) on_open(userdata);
+        }
+    }
+};
+
+static void stream_on_read(udx_stream_t* raw, ssize_t nread, const uv_buf_t* buf) {
+    auto* s = static_cast<hyperdht_stream_s*>(raw->data);
+    if (!s) return;
+    if (nread <= 0) {
+        if (nread < 0 && !s->closed) {
+            s->closed = true;
+            if (s->on_close) s->on_close(s->userdata);
+        }
+        return;
+    }
+
+    auto* data = reinterpret_cast<const uint8_t*>(buf->base);
+    s->recv_buf.insert(s->recv_buf.end(), data, data + nread);
+
+    // Phase 1: header exchange (59 bytes: uint24_le(56) + 56-byte payload)
+    if (!s->header_received) {
+        if (s->recv_buf.size() >= 59) {
+            uint32_t hdr_len = static_cast<uint32_t>(s->recv_buf[0])
+                             | (static_cast<uint32_t>(s->recv_buf[1]) << 8)
+                             | (static_cast<uint32_t>(s->recv_buf[2]) << 16);
+            if (hdr_len == 56) {
+                s->ss->receive_header(s->recv_buf.data() + 3, 56);
+                s->header_received = true;
+                s->recv_buf.erase(s->recv_buf.begin(), s->recv_buf.begin() + 59);
+                s->check_open();
+            }
+        }
+        if (!s->header_received) return;
+    }
+
+    // Phase 2: decrypt data frames (uint24_le(len) + encrypted_payload)
+    while (s->recv_buf.size() >= 3) {
+        uint32_t frame_len = static_cast<uint32_t>(s->recv_buf[0])
+                           | (static_cast<uint32_t>(s->recv_buf[1]) << 8)
+                           | (static_cast<uint32_t>(s->recv_buf[2]) << 16);
+        if (s->recv_buf.size() < 3 + frame_len) break;
+
+        auto dec = s->ss->decrypt(s->recv_buf.data() + 3, frame_len);
+        s->recv_buf.erase(s->recv_buf.begin(),
+                          s->recv_buf.begin() + 3 + frame_len);
+
+        if (dec.has_value() && s->on_data) {
+            s->on_data(dec->data(), dec->size(), s->userdata);
+        }
+    }
+}
+
+static void stream_on_close_cb(udx_stream_t* raw, int) {
+    auto* s = static_cast<hyperdht_stream_s*>(raw->data);
+    if (s && !s->closed) {
+        s->closed = true;
+        if (s->on_close) s->on_close(s->userdata);
+    }
+}
+
+hyperdht_stream_t* hyperdht_stream_open(
+    hyperdht_t* dht,
+    const hyperdht_connection_t* conn,
+    hyperdht_close_cb on_open,
+    hyperdht_data_cb on_data,
+    hyperdht_close_cb on_close,
+    void* userdata) {
+
+    if (!dht || !dht->dht || !conn) return nullptr;
+
+    auto* s = new (std::nothrow) hyperdht_stream_s;
+    if (!s) return nullptr;
+
+    s->dht = dht;
+    s->on_open = on_open;
+    s->on_data = on_data;
+    s->on_close = on_close;
+    s->userdata = userdata;
+
+    // Create SecretStream from connection keys
+    hyperdht::noise::Key tx{}, rx{};
+    hyperdht::noise::Hash hash{};
+    memcpy(tx.data(), conn->tx_key, 32);
+    memcpy(rx.data(), conn->rx_key, 32);
+    memcpy(hash.data(), conn->handshake_hash, 64);
+
+    s->ss = new hyperdht::secret_stream::SecretStream(
+        tx, rx, hash, conn->is_initiator != 0);
+
+    // Init UDX stream (reliable UDP)
+    udx_stream_init(dht->dht->socket().udx_handle(), &s->raw_stream,
+                    conn->local_udx_id, stream_on_close_cb, nullptr);
+    s->raw_stream.data = s;
+
+    // Connect to peer through the holepunched address
+    struct sockaddr_in dest{};
+    uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
+    udx_stream_connect(&s->raw_stream, dht->dht->socket().socket_handle(),
+                       conn->remote_udx_id,
+                       reinterpret_cast<const struct sockaddr*>(&dest));
+
+    // Send SecretStream header (starts the encrypted channel)
+    auto header = s->ss->create_header_message();
+    auto* hdr_buf = new std::vector<uint8_t>(std::move(header));
+    uv_buf_t uv_buf = uv_buf_init(
+        reinterpret_cast<char*>(hdr_buf->data()),
+        static_cast<unsigned int>(hdr_buf->size()));
+
+    auto* wreq = static_cast<udx_stream_write_t*>(
+        calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
+
+    struct HdrCtx { std::vector<uint8_t>* buf; hyperdht_stream_s* stream; };
+    wreq->data = new HdrCtx{hdr_buf, s};
+
+    udx_stream_write(wreq, &s->raw_stream, &uv_buf, 1,
+        [](udx_stream_write_t* req, int status, int) {
+            auto* ctx = static_cast<HdrCtx*>(req->data);
+            if (status >= 0) {
+                ctx->stream->header_sent = true;
+                ctx->stream->check_open();
+            }
+            delete ctx->buf;
+            delete ctx;
+            free(req);
+        });
+
+    // Start reading (receives remote header, then encrypted data)
+    udx_stream_read_start(&s->raw_stream, stream_on_read);
+
+    return s;
+}
+
+int hyperdht_stream_write(hyperdht_stream_t* stream,
+                          const uint8_t* data, size_t len) {
+    if (!stream || !stream->open || stream->closed || !data) return -1;
+
+    // Encrypt with SecretStream (XChaCha20-Poly1305)
+    auto encrypted = stream->ss->encrypt(data, len);
+    auto* enc_buf = new std::vector<uint8_t>(std::move(encrypted));
+    uv_buf_t uv_buf = uv_buf_init(
+        reinterpret_cast<char*>(enc_buf->data()),
+        static_cast<unsigned int>(enc_buf->size()));
+
+    auto* wreq = static_cast<udx_stream_write_t*>(
+        calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
+    wreq->data = enc_buf;
+
+    int rc = udx_stream_write(wreq, &stream->raw_stream, &uv_buf, 1,
+        [](udx_stream_write_t* req, int, int) {
+            delete static_cast<std::vector<uint8_t>*>(req->data);
+            free(req);
+        });
+
+    if (rc < 0) {
+        delete enc_buf;
+        free(wreq);
+    }
+    return rc >= 0 ? 0 : rc;
+}
+
+void hyperdht_stream_close(hyperdht_stream_t* stream) {
+    if (!stream || stream->closed) return;
+    stream->closed = true;
+
+    auto* wreq = static_cast<udx_stream_write_t*>(
+        calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
+    udx_stream_write_end(wreq, &stream->raw_stream, nullptr, 0,
+        [](udx_stream_write_t* req, int, int) { free(req); });
+}
+
+int hyperdht_stream_is_open(const hyperdht_stream_t* stream) {
+    if (!stream) return 0;
+    return stream->open ? 1 : 0;
 }

@@ -88,7 +88,7 @@ First wire-compatible non-JS HyperDHT implementation. C++20, single-threaded lib
 
 | Test | Result |
 |------|--------|
-| C++ client → JS server (full pipeline) | Working (~12s) |
+| C++ client → JS server (full pipeline) | Working |
 | JS client → C++ server (full pipeline) | Working |
 | C++ immutablePut → JS immutableGet | Working |
 | JS immutablePut → C++ immutableGet | Working |
@@ -123,7 +123,9 @@ First wire-compatible non-JS HyperDHT implementation. C++20, single-threaded lib
 | # | Item | Effort |
 |---|------|--------|
 | 9 | Nix package (`packages.default` in flake.nix) | ~50 lines |
-| 10 | ESP-IDF component wrapper | ~50 lines |
+| 10 | ESP-IDF component wrapper + `HYPERDHT_EMBEDDED` compile flag | ~50 lines |
+
+`HYPERDHT_EMBEDDED=ON` would: reduce routing table (256→64 buckets), shrink congestion window (80→16), strip mutable/immutable storage codecs, lower buffer sizes. Targets ESP32-S3 with 8MB PSRAM.
 
 ### Documentation
 

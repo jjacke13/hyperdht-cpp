@@ -119,6 +119,24 @@ The most impactful single bug: `has_bytes()` integer overflow — a security vul
 | datrs/hyperswarm-rs | Rust | 2024 | Partial implementation, doesn't interop with JS nodes |
 | fsteff/libudx-rs | Rust | 2022 | FFI bindings only, no HyperDHT protocol |
 
+## The Result
+
+5 days ago, HyperDHT was JavaScript-only. If you wanted P2P encrypted connections, you needed Node.js.
+
+Now:
+
+```python
+# Python — 4 lines to accept encrypted P2P connections
+from hyperdht import HyperDHT, KeyPair
+dht = HyperDHT()
+server = dht.create_server()
+server.listen(KeyPair.generate(), lambda c: print(f"Peer: {c.remote_key.hex()[:16]}..."))
+```
+
+And this Python server can talk to any JS HyperDHT client on the public network. And vice versa. Full Noise IK encryption, NAT holepunching, DHT routing — all happening underneath those 4 lines.
+
+The same library can power a Go service, a Rust daemon, a Swift iOS app, an ESP32 sensor. All talking to each other and to existing JS nodes. One network.
+
 ## Stats
 
 | Metric | Value |

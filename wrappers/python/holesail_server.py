@@ -7,9 +7,10 @@ powered by hyperdht-cpp. Proves that the C++ HyperDHT library can be
 used from Python to accept encrypted P2P connections.
 
 Usage:
-    python holesail_server.py [port]
+    python holesail_server.py [port] [--secure]
 
-    port: local TCP port to expose (default: 8080)
+    port:     local TCP port to expose (default: 8080)
+    --secure: use hs://s000 mode (firewall rejects unknown peers)
 
 What it does:
     1. Creates a HyperDHT node with a random keypair
@@ -43,6 +44,7 @@ from hyperdht import HyperDHT, KeyPair
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+    secure = "--secure" in sys.argv or "-s" in sys.argv
 
     # Create DHT node
     dht = HyperDHT()
@@ -50,13 +52,20 @@ def main():
 
     # Generate holesail-compatible connection key
     # holesail format: hs://[s000|0000]<64-hex-char-key>
-    # The seed for the DHT keypair is SHA256(key)
+    # Secure mode (s000): seed = SHA256(key), firewall enforces matching pubkey
+    # Standard mode (0000): seed = SHA256(key), no firewall
     connection_key = os.urandom(32).hex()
     seed = hashlib.sha256(connection_key.encode()).digest()
     kp = KeyPair.from_seed(seed)
 
     # Create server
     server = dht.create_server()
+
+    # Secure mode: firewall rejects connections from unknown peers
+    # Only clients who derive the same keypair from the connection key can connect
+    if secure:
+        server.set_firewall(
+            lambda remote_pk, host, port: remote_pk != kp.public_key)
 
     connections = []
 
@@ -72,7 +81,8 @@ def main():
     server.listen(kp, on_connection)
 
     # Print connection info (holesail-compatible)
-    hs_link = f"hs://0000{connection_key}"
+    prefix = "s000" if secure else "0000"
+    hs_link = f"hs://{prefix}{connection_key}"
     pk_hex = kp.public_key.hex()
     print(f"""
   ╔══════════════════════════════════════════════════════════════════════════╗

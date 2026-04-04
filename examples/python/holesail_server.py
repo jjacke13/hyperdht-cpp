@@ -164,6 +164,16 @@ def main():
   Ctrl+C to stop
 """)
 
+    # QR code for the hs:// link (like JS holesail)
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(hs_link)
+        qr.print_ascii(invert=True)
+        print()
+    except ImportError:
+        pass  # qrcode not installed — skip silently
+
     # Run event loop in background thread so Ctrl+C works
     thread = threading.Thread(target=dht.run, daemon=True)
     thread.start()

@@ -89,7 +89,7 @@
           python = pkgs.mkShell {
             buildInputs = [
               sharedLib
-              pkgs.python3
+              (pkgs.python3.withPackages (ps: [ ps.qrcode ]))
               pkgs.libuv
             ];
 

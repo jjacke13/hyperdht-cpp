@@ -104,6 +104,20 @@ private:
     uint32_t next_hp_id_ = 0;
     std::unordered_map<uint32_t, std::unique_ptr<server_connection::ServerConnection>> connections_;
 
+    // Pending punch: waiting for a probe from the client to learn their real address.
+    // After holepunch round completes, we send probes and wait for one back.
+    // The probe's source address is the REAL peer address (not the payload guess).
+    struct PendingPunch {
+        std::unique_ptr<server_connection::ServerConnection> conn;
+        compact::Ipv4Address fallback_addr;  // Address from holepunch payload
+        uv_timer_t* timeout = nullptr;       // Fall back after 10s
+    };
+    std::unordered_map<uint32_t, PendingPunch> pending_punches_;
+    void on_probe_received(const compact::Ipv4Address& from);
+    void punch_timeout(uint32_t hp_id);
+    void install_probe_listener();
+    bool probe_listener_installed_ = false;
+
     // Stale holepunch cleanup (JS: HANDSHAKE_CLEAR_WAIT = 10s)
     static constexpr uint64_t HP_CLEANUP_MS = 30000;  // 30s
     uv_timer_t* cleanup_timer_ = nullptr;

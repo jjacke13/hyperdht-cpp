@@ -101,19 +101,8 @@ void Server::close(std::function<void()> on_done) {
     // Remove from router
     router_.remove(target_);
 
-    // Clear active connections and pending punches
+    // Clear active connections
     connections_.clear();
-    for (auto& [id, pp] : pending_punches_) {
-        if (pp.timeout) {
-            uv_timer_stop(pp.timeout);
-            auto* data = static_cast<std::pair<Server*, uint32_t>*>(pp.timeout->data);
-            if (data) delete data;
-            pp.timeout->data = nullptr;
-            uv_close(reinterpret_cast<uv_handle_t*>(pp.timeout),
-                     [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-        }
-    }
-    pending_punches_.clear();
 
     if (on_done) on_done();
 }
@@ -241,50 +230,31 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                 reply.remote_addresses.size());
 
         // Send probes to client's valid addresses
-        compact::Ipv4Address fallback_addr;
-        bool have_fallback = false;
+        compact::Ipv4Address valid_peer_addr;
+        bool have_valid = false;
 
         for (const auto& addr : reply.remote_addresses) {
             if (addr.port == 0) continue;
             socket_.send_probe(addr);
-            if (!have_fallback) {
-                fallback_addr = addr;
-                have_fallback = true;
+            if (!have_valid) {
+                valid_peer_addr = addr;
+                have_valid = true;
             }
         }
-        if (!have_fallback && peer_address.port != 0) {
-            fallback_addr = peer_address;
-            have_fallback = true;
+        if (!have_valid && peer_address.port != 0) {
+            valid_peer_addr = peer_address;
+            have_valid = true;
         }
 
-        if (!have_fallback) return;
-
-        // DON'T call on_socket() yet. Wait for a probe from the client
-        // to learn their REAL address (CGNAT may remap ports).
-        // JS does this via the Puncher's onconnect callback.
-        auto conn_ptr = std::move(it->second);
-        connections_.erase(it);
-
-        install_probe_listener();
-
-        PendingPunch pp;
-        pp.conn = std::move(conn_ptr);
-        pp.fallback_addr = fallback_addr;
-
-        // Timeout: if no probe arrives within 10s, use the fallback address
-        pp.timeout = new uv_timer_t;
-        uv_timer_init(socket_.loop(), pp.timeout);
-        auto* timeout_data = new std::pair<Server*, uint32_t>(this, hp_msg.id);
-        pp.timeout->data = timeout_data;
-        uv_timer_start(pp.timeout, [](uv_timer_t* t) {
-            auto* data = static_cast<std::pair<Server*, uint32_t>*>(t->data);
-            data->first->punch_timeout(data->second);
-            delete data;
-            uv_close(reinterpret_cast<uv_handle_t*>(t),
-                     [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-        }, 2000, 0);  // 2s — probe arrives in <1s or not at all
-
-        pending_punches_[hp_msg.id] = std::move(pp);
+        // Call on_socket immediately with the payload address.
+        // The C API's stream_open uses a UDX firewall callback to discover
+        // the client's REAL address from the first incoming packet — so the
+        // address here is just a hint for ConnectionInfo, not where we connect.
+        if (have_valid) {
+            auto conn_ptr = std::move(it->second);
+            connections_.erase(it);
+            on_socket(*conn_ptr, valid_peer_addr);
+        }
     }
 }
 
@@ -353,66 +323,6 @@ void Server::cleanup_stale_connections() {
         DHT_LOG("  [server] Cleaning up stale holepunch session id=%u\n", id);
         connections_.erase(id);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Probe-based address discovery
-// ---------------------------------------------------------------------------
-
-void Server::install_probe_listener() {
-    if (probe_listener_installed_) return;
-    probe_listener_installed_ = true;
-
-    socket_.on_holepunch_probe([this](const compact::Ipv4Address& from) {
-        on_probe_received(from);
-    });
-}
-
-void Server::on_probe_received(const compact::Ipv4Address& from) {
-    if (closed_ || pending_punches_.empty()) return;
-
-    // Find the first pending punch (probe doesn't carry an ID, so we match
-    // the first one — in practice there's rarely more than one at a time).
-    // This matches JS behavior where the Puncher receives the probe and
-    // calls onsocket with the source address.
-    auto it = pending_punches_.begin();
-    if (it == pending_punches_.end()) return;
-
-    auto hp_id = it->first;
-    auto& pp = it->second;
-
-    DHT_LOG("  [server] Probe received from %s:%u → connecting (id=%u)\n",
-            from.host_string().c_str(), from.port, hp_id);
-
-    // Cancel timeout
-    if (pp.timeout) {
-        uv_timer_stop(pp.timeout);
-        auto* data = static_cast<std::pair<Server*, uint32_t>*>(pp.timeout->data);
-        delete data;
-        pp.timeout->data = nullptr;
-        uv_close(reinterpret_cast<uv_handle_t*>(pp.timeout),
-                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-    }
-
-    // Use the probe's source as the real peer address
-    auto conn_ptr = std::move(pp.conn);
-    pending_punches_.erase(it);
-    on_socket(*conn_ptr, from);
-}
-
-void Server::punch_timeout(uint32_t hp_id) {
-    auto it = pending_punches_.find(hp_id);
-    if (it == pending_punches_.end()) return;
-
-    auto& pp = it->second;
-    DHT_LOG("  [server] Probe timeout (id=%u), using fallback address %s:%u\n",
-            hp_id, pp.fallback_addr.host_string().c_str(), pp.fallback_addr.port);
-
-    auto conn_ptr = std::move(pp.conn);
-    auto addr = pp.fallback_addr;
-    pp.timeout = nullptr;  // Already being closed by the timer callback
-    pending_punches_.erase(it);
-    on_socket(*conn_ptr, addr);
 }
 
 }  // namespace server

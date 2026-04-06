@@ -425,6 +425,33 @@ static void stream_on_close_cb(udx_stream_t* raw, int) {
     delete s;
 }
 
+// Send the SecretStream header over the connected UDX stream.
+static void stream_send_header(hyperdht_stream_s* s) {
+    auto header = s->ss->create_header_message();
+    auto* hdr_buf = new std::vector<uint8_t>(std::move(header));
+    uv_buf_t uv_buf = uv_buf_init(
+        reinterpret_cast<char*>(hdr_buf->data()),
+        static_cast<unsigned int>(hdr_buf->size()));
+
+    auto* wreq = static_cast<udx_stream_write_t*>(
+        calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
+
+    struct HdrCtx { std::vector<uint8_t>* buf; hyperdht_stream_s* stream; };
+    wreq->data = new HdrCtx{hdr_buf, s};
+
+    udx_stream_write(wreq, &s->raw_stream, &uv_buf, 1,
+        [](udx_stream_write_t* req, int status, int) {
+            auto* ctx = static_cast<HdrCtx*>(req->data);
+            if (status >= 0) {
+                ctx->stream->header_sent = true;
+                ctx->stream->check_open();
+            }
+            delete ctx->buf;
+            delete ctx;
+            free(req);
+        });
+}
+
 hyperdht_stream_t* hyperdht_stream_open(
     hyperdht_t* dht,
     const hyperdht_connection_t* conn,
@@ -454,16 +481,20 @@ hyperdht_stream_t* hyperdht_stream_open(
     s->ss = new hyperdht::secret_stream::SecretStream(
         tx, rx, hash, conn->is_initiator != 0);
 
-    // Init UDX stream (reliable UDP)
+    // Init UDX stream
     udx_stream_init(dht->dht->socket().udx_handle(), &s->raw_stream,
                     conn->local_udx_id, stream_on_close_cb, nullptr);
     s->raw_stream.data = s;
 
-    // Connect to peer through the holepunched address
+    // Connect to peer immediately. The address from the holepunch payload
+    // may not be the client's real CGNAT address, causing brief rto
+    // retransmissions until UDX adjusts. The proper fix (creating the
+    // rawStream during handshake with a firewall callback, like JS does)
+    // requires handshake deduplication first to avoid cirbuf collisions.
     if (conn->peer_port == 0) {
         delete s->ss;
         delete s;
-        return nullptr;  // Can't connect to port 0
+        return nullptr;
     }
     struct sockaddr_in dest{};
     uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
@@ -471,32 +502,10 @@ hyperdht_stream_t* hyperdht_stream_open(
                        conn->remote_udx_id,
                        reinterpret_cast<const struct sockaddr*>(&dest));
 
-    // Send SecretStream header (starts the encrypted channel)
-    auto header = s->ss->create_header_message();
-    auto* hdr_buf = new std::vector<uint8_t>(std::move(header));
-    uv_buf_t uv_buf = uv_buf_init(
-        reinterpret_cast<char*>(hdr_buf->data()),
-        static_cast<unsigned int>(hdr_buf->size()));
+    // Send SecretStream header
+    stream_send_header(s);
 
-    auto* wreq = static_cast<udx_stream_write_t*>(
-        calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
-
-    struct HdrCtx { std::vector<uint8_t>* buf; hyperdht_stream_s* stream; };
-    wreq->data = new HdrCtx{hdr_buf, s};
-
-    udx_stream_write(wreq, &s->raw_stream, &uv_buf, 1,
-        [](udx_stream_write_t* req, int status, int) {
-            auto* ctx = static_cast<HdrCtx*>(req->data);
-            if (status >= 0) {
-                ctx->stream->header_sent = true;
-                ctx->stream->check_open();
-            }
-            delete ctx->buf;
-            delete ctx;
-            free(req);
-        });
-
-    // Start reading (receives remote header, then encrypted data)
+    // Start reading
     udx_stream_read_start(&s->raw_stream, stream_on_read);
 
     return s;

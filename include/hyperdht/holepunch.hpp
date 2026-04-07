@@ -82,8 +82,9 @@ HolepunchPayload decode_holepunch_payload(const uint8_t* data, size_t len);
 
 struct HolepunchResult {
     bool success = false;
-    compact::Ipv4Address address;  // Peer's address to connect to
-    uint32_t firewall = 0;         // Peer's firewall status
+    compact::Ipv4Address address;       // Peer's address to connect to
+    uint32_t firewall = 0;              // Peer's firewall status
+    udx_socket_t* socket = nullptr;     // Socket that received the probe (JS: ref.socket)
 };
 
 using OnHolepunchCallback = std::function<void(const HolepunchResult& result)>;
@@ -149,6 +150,7 @@ public:
     }
 
     void close();
+    udx_socket_t* socket_handle() { return &socket_; }
     bool is_closing() const { return closing_; }
 
 private:
@@ -237,7 +239,7 @@ public:
     void send_probe(const compact::Ipv4Address& addr);
 
     // Handle incoming UDP from a peer (success detection)
-    void on_message(const compact::Ipv4Address& from);
+    void on_message(const compact::Ipv4Address& from, udx_socket_t* recv_socket = nullptr);
 
     // Close the timer handle. Must be called before destruction if the event
     // loop is still running. Calls on_closed when the handle is fully closed.

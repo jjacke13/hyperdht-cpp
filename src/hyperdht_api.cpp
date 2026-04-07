@@ -170,7 +170,8 @@ int hyperdht_connect(hyperdht_t* dht,
                         result.handshake_hash, result.remote_public_key,
                         result.peer_address, result.remote_udx_id,
                         result.local_udx_id, true);
-        conn.raw_stream = result.raw_stream;  // Pass pre-created rawStream
+        conn.raw_stream = result.raw_stream;
+        conn.udx_socket = result.udx_socket;  // Socket from holepunch probe
         cb(0, &conn, userdata);
     });
 
@@ -500,6 +501,9 @@ hyperdht_stream_t* hyperdht_stream_open(
         if (conn->peer_port != 0) {
             struct sockaddr_in dest{};
             uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
+            // Always use main socket for UDX. The main socket probed the server
+            // (dual-socket probing), so its NAT mapping is open. The pool socket
+            // from holepunch is closed after probe detection.
             udx_stream_connect(s->raw, dht->dht->socket().socket_handle(),
                                conn->remote_udx_id,
                                reinterpret_cast<const struct sockaddr*>(&dest));

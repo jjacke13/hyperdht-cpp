@@ -328,6 +328,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                             result.handshake_hash = state->hs_result.handshake_hash;
                             result.remote_public_key = state->hs_result.remote_public_key;
                             result.peer_address = hp.address;
+                            result.udx_socket = hp.socket;  // JS: ref.socket from probe
                             result.local_udx_id = state->our_udx_id;
                             if (state->hs_result.remote_payload.udx.has_value()) {
                                 result.remote_udx_id = state->hs_result.remote_payload.udx->id;

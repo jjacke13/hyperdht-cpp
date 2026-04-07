@@ -278,7 +278,7 @@ void Holepuncher::open_session(const compact::Ipv4Address& addr) {
     }
 }
 
-void Holepuncher::on_message(const compact::Ipv4Address& from) {
+void Holepuncher::on_message(const compact::Ipv4Address& from, udx_socket_t* recv_socket) {
     DHT_LOG("  [hp] PROBE RECEIVED from %s:%u!\n",
             from.host_string().c_str(), from.port);
     if (connected_) return;
@@ -302,6 +302,7 @@ void Holepuncher::on_message(const compact::Ipv4Address& from) {
         result.success = true;
         result.address = from;
         result.firewall = remote_firewall_;
+        result.socket = recv_socket;  // JS: onconnect(ref.socket, port, host)
         cb(result);
     }
 }
@@ -948,12 +949,14 @@ void holepunch_connect(rpc::RpcSocket& socket,
 
             state->puncher = puncher;
 
-            // Listen for probes on BOTH pool socket and main socket (fallback)
+            // Listen for probes on BOTH pool socket and main socket.
+            // Pass the receiving socket so UDX connect uses the right one.
             state->pool->on_holepunch_probe([state](const Ipv4Address& from) {
-                if (state->puncher) state->puncher->on_message(from);
+                if (state->puncher) state->puncher->on_message(from,
+                    state->pool ? state->pool->socket_handle() : nullptr);
             });
-            socket.on_holepunch_probe([state](const Ipv4Address& from) {
-                if (state->puncher) state->puncher->on_message(from);
+            socket.on_holepunch_probe([state, &socket](const Ipv4Address& from) {
+                if (state->puncher) state->puncher->on_message(from, socket.socket_handle());
             });
 
             // Start overall timeout

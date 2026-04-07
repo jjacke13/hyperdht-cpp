@@ -149,12 +149,16 @@ TEST(HyperDHT, LiveConnect) {
                r.local_udx_id, r.remote_udx_id,
                r.raw_stream ? "yes" : "no");
 
-        // Step 2: UDX stream connect — reuse rawStream from ConnectResult
+        // Step 2: UDX stream connect — reuse rawStream, clear stale firewall first
         stream = r.raw_stream;
+        udx_stream_firewall(stream, nullptr);  // Clear holepunch firewall
         struct sockaddr_in dest{};
         uv_ip4_addr(r.peer_address.host_string().c_str(), r.peer_address.port, &dest);
-        udx_stream_connect(stream, dht.socket().socket_handle(),
-                           r.remote_udx_id,
+        printf("  Connecting UDX to %s:%u (us=%u them=%u)\n",
+               r.peer_address.host_string().c_str(), r.peer_address.port,
+               r.local_udx_id, r.remote_udx_id);
+        fflush(stdout);
+        udx_stream_connect(stream, dht.socket().socket_handle(), r.remote_udx_id,
                            reinterpret_cast<const struct sockaddr*>(&dest));
 
         // Step 3: SecretStream header exchange

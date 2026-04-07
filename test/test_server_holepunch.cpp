@@ -104,11 +104,13 @@ TEST(ServerHolepunch, ProbeRound) {
 
     auto value = make_client_holepunch(*setup.client_secure, hp);
 
+    // is_server_relay=true so token is returned (matches JS behavior)
     auto reply = handle_holepunch(
         setup.conn, value,
         Ipv4Address::from_string("10.0.0.1", 5000),
         peer_connect::FIREWALL_CONSISTENT,
-        {Ipv4Address::from_string("5.6.7.8", 49737)});
+        {Ipv4Address::from_string("5.6.7.8", 49737)},
+        true);  // is_server_relay
 
     EXPECT_FALSE(reply.value.empty());
     EXPECT_FALSE(reply.should_punch);  // Client isn't punching yet
@@ -123,7 +125,7 @@ TEST(ServerHolepunch, ProbeRound) {
         decrypted->data(), decrypted->size());
     EXPECT_EQ(resp.error, peer_connect::ERROR_NONE);
     EXPECT_EQ(resp.firewall, peer_connect::FIREWALL_CONSISTENT);
-    EXPECT_TRUE(resp.token.has_value());
+    EXPECT_TRUE(resp.token.has_value());  // Token returned because is_server_relay
     EXPECT_EQ(resp.addresses.size(), 1u);
 }
 

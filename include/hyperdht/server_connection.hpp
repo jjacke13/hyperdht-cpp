@@ -113,7 +113,8 @@ HolepunchReply handle_holepunch(
     const std::vector<uint8_t>& value,
     const compact::Ipv4Address& client_address,
     uint32_t our_firewall,
-    const std::vector<compact::Ipv4Address>& our_addresses);
+    const std::vector<compact::Ipv4Address>& our_addresses,
+    bool is_server_relay = false);
 
 }  // namespace server_connection
 }  // namespace hyperdht

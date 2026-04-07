@@ -49,6 +49,7 @@ std::vector<uint8_t> encode_noise_payload(const NoisePayload& p) {
     if (!p.addresses4.empty()) flags |= 2;
     if (p.udx.has_value()) flags |= 8;
     if (p.has_secret_stream) flags |= 16;
+    if (!p.relay_addresses.empty()) flags |= 64;
     Uint::preencode(state, flags);
     Uint::preencode(state, p.error);
     Uint::preencode(state, p.firewall);
@@ -72,6 +73,9 @@ std::vector<uint8_t> encode_noise_payload(const NoisePayload& p) {
     }
     if (p.has_secret_stream) {
         Uint::preencode(state, 1u);
+    }
+    if (!p.relay_addresses.empty()) {
+        Array<Ipv4Addr, Ipv4Address>::preencode(state, p.relay_addresses);
     }
 
     std::vector<uint8_t> buf(state.end);
@@ -102,6 +106,9 @@ std::vector<uint8_t> encode_noise_payload(const NoisePayload& p) {
     }
     if (p.has_secret_stream) {
         Uint::encode(state, 1u);
+    }
+    if (!p.relay_addresses.empty()) {
+        Array<Ipv4Addr, Ipv4Address>::encode(state, p.relay_addresses);
     }
 
     return buf;

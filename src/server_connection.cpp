@@ -102,6 +102,11 @@ std::optional<ServerConnection> handle_handshake(
             }
             response.holepunch = hp_info;
         }
+
+        // relayAddresses — JS: relayAddresses.length ? relayAddresses : null
+        for (const auto& ri : relay_infos) {
+            response.relay_addresses.push_back(ri.relay_address);
+        }
     }
 
     // Step 8: Encode and encrypt our response via Noise msg2
@@ -141,7 +146,8 @@ HolepunchReply handle_holepunch(
     const std::vector<uint8_t>& value,
     const compact::Ipv4Address& client_address,
     uint32_t our_firewall,
-    const std::vector<compact::Ipv4Address>& our_addresses) {
+    const std::vector<compact::Ipv4Address>& our_addresses,
+    bool is_server_relay) {
 
     HolepunchReply reply;
 
@@ -217,7 +223,10 @@ HolepunchReply handle_holepunch(
     resp.connected = false;
     resp.addresses = our_addresses;
     // remote_address is always null in JS server responses
-    resp.token = our_token;
+    // JS: token only returned if request came from a known relay (isServerRelay)
+    if (is_server_relay) {
+        resp.token = our_token;
+    }
     if (client_hp.token.has_value()) {
         resp.remote_token = client_hp.token;
     }

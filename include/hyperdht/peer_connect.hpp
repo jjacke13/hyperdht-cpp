@@ -78,6 +78,7 @@ struct NoisePayload {
     std::vector<compact::Ipv4Address> addresses4;
     std::optional<UdxInfo> udx;
     bool has_secret_stream = false;
+    std::vector<compact::Ipv4Address> relay_addresses;  // flag bit 6
 };
 
 // Encode/decode noisePayload

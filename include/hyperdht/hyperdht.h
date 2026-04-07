@@ -92,6 +92,7 @@ typedef struct {
     char peer_host[46];     /**< Peer IP address as string */
     uint16_t peer_port;
     int is_initiator;       /**< 1 if we initiated, 0 if we accepted */
+    void* raw_stream;       /**< Pre-created UDX stream (server side), or NULL */
 } hyperdht_connection_t;
 
 /* =========================================================================

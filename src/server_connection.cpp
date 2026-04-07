@@ -10,6 +10,58 @@
 namespace hyperdht {
 namespace server_connection {
 
+ServerConnection::~ServerConnection() {
+    if (raw_stream) {
+        udx_stream_destroy(raw_stream);
+        // The finalize callback (set during init) will delete the memory
+        raw_stream = nullptr;
+    }
+}
+
+ServerConnection::ServerConnection(ServerConnection&& other) noexcept
+    : id(other.id), round(other.round),
+      tx_key(other.tx_key), rx_key(other.rx_key),
+      handshake_hash(other.handshake_hash),
+      remote_public_key(other.remote_public_key),
+      remote_payload(std::move(other.remote_payload)),
+      reply_noise(std::move(other.reply_noise)),
+      secure(std::move(other.secure)),
+      local_udx_id(other.local_udx_id),
+      raw_stream(other.raw_stream),
+      our_firewall(other.our_firewall),
+      our_addresses(std::move(other.our_addresses)),
+      firewalled(other.firewalled),
+      has_error(other.has_error),
+      error_code(other.error_code),
+      created_at(other.created_at) {
+    other.raw_stream = nullptr;  // Transfer ownership
+}
+
+ServerConnection& ServerConnection::operator=(ServerConnection&& other) noexcept {
+    if (this != &other) {
+        if (raw_stream) udx_stream_destroy(raw_stream);
+        id = other.id;
+        round = other.round;
+        tx_key = other.tx_key;
+        rx_key = other.rx_key;
+        handshake_hash = other.handshake_hash;
+        remote_public_key = other.remote_public_key;
+        remote_payload = std::move(other.remote_payload);
+        reply_noise = std::move(other.reply_noise);
+        secure = std::move(other.secure);
+        local_udx_id = other.local_udx_id;
+        raw_stream = other.raw_stream;
+        other.raw_stream = nullptr;
+        our_firewall = other.our_firewall;
+        our_addresses = std::move(other.our_addresses);
+        firewalled = other.firewalled;
+        has_error = other.has_error;
+        error_code = other.error_code;
+        created_at = other.created_at;
+    }
+    return *this;
+}
+
 std::optional<ServerConnection> handle_handshake(
     const noise::Keypair& server_keypair,
     const std::vector<uint8_t>& noise_msg1,
@@ -206,8 +258,12 @@ HolepunchReply handle_holepunch(
     // Generate our token for the client's address
     auto our_token = conn.secure->token(client_address.host_string());
 
-    // Check if client echoed our token (address verification)
-    // bool echoed = client_hp.remote_token.has_value() && (our_token == *client_hp.remote_token);
+    // JS: echoed = isServerRelay && !!remoteToken && equals(token, remoteToken)
+    // If the client echoed our token, their address is verified (they're at peerAddress)
+    bool echoed = is_server_relay &&
+                  client_hp.remote_token.has_value() &&
+                  (our_token == *client_hp.remote_token);
+    reply.address_verified = echoed;
 
     // If client is punching → we should start probing too
     if (client_hp.punching && !client_hp.addresses.empty()) {

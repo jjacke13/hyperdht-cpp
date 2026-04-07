@@ -53,6 +53,7 @@ static void fill_connection(hyperdht_connection_t* out,
     out->peer_host[sizeof(out->peer_host) - 1] = '\0';
     out->peer_port = addr.port;
     out->is_initiator = initiator ? 1 : 0;
+    out->raw_stream = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +214,7 @@ int hyperdht_server_listen(hyperdht_server_t* srv,
                             info.handshake_hash, info.remote_public_key,
                             info.peer_address, info.remote_udx_id,
                             info.local_udx_id, info.is_initiator);
+            conn.raw_stream = info.raw_stream;  // Pass pre-created rawStream
             srv->cb(&conn, srv->userdata);
         });
 
@@ -341,7 +343,8 @@ int hyperdht_mutable_get(hyperdht_t* dht,
 // ---------------------------------------------------------------------------
 
 struct hyperdht_stream_s {
-    udx_stream_t raw_stream{};
+    udx_stream_t raw_stream{};       // Used for client path (no pre-created stream)
+    udx_stream_t* raw = nullptr;     // Points to raw_stream or pre-created stream
     hyperdht::secret_stream::SecretStream* ss = nullptr;
     hyperdht_t* dht = nullptr;
 
@@ -419,7 +422,8 @@ static void stream_on_close_cb(udx_stream_t* raw, int) {
         s->closed = true;
         if (s->on_close) s->on_close(s->userdata);
     }
-    // Free resources — the UDX stream is fully closed at this point
+    // Free the wrapper — but NOT the udx_stream_t yet (libudx still
+    // accesses it after on_close). The finalize callback handles that.
     raw->data = nullptr;
     delete s->ss;
     delete s;
@@ -439,7 +443,7 @@ static void stream_send_header(hyperdht_stream_s* s) {
     struct HdrCtx { std::vector<uint8_t>* buf; hyperdht_stream_s* stream; };
     wreq->data = new HdrCtx{hdr_buf, s};
 
-    udx_stream_write(wreq, &s->raw_stream, &uv_buf, 1,
+    udx_stream_write(wreq, s->raw, &uv_buf, 1,
         [](udx_stream_write_t* req, int status, int) {
             auto* ctx = static_cast<HdrCtx*>(req->data);
             if (status >= 0) {
@@ -481,32 +485,45 @@ hyperdht_stream_t* hyperdht_stream_open(
     s->ss = new hyperdht::secret_stream::SecretStream(
         tx, rx, hash, conn->is_initiator != 0);
 
-    // Init UDX stream
-    udx_stream_init(dht->dht->socket().udx_handle(), &s->raw_stream,
-                    conn->local_udx_id, stream_on_close_cb, nullptr);
-    s->raw_stream.data = s;
+    if (conn->raw_stream) {
+        // Server path: reuse the rawStream created during handshake.
+        // It's already registered on the socket with a firewall callback.
+        // Matches JS: hs.rawStream.connect(socket, remotePayload.udx.id, port, host)
+        s->raw = static_cast<udx_stream_t*>(conn->raw_stream);
+        s->raw->data = s;
+        s->raw->on_close = stream_on_close_cb;
 
-    // Connect to peer immediately. The address from the holepunch payload
-    // may not be the client's real CGNAT address, causing brief rto
-    // retransmissions until UDX adjusts. The proper fix (creating the
-    // rawStream during handshake with a firewall callback, like JS does)
-    // requires handshake deduplication first to avoid cirbuf collisions.
-    if (conn->peer_port == 0) {
-        delete s->ss;
-        delete s;
-        return nullptr;
+        if (conn->peer_port != 0) {
+            struct sockaddr_in dest{};
+            uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
+            udx_stream_connect(s->raw, dht->dht->socket().socket_handle(),
+                               conn->remote_udx_id,
+                               reinterpret_cast<const struct sockaddr*>(&dest));
+        }
+    } else {
+        // Client path: create a new UDX stream (embedded in struct)
+        s->raw = &s->raw_stream;
+        udx_stream_init(dht->dht->socket().udx_handle(), s->raw,
+                        conn->local_udx_id, stream_on_close_cb, nullptr);
+        s->raw->data = s;
+
+        if (conn->peer_port == 0) {
+            delete s->ss;
+            delete s;
+            return nullptr;
+        }
+        struct sockaddr_in dest{};
+        uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
+        udx_stream_connect(s->raw, dht->dht->socket().socket_handle(),
+                           conn->remote_udx_id,
+                           reinterpret_cast<const struct sockaddr*>(&dest));
     }
-    struct sockaddr_in dest{};
-    uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
-    udx_stream_connect(&s->raw_stream, dht->dht->socket().socket_handle(),
-                       conn->remote_udx_id,
-                       reinterpret_cast<const struct sockaddr*>(&dest));
 
     // Send SecretStream header
     stream_send_header(s);
 
     // Start reading
-    udx_stream_read_start(&s->raw_stream, stream_on_read);
+    udx_stream_read_start(s->raw, stream_on_read);
 
     return s;
 }
@@ -526,7 +543,7 @@ int hyperdht_stream_write(hyperdht_stream_t* stream,
         calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
     wreq->data = enc_buf;
 
-    int rc = udx_stream_write(wreq, &stream->raw_stream, &uv_buf, 1,
+    int rc = udx_stream_write(wreq, stream->raw, &uv_buf, 1,
         [](udx_stream_write_t* req, int, int) {
             delete static_cast<std::vector<uint8_t>*>(req->data);
             free(req);
@@ -550,7 +567,7 @@ void hyperdht_stream_close(hyperdht_stream_t* stream) {
     // writes and triggers a ref_count assertion in libudx.
     auto* wreq = static_cast<udx_stream_write_t*>(
         calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
-    udx_stream_write_end(wreq, &stream->raw_stream, nullptr, 0,
+    udx_stream_write_end(wreq, stream->raw, nullptr, 0,
         [](udx_stream_write_t* req, int, int) { free(req); });
 }
 

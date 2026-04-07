@@ -6,6 +6,18 @@
 
 #include "hyperdht/debug.hpp"
 
+// Firewall callback for pre-created rawStreams. Fires when the client's
+// first UDX packet arrives. We learn the REAL peer address here.
+// Matches JS: createRawStream({firewall: (socket, port, host) => {...}})
+static int server_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket,
+                                       const struct sockaddr* from) {
+    // Accept the packet — we don't block any traffic (like JS returns false)
+    (void)stream;
+    (void)socket;
+    (void)from;
+    return 0;
+}
+
 namespace hyperdht {
 namespace server {
 
@@ -86,10 +98,21 @@ void Server::close(std::function<void()> on_done) {
         announcer_.reset();
     }
 
+    // Cancel all session timers
+    for (auto& [id, timer] : session_timers_) {
+        uv_timer_stop(timer);
+        auto* ctx = static_cast<std::pair<Server*, uint32_t>*>(timer->data);
+        delete ctx;
+        timer->data = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(timer),
+                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+    }
+    session_timers_.clear();
+
     // Remove from router
     router_.remove(target_);
 
-    // Clear active connections
+    // Clear active connections (ServerConnection destructor handles raw_stream)
     connections_.clear();
     handshake_dedup_.clear();
 
@@ -170,11 +193,20 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     reply_fn(std::move(reply_noise));
 
     if (conn.has_error) {
-        // Firewalled or version mismatch — don't store connection
         return;
     }
 
-    // Store connection (both paths need stable memory)
+    // Create rawStream NOW (during handshake, before holepunch starts).
+    // Matches JS: hs.rawStream = this.dht.createRawStream({firewall})
+    // The stream is registered on the socket so the client's first UDX
+    // packet triggers the firewall callback with the real address.
+    auto* raw = new udx_stream_t;
+    udx_stream_init(socket_.udx_handle(), raw, conn.local_udx_id,
+                    [](udx_stream_t*, int) {},
+                    [](udx_stream_t* s) { delete s; });  // finalize: free heap stream
+    udx_stream_firewall(raw, server_raw_stream_firewall);
+    conn.raw_stream = raw;
+
     auto conn_ptr = std::make_unique<server_connection::ServerConnection>(std::move(conn));
 
     // If client is OPEN, connect directly
@@ -190,18 +222,21 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     connections_[hp_id] = std::move(conn_ptr);
     handshake_dedup_[noise_key] = hp_id;
 
-    // Per-session timeout — matches JS _clearLater(hs, id, k) with HANDSHAKE_INITIAL_TIMEOUT
+    // Per-session timeout — matches JS _clearLater(hs, id, k)
     auto* timer = new uv_timer_t;
     uv_timer_init(socket_.loop(), timer);
     auto* ctx = new std::pair<Server*, uint32_t>(this, hp_id);
     timer->data = ctx;
     uv_timer_start(timer, [](uv_timer_t* t) {
         auto* c = static_cast<std::pair<Server*, uint32_t>*>(t->data);
-        c->first->clear_session(c->second);
+        if (c->first && !c->first->closed_) {
+            c->first->clear_session(c->second);
+        }
         delete c;
         uv_close(reinterpret_cast<uv_handle_t*>(t),
                  [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
     }, HP_TIMEOUT_MS, 0);
+    session_timers_[hp_id] = timer;
 
     DHT_LOG( "  [server] Handshake complete (id=%d), waiting for holepunch\n", hp_id);
 }
@@ -273,15 +308,25 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
             have_valid = true;
         }
 
-        // Call on_socket with the best address we have from the holepunch.
-        // May differ from client's real CGNAT address (causes brief rto).
-        // TODO: create rawStream during handshake with firewall callback
-        // to learn the real address from the first incoming packet (like JS).
+        // Call on_socket — the rawStream was created during handshake
+        // and registered on the socket. The firewall callback accepted
+        // the client's first UDX packet (learning the real address).
         if (have_valid) {
+            auto hp_id = it->first;
             auto conn_ptr = std::move(it->second);
-            // Clean dedup entry for this connection
+            // Clean dedup + timer for this connection
             for (auto dit = handshake_dedup_.begin(); dit != handshake_dedup_.end(); ++dit) {
-                if (dit->second == it->first) { handshake_dedup_.erase(dit); break; }
+                if (dit->second == hp_id) { handshake_dedup_.erase(dit); break; }
+            }
+            auto tit = session_timers_.find(hp_id);
+            if (tit != session_timers_.end()) {
+                uv_timer_stop(tit->second);
+                auto* ctx = static_cast<std::pair<Server*, uint32_t>*>(tit->second->data);
+                delete ctx;
+                tit->second->data = nullptr;
+                uv_close(reinterpret_cast<uv_handle_t*>(tit->second),
+                         [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+                session_timers_.erase(tit);
             }
             connections_.erase(it);
             on_socket(*conn_ptr, valid_peer_addr);
@@ -305,6 +350,8 @@ void Server::on_socket(server_connection::ServerConnection& conn,
     info.peer_address = peer_addr;
     info.local_udx_id = conn.local_udx_id;
     info.is_initiator = false;
+    info.raw_stream = conn.raw_stream;  // Transfer ownership to caller
+    conn.raw_stream = nullptr;          // Prevent double-free
 
     if (conn.remote_payload.udx.has_value()) {
         info.remote_udx_id = conn.remote_payload.udx->id;
@@ -327,10 +374,13 @@ void Server::clear_session(uint32_t hp_id) {
 
     DHT_LOG("  [server] Session timeout id=%u\n", hp_id);
 
-    // Remove dedup entry (JS: this._connects.delete(k))
+    // Remove dedup entry
     for (auto dit = handshake_dedup_.begin(); dit != handshake_dedup_.end(); ++dit) {
         if (dit->second == hp_id) { handshake_dedup_.erase(dit); break; }
     }
+    // Remove session timer (already fired, but clean the map)
+    session_timers_.erase(hp_id);
+    // Erase connection (destructor handles raw_stream cleanup)
     connections_.erase(it);
 }
 

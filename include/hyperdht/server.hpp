@@ -48,6 +48,7 @@ struct ConnectionInfo {
     uint32_t remote_udx_id = 0;     // Peer's UDX stream ID
     uint32_t local_udx_id = 0;      // Our UDX stream ID
     bool is_initiator = false;       // Server is always responder
+    udx_stream_t* raw_stream = nullptr;  // Pre-created during handshake (like JS rawStream)
 };
 
 // ---------------------------------------------------------------------------
@@ -112,6 +113,7 @@ private:
 
     // Per-session cleanup — matches JS _clearLater / HANDSHAKE_INITIAL_TIMEOUT (10s)
     static constexpr uint64_t HP_TIMEOUT_MS = 10000;
+    std::unordered_map<uint32_t, uv_timer_t*> session_timers_;
     void clear_session(uint32_t hp_id);
 
     // Router callbacks

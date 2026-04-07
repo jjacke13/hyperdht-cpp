@@ -11,6 +11,8 @@
 #include <optional>
 #include <vector>
 
+#include <udx.h>
+
 #include "hyperdht/compact.hpp"
 #include "hyperdht/holepunch.hpp"
 #include "hyperdht/noise_wrap.hpp"
@@ -24,6 +26,13 @@ namespace server_connection {
 // ---------------------------------------------------------------------------
 
 struct ServerConnection {
+    ~ServerConnection();
+    ServerConnection() = default;
+    ServerConnection(ServerConnection&& other) noexcept;
+    ServerConnection& operator=(ServerConnection&& other) noexcept;
+    ServerConnection(const ServerConnection&) = delete;
+    ServerConnection& operator=(const ServerConnection&) = delete;
+
     int id = -1;                      // Holepunch slot ID
     int round = 0;                    // Current holepunch round
 
@@ -40,8 +49,11 @@ struct ServerConnection {
     // Holepunch encryption
     std::unique_ptr<holepunch::SecurePayload> secure;
 
-    // UDX stream ID we assigned
+    // UDX stream — created during handshake (like JS rawStream), registered
+    // on the socket with firewall callback before holepunch starts.
+    // Ownership transferred to stream_open when connection completes.
     uint32_t local_udx_id = 0;
+    udx_stream_t* raw_stream = nullptr;  // Heap-allocated, nullable
 
     // Server's address info for the response
     uint32_t our_firewall = peer_connect::FIREWALL_UNKNOWN;
@@ -104,6 +116,7 @@ std::optional<ServerConnection> handle_handshake(
 struct HolepunchReply {
     std::vector<uint8_t> value;      // Encrypted reply payload
     bool should_punch = false;        // True if server should start probing
+    bool address_verified = false;    // True if client echoed our token (relay verification)
     uint32_t remote_firewall = 0;     // Client's reported firewall
     std::vector<compact::Ipv4Address> remote_addresses;  // Client's addresses to probe
 };

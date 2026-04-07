@@ -6,16 +6,21 @@
 
 #include "hyperdht/debug.hpp"
 
+// Context stored in rawStream->data during handshake→connection window
+struct RawStreamCtx {
+    hyperdht::server::Server* server;
+};
+
 // Firewall callback for pre-created rawStreams. Fires when the client's
-// first UDX packet arrives. We learn the REAL peer address here.
-// Matches JS: createRawStream({firewall: (socket, port, host) => {...}})
+// first UDX packet arrives with the REAL peer address.
+// Matches JS: rawStream firewall → hs.onsocket(socket, port, host)
 static int server_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket,
                                        const struct sockaddr* from) {
-    // Accept the packet — we don't block any traffic (like JS returns false)
-    (void)stream;
-    (void)socket;
-    (void)from;
-    return 0;
+    auto* ctx = static_cast<RawStreamCtx*>(stream->data);
+    if (ctx && ctx->server) {
+        ctx->server->on_raw_stream_firewall(stream, from);
+    }
+    return 0;  // accept (like JS returns false)
 }
 
 namespace hyperdht {
@@ -108,6 +113,7 @@ void Server::close(std::function<void()> on_done) {
                  [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
     }
     session_timers_.clear();
+    pending_punch_streams_.clear();
 
     // Remove from router
     router_.remove(target_);
@@ -201,9 +207,14 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     // The stream is registered on the socket so the client's first UDX
     // packet triggers the firewall callback with the real address.
     auto* raw = new udx_stream_t;
+    auto* raw_ctx = new RawStreamCtx{this};
     udx_stream_init(socket_.udx_handle(), raw, conn.local_udx_id,
-                    [](udx_stream_t*, int) {},
-                    [](udx_stream_t* s) { delete s; });  // finalize: free heap stream
+                    [](udx_stream_t* s, int) {
+                        delete static_cast<RawStreamCtx*>(s->data);
+                        s->data = nullptr;
+                    },
+                    [](udx_stream_t* s) { delete s; });
+    raw->data = raw_ctx;
     udx_stream_firewall(raw, server_raw_stream_firewall);
     conn.raw_stream = raw;
 
@@ -291,46 +302,29 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                 hp_msg.id, reply.remote_firewall,
                 reply.remote_addresses.size());
 
-        // Send probes to client's valid addresses
-        compact::Ipv4Address valid_peer_addr;
-        bool have_valid = false;
-
+        // Send probes to client's valid addresses.
+        // JS responder: sends probes AND echoes incoming probes.
         for (const auto& addr : reply.remote_addresses) {
             if (addr.port == 0) continue;
             socket_.send_probe(addr);
-            if (!have_valid) {
-                valid_peer_addr = addr;
-                have_valid = true;
-            }
-        }
-        if (!have_valid && peer_address.port != 0) {
-            valid_peer_addr = peer_address;
-            have_valid = true;
         }
 
-        // Call on_socket — the rawStream was created during handshake
-        // and registered on the socket. The firewall callback accepted
-        // the client's first UDX packet (learning the real address).
-        if (have_valid) {
-            auto hp_id = it->first;
-            auto conn_ptr = std::move(it->second);
-            // Clean dedup + timer for this connection
-            for (auto dit = handshake_dedup_.begin(); dit != handshake_dedup_.end(); ++dit) {
-                if (dit->second == hp_id) { handshake_dedup_.erase(dit); break; }
-            }
-            auto tit = session_timers_.find(hp_id);
-            if (tit != session_timers_.end()) {
-                uv_timer_stop(tit->second);
-                auto* ctx = static_cast<std::pair<Server*, uint32_t>*>(tit->second->data);
-                delete ctx;
-                tit->second->data = nullptr;
-                uv_close(reinterpret_cast<uv_handle_t*>(tit->second),
-                         [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-                session_timers_.erase(tit);
-            }
-            connections_.erase(it);
-            on_socket(*conn_ptr, valid_peer_addr);
+        // Register this connection for rawStream firewall detection.
+        // When the client's UDX packet arrives, the firewall fires
+        // with the real address → on_raw_stream_firewall → on_socket.
+        // This matches JS: server doesn't call onsocket from holepunch
+        // handler — it waits for the rawStream firewall to fire.
+        if (conn.raw_stream) {
+            pending_punch_streams_[conn.local_udx_id] = hp_msg.id;
         }
+
+        // Install probe echo — JS responder echoes probes back.
+        // This tells the client "I can reach you" → client connects UDX.
+        socket_.on_holepunch_probe([this](const compact::Ipv4Address& from) {
+            if (closed_) return;
+            // Echo it back (JS: holepunch(ref.socket, addr, false))
+            socket_.send_probe(from);
+        });
     }
 }
 
@@ -350,8 +344,13 @@ void Server::on_socket(server_connection::ServerConnection& conn,
     info.peer_address = peer_addr;
     info.local_udx_id = conn.local_udx_id;
     info.is_initiator = false;
-    info.raw_stream = conn.raw_stream;  // Transfer ownership to caller
-    conn.raw_stream = nullptr;          // Prevent double-free
+    // Transfer rawStream ownership. Clean up the Server's firewall context.
+    if (conn.raw_stream && conn.raw_stream->data) {
+        delete static_cast<RawStreamCtx*>(conn.raw_stream->data);
+        conn.raw_stream->data = nullptr;
+    }
+    info.raw_stream = conn.raw_stream;
+    conn.raw_stream = nullptr;
 
     if (conn.remote_payload.udx.has_value()) {
         info.remote_udx_id = conn.remote_payload.udx->id;
@@ -382,6 +381,53 @@ void Server::clear_session(uint32_t hp_id) {
     session_timers_.erase(hp_id);
     // Erase connection (destructor handles raw_stream cleanup)
     connections_.erase(it);
+}
+
+// ---------------------------------------------------------------------------
+// rawStream firewall — client's first UDX packet arrived with real address
+// ---------------------------------------------------------------------------
+
+void Server::on_raw_stream_firewall(udx_stream_t* stream, const struct sockaddr* from) {
+    if (closed_) return;
+
+    // Find the pending punch for this stream's local_id
+    auto pit = pending_punch_streams_.find(stream->local_id);
+    if (pit == pending_punch_streams_.end()) return;
+
+    auto hp_id = pit->second;
+    pending_punch_streams_.erase(pit);
+
+    auto it = connections_.find(hp_id);
+    if (it == connections_.end()) return;
+
+    // Extract the real peer address from the incoming packet
+    auto* addr_in = reinterpret_cast<const struct sockaddr_in*>(from);
+    char host[INET_ADDRSTRLEN];
+    uv_ip4_name(addr_in, host, sizeof(host));
+    auto real_addr = compact::Ipv4Address::from_string(host, ntohs(addr_in->sin_port));
+
+    DHT_LOG("  [server] rawStream firewall: real addr %s:%u (id=%u)\n",
+            host, ntohs(addr_in->sin_port), hp_id);
+
+    // Take ownership and clean up
+    auto conn_ptr = std::move(it->second);
+    for (auto dit = handshake_dedup_.begin(); dit != handshake_dedup_.end(); ++dit) {
+        if (dit->second == hp_id) { handshake_dedup_.erase(dit); break; }
+    }
+    auto tit = session_timers_.find(hp_id);
+    if (tit != session_timers_.end()) {
+        uv_timer_stop(tit->second);
+        auto* ctx = static_cast<std::pair<Server*, uint32_t>*>(tit->second->data);
+        delete ctx;
+        tit->second->data = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(tit->second),
+                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+        session_timers_.erase(tit);
+    }
+    connections_.erase(it);
+
+    // Connect with the REAL address from the UDX packet
+    on_socket(*conn_ptr, real_addr);
 }
 
 }  // namespace server

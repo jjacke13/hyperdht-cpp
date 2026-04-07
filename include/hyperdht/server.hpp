@@ -111,6 +111,14 @@ private:
     // Entries removed when connection completes or times out.
     std::unordered_map<std::string, uint32_t> handshake_dedup_;
 
+    // Pending punches: connections waiting for the client's UDX packet
+    // to arrive via the rawStream firewall. Maps local_udx_id → hp_id.
+    std::unordered_map<uint32_t, uint32_t> pending_punch_streams_;
+public:
+    // Called by rawStream firewall callback (static C function needs access)
+    void on_raw_stream_firewall(udx_stream_t* stream, const struct sockaddr* from);
+private:
+
     // Per-session cleanup — matches JS _clearLater / HANDSHAKE_INITIAL_TIMEOUT (10s)
     static constexpr uint64_t HP_TIMEOUT_MS = 10000;
     std::unordered_map<uint32_t, uv_timer_t*> session_timers_;

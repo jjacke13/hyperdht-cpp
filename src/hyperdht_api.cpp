@@ -490,6 +490,9 @@ hyperdht_stream_t* hyperdht_stream_open(
         // It's already registered on the socket with a firewall callback.
         // Matches JS: hs.rawStream.connect(socket, remotePayload.udx.id, port, host)
         s->raw = static_cast<udx_stream_t*>(conn->raw_stream);
+        // The Server stored context in raw->data during handshake.
+        // We're taking over — clear it (the on_close callback would have
+        // freed it, but we're replacing on_close too).
         s->raw->data = s;
         s->raw->on_close = stream_on_close_cb;
 

@@ -21,6 +21,8 @@
 #include <uv.h>
 
 #include "hyperdht/compact.hpp"
+#include "hyperdht/messages.hpp"
+#include "hyperdht/nat_sampler.hpp"
 #include "hyperdht/peer_connect.hpp"
 #include "hyperdht/rpc.hpp"
 
@@ -110,6 +112,80 @@ struct RemoteAddr {
     compact::Ipv4Address addr;
     bool verified = false;
 };
+
+// ---------------------------------------------------------------------------
+// PoolSocket — lightweight UDP socket for holepunch probing
+// ---------------------------------------------------------------------------
+// JS: dht._socketPool.acquire() returns a fresh socket per holepunch.
+// This is a stripped-down RPC sender: encode request → send → match TID.
+// No congestion, no drain, no routing — just PING (for NAT discovery)
+// and probe send/recv.
+
+class PoolSocket {
+public:
+    PoolSocket(uv_loop_t* loop, udx_t* udx);
+    ~PoolSocket();
+
+    PoolSocket(const PoolSocket&) = delete;
+    PoolSocket& operator=(const PoolSocket&) = delete;
+
+    int bind();
+    bool is_bound() const { return bound_; }
+
+    // Send an RPC request from this socket. Minimal: no retries, 2s timeout.
+    void request(const messages::Request& req,
+                 rpc::OnResponseCallback on_response,
+                 rpc::OnTimeoutCallback on_timeout = nullptr);
+
+    // Probes
+    void send_probe(const compact::Ipv4Address& to);
+    void send_probe_ttl(const compact::Ipv4Address& to, int ttl);
+    void on_holepunch_probe(rpc::OnProbeCallback cb) { on_probe_ = std::move(cb); }
+
+    // NAT sampler (fed from PING responses)
+    nat::NatSampler& nat_sampler() { return nat_sampler_; }
+    const std::vector<compact::Ipv4Address>& addresses() const {
+        return nat_sampler_.addresses();
+    }
+
+    void close();
+    bool is_closing() const { return closing_; }
+
+private:
+    struct Inflight {
+        uint16_t tid = 0;
+        rpc::OnResponseCallback on_response;
+        rpc::OnTimeoutCallback on_timeout;
+        uv_timer_t* timer = nullptr;
+    };
+
+    uv_loop_t* loop_;
+    udx_socket_t socket_{};
+    bool bound_ = false;
+    bool closing_ = false;
+
+    nat::NatSampler nat_sampler_;
+    uint16_t next_tid_ = 0;
+    std::vector<Inflight*> inflight_;
+    rpc::OnProbeCallback on_probe_;
+
+    void handle_message(const uint8_t* data, size_t len,
+                        const struct sockaddr_in* addr);
+    static void on_recv(udx_socket_t* socket, ssize_t nread,
+                        const uv_buf_t* buf, const struct sockaddr* addr);
+};
+
+// Discover pool socket's external address by PINGing DHT nodes.
+// Calls on_done(true) when enough samples collected, false on failure.
+void discover_pool_addresses(
+    PoolSocket& pool,
+    const routing::RoutingTable& table,
+    const compact::Ipv4Address& relay_addr,
+    std::function<void(bool)> on_done);
+
+// ---------------------------------------------------------------------------
+// Holepuncher — the UDP probe engine
+// ---------------------------------------------------------------------------
 
 class Holepuncher {
 public:

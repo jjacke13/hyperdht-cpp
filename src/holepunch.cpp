@@ -375,6 +375,271 @@ void Holepuncher::on_punch_timer(uv_timer_t* timer) {
 }
 
 // ---------------------------------------------------------------------------
+// PoolSocket — lightweight UDP socket for holepunch probing
+// ---------------------------------------------------------------------------
+
+PoolSocket::PoolSocket(uv_loop_t* loop, udx_t* udx)
+    : loop_(loop) {
+    udx_socket_init(udx, &socket_, nullptr);
+    socket_.data = this;
+    next_tid_ = static_cast<uint16_t>(randombytes_uniform(0xFFFF));
+}
+
+PoolSocket::~PoolSocket() {
+    if (!closing_) close();
+}
+
+int PoolSocket::bind() {
+    struct sockaddr_in addr{};
+    uv_ip4_addr("0.0.0.0", 0, &addr);
+    int rc = udx_socket_bind(&socket_, reinterpret_cast<const struct sockaddr*>(&addr), 0);
+    if (rc == 0) {
+        bound_ = true;
+        udx_socket_recv_start(&socket_, on_recv);
+    }
+    return rc;
+}
+
+void PoolSocket::on_recv(udx_socket_t* s, ssize_t nread,
+                          const uv_buf_t* buf, const struct sockaddr* addr) {
+    if (nread <= 0 || !addr) return;
+    auto* self = static_cast<PoolSocket*>(s->data);
+    if (!self || self->closing_) return;
+    self->handle_message(reinterpret_cast<const uint8_t*>(buf->base),
+                         static_cast<size_t>(nread),
+                         reinterpret_cast<const struct sockaddr_in*>(addr));
+}
+
+void PoolSocket::handle_message(const uint8_t* data, size_t len,
+                                 const struct sockaddr_in* addr) {
+    char host[INET_ADDRSTRLEN];
+    uv_ip4_name(addr, host, sizeof(host));
+    DHT_LOG("  [pool] Recv %zu bytes from %s:%u (type=0x%02x)\n",
+            len, host, ntohs(addr->sin_port), len > 0 ? data[0] : 0);
+
+    // 1-byte probe → holepunch callback
+    if (len == 1 && data[0] == 0x00) {
+        if (on_probe_) {
+            char host[INET_ADDRSTRLEN];
+            uv_ip4_name(addr, host, sizeof(host));
+            auto from = Ipv4Address::from_string(host, ntohs(addr->sin_port));
+            on_probe_(from);
+        }
+        return;
+    }
+
+    // Try to decode as RPC message
+    if (len < 2) return;
+    messages::Request req;
+    messages::Response resp;
+    auto type = messages::decode_message(data, len, req, resp);
+
+    if (type == messages::RESPONSE_ID) {
+        // Feed NAT sampler: resp.from.addr = wire `to` field = our external address
+        char host[INET_ADDRSTRLEN];
+        uv_ip4_name(addr, host, sizeof(host));
+        auto remote_addr = Ipv4Address::from_string(host, ntohs(addr->sin_port));
+        nat_sampler_.add(resp.from.addr, remote_addr);
+
+        // Match TID → call response callback
+        for (auto it = inflight_.begin(); it != inflight_.end(); ++it) {
+            if ((*it)->tid == resp.tid) {
+                auto* inf = *it;
+                inflight_.erase(it);
+                if (inf->timer) {
+                    uv_timer_stop(inf->timer);
+                    uv_close(reinterpret_cast<uv_handle_t*>(inf->timer),
+                             [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+                }
+                auto cb = std::move(inf->on_response);
+                delete inf;
+                if (cb) cb(resp);
+                return;
+            }
+        }
+    }
+}
+
+void PoolSocket::request(const messages::Request& req,
+                          rpc::OnResponseCallback on_response,
+                          rpc::OnTimeoutCallback on_timeout) {
+    auto* inf = new Inflight;
+    inf->tid = next_tid_++;
+    inf->on_response = std::move(on_response);
+    inf->on_timeout = std::move(on_timeout);
+
+    // Encode request with our TID
+    messages::Request msg = req;
+    msg.tid = inf->tid;
+    auto buf = messages::encode_request(msg);
+
+    // Send from pool socket
+    struct SendCtx {
+        udx_socket_send_t req{};
+        std::vector<uint8_t> buf;
+    };
+    auto* ctx = new SendCtx;
+    ctx->buf = std::move(buf);
+    ctx->req.data = ctx;
+    uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(ctx->buf.data()),
+                                    static_cast<unsigned int>(ctx->buf.size()));
+    struct sockaddr_in dest{};
+    uv_ip4_addr(req.to.addr.host_string().c_str(), req.to.addr.port, &dest);
+    DHT_LOG("  [pool] Sending request (tid=%u, cmd=%u, %zu bytes) to %s:%u\n",
+            inf->tid, msg.command, ctx->buf.size(),
+            req.to.addr.host_string().c_str(), req.to.addr.port);
+    int rc = udx_socket_send(&ctx->req, &socket_, &uv_buf, 1,
+                    reinterpret_cast<const struct sockaddr*>(&dest),
+                    [](udx_socket_send_t* r, int status) {
+                        if (status < 0) {
+                            DHT_LOG("  [pool] Send failed: %d\n", status);
+                        }
+                        delete static_cast<SendCtx*>(r->data);
+                    });
+    if (rc < 0) {
+        DHT_LOG("  [pool] udx_socket_send returned: %d\n", rc);
+    }
+
+    // Timeout (2s, no retries — matches JS {retry: false})
+    inf->timer = new uv_timer_t;
+    uv_timer_init(loop_, inf->timer);
+    inf->timer->data = inf;
+    uv_timer_start(inf->timer, [](uv_timer_t* t) {
+        auto* inf = static_cast<Inflight*>(t->data);
+        auto timeout_cb = std::move(inf->on_timeout);
+        uv_close(reinterpret_cast<uv_handle_t*>(t),
+                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+        uint16_t tid = inf->tid;
+        delete inf;
+        if (timeout_cb) timeout_cb(tid);
+    }, 2000, 0);
+
+    inflight_.push_back(inf);
+}
+
+void PoolSocket::send_probe(const Ipv4Address& to) {
+    if (closing_) return;
+    struct SendCtx {
+        udx_socket_send_t req{};
+        uint8_t buf = 0x00;
+    };
+    auto* ctx = new SendCtx;
+    ctx->req.data = ctx;
+    uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(&ctx->buf), 1);
+    struct sockaddr_in dest{};
+    uv_ip4_addr(to.host_string().c_str(), to.port, &dest);
+    udx_socket_send(&ctx->req, &socket_, &uv_buf, 1,
+                    reinterpret_cast<const struct sockaddr*>(&dest),
+                    [](udx_socket_send_t* r, int) {
+                        delete static_cast<SendCtx*>(r->data);
+                    });
+}
+
+void PoolSocket::send_probe_ttl(const Ipv4Address& to, int ttl) {
+    if (closing_) return;
+    struct SendCtx {
+        udx_socket_send_t req{};
+        uint8_t buf = 0x00;
+    };
+    auto* ctx = new SendCtx;
+    ctx->req.data = ctx;
+    uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(&ctx->buf), 1);
+    struct sockaddr_in dest{};
+    uv_ip4_addr(to.host_string().c_str(), to.port, &dest);
+    udx_socket_send_ttl(&ctx->req, &socket_, &uv_buf, 1,
+                        reinterpret_cast<const struct sockaddr*>(&dest), ttl,
+                        [](udx_socket_send_t* r, int) {
+                            delete static_cast<SendCtx*>(r->data);
+                        });
+}
+
+void PoolSocket::close() {
+    if (closing_) return;
+    closing_ = true;
+    socket_.data = nullptr;
+    // Clean up inflight
+    for (auto* inf : inflight_) {
+        if (inf->timer) {
+            uv_timer_stop(inf->timer);
+            uv_close(reinterpret_cast<uv_handle_t*>(inf->timer),
+                     [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+        }
+        delete inf;
+    }
+    inflight_.clear();
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&socket_))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(&socket_), nullptr);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// discover_pool_addresses — PING DHT nodes from pool socket for NAT discovery
+// ---------------------------------------------------------------------------
+
+void discover_pool_addresses(
+    PoolSocket& pool,
+    const routing::RoutingTable& table,
+    const compact::Ipv4Address& relay_addr,
+    std::function<void(bool)> on_done) {
+
+    struct DiscoverCtx {
+        PoolSocket* pool;
+        std::function<void(bool)> on_done;
+        int pending = 0;
+        bool done = false;
+    };
+    auto ctx = std::make_shared<DiscoverCtx>();
+    ctx->pool = &pool;
+    ctx->on_done = std::move(on_done);
+
+    auto finish = [ctx]() {
+        if (ctx->done) return;
+        if (--ctx->pending <= 0) {
+            ctx->done = true;
+            bool ok = ctx->pool->nat_sampler().sampled() >= 2;
+            if (ctx->on_done) ctx->on_done(ok);
+        }
+    };
+
+    // Pick up to 5 DHT nodes for PING (JS: nat.autoSample with 4+ nodes)
+    std::vector<compact::Ipv4Address> targets;
+    targets.push_back(relay_addr);
+
+    // Use routing table nodes if available
+    auto closest = table.closest(routing::NodeId{}, 20);
+    int skip = closest.size() >= 8 ? 5 : 0;
+    for (size_t i = skip; i < closest.size() && targets.size() < 5; i++) {
+        targets.push_back(Ipv4Address::from_string(closest[i]->host, closest[i]->port));
+    }
+
+    // Fallback: use bootstrap nodes when routing table is sparse
+    if (targets.size() < 4) {
+        static const char* bootstrap[] = {
+            "88.99.3.86", "142.93.90.113", "138.68.147.8"  // Public HyperDHT bootstrap
+        };
+        for (const auto& host : bootstrap) {
+            if (targets.size() >= 5) break;
+            targets.push_back(Ipv4Address::from_string(host, 49737));
+        }
+    }
+
+    ctx->pending = static_cast<int>(targets.size()) + 1;  // +1 for initial decrement
+
+    for (const auto& target : targets) {
+        messages::Request ping;
+        ping.command = messages::CMD_PING;
+        ping.internal = true;
+        ping.to.addr = target;
+
+        pool.request(ping,
+            [ctx, finish](const messages::Response&) { finish(); },
+            [ctx, finish](uint16_t) { finish(); });
+    }
+
+    finish();  // Decrement initial +1
+}
+
+// ---------------------------------------------------------------------------
 // PEER_HOLEPUNCH message encoding
 // ---------------------------------------------------------------------------
 
@@ -434,21 +699,24 @@ constexpr uint64_t HOLEPUNCH_TIMEOUT_MS = 15000;  // 15 seconds overall
 struct PunchState {
     std::shared_ptr<SecurePayload> secure;
     std::shared_ptr<Holepuncher> puncher;
+    std::shared_ptr<PoolSocket> pool;  // JS: dht._socketPool.acquire()
     OnHolepunchCallback on_done;
     rpc::RpcSocket* socket = nullptr;
     uv_timer_t* timeout = nullptr;
     bool completed = false;
-    int round = 0;               // Current holepunch round
-    bool retried_unknown = false; // JS: retry once if server fw=UNKNOWN
+    int round = 0;
+    bool retried_unknown = false;
 
     void complete(const HolepunchResult& result) {
         if (completed) return;
         completed = true;
 
-        // Stop probing
         if (puncher) puncher->stop();
 
-        // Clear probe listener
+        // Close pool socket
+        if (pool) pool->close();
+
+        // Clear probe listener on main socket
         if (socket) socket->on_holepunch_probe(nullptr);
 
         // Stop and close timeout timer
@@ -493,25 +761,39 @@ void holepunch_connect(rpc::RpcSocket& socket,
     state->on_done = std::move(on_done);
     state->socket = &socket;
 
+    // Create pool socket (JS: dht._socketPool.acquire())
+    state->pool = std::make_shared<PoolSocket>(socket.loop(), socket.udx_handle());
+    state->pool->bind();
+
     // Compute target hash (reused for both rounds)
     std::array<uint8_t, 32> target{};
     crypto_generichash(target.data(), 32,
                        hs_result.remote_public_key.data(), 32,
                        nullptr, 0);
 
+    // Discover pool socket's external address via PINGs (JS: nat.autoSample())
+    discover_pool_addresses(*state->pool, socket.table(), relay_addr,
+        [state, &socket, target, relay_addr, peer_addr, holepunch_id,
+         local_firewall, local_addresses](bool addr_ok) {
+
+        if (state->completed) return;
+
+        // Use pool socket's discovered addresses if available, else fall back to main
+        auto pool_addrs = state->pool->addresses();
+        auto& addrs = pool_addrs.empty() ? local_addresses : pool_addrs;
+
+        DHT_LOG("  [hp] Pool NAT: fw=%u, %zu addrs (discovered=%s)\n",
+                state->pool->nat_sampler().firewall(), pool_addrs.size(),
+                addr_ok ? "yes" : "no");
+
     // -----------------------------------------------------------------------
     // Round 1: probe exchange — send our firewall info, get server's
     // -----------------------------------------------------------------------
-    // Get our public address from the RPC socket's perspective.
-    // This is the address DHT nodes see us as (from response `to` field).
-    // Without NAT sampling, we use the socket's local address as a placeholder —
-    // the relay will provide our real address to the server via peerAddress.
     HolepunchPayload probe;
     probe.error = peer_connect::ERROR_NONE;
     probe.firewall = local_firewall;
     probe.round = 0;
-    probe.addresses = local_addresses;
-    // JS: remoteAddress = serverAddress (where we think the server is)
+    probe.addresses = addrs;
     probe.remote_address = peer_addr;
 
     auto probe_bytes = encode_holepunch_payload(probe);
@@ -534,6 +816,9 @@ void holepunch_connect(rpc::RpcSocket& socket,
             holepunch_id,
             peer_addr.host_string().c_str(), peer_addr.port);
 
+    // Send Round 1 from MAIN socket — the relay must see the same address
+    // as the handshake so the server's rawStream can reach us. Pool socket
+    // is used for probes only.
     socket.request(req,
         [state, &socket, relay_addr, peer_addr, holepunch_id, target, local_firewall]
         (const messages::Response& resp) {
@@ -614,6 +899,10 @@ void holepunch_connect(rpc::RpcSocket& socket,
             if (hp_resp.peer_address.has_value()) {
                 server_addrs.push_back(*hp_resp.peer_address);
             }
+            for (size_t i = 0; i < server_addrs.size(); i++) {
+                DHT_LOG("  [hp] Server addr[%zu]: %s:%u\n", i,
+                        server_addrs[i].host_string().c_str(), server_addrs[i].port);
+            }
             if (server_addrs.empty()) {
                 state->complete({});
                 return;
@@ -640,26 +929,31 @@ void holepunch_connect(rpc::RpcSocket& socket,
             if (!server_addrs.empty()) verified_host = server_addrs[0].host_string();
             puncher->update_remote(server_addrs, verified_host);
 
-            // Wire probe sending through the SAME RpcSocket
-            puncher->set_send_fn([&socket](const Ipv4Address& addr) {
-                socket.send_probe(addr);
+            // Send probes from BOTH main socket and pool socket.
+            // Main socket: opens CGNAT mapping so server's probes to our
+            // main address (from relay) get through.
+            // Pool socket: creates secondary mapping for the pool address.
+            puncher->set_send_fn([state, &socket](const Ipv4Address& addr) {
+                socket.send_probe(addr);  // Main socket — opens CGNAT for server
+                if (state->pool) state->pool->send_probe(addr);  // Pool socket
             });
-            puncher->set_send_ttl_fn([&socket](const Ipv4Address& addr, int ttl) {
+            puncher->set_send_ttl_fn([state, &socket](const Ipv4Address& addr, int ttl) {
                 socket.send_probe_ttl(addr, ttl);
+                if (state->pool) state->pool->send_probe_ttl(addr, ttl);
             });
 
-            // When we detect an incoming probe → success
             puncher->on_connect([state](const HolepunchResult& result) {
                 state->complete(result);
             });
 
             state->puncher = puncher;
 
-            // Register probe listener on the RPC socket (same socket as RPC traffic)
+            // Listen for probes on BOTH pool socket and main socket (fallback)
+            state->pool->on_holepunch_probe([state](const Ipv4Address& from) {
+                if (state->puncher) state->puncher->on_message(from);
+            });
             socket.on_holepunch_probe([state](const Ipv4Address& from) {
-                if (state->puncher) {
-                    state->puncher->on_message(from);
-                }
+                if (state->puncher) state->puncher->on_message(from);
             });
 
             // Start overall timeout
@@ -682,10 +976,11 @@ void holepunch_connect(rpc::RpcSocket& socket,
             // Round 2: punch exchange — tell server to start probing
             // -------------------------------------------------------------------
 
-            // Our public address: the relay response `to` field tells us how
-            // the relay sees us. The server needs this to know WHERE to probe.
+            // Our public address from relay response `to` field. Since Round 1
+            // was sent from the pool socket, this is the POOL socket's external
+            // address — exactly what the server needs to probe.
             Ipv4Address our_addr = resp.from.addr;
-            DHT_LOG( "  [hp] Our address (from relay): %s:%u\n",
+            DHT_LOG("  [hp] Our pool address (from relay): %s:%u\n",
                     our_addr.host_string().c_str(), our_addr.port);
 
             HolepunchPayload punch;
@@ -721,6 +1016,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
             DHT_LOG( "  [hp] Sending round 2 (punching=true) to %s:%u\n",
                     relay_addr.host_string().c_str(), relay_addr.port);
 
+            // Send Round 2 from MAIN socket (same address as handshake)
             socket.request(req2,
                 [state, puncher, server_addrs](const messages::Response& r2resp) {
                     if (state->completed) return;
@@ -776,6 +1072,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
             DHT_LOG( "  [hp] Round 1: TIMEOUT (no response from relay)\n");
             state->complete({});
         });
+    });  // end discover_pool_addresses callback
 }
 
 }  // namespace holepunch

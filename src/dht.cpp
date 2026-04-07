@@ -19,11 +19,17 @@ struct ClientRawStreamCtx {
 // Matches JS: rawStream firewall → c.onsocket(socket, port, host)
 static int client_raw_stream_firewall(udx_stream_t* stream, udx_socket_t*,
                                        const struct sockaddr* from) {
+    auto* addr_in = reinterpret_cast<const struct sockaddr_in*>(from);
+    char host[INET_ADDRSTRLEN];
+    uv_ip4_name(addr_in, host, sizeof(host));
+    printf("  [rawStream] FIREWALL FIRED from %s:%u (stream=%u)\n",
+           host, ntohs(addr_in->sin_port), stream->local_id);
+    fflush(stdout);
     auto* ctx = static_cast<ClientRawStreamCtx*>(stream->data);
     if (ctx && !ctx->alive.expired() && ctx->on_firewall) {
         ctx->on_firewall(stream, from);
     }
-    return 0;  // accept (like JS returns false)
+    return 0;
 }
 
 namespace hyperdht {

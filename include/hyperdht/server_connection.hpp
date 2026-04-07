@@ -64,6 +64,10 @@ struct ServerConnection {
     bool has_error = false;
     uint32_t error_code = peer_connect::ERROR_NONE;
 
+    // Server-side puncher — sends 10 rounds of probes at 1s intervals
+    // (JS: hs.puncher = new Holepuncher(dht, session, false))
+    std::shared_ptr<holepunch::Holepuncher> puncher;
+
     // Timestamp for stale cleanup (uv_now millis)
     uint64_t created_at = 0;
 };

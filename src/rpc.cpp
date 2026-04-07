@@ -335,6 +335,25 @@ void RpcSocket::send_probe(const compact::Ipv4Address& to) {
     udp_send(probe_byte, to);
 }
 
+void RpcSocket::send_probe_ttl(const compact::Ipv4Address& to, int ttl) {
+    auto* ctx = new SendContext;
+    ctx->buf = {0x00};
+    ctx->req.data = ctx;
+
+    uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(ctx->buf.data()),
+                                    static_cast<unsigned int>(ctx->buf.size()));
+
+    struct sockaddr_in dest{};
+    uv_ip4_addr(to.host_string().c_str(), to.port, &dest);
+
+    udx_socket_send_ttl(&ctx->req, &socket_, &uv_buf, 1,
+                        reinterpret_cast<const struct sockaddr*>(&dest),
+                        ttl,
+                        [](udx_socket_send_t* req, int) {
+                            delete static_cast<SendContext*>(req->data);
+                        });
+}
+
 void RpcSocket::handle_message(const uint8_t* data, size_t len,
                                const struct sockaddr_in* addr) {
     if (closing_) return;

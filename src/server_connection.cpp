@@ -33,6 +33,7 @@ ServerConnection::ServerConnection(ServerConnection&& other) noexcept
       firewalled(other.firewalled),
       has_error(other.has_error),
       error_code(other.error_code),
+      puncher(std::move(other.puncher)),
       created_at(other.created_at) {
     other.raw_stream = nullptr;  // Transfer ownership
 }
@@ -57,6 +58,7 @@ ServerConnection& ServerConnection::operator=(ServerConnection&& other) noexcept
         firewalled = other.firewalled;
         has_error = other.has_error;
         error_code = other.error_code;
+        puncher = std::move(other.puncher);
         created_at = other.created_at;
     }
     return *this;

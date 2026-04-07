@@ -62,6 +62,7 @@ struct ConnectResult {
     compact::Ipv4Address peer_address;
     uint32_t remote_udx_id = 0;
     uint32_t local_udx_id = 0;
+    udx_stream_t* raw_stream = nullptr;  // Pre-created during handshake (like JS rawStream)
 };
 
 using ConnectCallback = std::function<void(int error, const ConnectResult& result)>;

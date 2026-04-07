@@ -132,6 +132,9 @@ public:
     // Send a 1-byte [0x00] UDP probe to the given address
     void send_probe(const compact::Ipv4Address& to);
 
+    // Send a 1-byte [0x00] probe with custom TTL (JS: openSession uses TTL=5)
+    void send_probe_ttl(const compact::Ipv4Address& to, int ttl);
+
     // Send raw UDP bytes to an address (used for probes and RPC)
     void udp_send(const std::vector<uint8_t>& buf, const compact::Ipv4Address& to);
 

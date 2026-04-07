@@ -170,6 +170,7 @@ int hyperdht_connect(hyperdht_t* dht,
                         result.handshake_hash, result.remote_public_key,
                         result.peer_address, result.remote_udx_id,
                         result.local_udx_id, true);
+        conn.raw_stream = result.raw_stream;  // Pass pre-created rawStream
         cb(0, &conn, userdata);
     });
 
@@ -486,9 +487,9 @@ hyperdht_stream_t* hyperdht_stream_open(
         tx, rx, hash, conn->is_initiator != 0);
 
     if (conn->raw_stream) {
-        // Server path: reuse the rawStream created during handshake.
-        // It's already registered on the socket with a firewall callback.
-        // Matches JS: hs.rawStream.connect(socket, remotePayload.udx.id, port, host)
+        // Reuse the rawStream pre-created during handshake (both client and server).
+        // Already registered on the socket; firewall ctx already cleaned up.
+        // Matches JS: rawStream.connect(socket, remotePayload.udx.id, port, host)
         s->raw = static_cast<udx_stream_t*>(conn->raw_stream);
         // The Server stored context in raw->data during handshake.
         // We're taking over — clear it (the on_close callback would have
@@ -504,7 +505,7 @@ hyperdht_stream_t* hyperdht_stream_open(
                                reinterpret_cast<const struct sockaddr*>(&dest));
         }
     } else {
-        // Client path: create a new UDX stream (embedded in struct)
+        // Fallback: create a new UDX stream (no pre-created rawStream)
         s->raw = &s->raw_stream;
         udx_stream_init(dht->dht->socket().udx_handle(), s->raw,
                         conn->local_udx_id, stream_on_close_cb, nullptr);

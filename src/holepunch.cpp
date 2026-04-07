@@ -264,24 +264,38 @@ void Holepuncher::stop() {
 
 void Holepuncher::send_probe(const compact::Ipv4Address& addr) {
     if (send_fn_) {
-        DHT_LOG( "  [hp] Sending probe to %s:%u\n",
+        DHT_LOG("  [hp] Sending probe to %s:%u\n",
                 addr.host_string().c_str(), addr.port);
         send_fn_(addr);
     }
 }
 
+void Holepuncher::open_session(const compact::Ipv4Address& addr) {
+    if (send_ttl_fn_) {
+        DHT_LOG("  [hp] openSession (TTL=5) to %s:%u\n",
+                addr.host_string().c_str(), addr.port);
+        send_ttl_fn_(addr, 5);  // HOLEPUNCH_TTL = 5
+    }
+}
+
 void Holepuncher::on_message(const compact::Ipv4Address& from) {
-    DHT_LOG( "  [hp] PROBE RECEIVED from %s:%u!\n",
+    DHT_LOG("  [hp] PROBE RECEIVED from %s:%u!\n",
             from.host_string().c_str(), from.port);
     if (connected_) return;
 
+    // JS: non-initiator echoes probe back, does NOT set connected (holepuncher.js:125-128)
+    if (!is_initiator_) {
+        send_probe(from);
+        return;
+    }
+
+    // Initiator: probe echo received → connection established
     connected_ = true;
     punching_ = false;
     if (punch_timer_ && !uv_is_closing(reinterpret_cast<uv_handle_t*>(punch_timer_))) {
         uv_timer_stop(punch_timer_);
     }
 
-    // Move-and-call: prevent reentrancy if callback destroys us
     auto cb = std::move(on_connect_);
     if (cb) {
         HolepunchResult result;
@@ -300,19 +314,26 @@ void Holepuncher::consistent_probe() {
     if (!punching_ || connected_ || punch_round_ >= 10) {
         if (punching_ && !connected_) {
             punching_ = false;
-            // Failed after 10 rounds
         }
         return;
     }
 
-    // Send probe to each known remote address
-    for (const auto& addr : remote_addresses_) {
-        send_probe(addr);
+    // JS: non-initiator waits 1s before first round (holepuncher.js:217)
+    // Gives initiator's openSession time to prime NAT
+    if (!is_initiator_ && punch_round_ == 0) {
+        punch_round_++;
+        uv_timer_start(punch_timer_, on_punch_timer, 1000, 0);
+        return;
+    }
+
+    // Send probes, filtering unverified addrs (JS: holepuncher.js:224)
+    for (const auto& ra : remote_addresses_) {
+        if (!ra.verified && (punch_round_ & 3) != 0) continue;
+        if (ra.addr.port == 0) continue;
+        send_probe(ra.addr);
     }
 
     punch_round_++;
-
-    // Schedule next round in 1 second
     uv_timer_start(punch_timer_, on_punch_timer, 1000, 0);
 }
 
@@ -329,7 +350,7 @@ void Holepuncher::random_probes() {
 
     // Send probe to a random port on the remote host
     if (!remote_addresses_.empty()) {
-        auto addr = remote_addresses_[0];
+        auto addr = remote_addresses_[0].addr;
         // Random port between 1000-65535
         uint16_t random_port = static_cast<uint16_t>(1000 + randombytes_uniform(64536));
         auto probe_addr = Ipv4Address::from_string(addr.host_string(), random_port);
@@ -614,11 +635,17 @@ void holepunch_connect(rpc::RpcSocket& socket,
             auto puncher = std::make_shared<Holepuncher>(socket.loop(), true);
             puncher->set_local_firewall(local_firewall);
             puncher->set_remote_firewall(effective_remote_fw);
-            puncher->set_remote_addresses(server_addrs);
+            // Use update_remote with first address verified (from relay)
+            std::string verified_host;
+            if (!server_addrs.empty()) verified_host = server_addrs[0].host_string();
+            puncher->update_remote(server_addrs, verified_host);
 
             // Wire probe sending through the SAME RpcSocket
             puncher->set_send_fn([&socket](const Ipv4Address& addr) {
                 socket.send_probe(addr);
+            });
+            puncher->set_send_ttl_fn([&socket](const Ipv4Address& addr, int ttl) {
+                socket.send_probe_ttl(addr, ttl);
             });
 
             // When we detect an incoming probe → success
@@ -726,13 +753,14 @@ void holepunch_connect(rpc::RpcSocket& socket,
                         }
                     }
 
-                    // Start probing. DON'T report success immediately —
-                    // wait for an incoming probe from the server, which
-                    // gives us the REAL address (matches JS initiator:
-                    // onconnect fires when probe arrives, not after sending).
-                    // The puncher's on_connect callback (set at line 603)
-                    // calls state->complete with the real address.
-                    // The timeout timer handles the failure case.
+                    // JS: openSession before punching (connect.js:557)
+                    // Prime NAT with low-TTL probe
+                    if (!server_addrs.empty()) {
+                        puncher->open_session(server_addrs[0]);
+                    }
+
+                    // Start probing. Wait for incoming probe echo from server
+                    // (JS: onconnect fires when probe arrives).
                     puncher->punch();
                 },
                 [state, puncher](uint16_t) {

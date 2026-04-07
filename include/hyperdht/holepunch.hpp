@@ -102,6 +102,14 @@ bool try_direct_connect(const peer_connect::HandshakeResult& hs,
 
 // Callback for sending a UDP probe to an address
 using SendProbeFn = std::function<void(const compact::Ipv4Address& addr)>;
+// Callback for sending a probe with custom TTL (JS: openSession uses TTL=5)
+using SendProbeTtlFn = std::function<void(const compact::Ipv4Address& addr, int ttl)>;
+
+// Remote address with verification status (JS: addr.verified in holepuncher.js)
+struct RemoteAddr {
+    compact::Ipv4Address addr;
+    bool verified = false;
+};
 
 class Holepuncher {
 public:
@@ -113,14 +121,30 @@ public:
 
     // Set the function used to send UDP probes (typically RpcSocket::send_probe)
     void set_send_fn(SendProbeFn fn) { send_fn_ = std::move(fn); }
+    void set_send_ttl_fn(SendProbeTtlFn fn) { send_ttl_fn_ = std::move(fn); }
+
+    // JS: openSession(addr) — send low-TTL (5) probe to prime NAT mapping
+    void open_session(const compact::Ipv4Address& addr);
 
     // Set our firewall type and the remote's
     void set_local_firewall(uint32_t fw) { local_firewall_ = fw; }
     void set_remote_firewall(uint32_t fw) { remote_firewall_ = fw; }
 
-    // Set target addresses to probe
+    // Set target addresses (all unverified)
     void set_remote_addresses(const std::vector<compact::Ipv4Address>& addrs) {
-        remote_addresses_ = addrs;
+        remote_addresses_.clear();
+        for (const auto& a : addrs) remote_addresses_.push_back({a, false});
+    }
+
+    // JS: updateRemote — set addresses with optional verified host
+    void update_remote(const std::vector<compact::Ipv4Address>& addrs,
+                       const std::string& verified_host = "") {
+        remote_addresses_.clear();
+        for (const auto& a : addrs) {
+            bool v = (!verified_host.empty() && a.host_string() == verified_host) ||
+                     is_verified(a.host_string());
+            remote_addresses_.push_back({a, v});
+        }
     }
 
     // Set callback for when a connection is established
@@ -155,11 +179,12 @@ private:
     uint32_t local_firewall_ = peer_connect::FIREWALL_UNKNOWN;
     uint32_t remote_firewall_ = peer_connect::FIREWALL_UNKNOWN;
 
-    std::vector<compact::Ipv4Address> remote_addresses_;
+    std::vector<RemoteAddr> remote_addresses_;
     int punch_round_ = 0;
     int random_probes_left_ = 0;
 
     SendProbeFn send_fn_;
+    SendProbeTtlFn send_ttl_fn_;
     OnHolepunchCallback on_connect_;
 
     // Heap-allocated so libuv can outlive this object during async close
@@ -169,6 +194,13 @@ private:
     void consistent_probe();   // CONSISTENT+CONSISTENT
     void random_probes();      // CONSISTENT+RANDOM
     // RANDOM+CONSISTENT would need multiple sockets — simplified for now
+
+    bool is_verified(const std::string& host) const {
+        for (const auto& ra : remote_addresses_) {
+            if (ra.verified && ra.addr.host_string() == host) return true;
+        }
+        return false;
+    }
 
     static void on_punch_timer(uv_timer_t* timer);
 };

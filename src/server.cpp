@@ -298,31 +298,38 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     }
 
     if (reply.should_punch) {
-        DHT_LOG( "  [server] Client punching (id=%d, fw=%u, %zu addrs)\n",
+        DHT_LOG("  [server] Client punching (id=%d, fw=%u, %zu addrs)\n",
                 hp_msg.id, reply.remote_firewall,
                 reply.remote_addresses.size());
 
-        // Send probes to client's valid addresses.
-        // JS responder: sends probes AND echoes incoming probes.
-        for (const auto& addr : reply.remote_addresses) {
-            if (addr.port == 0) continue;
-            socket_.send_probe(addr);
+        // JS: server creates Holepuncher(dht, session, false) and calls punch()
+        // → 10 rounds of probes at 1s intervals. Non-initiator echoes received probes.
+        if (!conn.puncher) {
+            conn.puncher = std::make_shared<holepunch::Holepuncher>(socket_.loop(), false);
+            conn.puncher->set_send_fn([this](const compact::Ipv4Address& addr) {
+                if (!closed_) socket_.send_probe(addr);
+            });
+            conn.puncher->set_local_firewall(our_fw);
         }
+        conn.puncher->set_remote_firewall(reply.remote_firewall);
 
-        // Register this connection for rawStream firewall detection.
-        // When the client's UDX packet arrives, the firewall fires
-        // with the real address → on_raw_stream_firewall → on_socket.
-        // This matches JS: server doesn't call onsocket from holepunch
-        // handler — it waits for the rawStream firewall to fire.
+        // Filter out port-0 addresses and set as remote targets
+        std::vector<compact::Ipv4Address> valid_addrs;
+        for (const auto& addr : reply.remote_addresses) {
+            if (addr.port != 0) valid_addrs.push_back(addr);
+        }
+        conn.puncher->set_remote_addresses(valid_addrs);
+        conn.puncher->punch();
+
+        // Register for rawStream firewall detection
         if (conn.raw_stream) {
             pending_punch_streams_[conn.local_udx_id] = hp_msg.id;
         }
 
-        // Install probe echo — JS responder echoes probes back.
-        // This tells the client "I can reach you" → client connects UDX.
+        // Install probe listener — routes to puncher's on_message (echoes back)
+        // and also serves as a global echo for any probe from any client
         socket_.on_holepunch_probe([this](const compact::Ipv4Address& from) {
             if (closed_) return;
-            // Echo it back (JS: holepunch(ref.socket, addr, false))
             socket_.send_probe(from);
         });
     }

@@ -337,7 +337,6 @@ void peer_handshake(rpc::RpcSocket& socket,
             result.remote_public_key = remote_pubkey;
 
             on_done(result);
-            // noise_ik shared_ptr released automatically when both lambdas are destroyed
         },
         [noise_ik, on_done](uint16_t) {
             HandshakeResult result;

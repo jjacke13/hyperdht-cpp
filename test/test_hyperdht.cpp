@@ -5,8 +5,11 @@
 
 #include <sodium.h>
 #include <uv.h>
+#include <udx.h>
 
 #include "hyperdht/dht.hpp"
+#include "hyperdht/hyperdht.h"
+#include "hyperdht/secret_stream.hpp"
 
 using namespace hyperdht;
 
@@ -105,6 +108,106 @@ TEST(HyperDHT, DestroyClosesServers) {
     EXPECT_EQ(dht.router().size(), 0u);
 
     uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// Live test: HyperDHT::connect() → stream open → SecretStream to JS server.
+// Uses the full do_connect pipeline (rawStream + holepunch) + C API stream.
+// Set SERVER_KEY=<64-hex-chars> to enable.
+TEST(HyperDHT, LiveConnect) {
+    const char* key_env = std::getenv("SERVER_KEY");
+    if (!key_env || strlen(key_env) != 64) {
+        GTEST_SKIP() << "Set SERVER_KEY=<64-hex-chars> to run this test";
+    }
+
+    noise::PubKey server_pk{};
+    for (int i = 0; i < 32; i++) {
+        unsigned int byte;
+        sscanf(key_env + i * 2, "%02x", &byte);
+        server_pk[i] = static_cast<uint8_t>(byte);
+    }
+
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    dht.bind();
+    printf("  Bound to port %u\n", dht.port());
+
+    bool connected = false;
+    bool header_received = false;
+    udx_stream_t* stream = nullptr;
+    secret_stream::SecretStream* ss = nullptr;
+
+    dht.connect(server_pk, [&](int err, const ConnectResult& r) {
+        printf("  connect: err=%d success=%d\n", err, r.success);
+        if (err != 0 || !r.success) return;
+
+        connected = true;
+        printf("  peer: %s:%u  udx: us=%u them=%u  rawStream=%s\n",
+               r.peer_address.host_string().c_str(), r.peer_address.port,
+               r.local_udx_id, r.remote_udx_id,
+               r.raw_stream ? "yes" : "no");
+
+        // Step 2: UDX stream connect — reuse rawStream from ConnectResult
+        stream = r.raw_stream;
+        struct sockaddr_in dest{};
+        uv_ip4_addr(r.peer_address.host_string().c_str(), r.peer_address.port, &dest);
+        udx_stream_connect(stream, dht.socket().socket_handle(),
+                           r.remote_udx_id,
+                           reinterpret_cast<const struct sockaddr*>(&dest));
+
+        // Step 3: SecretStream header exchange
+        ss = new secret_stream::SecretStream(r.tx_key, r.rx_key, r.handshake_hash, true);
+        auto header = ss->create_header_message();
+        printf("  Sending SecretStream header (%zu bytes)\n", header.size());
+
+        auto* hdr_buf = new std::vector<uint8_t>(std::move(header));
+        uv_buf_t uv_buf = uv_buf_init(
+            reinterpret_cast<char*>(hdr_buf->data()),
+            static_cast<unsigned int>(hdr_buf->size()));
+        auto* wreq = static_cast<udx_stream_write_t*>(
+            calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
+        wreq->data = hdr_buf;
+        udx_stream_write(wreq, stream, &uv_buf, 1,
+            [](udx_stream_write_t* req, int, int) {
+                delete static_cast<std::vector<uint8_t>*>(req->data);
+                free(req);
+            });
+
+        // Read the server's header + data
+        stream->data = &header_received;
+        udx_stream_read_start(stream, [](udx_stream_t* s, ssize_t nread, const uv_buf_t* buf) {
+            if (nread <= 0) return;
+            auto* hdr_done = static_cast<bool*>(s->data);
+            if (!*hdr_done && nread >= 59) {
+                printf("  Received server SecretStream header!\n");
+                *hdr_done = true;
+            }
+        });
+    });
+
+    // Timeout — clean up and stop
+    uv_timer_t timeout;
+    uv_timer_init(&loop, &timeout);
+    struct TimeoutCtx { HyperDHT* dht; udx_stream_t** stream; secret_stream::SecretStream** ss; };
+    auto* tctx = new TimeoutCtx{&dht, &stream, &ss};
+    timeout.data = tctx;
+    uv_timer_start(&timeout, [](uv_timer_t* t) {
+        auto* c = static_cast<TimeoutCtx*>(t->data);
+        printf("  TIMEOUT — cleaning up\n");
+        if (*c->stream) udx_stream_destroy(*c->stream);
+        delete *c->ss;
+        c->dht->destroy();
+        delete c;
+        uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
+    }, 45000, 0);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+
+    EXPECT_TRUE(connected) << "connect should succeed";
+    EXPECT_TRUE(header_received) << "SecretStream header should be received";
+
     uv_loop_close(&loop);
 }
 

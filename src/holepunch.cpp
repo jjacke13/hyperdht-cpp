@@ -417,6 +417,8 @@ struct PunchState {
     rpc::RpcSocket* socket = nullptr;
     uv_timer_t* timeout = nullptr;
     bool completed = false;
+    int round = 0;               // Current holepunch round
+    bool retried_unknown = false; // JS: retry once if server fw=UNKNOWN
 
     void complete(const HolepunchResult& result) {
         if (completed) return;
@@ -488,6 +490,8 @@ void holepunch_connect(rpc::RpcSocket& socket,
     probe.firewall = local_firewall;
     probe.round = 0;
     probe.addresses = local_addresses;
+    // JS: remoteAddress = serverAddress (where we think the server is)
+    probe.remote_address = peer_addr;
 
     auto probe_bytes = encode_holepunch_payload(probe);
     auto encrypted_probe = state->secure->encrypt(probe_bytes.data(), probe_bytes.size());
@@ -566,6 +570,24 @@ void holepunch_connect(rpc::RpcSocket& socket,
                 return;
             }
 
+            // JS: if remote firewall is UNKNOWN AND both sides would be
+            // unknown/random, abort. If only remote is UNKNOWN, treat as
+            // CONSISTENT (optimistic) — the server may not have sampled
+            // enough yet but is likely reachable.
+            uint32_t effective_remote_fw = server_r1.firewall;
+            if (effective_remote_fw == peer_connect::FIREWALL_UNKNOWN) {
+                DHT_LOG("  [hp] Server firewall UNKNOWN, treating as CONSISTENT\n");
+                effective_remote_fw = peer_connect::FIREWALL_CONSISTENT;
+            }
+
+            // JS: abort if both sides are RANDOM (impossible to punch)
+            if (effective_remote_fw >= peer_connect::FIREWALL_RANDOM &&
+                local_firewall >= peer_connect::FIREWALL_RANDOM) {
+                DHT_LOG("  [hp] Both sides RANDOM — cannot holepunch\n");
+                state->complete({});
+                return;
+            }
+
             // Collect server's addresses (from payload + relay peerAddress)
             std::vector<Ipv4Address> server_addrs = server_r1.addresses;
             if (hp_resp.peer_address.has_value()) {
@@ -591,7 +613,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
             // -------------------------------------------------------------------
             auto puncher = std::make_shared<Holepuncher>(socket.loop(), true);
             puncher->set_local_firewall(local_firewall);
-            puncher->set_remote_firewall(server_r1.firewall);
+            puncher->set_remote_firewall(effective_remote_fw);
             puncher->set_remote_addresses(server_addrs);
 
             // Wire probe sending through the SAME RpcSocket
@@ -704,29 +726,21 @@ void holepunch_connect(rpc::RpcSocket& socket,
                         }
                     }
 
-                    // Start our probing (opens NAT holes for the server)
+                    // Start probing. DON'T report success immediately —
+                    // wait for an incoming probe from the server, which
+                    // gives us the REAL address (matches JS initiator:
+                    // onconnect fires when probe arrives, not after sending).
+                    // The puncher's on_connect callback (set at line 603)
+                    // calls state->complete with the real address.
+                    // The timeout timer handles the failure case.
                     puncher->punch();
-
-                    // Report success immediately — the caller should connect
-                    // the UDX stream now. UDX SYN retries + our probes will
-                    // open the NAT from both sides. We don't wait for a [0x00]
-                    // probe back because the server may connect its stream
-                    // (and stop probing) before we detect one.
-                    HolepunchResult result;
-                    result.success = true;
-                    result.firewall = server_addrs.empty() ? 0 : 0;
-                    result.address = server_addrs[0];
-                    state->complete(result);
                 },
-                [state, puncher, server_addrs](uint16_t) {
+                [state, puncher](uint16_t) {
                     DHT_LOG( "  [hp] Round 2: TIMEOUT\n");
-                    // Round 2 timeout — still try probing and report address
+                    // Round 2 relay timeout — still start probing.
+                    // The puncher on_connect or overall timeout handles completion.
                     if (!state->completed) {
                         puncher->punch();
-                        HolepunchResult result;
-                        result.success = true;
-                        result.address = server_addrs[0];
-                        state->complete(result);
                     }
                 });
         },

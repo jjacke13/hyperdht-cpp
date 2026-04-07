@@ -152,10 +152,27 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                         return;
                     }
 
-                    // Step 3: PEER_HOLEPUNCH
+                    // JS: if no holepunch info (server is OPEN or unreachable
+                    // for holepunching), try direct connect using addresses
                     if (!hs.remote_payload.holepunch.has_value() ||
                         hs.remote_payload.holepunch->relays.empty()) {
-                        state->complete(-4);
+                        // Use first address from the server's payload
+                        if (!hs.remote_payload.addresses4.empty()) {
+                            ConnectResult result;
+                            result.success = true;
+                            result.tx_key = hs.tx_key;
+                            result.rx_key = hs.rx_key;
+                            result.handshake_hash = hs.handshake_hash;
+                            result.remote_public_key = hs.remote_public_key;
+                            result.peer_address = hs.remote_payload.addresses4[0];
+                            result.local_udx_id = state->our_udx_id;
+                            if (hs.remote_payload.udx.has_value()) {
+                                result.remote_udx_id = hs.remote_payload.udx->id;
+                            }
+                            state->complete(0, result);
+                        } else {
+                            state->complete(-4);
+                        }
                         return;
                     }
 

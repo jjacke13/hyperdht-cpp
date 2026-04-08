@@ -20,6 +20,7 @@
 // Channels pair by (protocol, id): when both sides open the same
 // (protocol, id), the channels are linked and data can flow.
 
+#include <any>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -39,6 +40,8 @@ constexpr uint32_t CONTROL_BATCH = 0;
 constexpr uint32_t CONTROL_OPEN = 1;
 constexpr uint32_t CONTROL_REJECT = 2;
 constexpr uint32_t CONTROL_CLOSE = 3;
+
+constexpr size_t MAX_BUFFERED = 32768;  // 32KB backpressure threshold
 
 // ---------------------------------------------------------------------------
 // Forward declarations
@@ -83,10 +86,14 @@ public:
     uint32_t local_id() const { return local_id_; }
     uint32_t remote_id() const { return remote_id_; }
 
+    // Arbitrary application data (matches JS userData)
+    std::any user_data;
+
     // Callbacks
     std::function<void(const uint8_t* handshake, size_t len)> on_open;
     std::function<void()> on_close;
     std::function<void()> on_destroy;
+    std::function<void()> on_drain;  // Fired when mux is drained
 
 private:
     friend class Mux;
@@ -105,12 +112,20 @@ private:
     std::vector<uint8_t> local_handshake_;
     std::vector<MessageHandler> messages_;
 
+    // Buffered messages received before channel is fully opened
+    struct PendingMessage {
+        uint32_t type;
+        std::vector<uint8_t> data;
+    };
+    std::vector<PendingMessage> pending_messages_;
+
     // Pairing key: "protocol##hex(id)"
     std::string pair_key() const;
 
     // Called by Mux when remote opens matching channel
     void set_remote_id(uint32_t id) { remote_id_ = id; }
     void fully_open(const uint8_t* remote_handshake, size_t len);
+    void drain_pending();  // Process buffered messages after open
     void remote_close();
     void destroy();
     void dispatch(uint32_t type, const uint8_t* data, size_t len);
@@ -123,13 +138,15 @@ private:
 class Mux {
 public:
     // write_fn: called to write a frame to the underlying stream.
-    // The frame is a complete Protomux message (caller wraps in SecretStream).
-    using WriteFn = std::function<void(const uint8_t* data, size_t len)>;
+    // Returns true if drained (no backpressure), false if backpressured.
+    using WriteFn = std::function<bool(const uint8_t* data, size_t len)>;
     explicit Mux(WriteFn write_fn);
 
     // Create a channel. Returns a non-owning pointer (Mux owns the channel).
+    // unique: if true (default), returns nullptr if (protocol, id) already open
     Channel* create_channel(const std::string& protocol,
-                            const std::vector<uint8_t>& id = {});
+                            const std::vector<uint8_t>& id = {},
+                            bool unique = true);
 
     // Feed an incoming frame (after SecretStream decryption).
     // Each call = one complete Protomux frame.
@@ -139,15 +156,47 @@ public:
     void cork();
     void uncork();
 
-    // Register notification for incoming channel opens from remote.
-    // Called when remote opens a channel we haven't created locally yet.
+    // -----------------------------------------------------------------------
+    // Notify: per-protocol callback registration (matches JS pair/unpair)
+    // -----------------------------------------------------------------------
+
     using NotifyFn = std::function<void(const std::string& protocol,
                                         const std::vector<uint8_t>& id,
                                         const uint8_t* handshake, size_t hs_len)>;
+
+    // Register a notify callback for a specific (protocol, id) pair.
+    // If id is empty, matches any id for that protocol.
+    void pair(const std::string& protocol, const std::vector<uint8_t>& id,
+              NotifyFn fn);
+
+    // Unregister a notify callback
+    void unpair(const std::string& protocol, const std::vector<uint8_t>& id);
+
+    // Global fallback notify (called if no pair match)
     void on_notify(NotifyFn fn) { on_notify_ = std::move(fn); }
+
+    // -----------------------------------------------------------------------
+    // Backpressure
+    // -----------------------------------------------------------------------
+
+    // True if the underlying stream has capacity (no backpressure)
+    bool drained() const { return drained_; }
+
+    // Call when underlying stream drains — fires ondrain on all channels
+    void on_stream_drain();
+
+    // Number of bytes buffered in pending message queues
+    size_t buffered() const { return buffered_bytes_; }
+
+    // -----------------------------------------------------------------------
+    // State queries
+    // -----------------------------------------------------------------------
 
     // Number of active channels
     size_t channel_count() const { return channels_.size(); }
+
+    // True if all allocated local IDs are freed (no active channels)
+    bool is_idle() const { return channels_.empty(); }
 
 private:
     friend class Channel;
@@ -164,6 +213,9 @@ private:
     // Local ID → Channel* lookup (for incoming CLOSE/pairing)
     std::unordered_map<uint32_t, Channel*> local_to_channel_;
 
+    // Per-protocol notify callbacks (pair/unpair)
+    std::unordered_map<std::string, NotifyFn> pair_notify_;
+
     // Pending remote opens waiting for local pairing
     struct PendingOpen {
         uint32_t remote_local_id;   // The remote's local ID for this channel
@@ -177,7 +229,11 @@ private:
     int cork_count_ = 0;
     std::vector<uint8_t> cork_buffer_;
 
-    // Write a frame (respects cork)
+    // Backpressure state
+    bool drained_ = true;
+    size_t buffered_bytes_ = 0;
+
+    // Write a frame (respects cork, updates drained)
     void write_frame(const uint8_t* data, size_t len);
 
     // Control message handlers
@@ -190,6 +246,11 @@ private:
     // Pairing
     Channel* find_by_pair_key(const std::string& key);
     void try_pair(Channel* local, const PendingOpen& remote);
+
+    // Notify dispatch — checks pair map then global fallback
+    void dispatch_notify(const std::string& protocol,
+                         const std::vector<uint8_t>& id,
+                         const uint8_t* handshake, size_t hs_len);
 
     // Remove a channel from all lookups
     void remove_channel(Channel* ch);

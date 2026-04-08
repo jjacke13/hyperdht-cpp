@@ -231,6 +231,19 @@ void Channel::fully_open(const uint8_t* remote_handshake, size_t len) {
     if (opened_ || destroyed_) return;
     opened_ = true;
     if (on_open) on_open(remote_handshake, len);
+    drain_pending();
+}
+
+void Channel::drain_pending() {
+    // Process any messages that arrived before channel was fully opened
+    auto pending = std::move(pending_messages_);
+    pending_messages_.clear();
+    for (const auto& pm : pending) {
+        mux_.buffered_bytes_ -= pm.data.size();
+        if (!destroyed_) {
+            dispatch(pm.type, pm.data.data(), pm.data.size());
+        }
+    }
 }
 
 void Channel::remote_close() {
@@ -269,15 +282,27 @@ void Channel::dispatch(uint32_t type, const uint8_t* data, size_t len) {
 Mux::Mux(WriteFn write_fn) : write_fn_(std::move(write_fn)) {}
 
 Channel* Mux::create_channel(const std::string& protocol,
-                              const std::vector<uint8_t>& id) {
+                              const std::vector<uint8_t>& id,
+                              bool unique) {
+    // Build pair key for uniqueness check
+    std::string key = protocol + "##";
+    if (!id.empty()) {
+        key += to_hex(id.data(), id.size());
+    }
+
+    // Unique check: reject if (protocol, id) already open
+    if (unique) {
+        Channel* existing = find_by_pair_key(key);
+        if (existing && existing->opened_) {
+            return nullptr;
+        }
+    }
+
     uint32_t local_id = next_local_id_++;
     auto ch = std::make_unique<Channel>(*this, protocol, id, local_id);
     Channel* ptr = ch.get();
     channels_.push_back(std::move(ch));
     local_to_channel_[local_id] = ptr;
-
-    // Don't auto-pair here — wait for channel.open() so the caller
-    // has time to set on_open and add message handlers first.
 
     return ptr;
 }
@@ -287,7 +312,9 @@ void Mux::write_frame(const uint8_t* data, size_t len) {
         cork_buffer_.insert(cork_buffer_.end(), data, data + len);
         return;
     }
-    if (write_fn_) write_fn_(data, len);
+    if (write_fn_) {
+        drained_ = write_fn_(data, len);
+    }
 }
 
 void Mux::cork() {
@@ -299,7 +326,7 @@ void Mux::uncork() {
         cork_count_ = 0;
         if (!cork_buffer_.empty()) {
             if (write_fn_) {
-                write_fn_(cork_buffer_.data(), cork_buffer_.size());
+                drained_ = write_fn_(cork_buffer_.data(), cork_buffer_.size());
             }
             cork_buffer_.clear();
         }
@@ -375,12 +402,7 @@ void Mux::handle_open(const uint8_t* data, size_t len) {
         PendingOpen pending{remote_local_id, handshake, protocol, id};
         pending_remote_[key] = std::move(pending);
 
-        if (on_notify_) {
-            auto proto_copy = protocol;
-            auto id_copy = id;
-            auto hs_copy = handshake;
-            on_notify_(proto_copy, id_copy, hs_copy.data(), hs_copy.size());
-        }
+        dispatch_notify(protocol, id, handshake.data(), handshake.size());
     }
 }
 
@@ -454,13 +476,23 @@ void Mux::handle_data(uint32_t channel_id, const uint8_t* data, size_t len) {
     if (it == remote_to_channel_.end()) return;
 
     Channel* ch = it->second;
-    if (!ch->opened_ || ch->destroyed_) return;
+    if (ch->destroyed_) return;
 
     const uint8_t* ptr = data;
     const uint8_t* end = data + len;
 
     uint32_t type = static_cast<uint32_t>(varint_decode(ptr, end));
     size_t remaining = static_cast<size_t>(end - ptr);
+
+    if (!ch->opened_) {
+        // Buffer the message until channel is fully opened
+        Channel::PendingMessage pm;
+        pm.type = type;
+        pm.data.assign(ptr, ptr + remaining);
+        buffered_bytes_ += remaining;
+        ch->pending_messages_.push_back(std::move(pm));
+        return;
+    }
 
     ch->dispatch(type, ptr, remaining);
 }
@@ -485,6 +517,69 @@ void Mux::try_pair(Channel* local, const PendingOpen& remote) {
 
     // Fully open with the remote's handshake
     local->fully_open(remote.handshake.data(), remote.handshake.size());
+}
+
+// ---------------------------------------------------------------------------
+// Pair/Unpair
+// ---------------------------------------------------------------------------
+
+void Mux::pair(const std::string& protocol, const std::vector<uint8_t>& id,
+               NotifyFn fn) {
+    std::string key = protocol + "##";
+    if (!id.empty()) {
+        key += to_hex(id.data(), id.size());
+    }
+    pair_notify_[key] = std::move(fn);
+}
+
+void Mux::unpair(const std::string& protocol, const std::vector<uint8_t>& id) {
+    std::string key = protocol + "##";
+    if (!id.empty()) {
+        key += to_hex(id.data(), id.size());
+    }
+    pair_notify_.erase(key);
+}
+
+void Mux::dispatch_notify(const std::string& protocol,
+                           const std::vector<uint8_t>& id,
+                           const uint8_t* handshake, size_t hs_len) {
+    // Check specific (protocol, id) first
+    std::string key = protocol + "##";
+    if (!id.empty()) {
+        key += to_hex(id.data(), id.size());
+    }
+    auto it = pair_notify_.find(key);
+    if (it != pair_notify_.end()) {
+        it->second(protocol, id, handshake, hs_len);
+        return;
+    }
+
+    // Fall back to protocol-only (empty id)
+    std::string proto_key = protocol + "##";
+    it = pair_notify_.find(proto_key);
+    if (it != pair_notify_.end()) {
+        it->second(protocol, id, handshake, hs_len);
+        return;
+    }
+
+    // Global fallback
+    if (on_notify_) {
+        on_notify_(protocol, id, handshake, hs_len);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drain
+// ---------------------------------------------------------------------------
+
+void Mux::on_stream_drain() {
+    drained_ = true;
+    // Notify all channels
+    for (auto& ch : channels_) {
+        if (ch->opened_ && !ch->destroyed_ && ch->on_drain) {
+            ch->on_drain();
+        }
+    }
 }
 
 void Mux::remove_channel(Channel* ch) {

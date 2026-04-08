@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "description": "JS dependencies for hyperdht-cpp cross-tests. Versions pinned to match VERSIONS.md.",
+  "dependencies": {
+    "hyperdht": "6.29.1",
+    "compact-encoding": "2.19.0",
+    "compact-encoding-net": "1.2.0"
+  }
+}

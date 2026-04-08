@@ -14,6 +14,8 @@ using compact::Buffer;
 using compact::Fixed32;
 using compact::Ipv4Addr;
 using compact::Ipv4Address;
+using compact::Ipv6Addr;
+using compact::Ipv6Address;
 using compact::Array;
 
 // Real HyperDHT prologue: NS_PEER_HANDSHAKE
@@ -47,8 +49,10 @@ std::vector<uint8_t> encode_noise_payload(const NoisePayload& p) {
     uint32_t flags = 0;
     if (p.holepunch.has_value()) flags |= 1;
     if (!p.addresses4.empty()) flags |= 2;
+    if (!p.addresses6.empty()) flags |= 4;
     if (p.udx.has_value()) flags |= 8;
     if (p.has_secret_stream) flags |= 16;
+    if (p.relay_through.has_value()) flags |= 32;
     if (!p.relay_addresses.empty()) flags |= 64;
     Uint::preencode(state, flags);
     Uint::preencode(state, p.error);
@@ -65,6 +69,9 @@ std::vector<uint8_t> encode_noise_payload(const NoisePayload& p) {
     if (!p.addresses4.empty()) {
         Array<Ipv4Addr, Ipv4Address>::preencode(state, p.addresses4);
     }
+    if (!p.addresses6.empty()) {
+        Array<Ipv6Addr, Ipv6Address>::preencode(state, p.addresses6);
+    }
     if (p.udx.has_value()) {
         Uint::preencode(state, p.udx->version);
         Uint::preencode(state, p.udx->reusable_socket ? 1u : 0u);
@@ -73,6 +80,12 @@ std::vector<uint8_t> encode_noise_payload(const NoisePayload& p) {
     }
     if (p.has_secret_stream) {
         Uint::preencode(state, 1u);
+    }
+    if (p.relay_through.has_value()) {
+        Uint::preencode(state, p.relay_through->version);
+        Uint::preencode(state, 0u);  // flags (reserved, always 0)
+        Fixed32::preencode(state, p.relay_through->public_key);
+        Fixed32::preencode(state, p.relay_through->token);
     }
     if (!p.relay_addresses.empty()) {
         Array<Ipv4Addr, Ipv4Address>::preencode(state, p.relay_addresses);
@@ -98,6 +111,9 @@ std::vector<uint8_t> encode_noise_payload(const NoisePayload& p) {
     if (!p.addresses4.empty()) {
         Array<Ipv4Addr, Ipv4Address>::encode(state, p.addresses4);
     }
+    if (!p.addresses6.empty()) {
+        Array<Ipv6Addr, Ipv6Address>::encode(state, p.addresses6);
+    }
     if (p.udx.has_value()) {
         Uint::encode(state, p.udx->version);
         Uint::encode(state, p.udx->reusable_socket ? 1u : 0u);
@@ -106,6 +122,12 @@ std::vector<uint8_t> encode_noise_payload(const NoisePayload& p) {
     }
     if (p.has_secret_stream) {
         Uint::encode(state, 1u);
+    }
+    if (p.relay_through.has_value()) {
+        Uint::encode(state, p.relay_through->version);
+        Uint::encode(state, 0u);  // flags
+        Fixed32::encode(state, p.relay_through->public_key);
+        Fixed32::encode(state, p.relay_through->token);
     }
     if (!p.relay_addresses.empty()) {
         Array<Ipv4Addr, Ipv4Address>::encode(state, p.relay_addresses);
@@ -153,9 +175,8 @@ NoisePayload decode_noise_payload(const uint8_t* data, size_t len) {
         if (state.error) return p;
     }
     if (flags & 4) {
-        auto addrs6 = Array<Ipv4Addr, Ipv4Address>::decode(state);
+        p.addresses6 = Array<Ipv6Addr, Ipv6Address>::decode(state);
         if (state.error) return p;
-        (void)addrs6;
     }
     if (flags & 8) {
         UdxInfo info;
@@ -177,23 +198,20 @@ NoisePayload decode_noise_payload(const uint8_t* data, size_t len) {
         p.has_secret_stream = true;
     }
     if (flags & 32) {
-        // relayThrough: { version, flags, publicKey, token }
-        Uint::decode(state);
+        RelayThroughInfo rt;
+        rt.version = static_cast<uint32_t>(Uint::decode(state));
         if (state.error) return p;
-        Uint::decode(state);
+        Uint::decode(state);  // flags (reserved)
         if (state.error) return p;
-        Fixed32::decode(state);
+        rt.public_key = Fixed32::decode(state);
         if (state.error) return p;
-        Fixed32::decode(state);
+        rt.token = Fixed32::decode(state);
         if (state.error) return p;
+        p.relay_through = rt;
     }
     if (flags & 64) {
-        // relayAddresses — append to addresses4 so callers can try them
-        auto relay_addrs = Array<Ipv4Addr, Ipv4Address>::decode(state);
+        p.relay_addresses = Array<Ipv4Addr, Ipv4Address>::decode(state);
         if (state.error) return p;
-        for (const auto& a : relay_addrs) {
-            p.addresses4.push_back(a);
-        }
     }
 
     return p;

@@ -439,3 +439,141 @@ TEST(Error, EncodeOverflow) {
     Uint::encode(s, 0xFFFF);  // needs 3 bytes
     EXPECT_TRUE(s.error);
 }
+
+// ===========================================================================
+// IPv6 Address
+// ===========================================================================
+
+TEST(Ipv6Address, FromStringFull) {
+    auto addr = Ipv6Address::from_string("2001:db8:0:0:0:0:0:1", 8080);
+    // 2001 = 0x20, 0x01
+    EXPECT_EQ(addr.host[0], 0x20);
+    EXPECT_EQ(addr.host[1], 0x01);
+    // 0db8
+    EXPECT_EQ(addr.host[2], 0x0d);
+    EXPECT_EQ(addr.host[3], 0xb8);
+    // groups 3-7 are 0 except last
+    for (int i = 4; i < 14; i++) {
+        EXPECT_EQ(addr.host[i], 0) << "byte " << i;
+    }
+    // 0001
+    EXPECT_EQ(addr.host[14], 0x00);
+    EXPECT_EQ(addr.host[15], 0x01);
+    EXPECT_EQ(addr.port, 8080);
+}
+
+TEST(Ipv6Address, FromStringCompressed) {
+    // :: expands to fill missing groups
+    auto addr = Ipv6Address::from_string("fe80::1", 443);
+    EXPECT_EQ(addr.host[0], 0xfe);
+    EXPECT_EQ(addr.host[1], 0x80);
+    for (int i = 2; i < 14; i++) {
+        EXPECT_EQ(addr.host[i], 0) << "byte " << i;
+    }
+    EXPECT_EQ(addr.host[14], 0x00);
+    EXPECT_EQ(addr.host[15], 0x01);
+    EXPECT_EQ(addr.port, 443);
+}
+
+TEST(Ipv6Address, FromStringLoopback) {
+    auto addr = Ipv6Address::from_string("::1", 0);
+    for (int i = 0; i < 15; i++) {
+        EXPECT_EQ(addr.host[i], 0) << "byte " << i;
+    }
+    EXPECT_EQ(addr.host[15], 0x01);
+}
+
+TEST(Ipv6Address, FromStringAllZeros) {
+    auto addr = Ipv6Address::from_string("::", 1234);
+    for (int i = 0; i < 16; i++) {
+        EXPECT_EQ(addr.host[i], 0) << "byte " << i;
+    }
+    EXPECT_EQ(addr.port, 1234);
+}
+
+TEST(Ipv6Address, ToString) {
+    // Matches JS output: full expanded, no leading zeros, no :: compression
+    auto addr = Ipv6Address::from_string("2001:db8::1", 0);
+    EXPECT_EQ(addr.host_string(), "2001:db8:0:0:0:0:0:1");
+}
+
+TEST(Ipv6Address, ToStringLoopback) {
+    auto addr = Ipv6Address::from_string("::1", 0);
+    EXPECT_EQ(addr.host_string(), "0:0:0:0:0:0:0:1");
+}
+
+TEST(Ipv6Address, ToStringAllZeros) {
+    Ipv6Address addr;
+    EXPECT_EQ(addr.host_string(), "0:0:0:0:0:0:0:0");
+}
+
+TEST(Ipv6Address, ToStringFull) {
+    auto addr = Ipv6Address::from_string("fe80:0:0:0:0:0:0:1", 0);
+    EXPECT_EQ(addr.host_string(), "fe80:0:0:0:0:0:0:1");
+}
+
+TEST(Ipv6Address, StringRoundTrip) {
+    auto addr = Ipv6Address::from_string("2001:db8:85a3:0:0:8a2e:370:7334", 49737);
+    EXPECT_EQ(addr.host_string(), "2001:db8:85a3:0:0:8a2e:370:7334");
+    EXPECT_EQ(addr.port, 49737);
+}
+
+TEST(Ipv6Addr, RoundTrip) {
+    auto addr = Ipv6Address::from_string("2001:db8::1", 8080);
+    round_trip<Ipv6Addr>(addr);
+}
+
+TEST(Ipv6Addr, WireFormat) {
+    auto addr = Ipv6Address::from_string("fe80::1", 0x1234);
+    auto buf = encode_value<Ipv6Addr>(addr);
+    ASSERT_EQ(buf.size(), 18);
+    // fe80 group: big-endian
+    EXPECT_EQ(buf[0], 0xfe);
+    EXPECT_EQ(buf[1], 0x80);
+    // Groups 2-7: all zeros (12 bytes)
+    for (int i = 2; i < 14; i++) {
+        EXPECT_EQ(buf[i], 0) << "byte " << i;
+    }
+    // 0001 group
+    EXPECT_EQ(buf[14], 0x00);
+    EXPECT_EQ(buf[15], 0x01);
+    // Port LE
+    EXPECT_EQ(buf[16], 0x34);
+    EXPECT_EQ(buf[17], 0x12);
+}
+
+TEST(Ipv6Addr, DecodeShortBuffer) {
+    // Only 10 bytes — needs 18
+    std::vector<uint8_t> buf(10, 0);
+    auto s = State::for_decode(buf.data(), buf.size());
+    auto addr = Ipv6Addr::decode(s);
+    EXPECT_TRUE(s.error);
+}
+
+TEST(Ipv6Array, Empty) {
+    std::vector<Ipv6Address> addrs;
+    auto buf = encode_value<Ipv6Array>(addrs);
+    ASSERT_EQ(buf.size(), 1);
+    EXPECT_EQ(buf[0], 0x00);
+
+    auto decoded = decode_value<Ipv6Array, std::vector<Ipv6Address>>(buf);
+    EXPECT_TRUE(decoded.empty());
+}
+
+TEST(Ipv6Array, MultipleAddresses) {
+    std::vector<Ipv6Address> addrs = {
+        Ipv6Address::from_string("2001:db8::1", 8080),
+        Ipv6Address::from_string("fe80::1", 443),
+        Ipv6Address::from_string("::1", 0),
+    };
+
+    auto buf = encode_value<Ipv6Array>(addrs);
+    // varint(3)=1 + 3*18=54 = 55 bytes
+    EXPECT_EQ(buf.size(), 55);
+
+    auto decoded = decode_value<Ipv6Array, std::vector<Ipv6Address>>(buf);
+    ASSERT_EQ(decoded.size(), 3);
+    EXPECT_EQ(decoded[0], addrs[0]);
+    EXPECT_EQ(decoded[1], addrs[1]);
+    EXPECT_EQ(decoded[2], addrs[2]);
+}

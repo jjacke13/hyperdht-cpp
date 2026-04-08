@@ -91,6 +91,48 @@ const vectors = {
             ])
         },
     ],
+
+    // IPv6 address (compact-encoding-net)
+    ipv6addr: [
+        {
+            host: '2001:db8:0:0:0:0:0:1', port: 8080,
+            hex: encode(net.ipv6Address, { host: '2001:db8::1', port: 8080 })
+        },
+        {
+            host: 'fe80:0:0:0:0:0:0:1', port: 443,
+            hex: encode(net.ipv6Address, { host: 'fe80::1', port: 443 })
+        },
+        {
+            host: '0:0:0:0:0:0:0:1', port: 0,
+            hex: encode(net.ipv6Address, { host: '::1', port: 0 })
+        },
+        {
+            host: '0:0:0:0:0:0:0:0', port: 1234,
+            hex: encode(net.ipv6Address, { host: '::', port: 1234 })
+        },
+        {
+            host: '2001:db8:85a3:0:0:8a2e:370:7334', port: 49737,
+            hex: encode(net.ipv6Address, { host: '2001:db8:85a3::8a2e:370:7334', port: 49737 })
+        },
+    ],
+
+    // Array of IPv6 addresses
+    ipv6array: [
+        {
+            addrs: [],
+            hex: encode(c.array(net.ipv6Address), [])
+        },
+        {
+            addrs: [
+                { host: '2001:db8:0:0:0:0:0:1', port: 8080 },
+                { host: 'fe80:0:0:0:0:0:0:1', port: 443 },
+            ],
+            hex: encode(c.array(net.ipv6Address), [
+                { host: '2001:db8::1', port: 8080 },
+                { host: 'fe80::1', port: 443 },
+            ])
+        },
+    ],
 }
 
 console.log(JSON.stringify(vectors, null, 2))

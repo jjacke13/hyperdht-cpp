@@ -359,4 +359,128 @@ Ipv4Address Ipv4Addr::decode(State& s) {
     return addr;
 }
 
+// ---------------------------------------------------------------------------
+// Ipv6Address — string conversion
+// ---------------------------------------------------------------------------
+
+std::string Ipv6Address::host_string() const {
+    // JS compact-encoding-net outputs full expanded hex groups with no ::
+    // e.g. "fe80:0:0:0:0:0:0:1"
+    static const char hex_chars[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(39);  // max "xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx"
+    for (int g = 0; g < 8; g++) {
+        if (g > 0) result += ':';
+        uint16_t val = static_cast<uint16_t>(host[g * 2]) << 8 |
+                       static_cast<uint16_t>(host[g * 2 + 1]);
+        // Output without leading zeros (matches JS .toString(16))
+        if (val == 0) {
+            result += '0';
+        } else {
+            char buf[5];
+            int len = 0;
+            for (uint16_t v = val; v > 0; v >>= 4) {
+                buf[len++] = hex_chars[v & 0xf];
+            }
+            for (int i = len - 1; i >= 0; i--) {
+                result += buf[i];
+            }
+        }
+    }
+    return result;
+}
+
+Ipv6Address Ipv6Address::from_string(const std::string& host_str, uint16_t port) {
+    Ipv6Address addr;
+    addr.port = port;
+
+    // Split on ':' into tokens, noting where '::' appears
+    // "fe80::1" → tokens = ["fe80", "", "1"], double_colon between index 0 and 1
+    // "2001:db8:0:0:0:0:0:1" → tokens = ["2001","db8","0","0","0","0","0","1"]
+    // "::1" → tokens = ["", "", "1"]
+
+    std::vector<uint16_t> before_groups;  // groups before ::
+    std::vector<uint16_t> after_groups;   // groups after ::
+    bool found_double_colon = false;
+
+    // Find :: position in the string
+    auto dc = host_str.find("::");
+    std::string before_str, after_str;
+    if (dc != std::string::npos) {
+        found_double_colon = true;
+        before_str = host_str.substr(0, dc);
+        after_str = host_str.substr(dc + 2);
+    } else {
+        before_str = host_str;
+    }
+
+    // Parse colon-separated hex groups from a string
+    auto parse_groups = [](const std::string& s, std::vector<uint16_t>& out) {
+        if (s.empty()) return;
+        size_t pos = 0;
+        while (pos <= s.size()) {
+            size_t colon = s.find(':', pos);
+            if (colon == std::string::npos) colon = s.size();
+            uint16_t val = 0;
+            for (size_t i = pos; i < colon; i++) {
+                char c = s[i];
+                if (c >= '0' && c <= '9') val = val * 16 + (c - '0');
+                else if (c >= 'a' && c <= 'f') val = val * 16 + (c - 'a' + 10);
+                else if (c >= 'A' && c <= 'F') val = val * 16 + (c - 'A' + 10);
+            }
+            out.push_back(val);
+            pos = colon + 1;
+        }
+    };
+
+    if (found_double_colon) {
+        parse_groups(before_str, before_groups);
+        parse_groups(after_str, after_groups);
+        // Fill in zeros between before and after to make 8 groups
+        size_t missing = 8 - before_groups.size() - after_groups.size();
+        std::vector<uint16_t> groups;
+        groups.insert(groups.end(), before_groups.begin(), before_groups.end());
+        for (size_t g = 0; g < missing; g++) groups.push_back(0);
+        groups.insert(groups.end(), after_groups.begin(), after_groups.end());
+        for (size_t g = 0; g < 8 && g < groups.size(); g++) {
+            addr.host[g * 2] = static_cast<uint8_t>(groups[g] >> 8);
+            addr.host[g * 2 + 1] = static_cast<uint8_t>(groups[g] & 0xff);
+        }
+    } else {
+        parse_groups(before_str, before_groups);
+        for (size_t g = 0; g < 8 && g < before_groups.size(); g++) {
+            addr.host[g * 2] = static_cast<uint8_t>(before_groups[g] >> 8);
+            addr.host[g * 2 + 1] = static_cast<uint8_t>(before_groups[g] & 0xff);
+        }
+    }
+
+    return addr;
+}
+
+// ---------------------------------------------------------------------------
+// Ipv6Addr codec
+// ---------------------------------------------------------------------------
+
+void Ipv6Addr::preencode(State& s, const Ipv6Address&) { s.end += SIZE; }
+
+void Ipv6Addr::encode(State& s, const Ipv6Address& v) {
+    if (s.error || !has_bytes(s, SIZE)) { s.error = true; return; }
+    // 16 bytes: IPv6 address (big-endian, stored as-is)
+    std::memcpy(s.buffer + s.start, v.host.data(), 16);
+    s.start += 16;
+    // 2 bytes: port LE
+    write_le16(s.buffer + s.start, v.port);
+    s.start += 2;
+}
+
+Ipv6Address Ipv6Addr::decode(State& s) {
+    Ipv6Address addr;
+    if (s.error || !has_bytes(s, SIZE)) { s.error = true; return addr; }
+    std::memcpy(addr.host.data(), s.data() + s.start, 16);
+    s.start += 16;
+    addr.port = read_le16(s.data() + s.start);
+    s.start += 2;
+    return addr;
+}
+
 }  // namespace hyperdht::compact

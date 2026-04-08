@@ -165,6 +165,32 @@ struct Ipv4Addr {
 };
 
 // ---------------------------------------------------------------------------
+// IPv6 Address (compact-encoding-net)
+//   Bytes 0-15: 8 x 16-bit groups (big-endian / network order)
+//   Bytes 16-17: Port (LE uint16)
+//   Total: 18 bytes fixed
+// ---------------------------------------------------------------------------
+struct Ipv6Address {
+    std::array<uint8_t, 16> host{};
+    uint16_t port = 0;
+
+    // Returns full expanded form: "fe80:0:0:0:0:0:0:1" (no :: compression,
+    // matching JS compact-encoding-net decode output)
+    std::string host_string() const;
+    static Ipv6Address from_string(const std::string& host, uint16_t port);
+
+    bool operator==(const Ipv6Address& other) const = default;
+};
+
+struct Ipv6Addr {
+    static constexpr size_t SIZE = 18;
+
+    static void preencode(State& s, const Ipv6Address& v);
+    static void encode(State& s, const Ipv6Address& v);
+    static Ipv6Address decode(State& s);
+};
+
+// ---------------------------------------------------------------------------
 // Array combinator — varint(count) + count * Enc::encode(element)
 //   Decode caps at 0x100000 (1M) elements.
 // ---------------------------------------------------------------------------
@@ -203,6 +229,7 @@ struct Array {
 
 // Convenience aliases for HyperDHT
 using Ipv4Array = Array<Ipv4Addr, Ipv4Address>;
+using Ipv6Array = Array<Ipv6Addr, Ipv6Address>;
 
 // ---------------------------------------------------------------------------
 // Frame combinator — varint(inner_length) + Enc::encode(value)

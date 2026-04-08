@@ -68,17 +68,25 @@ struct HolepunchInfo {
     std::vector<RelayInfo> relays;
 };
 
+struct RelayThroughInfo {
+    uint32_t version = 1;
+    std::array<uint8_t, 32> public_key{};
+    std::array<uint8_t, 32> token{};
+};
+
 struct NoisePayload {
     uint32_t version = 1;
     uint32_t error = ERROR_NONE;
     uint32_t firewall = FIREWALL_UNKNOWN;
 
-    // Optional fields
-    std::optional<HolepunchInfo> holepunch;
-    std::vector<compact::Ipv4Address> addresses4;
-    std::optional<UdxInfo> udx;
-    bool has_secret_stream = false;
-    std::vector<compact::Ipv4Address> relay_addresses;  // flag bit 6
+    // Optional fields (flag bits)
+    std::optional<HolepunchInfo> holepunch;               // bit 0
+    std::vector<compact::Ipv4Address> addresses4;         // bit 1
+    std::vector<compact::Ipv6Address> addresses6;         // bit 2
+    std::optional<UdxInfo> udx;                           // bit 3
+    bool has_secret_stream = false;                       // bit 4
+    std::optional<RelayThroughInfo> relay_through;        // bit 5
+    std::vector<compact::Ipv4Address> relay_addresses;    // bit 6
 };
 
 // Encode/decode noisePayload

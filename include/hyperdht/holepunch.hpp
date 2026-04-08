@@ -25,6 +25,7 @@
 #include "hyperdht/nat_sampler.hpp"
 #include "hyperdht/peer_connect.hpp"
 #include "hyperdht/rpc.hpp"
+#include "hyperdht/socket_pool.hpp"
 
 namespace hyperdht {
 namespace holepunch {
@@ -189,9 +190,41 @@ void discover_pool_addresses(
 // Holepuncher — the UDP probe engine
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Punch stats — shared counters for throttling (JS: dht._randomPunches, stats)
+// ---------------------------------------------------------------------------
+
+struct PunchStats {
+    int random_punches = 0;          // Active random punch count
+    uint64_t last_random_punch = 0;  // Timestamp of last random punch completion
+    int punches_consistent = 0;      // Total consistent punches attempted
+    int punches_random = 0;          // Total random punches attempted
+    int random_punch_limit = 1;      // Max concurrent random punches (JS default: 1)
+    uint64_t random_punch_interval = 20000;  // Min ms between random punches (JS: 20s)
+
+    // JS: roundPunch rate-limit check (connect.js:638-664)
+    bool can_random_punch(uint64_t now) const {
+        if (random_punches >= random_punch_limit) return false;
+        if (last_random_punch > 0 && (now - last_random_punch) < random_punch_interval) return false;
+        return true;
+    }
+};
+
+// Holepunch strategy constants
+constexpr int BIRTHDAY_SOCKETS = 256;
+constexpr int HOLEPUNCH_TTL = 5;
+constexpr int DEFAULT_TTL = 64;
+constexpr int MAX_REOPENS = 3;
+constexpr int CONSISTENT_ROUNDS = 10;
+constexpr int RANDOM_PROBES_COUNT = 1750;
+constexpr uint64_t CONSISTENT_INTERVAL_MS = 1000;
+constexpr uint64_t RANDOM_PROBE_INTERVAL_MS = 20;
+
 class Holepuncher {
 public:
-    Holepuncher(uv_loop_t* loop, bool is_initiator);
+    Holepuncher(uv_loop_t* loop, bool is_initiator,
+                socket_pool::SocketPool* pool = nullptr,
+                PunchStats* stats = nullptr);
     ~Holepuncher();
 
     Holepuncher(const Holepuncher&) = delete;
@@ -225,8 +258,9 @@ public:
         }
     }
 
-    // Set callback for when a connection is established
+    // Callbacks
     void on_connect(OnHolepunchCallback cb) { on_connect_ = std::move(cb); }
+    void on_abort(std::function<void()> cb) { on_abort_ = std::move(cb); }
 
     // Start punching — picks the right strategy based on firewall combo
     // Returns false if RANDOM+RANDOM (impossible)
@@ -239,14 +273,40 @@ public:
     void send_probe(const compact::Ipv4Address& addr);
 
     // Handle incoming UDP from a peer (success detection)
-    void on_message(const compact::Ipv4Address& from, udx_socket_t* recv_socket = nullptr);
+    void on_message(const compact::Ipv4Address& from,
+                    udx_socket_t* recv_socket = nullptr,
+                    socket_pool::SocketRef* ref = nullptr);
 
     // Close the timer handle. Must be called before destruction if the event
     // loop is still running. Calls on_closed when the handle is fully closed.
     void close(std::function<void()> on_closed = nullptr);
 
+    // Destroy — release all sockets, fire abort if not connected
+    void destroy();
+
+    // Analyze local NAT stability (JS: analyze(allowReopen))
+    // Returns true if NAT is stable enough for punching.
+    // If unstable and allowReopen is true, increments reopen counter.
+    // Calls on_done(stable) when analysis completes.
+    using OnAnalyzeDone = std::function<void(bool stable)>;
+    void analyze(bool allow_reopen, OnAnalyzeDone on_done);
+
+    // Reset callback — called when analyze determines a reopen is needed.
+    // The caller should: destroy the current NAT sampler, acquire a fresh socket,
+    // re-sample, and call analyze() again.
+    using OnResetFn = std::function<void()>;
+    void on_reset(OnResetFn fn) { on_reset_ = std::move(fn); }
+
+    // How many reopens have been attempted
+    int reopen_count() const { return reopen_count_; }
+
     bool is_connected() const { return connected_; }
     bool is_punching() const { return punching_; }
+    bool is_destroyed() const { return destroyed_; }
+    bool is_randomized() const { return randomized_; }
+
+    // Number of held socket refs (for birthday paradox tracking)
+    size_t holder_count() const { return holders_.size(); }
 
 private:
     uv_loop_t* loop_;
@@ -254,30 +314,59 @@ private:
     bool connected_ = false;
     bool punching_ = false;
     bool closing_ = false;
+    bool destroyed_ = false;
+    bool randomized_ = false;
     uint32_t local_firewall_ = peer_connect::FIREWALL_UNKNOWN;
     uint32_t remote_firewall_ = peer_connect::FIREWALL_UNKNOWN;
 
     std::vector<RemoteAddr> remote_addresses_;
     int punch_round_ = 0;
     int random_probes_left_ = 0;
+    size_t birthday_index_ = 0;      // Current index for keepAliveRandomNat cycling
+    int low_ttl_rounds_ = 1;         // First cycle uses low TTL (JS: lowTTLRounds)
 
     SendProbeFn send_fn_;
     SendProbeTtlFn send_ttl_fn_;
     OnHolepunchCallback on_connect_;
+    std::function<void()> on_abort_;
+
+    // Socket pool integration (JS: dht._socketPool)
+    socket_pool::SocketPool* pool_ = nullptr;
+    PunchStats* stats_ = nullptr;
+    std::vector<socket_pool::SocketRef*> holders_;  // JS: _allHolders
+    OnResetFn on_reset_;
+
+    void increment_randomized();
+    void decrement_randomized();
 
     // Heap-allocated so libuv can outlive this object during async close
     uv_timer_t* punch_timer_;
 
     // Strategy implementations
-    void consistent_probe();   // CONSISTENT+CONSISTENT
-    void random_probes();      // CONSISTENT+RANDOM
-    // RANDOM+CONSISTENT would need multiple sockets — simplified for now
+    void consistent_probe();          // CONSISTENT+CONSISTENT
+    void random_probes();             // CONSISTENT+RANDOM
+    void open_birthday_sockets();     // RANDOM+CONSISTENT: acquire sockets
+    void keep_alive_random_nat();     // RANDOM+CONSISTENT: cycle through birthday sockets
+
+    // NAT stability analysis
+    bool is_unstable() const;         // JS: _unstable()
+    int reopen_count_ = 0;            // Tracks reopen attempts (max MAX_REOPENS)
+
+    bool is_done() const { return destroyed_ || connected_; }
 
     bool is_verified(const std::string& host) const {
         for (const auto& ra : remote_addresses_) {
             if (ra.verified && ra.addr.host_string() == host) return true;
         }
         return false;
+    }
+
+    // Find first verified remote address (for random strategies)
+    const RemoteAddr* verified_remote() const {
+        for (const auto& ra : remote_addresses_) {
+            if (ra.verified) return &ra;
+        }
+        return nullptr;
     }
 
     static void on_punch_timer(uv_timer_t* timer);
@@ -322,6 +411,22 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        uint32_t local_firewall,
                        const std::vector<compact::Ipv4Address>& local_addresses,
                        OnHolepunchCallback on_done);
+
+// ---------------------------------------------------------------------------
+// Utility functions (JS: Holepuncher.localAddresses, Holepuncher.matchAddress)
+// ---------------------------------------------------------------------------
+
+// Get all local IPv4 addresses from network interfaces.
+// Returns addresses with the given port. Excludes internal (loopback).
+// Falls back to 127.0.0.1 if no external addresses found.
+std::vector<compact::Ipv4Address> local_addresses(uint16_t port);
+
+// Find the best matching remote address for LAN connections.
+// Matches by IP prefix: 3-octet match (same /24) > 2-octet > 1-octet.
+// Returns nullptr if no match found.
+const compact::Ipv4Address* match_address(
+    const std::vector<compact::Ipv4Address>& my_addresses,
+    const std::vector<compact::Ipv4Address>& remote_addresses);
 
 }  // namespace holepunch
 }  // namespace hyperdht

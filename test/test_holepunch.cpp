@@ -288,3 +288,335 @@ TEST(Holepunch, FailedHandshakeNoDirect) {
     HolepunchResult result;
     EXPECT_FALSE(try_direct_connect(hs, result));
 }
+
+// ---------------------------------------------------------------------------
+// Destroy + on_abort
+// ---------------------------------------------------------------------------
+
+TEST(Holepuncher, DestroyFiresAbort) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, true);
+    hp.set_local_firewall(FIREWALL_CONSISTENT);
+    hp.set_remote_firewall(FIREWALL_CONSISTENT);
+    hp.set_remote_addresses({Ipv4Address::from_string("10.0.0.1", 5000)});
+    hp.set_send_fn([](const Ipv4Address&) {});
+
+    bool aborted = false;
+    hp.on_abort([&]() { aborted = true; });
+
+    hp.punch();
+    EXPECT_TRUE(hp.is_punching());
+
+    hp.destroy();
+    EXPECT_TRUE(hp.is_destroyed());
+    EXPECT_TRUE(aborted);
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(Holepuncher, DestroyNoAbortIfConnected) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, true);
+    hp.set_local_firewall(FIREWALL_CONSISTENT);
+    hp.set_remote_firewall(FIREWALL_CONSISTENT);
+    hp.set_remote_addresses({Ipv4Address::from_string("10.0.0.1", 5000)});
+    hp.set_send_fn([](const Ipv4Address&) {});
+
+    bool aborted = false;
+    hp.on_abort([&]() { aborted = true; });
+
+    // Simulate connection before destroy
+    hp.on_message(Ipv4Address::from_string("10.0.0.1", 5000));
+    EXPECT_TRUE(hp.is_connected());
+
+    hp.destroy();
+    EXPECT_FALSE(aborted);
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// NAT stability (analyze / is_unstable)
+// ---------------------------------------------------------------------------
+
+TEST(Holepuncher, UnstableWhenBothRandom) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, true);
+    hp.set_local_firewall(FIREWALL_RANDOM);
+    hp.set_remote_firewall(FIREWALL_RANDOM);
+
+    EXPECT_TRUE(hp.is_punching() == false);
+    // Both RANDOM → unstable
+    bool stable = true;
+    hp.analyze(false, [&](bool s) { stable = s; });
+    EXPECT_FALSE(stable);
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(Holepuncher, StableWhenConsistent) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, true);
+    hp.set_local_firewall(FIREWALL_CONSISTENT);
+    hp.set_remote_firewall(FIREWALL_CONSISTENT);
+
+    bool stable = false;
+    hp.analyze(false, [&](bool s) { stable = s; });
+    EXPECT_TRUE(stable);
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(Holepuncher, UnstableWhenLocalUnknown) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, true);
+    hp.set_local_firewall(FIREWALL_UNKNOWN);
+    hp.set_remote_firewall(FIREWALL_CONSISTENT);
+
+    bool stable = true;
+    hp.analyze(false, [&](bool s) { stable = s; });
+    EXPECT_FALSE(stable);
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// PunchStats tracking
+// ---------------------------------------------------------------------------
+
+TEST(Holepuncher, StatsConsistentPunch) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    PunchStats stats;
+    Holepuncher hp(&loop, true, nullptr, &stats);
+    hp.set_local_firewall(FIREWALL_CONSISTENT);
+    hp.set_remote_firewall(FIREWALL_CONSISTENT);
+    hp.set_remote_addresses({Ipv4Address::from_string("10.0.0.1", 5000)});
+    hp.set_send_fn([](const Ipv4Address&) {});
+
+    hp.punch();
+    EXPECT_EQ(stats.punches_consistent, 1);
+    EXPECT_EQ(stats.punches_random, 0);
+    EXPECT_EQ(stats.random_punches, 0);
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(Holepuncher, StatsRandomPunch) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    PunchStats stats;
+    Holepuncher hp(&loop, true, nullptr, &stats);
+    hp.set_local_firewall(FIREWALL_CONSISTENT);
+    hp.set_remote_firewall(FIREWALL_RANDOM);
+
+    // Need a verified remote address for random probes
+    std::vector<Ipv4Address> addrs = {Ipv4Address::from_string("10.0.0.1", 5000)};
+    hp.update_remote(addrs, "10.0.0.1");
+    hp.set_send_fn([](const Ipv4Address&) {});
+
+    hp.punch();
+    EXPECT_EQ(stats.punches_random, 1);
+    EXPECT_EQ(stats.random_punches, 1);
+    EXPECT_TRUE(hp.is_randomized());
+
+    // Destroy should decrement
+    hp.destroy();
+    EXPECT_EQ(stats.random_punches, 0);
+    EXPECT_FALSE(hp.is_randomized());
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// Strategy selection
+// ---------------------------------------------------------------------------
+
+TEST(Holepuncher, ConsistentRandomUsesRandomProbes) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    int probe_count = 0;
+    Holepuncher hp(&loop, true);
+    hp.set_local_firewall(FIREWALL_CONSISTENT);
+    hp.set_remote_firewall(FIREWALL_RANDOM);
+    hp.set_send_fn([&](const Ipv4Address&) { probe_count++; });
+
+    std::vector<Ipv4Address> addrs = {Ipv4Address::from_string("10.0.0.1", 5000)};
+    hp.update_remote(addrs, "10.0.0.1");
+
+    bool started = hp.punch();
+    EXPECT_TRUE(started);
+    EXPECT_TRUE(hp.is_punching());
+    EXPECT_GE(probe_count, 1);  // At least first probe sent
+
+    hp.stop();
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(Holepuncher, AnalyzeCallsResetOnUnstable) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, true);
+    hp.set_local_firewall(FIREWALL_UNKNOWN);
+    hp.set_remote_firewall(FIREWALL_CONSISTENT);
+
+    int reset_count = 0;
+    hp.on_reset([&]() { reset_count++; });
+
+    // First analyze — unstable (local UNKNOWN), should trigger reset
+    bool stable = true;
+    hp.analyze(true, [&](bool s) { stable = s; });
+    EXPECT_FALSE(stable);
+    EXPECT_EQ(reset_count, 1);
+    EXPECT_EQ(hp.reopen_count(), 1);
+
+    // Second analyze — still unstable, should trigger again
+    hp.analyze(true, [&](bool s) { stable = s; });
+    EXPECT_EQ(reset_count, 2);
+    EXPECT_EQ(hp.reopen_count(), 2);
+
+    // Third analyze — still unstable, should trigger one more
+    hp.analyze(true, [&](bool s) { stable = s; });
+    EXPECT_EQ(reset_count, 3);
+    EXPECT_EQ(hp.reopen_count(), 3);
+
+    // Fourth analyze — max reopens reached, should NOT trigger reset
+    hp.analyze(true, [&](bool s) { stable = s; });
+    EXPECT_EQ(reset_count, 3);  // No more resets
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// localAddresses + matchAddress
+// ---------------------------------------------------------------------------
+
+TEST(Holepunch, MatchAddress3Octet) {
+    auto my = std::vector<Ipv4Address>{
+        Ipv4Address::from_string("192.168.1.100", 5000)
+    };
+    auto remote = std::vector<Ipv4Address>{
+        Ipv4Address::from_string("10.0.0.1", 3000),
+        Ipv4Address::from_string("192.168.1.50", 4000),
+    };
+    auto* result = match_address(my, remote);
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result->host_string(), "192.168.1.50");  // 3-octet match
+}
+
+TEST(Holepunch, MatchAddress2Octet) {
+    auto my = std::vector<Ipv4Address>{
+        Ipv4Address::from_string("192.168.1.100", 5000)
+    };
+    auto remote = std::vector<Ipv4Address>{
+        Ipv4Address::from_string("192.168.2.50", 4000),
+    };
+    auto* result = match_address(my, remote);
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result->host_string(), "192.168.2.50");  // 2-octet match
+}
+
+TEST(Holepunch, MatchAddressNoMatch) {
+    auto my = std::vector<Ipv4Address>{
+        Ipv4Address::from_string("192.168.1.100", 5000)
+    };
+    auto remote = std::vector<Ipv4Address>{
+        Ipv4Address::from_string("10.0.0.1", 3000),
+    };
+    auto* result = match_address(my, remote);
+    EXPECT_EQ(result, nullptr);  // No octet match
+}
+
+TEST(Holepunch, MatchAddressEmpty) {
+    auto my = std::vector<Ipv4Address>{
+        Ipv4Address::from_string("192.168.1.100", 5000)
+    };
+    std::vector<Ipv4Address> remote;
+    auto* result = match_address(my, remote);
+    EXPECT_EQ(result, nullptr);
+}
+
+TEST(Holepunch, MatchAddressPrefers3Over2) {
+    auto my = std::vector<Ipv4Address>{
+        Ipv4Address::from_string("192.168.1.100", 5000)
+    };
+    auto remote = std::vector<Ipv4Address>{
+        Ipv4Address::from_string("192.168.2.50", 4000),   // 2-octet
+        Ipv4Address::from_string("192.168.1.200", 4001),  // 3-octet
+    };
+    auto* result = match_address(my, remote);
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result->host_string(), "192.168.1.200");  // 3-octet wins
+}
+
+TEST(Holepunch, PunchStatsThrottling) {
+    PunchStats stats;
+    stats.random_punch_limit = 1;
+    stats.random_punch_interval = 20000;
+
+    // Initially can punch
+    EXPECT_TRUE(stats.can_random_punch(0));
+
+    // At limit
+    stats.random_punches = 1;
+    EXPECT_FALSE(stats.can_random_punch(0));
+
+    // Below limit but within interval
+    stats.random_punches = 0;
+    stats.last_random_punch = 10000;
+    EXPECT_FALSE(stats.can_random_punch(20000));  // 10s since last, need 20s
+
+    // Past interval
+    EXPECT_TRUE(stats.can_random_punch(30001));
+}
+
+TEST(Holepuncher, RandomConsistentNeedsPool) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, true);  // No pool
+    hp.set_local_firewall(FIREWALL_RANDOM);
+    hp.set_remote_firewall(FIREWALL_CONSISTENT);
+    std::vector<Ipv4Address> addrs = {Ipv4Address::from_string("10.0.0.1", 5000)};
+    hp.update_remote(addrs, "10.0.0.1");
+
+    // Without pool, RANDOM+CONSISTENT should fail
+    bool started = hp.punch();
+    EXPECT_FALSE(started);
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}

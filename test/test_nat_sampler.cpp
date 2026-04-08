@@ -173,3 +173,123 @@ TEST(PingNat, HandlerFormat) {
                      | (static_cast<uint16_t>(value[1]) << 8);
     EXPECT_EQ(decoded, 12345u);
 }
+
+// ---------------------------------------------------------------------------
+// Freeze/Unfreeze
+// ---------------------------------------------------------------------------
+
+TEST(NatSampler, FreezePreventUpdate) {
+    NatSampler s;
+
+    // Add 2 samples (not enough to classify)
+    s.add(addr("1.2.3.4", 5000), addr("10.0.0.1", 1000));
+    s.add(addr("1.2.3.4", 5000), addr("10.0.0.2", 1000));
+    EXPECT_EQ(s.firewall(), peer_connect::FIREWALL_UNKNOWN);
+
+    // Freeze
+    s.freeze();
+    EXPECT_TRUE(s.is_frozen());
+
+    // 3rd sample would normally trigger CONSISTENT, but we're frozen
+    s.add(addr("1.2.3.4", 5000), addr("10.0.0.3", 1000));
+    EXPECT_EQ(s.sampled(), 3);
+    EXPECT_EQ(s.firewall(), peer_connect::FIREWALL_UNKNOWN)
+        << "Frozen sampler should not update firewall";
+
+    // Unfreeze — should now update
+    s.unfreeze();
+    EXPECT_FALSE(s.is_frozen());
+    EXPECT_EQ(s.firewall(), peer_connect::FIREWALL_CONSISTENT)
+        << "Unfreeze should trigger classification update";
+}
+
+TEST(NatSampler, FreezeWhileConsistent) {
+    NatSampler s;
+
+    // Already classified as CONSISTENT
+    s.add(addr("1.2.3.4", 5000), addr("10.0.0.1", 1000));
+    s.add(addr("1.2.3.4", 5000), addr("10.0.0.2", 1000));
+    s.add(addr("1.2.3.4", 5000), addr("10.0.0.3", 1000));
+    EXPECT_EQ(s.firewall(), peer_connect::FIREWALL_CONSISTENT);
+
+    // Freeze and add conflicting samples
+    s.freeze();
+    s.add(addr("1.2.3.4", 9999), addr("10.0.0.4", 1000));
+    s.add(addr("1.2.3.4", 8888), addr("10.0.0.5", 1000));
+
+    // Should still be CONSISTENT (frozen)
+    EXPECT_EQ(s.firewall(), peer_connect::FIREWALL_CONSISTENT);
+
+    s.unfreeze();
+    // After unfreeze, re-evaluation with 5 samples (3 matching + 2 different)
+    // Top sample still has 3 hits → CONSISTENT
+    EXPECT_EQ(s.firewall(), peer_connect::FIREWALL_CONSISTENT);
+}
+
+TEST(NatSampler, ResetClearsFrozen) {
+    NatSampler s;
+    s.freeze();
+    EXPECT_TRUE(s.is_frozen());
+    s.reset();
+    EXPECT_FALSE(s.is_frozen());
+}
+
+// ---------------------------------------------------------------------------
+// OnChange callback
+// ---------------------------------------------------------------------------
+
+TEST(NatSampler, OnChangeCallback) {
+    NatSampler s;
+
+    uint32_t old_val = 999;
+    uint32_t new_val = 999;
+    int change_count = 0;
+
+    s.on_change([&](uint32_t old_fw, uint32_t new_fw) {
+        old_val = old_fw;
+        new_val = new_fw;
+        change_count++;
+    });
+
+    // 3 matching samples → UNKNOWN → CONSISTENT
+    s.add(addr("1.2.3.4", 5000), addr("10.0.0.1", 1000));
+    s.add(addr("1.2.3.4", 5000), addr("10.0.0.2", 1000));
+    s.add(addr("1.2.3.4", 5000), addr("10.0.0.3", 1000));
+
+    EXPECT_EQ(change_count, 1);
+    EXPECT_EQ(old_val, peer_connect::FIREWALL_UNKNOWN);
+    EXPECT_EQ(new_val, peer_connect::FIREWALL_CONSISTENT);
+}
+
+TEST(NatSampler, OnChangeNotFiredWhenSame) {
+    NatSampler s;
+    int change_count = 0;
+
+    s.on_change([&](uint32_t, uint32_t) { change_count++; });
+
+    // 5 matching samples — should only fire once (UNKNOWN → CONSISTENT on sample 3)
+    for (int i = 1; i <= 5; i++) {
+        auto from_str = "10.0.0." + std::to_string(i);
+        s.add(addr("1.2.3.4", 5000),
+              Ipv4Address::from_string(from_str, 1000));
+    }
+
+    EXPECT_EQ(change_count, 1);
+}
+
+TEST(NatSampler, OnChangeFiredOnUnfreeze) {
+    NatSampler s;
+    int change_count = 0;
+
+    s.on_change([&](uint32_t, uint32_t) { change_count++; });
+
+    // Freeze before 3rd sample
+    s.add(addr("1.2.3.4", 5000), addr("10.0.0.1", 1000));
+    s.add(addr("1.2.3.4", 5000), addr("10.0.0.2", 1000));
+    s.freeze();
+    s.add(addr("1.2.3.4", 5000), addr("10.0.0.3", 1000));
+    EXPECT_EQ(change_count, 0);  // Frozen — no callback
+
+    s.unfreeze();
+    EXPECT_EQ(change_count, 1);  // Unfreeze triggers classification → callback
+}

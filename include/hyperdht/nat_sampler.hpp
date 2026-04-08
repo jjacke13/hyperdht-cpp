@@ -16,6 +16,7 @@
 // Used by holepunch to report our firewall type to the server.
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -68,12 +69,23 @@ public:
     // Our most-seen port (0 if unknown or random)
     uint16_t port() const { return port_; }
 
+    // Freeze/unfreeze — prevents classification updates during holepunch.
+    // JS: nat.freeze() called before roundPunch gossip, unfreeze() after.
+    void freeze() { frozen_ = true; }
+    void unfreeze();
+    bool is_frozen() const { return frozen_; }
+
+    // Callback fired when firewall classification changes
+    using OnChangeFn = std::function<void(uint32_t old_fw, uint32_t new_fw)>;
+    void on_change(OnChangeFn fn) { on_change_ = std::move(fn); }
+
     // Reset all state
     void reset();
 
 private:
     uint32_t firewall_ = 0;  // FIREWALL_UNKNOWN
     int sampled_ = 0;
+    bool frozen_ = false;
     std::string host_;
     uint16_t port_ = 0;
 
@@ -82,6 +94,7 @@ private:
     std::unordered_set<std::string> visited_;  // "host:port" of source nodes
 
     std::vector<compact::Ipv4Address> addresses_;
+    OnChangeFn on_change_;
 
     void update_firewall();
     void update_addresses();

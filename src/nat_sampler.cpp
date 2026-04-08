@@ -46,12 +46,19 @@ NatSampler::NatSampler() = default;
 void NatSampler::reset() {
     firewall_ = FW_UNKNOWN;
     sampled_ = 0;
+    frozen_ = false;
     host_.clear();
     port_ = 0;
     samples_host_.clear();
     samples_full_.clear();
     visited_.clear();
     addresses_.clear();
+}
+
+void NatSampler::unfreeze() {
+    frozen_ = false;
+    update_firewall();
+    update_addresses();
 }
 
 bool NatSampler::add(const compact::Ipv4Address& addr,
@@ -65,8 +72,8 @@ bool NatSampler::add(const compact::Ipv4Address& addr,
     add_sample(samples_full_, addr.host_string(), addr.port);
     sampled_++;
 
-    // Update classification after ≥3 samples
-    if (sampled_ >= 3) {
+    // Update classification after ≥3 samples, unless frozen
+    if (sampled_ >= 3 && !frozen_) {
         update_firewall();
         update_addresses();
     }
@@ -88,36 +95,33 @@ void NatSampler::update_firewall() {
     if (sampled_ < 3) return;
     if (samples_full_.empty()) return;
 
+    uint32_t old_fw = firewall_;
     int max_hits = samples_full_[0].hits;
 
     if (max_hits >= 3) {
         firewall_ = FW_CONSISTENT;
-        return;
-    }
-
-    if (max_hits == 1) {
+    } else if (max_hits == 1) {
         firewall_ = FW_RANDOM;
-        return;
+    } else {
+        // max_hits == 2 — edge cases
+
+        // 1 host, ≥4 total samples → 2 bad ones → random
+        if (samples_host_.size() == 1 && sampled_ > 3) {
+            firewall_ = FW_RANDOM;
+        }
+        // Double hit on two different IPs → assume consistent
+        else if (samples_host_.size() > 1 && samples_full_.size() > 1 &&
+                 samples_full_[1].hits > 1) {
+            firewall_ = FW_CONSISTENT;
+        }
+        // >4 samples, no decision → assume random
+        else if (sampled_ > 4) {
+            firewall_ = FW_RANDOM;
+        }
     }
 
-    // max_hits == 2 — edge cases
-
-    // 1 host, ≥4 total samples → 2 bad ones → random
-    if (samples_host_.size() == 1 && sampled_ > 3) {
-        firewall_ = FW_RANDOM;
-        return;
-    }
-
-    // Double hit on two different IPs → assume consistent
-    if (samples_host_.size() > 1 && samples_full_.size() > 1 &&
-        samples_full_[1].hits > 1) {
-        firewall_ = FW_CONSISTENT;
-        return;
-    }
-
-    // >4 samples, no decision → assume random
-    if (sampled_ > 4) {
-        firewall_ = FW_RANDOM;
+    if (firewall_ != old_fw && on_change_) {
+        on_change_(old_fw, firewall_);
     }
 }
 

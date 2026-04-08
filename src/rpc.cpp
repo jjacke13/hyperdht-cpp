@@ -233,6 +233,18 @@ void RpcSocket::reply(const messages::Response& resp) {
     udp_send(buf, resp.from.addr);
 }
 
+void RpcSocket::stop_tick() {
+    if (bg_timer_ && !uv_is_closing(reinterpret_cast<uv_handle_t*>(bg_timer_))) {
+        uv_timer_stop(bg_timer_);
+    }
+}
+
+void RpcSocket::start_tick() {
+    if (bg_timer_ && !uv_is_closing(reinterpret_cast<uv_handle_t*>(bg_timer_))) {
+        uv_timer_start(bg_timer_, on_bg_tick, BG_TICK_MS, BG_TICK_MS);
+    }
+}
+
 void RpcSocket::close() {
     if (closing_) return;
     closing_ = true;

@@ -148,6 +148,10 @@ public:
     // Close the socket and stop all timers
     void close();
 
+    // Suspend/resume background tick timer (JS: dht.suspend/resume)
+    void stop_tick();
+    void start_tick();
+
     // --- Node state ---
     bool is_ephemeral() const { return ephemeral_; }
     bool is_firewalled() const { return firewalled_; }

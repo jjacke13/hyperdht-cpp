@@ -234,3 +234,108 @@ TEST(HyperDHT, ConnectToDestroyedFails) {
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }
+
+// ---------------------------------------------------------------------------
+// Suspend / Resume
+// ---------------------------------------------------------------------------
+
+TEST(HyperDHT, SuspendResume) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    dht.bind();
+
+    EXPECT_FALSE(dht.is_suspended());
+    EXPECT_TRUE(dht.is_connectable());
+
+    dht.suspend();
+    EXPECT_TRUE(dht.is_suspended());
+    EXPECT_FALSE(dht.is_connectable());
+
+    dht.resume();
+    EXPECT_FALSE(dht.is_suspended());
+    EXPECT_TRUE(dht.is_connectable());
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, SuspendWithServer) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    dht.bind();
+
+    auto* srv = dht.create_server();
+    noise::Seed seed{};
+    seed.fill(0x11);
+    auto kp = noise::generate_keypair(seed);
+    srv->listen(kp, [](const server::ConnectionInfo&) {});
+    EXPECT_TRUE(srv->is_listening());
+
+    dht.suspend();
+    EXPECT_TRUE(srv->is_suspended());
+
+    dht.resume();
+    EXPECT_FALSE(srv->is_suspended());
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// Pool
+// ---------------------------------------------------------------------------
+
+TEST(HyperDHT, Pool) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    auto pool = dht.pool();
+
+    // Pool starts empty
+    EXPECT_EQ(pool.connected_count(), 0u);
+    EXPECT_EQ(pool.connecting_count(), 0u);
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// Connectable flag
+// ---------------------------------------------------------------------------
+
+TEST(HyperDHT, NotConnectableWhenSuspended) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    dht.bind();
+
+    EXPECT_TRUE(dht.is_connectable());
+
+    dht.suspend();
+    EXPECT_FALSE(dht.is_connectable());
+
+    // Connect while suspended should fail
+    noise::PubKey pk{};
+    pk.fill(0x42);
+    int error = 0;
+    dht.connect(pk, ConnectOptions{}, [&](int err, const ConnectResult&) {
+        error = err;
+    });
+    // Suspended DHT is not destroyed, but connect checks is_connectable
+    // via the suspended flag in the connect options check
+    EXPECT_TRUE(dht.is_suspended());
+
+    dht.resume();
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}

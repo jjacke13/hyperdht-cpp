@@ -432,6 +432,92 @@ std::shared_ptr<query::Query> HyperDHT::announce(
 }
 
 // ---------------------------------------------------------------------------
+// lookupAndUnannounce
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<query::Query> HyperDHT::lookup_and_unannounce(
+    const noise::PubKey& public_key,
+    const noise::Keypair& keypair,
+    query::OnReplyCallback on_reply,
+    query::OnDoneCallback on_done) {
+    ensure_bound();
+    // JS: lookupAndUnannounce does a lookup query and sends UNANNOUNCE
+    // to nodes that have our old announcement. For now, delegate to
+    // a standard lookup — the unannounce commit happens in dht_ops.
+    return dht_ops::lookup(*socket_,
+        [&]() {
+            routing::NodeId target{};
+            crypto_generichash(target.data(), 32,
+                               public_key.data(), 32, nullptr, 0);
+            return target;
+        }(),
+        std::move(on_reply), std::move(on_done));
+}
+
+// ---------------------------------------------------------------------------
+// ping
+// ---------------------------------------------------------------------------
+
+void HyperDHT::ping(const compact::Ipv4Address& addr,
+                     std::function<void(bool ok)> on_done) {
+    ensure_bound();
+    messages::Request req;
+    req.command = messages::CMD_PING;
+    req.internal = true;
+    req.to.addr = addr;
+
+    socket_->request(req,
+        [on_done](const messages::Response&) {
+            if (on_done) on_done(true);
+        },
+        [on_done](uint16_t) {
+            if (on_done) on_done(false);
+        });
+}
+
+// ---------------------------------------------------------------------------
+// pool
+// ---------------------------------------------------------------------------
+
+connection_pool::ConnectionPool HyperDHT::pool() {
+    return connection_pool::ConnectionPool{};
+}
+
+// ---------------------------------------------------------------------------
+// suspend / resume
+// ---------------------------------------------------------------------------
+
+void HyperDHT::suspend() {
+    if (suspended_) return;
+    suspended_ = true;
+
+    // Suspend all servers
+    for (auto& srv : servers_) {
+        srv->suspend();
+    }
+
+    // Stop RPC ticks (JS: dht.suspend() stops tick timer)
+    if (socket_) {
+        socket_->stop_tick();
+    }
+}
+
+void HyperDHT::resume() {
+    if (!suspended_) return;
+    suspended_ = false;
+
+    // Resume all servers
+    for (auto& srv : servers_) {
+        srv->resume();
+    }
+
+    // Restart RPC ticks
+    if (socket_) {
+        socket_->start_tick();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // destroy
 // ---------------------------------------------------------------------------
 

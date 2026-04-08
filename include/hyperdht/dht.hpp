@@ -154,10 +154,36 @@ public:
         const std::vector<uint8_t>& value,
         query::OnDoneCallback on_done);
 
+    // --- DHT Operations (continued) ---
+
+    // Lookup and unannounce from old nodes (JS: lookupAndUnannounce)
+    std::shared_ptr<query::Query> lookup_and_unannounce(
+        const noise::PubKey& public_key,
+        const noise::Keypair& keypair,
+        query::OnReplyCallback on_reply,
+        query::OnDoneCallback on_done);
+
+    // Ping a specific node (JS: dht.ping(addr))
+    void ping(const compact::Ipv4Address& addr,
+              std::function<void(bool ok)> on_done);
+
+    // --- Connection Pool ---
+
+    // Create a new connection pool (JS: dht.pool())
+    connection_pool::ConnectionPool pool();
+
     // --- Lifecycle ---
+
+    // Suspend: stop all servers, clear pending connects (JS: dht.suspend())
+    void suspend();
+
+    // Resume: resume all servers (JS: dht.resume())
+    void resume();
 
     void destroy(std::function<void()> on_done = nullptr);
     bool is_destroyed() const { return destroyed_; }
+    bool is_suspended() const { return suspended_; }
+    bool is_connectable() const { return !suspended_ && !destroyed_; }
 
     // --- Accessors ---
 
@@ -177,6 +203,7 @@ private:
     std::vector<std::unique_ptr<server::Server>> servers_;
     bool bound_ = false;
     bool destroyed_ = false;
+    bool suspended_ = false;
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);  // Sentinel for async safety
     holepunch::PunchStats punch_stats_;
     std::unique_ptr<socket_pool::SocketPool> socket_pool_;

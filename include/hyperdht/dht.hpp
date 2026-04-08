@@ -28,13 +28,16 @@
 #include <uv.h>
 
 #include "hyperdht/compact.hpp"
+#include "hyperdht/connection_pool.hpp"
 #include "hyperdht/dht_ops.hpp"
+#include "hyperdht/holepunch.hpp"
 #include "hyperdht/noise_wrap.hpp"
 #include "hyperdht/query.hpp"
 #include "hyperdht/router.hpp"
 #include "hyperdht/rpc.hpp"
 #include "hyperdht/rpc_handlers.hpp"
 #include "hyperdht/server.hpp"
+#include "hyperdht/socket_pool.hpp"
 
 namespace hyperdht {
 
@@ -69,6 +72,28 @@ struct ConnectResult {
 using ConnectCallback = std::function<void(int error, const ConnectResult& result)>;
 
 // ---------------------------------------------------------------------------
+// Connect options (matches JS connect.js opts)
+// ---------------------------------------------------------------------------
+
+struct ConnectOptions {
+    // Connection pool for deduplication (JS: opts.pool)
+    connection_pool::ConnectionPool* pool = nullptr;
+
+    // Whether to attempt socket reuse from a previous connection (JS: opts.reusableSocket)
+    bool reusable_socket = false;
+
+    // Callback to veto holepunch based on firewall types (JS: opts.holepunch)
+    // Return false to abort. Args: remote_fw, local_fw, remote_addrs, local_addrs
+    using HolepunchVetoFn = std::function<bool(uint32_t, uint32_t,
+        const std::vector<compact::Ipv4Address>&,
+        const std::vector<compact::Ipv4Address>&)>;
+    HolepunchVetoFn holepunch_veto;
+
+    // Cached relay addresses for faster reconnect (JS: opts.relayAddresses)
+    std::vector<compact::Ipv4Address> relay_addresses;
+};
+
+// ---------------------------------------------------------------------------
 // HyperDHT
 // ---------------------------------------------------------------------------
 
@@ -91,10 +116,21 @@ public:
     void connect(const noise::PubKey& remote_public_key,
                  ConnectCallback on_done);
 
+    // Connect with options (pool, reusable socket, holepunch veto)
+    void connect(const noise::PubKey& remote_public_key,
+                 const ConnectOptions& opts,
+                 ConnectCallback on_done);
+
     // Connect with a specific keypair (instead of default)
     void connect(const noise::PubKey& remote_public_key,
                  const noise::Keypair& keypair,
                  ConnectCallback on_done);
+
+    // Shared punch stats for throttling across connections
+    holepunch::PunchStats& punch_stats() { return punch_stats_; }
+
+    // Socket pool for route caching and socket reuse
+    socket_pool::SocketPool* socket_pool() { return socket_pool_.get(); }
 
     // --- Server API ---
 
@@ -142,10 +178,16 @@ private:
     bool bound_ = false;
     bool destroyed_ = false;
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);  // Sentinel for async safety
+    holepunch::PunchStats punch_stats_;
+    std::unique_ptr<socket_pool::SocketPool> socket_pool_;
+
+    // Relay address cache for reconnect (JS: _relayAddressesCache)
+    std::unordered_map<std::string, std::vector<compact::Ipv4Address>> relay_cache_;
 
     void ensure_bound();
     void do_connect(const noise::PubKey& remote_pk,
                     const noise::Keypair& keypair,
+                    const ConnectOptions& opts,
                     ConnectCallback on_done);
 };
 

@@ -4,6 +4,7 @@
 
 #include <cstdio>
 
+#include "hyperdht/debug.hpp"
 #include "hyperdht/holepunch.hpp"
 #include "hyperdht/peer_connect.hpp"
 
@@ -85,7 +86,26 @@ void HyperDHT::ensure_bound() {
 
 void HyperDHT::connect(const noise::PubKey& remote_public_key,
                         ConnectCallback on_done) {
-    connect(remote_public_key, opts_.default_keypair, std::move(on_done));
+    connect(remote_public_key, ConnectOptions{}, std::move(on_done));
+}
+
+void HyperDHT::connect(const noise::PubKey& remote_public_key,
+                        const ConnectOptions& opts,
+                        ConnectCallback on_done) {
+    if (destroyed_) {
+        on_done(-1, {});
+        return;
+    }
+    ensure_bound();
+
+    // JS: if pool has existing connection, return it
+    if (opts.pool && opts.pool->has(remote_public_key)) {
+        // Connection already exists — caller should use pool.get() directly
+        on_done(-7, {});  // DUPLICATE
+        return;
+    }
+
+    do_connect(remote_public_key, opts_.default_keypair, opts, std::move(on_done));
 }
 
 void HyperDHT::connect(const noise::PubKey& remote_public_key,
@@ -96,11 +116,12 @@ void HyperDHT::connect(const noise::PubKey& remote_public_key,
         return;
     }
     ensure_bound();
-    do_connect(remote_public_key, keypair, std::move(on_done));
+    do_connect(remote_public_key, keypair, ConnectOptions{}, std::move(on_done));
 }
 
 void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                            const noise::Keypair& keypair,
+                           const ConnectOptions& opts,
                            ConnectCallback on_done) {
 
     // State shared across the async pipeline
@@ -182,7 +203,8 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
 
             // Step 2: try PEER_HANDSHAKE through relays, closest first.
             // JS: connectThroughNode for each relay, semaphore(2).
-            // We try sequentially from end (closest = freshest).
+            // We try sequentially from end (closest = freshest),
+            // but fire 2 initial attempts in parallel.
             state->relay_idx = static_cast<int>(state->relays.size()) - 1;
             state->try_relay_fn = std::make_shared<std::function<void()>>();
             *state->try_relay_fn = [state]() {
@@ -312,6 +334,26 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                     auto fw = state->socket->nat_sampler().firewall();
                     auto addrs = state->socket->nat_sampler().addresses();
 
+                    // JS: if our firewall is OPEN, wait passively for server
+                    // to probe us (via rawStream firewall callback). 10s timeout.
+                    if (fw == peer_connect::FIREWALL_OPEN) {
+                        DHT_LOG("  [connect] Our firewall is OPEN, waiting passively (10s)\n");
+                        auto* passive_timer = new uv_timer_t;
+                        uv_timer_init(state->socket->loop(), passive_timer);
+                        passive_timer->data = new std::shared_ptr<ConnState>(state);
+                        uv_timer_start(passive_timer, [](uv_timer_t* t) {
+                            auto* sp = static_cast<std::shared_ptr<ConnState>*>(t->data);
+                            if (sp && *sp && !(*sp)->completed) {
+                                (*sp)->complete(-6);  // Passive connect timeout
+                            }
+                            delete sp;
+                            t->data = nullptr;
+                            uv_close(reinterpret_cast<uv_handle_t*>(t),
+                                     [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+                        }, 10000, 0);
+                        return;
+                    }
+
                     holepunch::holepunch_connect(*state->socket, hs,
                         hp_relay, hp_peer, hp_info.id, fw, addrs,
                         [state](const holepunch::HolepunchResult& hp) {
@@ -338,7 +380,12 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                         });
                 });
             };
+            // Fire first attempt
             (*state->try_relay_fn)();
+            // Fire second attempt in parallel (JS: Semaphore(2))
+            if (state->relay_idx >= 0 && !state->completed) {
+                (*state->try_relay_fn)();
+            }
         });
 }
 

@@ -58,6 +58,9 @@ add_library(hyperdht
     src/peer_connect.cpp
     src/holepunch.cpp
     src/nat_sampler.cpp
+    src/socket_pool.cpp
+    src/connection_pool.cpp
+    src/async_utils.cpp
     src/health.cpp
     src/protomux.cpp
     src/dht_messages.cpp
@@ -340,6 +343,21 @@ if(HYPERDHT_BUILD_TESTS)
     target_link_libraries(test_nat_sampler PRIVATE hyperdht GTest::gtest_main)
     add_test(NAME test_nat_sampler COMMAND test_nat_sampler)
     gtest_discover_tests(test_nat_sampler)
+
+    add_executable(test_socket_pool test/test_socket_pool.cpp)
+    target_link_libraries(test_socket_pool PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_socket_pool COMMAND test_socket_pool)
+    gtest_discover_tests(test_socket_pool)
+
+    add_executable(test_connection_pool test/test_connection_pool.cpp)
+    target_link_libraries(test_connection_pool PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_connection_pool COMMAND test_connection_pool)
+    gtest_discover_tests(test_connection_pool)
+
+    add_executable(test_async_utils test/test_async_utils.cpp)
+    target_link_libraries(test_async_utils PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_async_utils COMMAND test_async_utils)
+    gtest_discover_tests(test_async_utils)
 
     add_executable(test_live_connect test/test_live_connect.cpp)
     target_link_libraries(test_live_connect PRIVATE hyperdht GTest::gtest_main)

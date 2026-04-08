@@ -79,14 +79,41 @@ public:
     // Set firewall callback (return true to reject a connection)
     void set_firewall(FirewallCb cb) { firewall_ = std::move(cb); }
 
+    // Holepunch veto callback (JS: opts.holepunch)
+    // Called during holepunch negotiation. Return false to abort.
+    // Args: remote_fw, local_fw, remote_addrs, local_addrs
+    using HolepunchCb = std::function<bool(
+        uint32_t remote_fw, uint32_t local_fw,
+        const std::vector<compact::Ipv4Address>& remote_addrs,
+        const std::vector<compact::Ipv4Address>& local_addrs)>;
+    void set_holepunch(HolepunchCb cb) { holepunch_cb_ = std::move(cb); }
+
+    // Suspend: stop announcer, clear pending holepunches (JS: server.suspend())
+    void suspend();
+    // Resume: restart announcer (JS: server.resume())
+    void resume();
+
     // Refresh announcements
     void refresh();
+
+    // Server's listening address (JS: server.address())
+    struct AddressInfo {
+        noise::PubKey public_key;
+        std::string host;
+        uint16_t port = 0;
+    };
+    AddressInfo address() const;
 
     // State
     bool is_listening() const { return listening_; }
     bool is_closed() const { return closed_; }
+    bool is_suspended() const { return suspended_; }
     const noise::PubKey& public_key() const { return keypair_.public_key; }
     const std::vector<peer_connect::RelayInfo>& relay_addresses() const;
+
+    // Configuration (JS: opts)
+    bool share_local_address = true;   // JS: opts.shareLocalAddress (default true)
+    uint64_t handshake_clear_wait = 10000;  // JS: opts.handshakeClearWait (default 10s)
 
 private:
     rpc::RpcSocket& socket_;
@@ -97,9 +124,11 @@ private:
     std::unique_ptr<announcer::Announcer> announcer_;
     OnConnectionCb on_connection_;
     FirewallCb firewall_;
+    HolepunchCb holepunch_cb_;
 
     bool listening_ = false;
     bool closed_ = false;
+    bool suspended_ = false;
 
     // Active holepunch sessions indexed by ID
     uint32_t next_hp_id_ = 0;
@@ -119,8 +148,7 @@ public:
     void on_raw_stream_firewall(udx_stream_t* stream, const struct sockaddr* from);
 private:
 
-    // Per-session cleanup — matches JS _clearLater / HANDSHAKE_INITIAL_TIMEOUT (10s)
-    static constexpr uint64_t HP_TIMEOUT_MS = 10000;
+    // Per-session cleanup — uses configurable handshake_clear_wait
     std::unordered_map<uint32_t, uv_timer_t*> session_timers_;
     void clear_session(uint32_t hp_id);
 

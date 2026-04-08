@@ -126,7 +126,45 @@ void Server::close(std::function<void()> on_done) {
 }
 
 void Server::refresh() {
-    if (announcer_) announcer_->refresh();
+    if (!suspended_ && announcer_) announcer_->refresh();
+}
+
+void Server::suspend() {
+    if (suspended_) return;
+    suspended_ = true;
+
+    // Stop announcer
+    if (announcer_) announcer_->stop();
+
+    // Clear pending holepunches (JS: server.suspend clears holepunches)
+    for (auto& [id, timer] : session_timers_) {
+        uv_timer_stop(timer);
+        auto* ctx = static_cast<std::pair<Server*, uint32_t>*>(timer->data);
+        delete ctx;
+        timer->data = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(timer),
+                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+    }
+    session_timers_.clear();
+    connections_.clear();
+    handshake_dedup_.clear();
+    pending_punch_streams_.clear();
+}
+
+void Server::resume() {
+    if (!suspended_) return;
+    suspended_ = false;
+
+    // Restart announcer
+    if (announcer_) announcer_->start();
+}
+
+Server::AddressInfo Server::address() const {
+    AddressInfo info;
+    info.public_key = keypair_.public_key;
+    info.host = "0.0.0.0";  // TODO: detect from socket
+    info.port = socket_.port();
+    return info;
 }
 
 const std::vector<peer_connect::RelayInfo>& Server::relay_addresses() const {
@@ -144,7 +182,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
                                 std::function<void(std::vector<uint8_t>)> reply_fn) {
     DHT_LOG( "  [server] on_peer_handshake: noise=%zu bytes, from=%s:%u\n",
             noise.size(), peer_address.host_string().c_str(), peer_address.port);
-    if (closed_) return;
+    if (closed_ || suspended_) return;
 
     // Dedup: same noise bytes = same client via different relay.
     // JS: k = noise.toString('hex'); if (_connects.has(k)) reuse session.
@@ -246,7 +284,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         delete c;
         uv_close(reinterpret_cast<uv_handle_t*>(t),
                  [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-    }, HP_TIMEOUT_MS, 0);
+    }, handshake_clear_wait, 0);
     session_timers_[hp_id] = timer;
 
     DHT_LOG( "  [server] Handshake complete (id=%d), waiting for holepunch\n", hp_id);
@@ -302,8 +340,17 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                 hp_msg.id, reply.remote_firewall,
                 reply.remote_addresses.size());
 
-        // JS: server creates Holepuncher(dht, session, false) and calls punch()
-        // → 10 rounds of probes at 1s intervals. Non-initiator echoes received probes.
+        // JS: opts.holepunch callback to veto (server.js:544)
+        if (holepunch_cb_) {
+            auto local_addrs = socket_.nat_sampler().addresses();
+            if (!holepunch_cb_(reply.remote_firewall, our_fw,
+                               reply.remote_addresses, local_addrs)) {
+                DHT_LOG("  [server] Holepunch vetoed by callback\n");
+                clear_session(hp_msg.id);
+                return;
+            }
+        }
+
         if (!conn.puncher) {
             conn.puncher = std::make_shared<holepunch::Holepuncher>(socket_.loop(), false);
             conn.puncher->set_send_fn([this](const compact::Ipv4Address& addr) {

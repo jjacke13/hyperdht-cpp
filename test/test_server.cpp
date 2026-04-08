@@ -240,3 +240,102 @@ TEST(Server, DoubleListenNoop) {
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }
+
+// ---------------------------------------------------------------------------
+// Suspend / Resume
+// ---------------------------------------------------------------------------
+
+TEST(Server, SuspendResume) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed seed{};
+    seed.fill(0x22);
+    auto kp = noise::generate_keypair(seed);
+
+    srv.listen(kp, [](const ConnectionInfo&) {});
+    EXPECT_TRUE(srv.is_listening());
+    EXPECT_FALSE(srv.is_suspended());
+
+    srv.suspend();
+    EXPECT_TRUE(srv.is_suspended());
+    EXPECT_TRUE(srv.is_listening());  // Still listening, just suspended
+
+    srv.resume();
+    EXPECT_FALSE(srv.is_suspended());
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// Address
+// ---------------------------------------------------------------------------
+
+TEST(Server, Address) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed seed{};
+    seed.fill(0x33);
+    auto kp = noise::generate_keypair(seed);
+
+    srv.listen(kp, [](const ConnectionInfo&) {});
+
+    auto addr = srv.address();
+    EXPECT_EQ(addr.public_key, kp.public_key);
+    EXPECT_GT(addr.port, 0u);
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+TEST(Server, ShareLocalAddressDefault) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+
+    router::Router router;
+    Server srv(socket, router);
+
+    EXPECT_TRUE(srv.share_local_address);  // Default: true
+    EXPECT_EQ(srv.handshake_clear_wait, 10000u);  // Default: 10s
+
+    srv.share_local_address = false;
+    EXPECT_FALSE(srv.share_local_address);
+
+    srv.handshake_clear_wait = 5000;
+    EXPECT_EQ(srv.handshake_clear_wait, 5000u);
+
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}

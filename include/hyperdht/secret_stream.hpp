@@ -12,10 +12,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <vector>
 
 #include <sodium.h>
+#include <uv.h>
 
 #include "hyperdht/noise_wrap.hpp"
 
@@ -53,6 +55,10 @@ uint32_t read_uint24_le(const uint8_t* buf);
 // SecretStream — encrypts/decrypts messages using secretstream
 // ---------------------------------------------------------------------------
 
+// Callbacks for timer events
+using OnTimeoutCallback = std::function<void()>;
+using OnKeepaliveCallback = std::function<void()>;
+
 class SecretStream {
 public:
     // Initialize from completed Noise IK handshake results
@@ -60,12 +66,14 @@ public:
     // rx_key: our receive key (from Noise split)
     // handshake_hash: from completed Noise handshake
     // is_initiator: which side of the handshake we are
+    // loop: optional libuv event loop for timer support (nullptr to disable)
     SecretStream(const Key& tx_key, const Key& rx_key,
-                 const noise::Hash& handshake_hash, bool is_initiator);
+                 const noise::Hash& handshake_hash, bool is_initiator,
+                 uv_loop_t* loop = nullptr);
 
     ~SecretStream();
 
-    // Non-copyable, non-movable (holds crypto state)
+    // Non-copyable, non-movable (holds crypto state + timer handles)
     SecretStream(const SecretStream&) = delete;
     SecretStream& operator=(const SecretStream&) = delete;
     SecretStream(SecretStream&&) = delete;
@@ -85,12 +93,35 @@ public:
 
     // Encrypt a message for sending
     // Returns: framed message (uint24_le(len) + encrypted_payload)
+    // Also refreshes the keepalive timer (we just sent data)
     std::vector<uint8_t> encrypt(const uint8_t* data, size_t len);
 
     // Decrypt a received message
     // Input: the encrypted payload (after stripping uint24_le length prefix)
     // Returns: decrypted plaintext, or nullopt on auth failure
+    // Also refreshes the timeout timer (we just received data)
+    // Empty messages (0-byte plaintext) are suppressed when keepalive is active
     std::optional<std::vector<uint8_t>> decrypt(const uint8_t* data, size_t len);
+
+    // -----------------------------------------------------------------------
+    // Keepalive / Timeout (matches JS @hyperswarm/secret-stream)
+    // -----------------------------------------------------------------------
+
+    // Set inactivity timeout (ms). If no data is received within this window,
+    // the on_timeout callback fires. 0 = disabled. Refreshed on every decrypt().
+    void set_timeout(uint64_t ms, OnTimeoutCallback cb);
+
+    // Set keepalive interval (ms). If no data is sent within this window,
+    // the on_keepalive callback fires (caller should send an empty message).
+    // 0 = disabled. Refreshed on every encrypt().
+    void set_keep_alive(uint64_t ms, OnKeepaliveCallback cb);
+
+    // Stop all timers (call before destroying the stream)
+    void stop_timers();
+
+    // Current timer values
+    uint64_t timeout() const { return timeout_ms_; }
+    uint64_t keep_alive() const { return keep_alive_ms_; }
 
     // Our stream ID and expected remote stream ID
     const StreamId& local_id() const { return local_id_; }
@@ -113,6 +144,23 @@ private:
     Key tx_key_;
     Key rx_key_;
     uint8_t header_bytes_[HEADERBYTES];  // Generated during push init
+
+    // Timer state
+    uv_loop_t* loop_ = nullptr;
+    uint64_t timeout_ms_ = 0;
+    uint64_t keep_alive_ms_ = 0;
+    uv_timer_t* timeout_timer_ = nullptr;
+    uv_timer_t* keepalive_timer_ = nullptr;
+    OnTimeoutCallback on_timeout_;
+    OnKeepaliveCallback on_keepalive_;
+
+    void start_timeout_timer();
+    void start_keepalive_timer();
+    void stop_timer(uv_timer_t*& timer);
+
+    static void on_timeout_cb(uv_timer_t* handle);
+    static void on_keepalive_cb(uv_timer_t* handle);
+    static void on_timer_close(uv_handle_t* handle);
 };
 
 }  // namespace secret_stream

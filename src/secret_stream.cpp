@@ -60,8 +60,9 @@ uint32_t read_uint24_le(const uint8_t* buf) {
 // ---------------------------------------------------------------------------
 
 SecretStream::SecretStream(const Key& tx_key, const Key& rx_key,
-                           const noise::Hash& handshake_hash, bool is_initiator)
-    : is_initiator_(is_initiator), tx_key_(tx_key), rx_key_(rx_key) {
+                           const noise::Hash& handshake_hash, bool is_initiator,
+                           uv_loop_t* loop)
+    : is_initiator_(is_initiator), tx_key_(tx_key), rx_key_(rx_key), loop_(loop) {
 
     // Compute stream IDs
     local_id_ = compute_stream_id(handshake_hash, is_initiator);
@@ -73,6 +74,7 @@ SecretStream::SecretStream(const Key& tx_key, const Key& rx_key,
 }
 
 SecretStream::~SecretStream() {
+    stop_timers();
     sodium_memzero(push_state_, sizeof(push_state_));
     sodium_memzero(pull_state_, sizeof(pull_state_));
     sodium_memzero(tx_key_.data(), KEYBYTES);
@@ -138,6 +140,12 @@ std::vector<uint8_t> SecretStream::encrypt(const uint8_t* data, size_t len) {
     // Correct size in case out_len differs from expected
     msg.resize(3 + static_cast<size_t>(out_len));
     write_uint24_le(msg.data(), static_cast<uint32_t>(out_len));
+
+    // Refresh keepalive timer — we just sent data
+    if (keepalive_timer_ != nullptr) {
+        uv_timer_again(keepalive_timer_);
+    }
+
     return msg;
 }
 
@@ -145,6 +153,11 @@ std::optional<std::vector<uint8_t>> SecretStream::decrypt(const uint8_t* data, s
     if (!is_ready()) return std::nullopt;  // Runtime guard (assert stripped in release)
 
     if (len < ABYTES) return std::nullopt;
+
+    // Refresh timeout timer — we just received data
+    if (timeout_timer_ != nullptr) {
+        uv_timer_again(timeout_timer_);
+    }
 
     std::vector<uint8_t> pt(len - ABYTES);
     unsigned long long pt_len = 0;
@@ -159,7 +172,84 @@ std::optional<std::vector<uint8_t>> SecretStream::decrypt(const uint8_t* data, s
 
     if (rc != 0) return std::nullopt;
     pt.resize(static_cast<size_t>(pt_len));
+
+    // Suppress empty keepalive messages (JS: if plain.byteLength === 0 && keepAlive !== 0)
+    if (pt.empty() && keep_alive_ms_ > 0) {
+        return std::nullopt;
+    }
+
     return pt;
+}
+
+// ---------------------------------------------------------------------------
+// Timer management
+// ---------------------------------------------------------------------------
+
+void SecretStream::set_timeout(uint64_t ms, OnTimeoutCallback cb) {
+    stop_timer(timeout_timer_);
+    timeout_ms_ = ms;
+    on_timeout_ = std::move(cb);
+    if (ms > 0 && loop_ != nullptr) {
+        start_timeout_timer();
+    }
+}
+
+void SecretStream::set_keep_alive(uint64_t ms, OnKeepaliveCallback cb) {
+    stop_timer(keepalive_timer_);
+    keep_alive_ms_ = ms;
+    on_keepalive_ = std::move(cb);
+    if (ms > 0 && loop_ != nullptr) {
+        start_keepalive_timer();
+    }
+}
+
+void SecretStream::stop_timers() {
+    stop_timer(timeout_timer_);
+    stop_timer(keepalive_timer_);
+}
+
+void SecretStream::start_timeout_timer() {
+    timeout_timer_ = new uv_timer_t;
+    uv_timer_init(loop_, timeout_timer_);
+    timeout_timer_->data = this;
+    // Single-fire: fires once after timeout_ms_, repeat=timeout_ms_ for uv_timer_again
+    uv_timer_start(timeout_timer_, on_timeout_cb, timeout_ms_, timeout_ms_);
+}
+
+void SecretStream::start_keepalive_timer() {
+    keepalive_timer_ = new uv_timer_t;
+    uv_timer_init(loop_, keepalive_timer_);
+    keepalive_timer_->data = this;
+    // Repeating: fires every keep_alive_ms_ of idle
+    uv_timer_start(keepalive_timer_, on_keepalive_cb, keep_alive_ms_, keep_alive_ms_);
+}
+
+void SecretStream::stop_timer(uv_timer_t*& timer) {
+    if (timer != nullptr) {
+        uv_timer_stop(timer);
+        uv_close(reinterpret_cast<uv_handle_t*>(timer), on_timer_close);
+        timer = nullptr;
+    }
+}
+
+void SecretStream::on_timeout_cb(uv_timer_t* handle) {
+    auto* self = static_cast<SecretStream*>(handle->data);
+    // Stop the timer — timeout fires once
+    uv_timer_stop(handle);
+    if (self->on_timeout_) {
+        self->on_timeout_();
+    }
+}
+
+void SecretStream::on_keepalive_cb(uv_timer_t* handle) {
+    auto* self = static_cast<SecretStream*>(handle->data);
+    if (self->on_keepalive_) {
+        self->on_keepalive_();
+    }
+}
+
+void SecretStream::on_timer_close(uv_handle_t* handle) {
+    delete reinterpret_cast<uv_timer_t*>(handle);
 }
 
 }  // namespace secret_stream

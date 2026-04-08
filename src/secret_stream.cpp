@@ -227,6 +227,7 @@ void SecretStream::start_keepalive_timer() {
 void SecretStream::stop_timer(uv_timer_t*& timer) {
     if (timer != nullptr) {
         uv_timer_stop(timer);
+        timer->data = nullptr;  // Prevent stale this in callback
         uv_close(reinterpret_cast<uv_handle_t*>(timer), on_timer_close);
         timer = nullptr;
     }

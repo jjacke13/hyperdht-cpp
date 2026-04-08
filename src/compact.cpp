@@ -437,7 +437,8 @@ Ipv6Address Ipv6Address::from_string(const std::string& host_str, uint16_t port)
         parse_groups(before_str, before_groups);
         parse_groups(after_str, after_groups);
         // Fill in zeros between before and after to make 8 groups
-        size_t missing = 8 - before_groups.size() - after_groups.size();
+        size_t total = before_groups.size() + after_groups.size();
+        size_t missing = (total < 8) ? (8 - total) : 0;
         std::vector<uint16_t> groups;
         groups.insert(groups.end(), before_groups.begin(), before_groups.end());
         for (size_t g = 0; g < missing; g++) groups.push_back(0);

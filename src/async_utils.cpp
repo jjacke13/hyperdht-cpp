@@ -8,12 +8,19 @@ namespace async_utils {
 // ---------------------------------------------------------------------------
 
 Sleeper::Sleeper(uv_loop_t* loop) : loop_(loop) {
-    uv_timer_init(loop_, &timer_);
-    timer_.data = this;
+    timer_ = new uv_timer_t;
+    uv_timer_init(loop_, timer_);
+    timer_->data = this;
 }
 
 Sleeper::~Sleeper() {
     cancel();
+    if (timer_ && !uv_is_closing(reinterpret_cast<uv_handle_t*>(timer_))) {
+        timer_->data = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(timer_),
+                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+    }
+    timer_ = nullptr;
 }
 
 void Sleeper::pause(uint64_t ms, Callback cb) {
@@ -24,19 +31,19 @@ void Sleeper::pause(uint64_t ms, Callback cb) {
 
     cb_ = std::move(cb);
     timer_active_ = true;
-    uv_timer_start(&timer_, on_timer, ms, 0);
+    uv_timer_start(timer_, on_timer, ms, 0);
 }
 
 void Sleeper::resume() {
-    if (timer_active_) {
-        uv_timer_stop(&timer_);
+    if (timer_active_ && timer_) {
+        uv_timer_stop(timer_);
         trigger();
     }
 }
 
 void Sleeper::cancel() {
-    if (timer_active_) {
-        uv_timer_stop(&timer_);
+    if (timer_active_ && timer_) {
+        uv_timer_stop(timer_);
         timer_active_ = false;
         cb_ = nullptr;
     }

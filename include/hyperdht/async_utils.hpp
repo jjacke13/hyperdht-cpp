@@ -49,7 +49,7 @@ public:
 
 private:
     uv_loop_t* loop_;
-    uv_timer_t timer_;
+    uv_timer_t* timer_ = nullptr;  // Heap-allocated for safe uv_close
     Callback cb_;
     bool timer_active_ = false;
     bool closing_ = false;

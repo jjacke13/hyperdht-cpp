@@ -239,7 +239,10 @@ void Channel::drain_pending() {
     auto pending = std::move(pending_messages_);
     pending_messages_.clear();
     for (const auto& pm : pending) {
-        mux_.buffered_bytes_ -= pm.data.size();
+        if (mux_.buffered_bytes_ >= pm.data.size())
+            mux_.buffered_bytes_ -= pm.data.size();
+        else
+            mux_.buffered_bytes_ = 0;
         if (!destroyed_) {
             dispatch(pm.type, pm.data.data(), pm.data.size());
         }
@@ -486,6 +489,10 @@ void Mux::handle_data(uint32_t channel_id, const uint8_t* data, size_t len) {
 
     if (!ch->opened_) {
         // Buffer the message until channel is fully opened
+        // Enforce MAX_BUFFERED to prevent unbounded memory growth
+        if (buffered_bytes_ + remaining > MAX_BUFFERED) {
+            return;  // Drop message — backpressure exceeded
+        }
         Channel::PendingMessage pm;
         pm.type = type;
         pm.data.assign(ptr, ptr + remaining);
@@ -574,8 +581,10 @@ void Mux::dispatch_notify(const std::string& protocol,
 
 void Mux::on_stream_drain() {
     drained_ = true;
-    // Notify all channels
-    for (auto& ch : channels_) {
+    // Snapshot: callbacks may close channels, modifying channels_ vector
+    auto snapshot = std::vector<Channel*>();
+    for (auto& ch : channels_) snapshot.push_back(ch.get());
+    for (auto* ch : snapshot) {
         if (ch->opened_ && !ch->destroyed_ && ch->on_drain) {
             ch->on_drain();
         }

@@ -461,8 +461,10 @@ void Holepuncher::destroy() {
     destroyed_ = true;
     punching_ = false;
 
-    // Release all holders
+    // Clear holepunch callbacks on holders before releasing — prevents
+    // lingering SocketRef from calling back into destroyed Holepuncher
     for (auto* h : holders_) {
+        h->on_holepunch_message = nullptr;
         h->release();
     }
     holders_.clear();
@@ -473,9 +475,12 @@ void Holepuncher::destroy() {
     }
 
     // Fire abort if not connected (JS: holepuncher.js:185-188)
+    // NOTE: on_abort_ must not delete this Holepuncher synchronously.
+    // The caller should use shared_ptr or deferred cleanup.
     if (!connected_) {
         decrement_randomized();
-        if (on_abort_) on_abort_();
+        auto cb = std::move(on_abort_);
+        if (cb) cb();
     }
 }
 
@@ -929,9 +934,11 @@ struct PunchState {
         // Clear probe listener on main socket
         if (socket) socket->on_holepunch_probe(nullptr);
 
-        // Stop and close timeout timer
+        // Stop and close timeout timer — delete the heap-allocated shared_ptr
         if (timeout && !uv_is_closing(reinterpret_cast<uv_handle_t*>(timeout))) {
             uv_timer_stop(timeout);
+            auto* sp = static_cast<std::shared_ptr<PunchState>*>(timeout->data);
+            delete sp;  // Free the heap-alloc'd shared_ptr before nulling
             timeout->data = nullptr;
             uv_close(reinterpret_cast<uv_handle_t*>(timeout),
                      [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
@@ -984,7 +991,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
 
     // Discover pool socket's external address via PINGs (JS: nat.autoSample())
     discover_pool_addresses(*state->pool, socket.table(), relay_addr,
-        [state, &socket, target, relay_addr, peer_addr, holepunch_id,
+        [state, target, relay_addr, peer_addr, holepunch_id,
          local_firewall, local_addresses](bool addr_ok) {
 
         if (state->completed) return;
@@ -1030,8 +1037,8 @@ void holepunch_connect(rpc::RpcSocket& socket,
     // Send Round 1 from MAIN socket — the relay must see the same address
     // as the handshake so the server's rawStream can reach us. Pool socket
     // is used for probes only.
-    socket.request(req,
-        [state, &socket, relay_addr, peer_addr, holepunch_id, target, local_firewall]
+    state->socket->request(req,
+        [state, relay_addr, peer_addr, holepunch_id, target, local_firewall]
         (const messages::Response& resp) {
             if (state->completed) return;
 
@@ -1134,7 +1141,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
             // -------------------------------------------------------------------
             // Set up the Holepuncher
             // -------------------------------------------------------------------
-            auto puncher = std::make_shared<Holepuncher>(socket.loop(), true);
+            auto puncher = std::make_shared<Holepuncher>(state->socket->loop(), true);
             puncher->set_local_firewall(local_firewall);
             puncher->set_remote_firewall(effective_remote_fw);
             // Use update_remote with first address verified (from relay)
@@ -1143,15 +1150,12 @@ void holepunch_connect(rpc::RpcSocket& socket,
             puncher->update_remote(server_addrs, verified_host);
 
             // Send probes from BOTH main socket and pool socket.
-            // Main socket: opens CGNAT mapping so server's probes to our
-            // main address (from relay) get through.
-            // Pool socket: creates secondary mapping for the pool address.
-            puncher->set_send_fn([state, &socket](const Ipv4Address& addr) {
-                socket.send_probe(addr);  // Main socket — opens CGNAT for server
-                if (state->pool) state->pool->send_probe(addr);  // Pool socket
+            puncher->set_send_fn([state](const Ipv4Address& addr) {
+                state->socket->send_probe(addr);
+                if (state->pool) state->pool->send_probe(addr);
             });
-            puncher->set_send_ttl_fn([state, &socket](const Ipv4Address& addr, int ttl) {
-                socket.send_probe_ttl(addr, ttl);
+            puncher->set_send_ttl_fn([state](const Ipv4Address& addr, int ttl) {
+                state->socket->send_probe_ttl(addr, ttl);
                 if (state->pool) state->pool->send_probe_ttl(addr, ttl);
             });
 
@@ -1162,18 +1166,18 @@ void holepunch_connect(rpc::RpcSocket& socket,
             state->puncher = puncher;
 
             // Listen for probes on BOTH pool socket and main socket.
-            // Pass the receiving socket so UDX connect uses the right one.
             state->pool->on_holepunch_probe([state](const Ipv4Address& from) {
                 if (state->puncher) state->puncher->on_message(from,
                     state->pool ? state->pool->socket_handle() : nullptr);
             });
-            socket.on_holepunch_probe([state, &socket](const Ipv4Address& from) {
-                if (state->puncher) state->puncher->on_message(from, socket.socket_handle());
+            state->socket->on_holepunch_probe([state](const Ipv4Address& from) {
+                if (state->puncher) state->puncher->on_message(from,
+                    state->socket->socket_handle());
             });
 
             // Start overall timeout
             auto* timer = new uv_timer_t;
-            uv_timer_init(socket.loop(), timer);
+            uv_timer_init(state->socket->loop(), timer);
             auto timeout_state = state;  // prevent shared_ptr from dying
             timer->data = new std::shared_ptr<PunchState>(timeout_state);
             state->timeout = timer;
@@ -1194,7 +1198,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
 
             Ipv4Address our_addr = resp.from.addr;
 
-            auto send_round2 = [state, &socket, relay_addr, peer_addr,
+            auto send_round2 = [state, relay_addr, peer_addr,
                                 holepunch_id, target, local_firewall,
                                 server_addrs, server_r1, puncher, our_addr]() {
             if (state->completed) return;
@@ -1244,7 +1248,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
             }
 
             // Send Round 2 from MAIN socket (same address as handshake)
-            socket.request(req2,
+            state->socket->request(req2,
                 [state, puncher, server_addrs](const messages::Response& r2resp) {
                     if (state->completed) return;
 

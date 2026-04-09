@@ -152,7 +152,12 @@ TEST(LiveConnect, FullPipeline) {
                state.our_udx_id, server_udx_id,
                hp_result.address.host_string().c_str(), hp_result.address.port);
 
-        // Create UDX stream using the SAME udx + socket as RPC
+        // Use the socket that received the holepunch probe (may be the main
+        // RPC socket OR a pool socket — both share the same udx_t handle).
+        // JS equivalent: c.onsocket(ref.socket, port, host)
+        udx_socket_t* punch_socket = hp_result.socket
+            ? hp_result.socket : rpc_socket.socket_handle();
+
         state.stream = new udx_stream_t;
         udx_stream_init(rpc_socket.udx_handle(), state.stream, state.our_udx_id,
             nullptr, nullptr);
@@ -162,7 +167,7 @@ TEST(LiveConnect, FullPipeline) {
         struct sockaddr_in dest{};
         uv_ip4_addr(hp_result.address.host_string().c_str(),
                      hp_result.address.port, &dest);
-        udx_stream_connect(state.stream, rpc_socket.socket_handle(),
+        udx_stream_connect(state.stream, punch_socket,
                            server_udx_id,
                            reinterpret_cast<const struct sockaddr*>(&dest));
 
@@ -413,7 +418,10 @@ TEST(LiveConnect, FullPipeline) {
 
     delete state.ss;
     if (state.stream) {
-        // Stream was already destroyed in shutdown or we need to clean up
+        udx_stream_destroy(state.stream);
+        delete state.stream;
+        state.stream = nullptr;
     }
+    uv_run(&loop, UV_RUN_NOWAIT);  // Process close callbacks
     uv_loop_close(&loop);
 }

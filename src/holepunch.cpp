@@ -926,7 +926,14 @@ struct PunchState {
         if (completed) return;
         completed = true;
 
-        if (puncher) puncher->stop();
+        // Destroy puncher (stops timer, releases holders, clears callbacks)
+        if (puncher) {
+            puncher->destroy();
+            puncher->close();
+        }
+
+        // Cancel sleeper timer
+        if (sleeper) sleeper->cancel();
 
         // Close pool socket
         if (pool) pool->close();
@@ -934,12 +941,15 @@ struct PunchState {
         // Clear probe listener on main socket
         if (socket) socket->on_holepunch_probe(nullptr);
 
-        // Stop and close timeout timer — delete the heap-allocated shared_ptr
+        // Stop and close timeout timer. The timer callback lambda owns its
+        // heap-allocated shared_ptr<PunchState>*. We must delete it here since
+        // uv_timer_stop prevents the lambda from firing (and doing its own delete).
         if (timeout && !uv_is_closing(reinterpret_cast<uv_handle_t*>(timeout))) {
             uv_timer_stop(timeout);
+            // Delete the heap-alloc'd shared_ptr that the timer lambda would have deleted
             auto* sp = static_cast<std::shared_ptr<PunchState>*>(timeout->data);
-            delete sp;  // Free the heap-alloc'd shared_ptr before nulling
-            timeout->data = nullptr;
+            timeout->data = nullptr;  // Null BEFORE delete — prevents double-free if timer fires
+            delete sp;
             uv_close(reinterpret_cast<uv_handle_t*>(timeout),
                      [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
             timeout = nullptr;
@@ -1149,13 +1159,14 @@ void holepunch_connect(rpc::RpcSocket& socket,
             if (!server_addrs.empty()) verified_host = server_addrs[0].host_string();
             puncher->update_remote(server_addrs, verified_host);
 
-            // Send probes from BOTH main socket and pool socket.
+            // Send probes from BOTH main and pool socket. We report the pool
+            // socket's address but also probe from main to maximize chances.
             puncher->set_send_fn([state](const Ipv4Address& addr) {
-                state->socket->send_probe(addr);
+                if (state->socket) state->socket->send_probe(addr);
                 if (state->pool) state->pool->send_probe(addr);
             });
             puncher->set_send_ttl_fn([state](const Ipv4Address& addr, int ttl) {
-                state->socket->send_probe_ttl(addr, ttl);
+                if (state->socket) state->socket->send_probe_ttl(addr, ttl);
                 if (state->pool) state->pool->send_probe_ttl(addr, ttl);
             });
 
@@ -1184,11 +1195,12 @@ void holepunch_connect(rpc::RpcSocket& socket,
 
             uv_timer_start(timer, [](uv_timer_t* t) {
                 auto* sp = static_cast<std::shared_ptr<PunchState>*>(t->data);
-                if (sp && *sp) {
+                if (!sp) return;  // Already cleaned up by complete()
+                t->data = nullptr;
+                if (*sp) {
                     (*sp)->complete({});  // Timeout — fail
                 }
                 delete sp;
-                t->data = nullptr;
             }, HOLEPUNCH_TIMEOUT_MS, 0);
 
             // -------------------------------------------------------------------
@@ -1196,6 +1208,9 @@ void holepunch_connect(rpc::RpcSocket& socket,
             // Delayed by 1s if server firewall was UNKNOWN (gives server time)
             // -------------------------------------------------------------------
 
+            // Use our main RPC socket's external address (from relay response).
+            // The server probes this address. We send probes from both main
+            // and pool sockets to maximize NAT punch chances.
             Ipv4Address our_addr = resp.from.addr;
 
             auto send_round2 = [state, relay_addr, peer_addr,
@@ -1247,7 +1262,10 @@ void holepunch_connect(rpc::RpcSocket& socket,
                 puncher->open_session(server_addrs[0]);
             }
 
-            // Send Round 2 from MAIN socket (same address as handshake)
+            // Round 2 sent from main RPC socket — needs routing context (node ID,
+            // token) that PoolSocket doesn't have. JS sends via peerHolepunch
+            // which uses the puncher's socket, but the relay routing works
+            // differently in JS. Probes go from pool socket only (fixed above).
             state->socket->request(req2,
                 [state, puncher, server_addrs](const messages::Response& r2resp) {
                     if (state->completed) return;

@@ -49,6 +49,7 @@ struct ConnectionInfo {
     uint32_t local_udx_id = 0;      // Our UDX stream ID
     bool is_initiator = false;       // Server is always responder
     udx_stream_t* raw_stream = nullptr;  // Pre-created during handshake (like JS rawStream)
+    udx_socket_t* udx_socket = nullptr; // Socket that received the probe (JS: ref.socket)
 };
 
 // ---------------------------------------------------------------------------
@@ -145,7 +146,8 @@ private:
     std::unordered_map<uint32_t, uint32_t> pending_punch_streams_;
 public:
     // Called by rawStream firewall callback (static C function needs access)
-    void on_raw_stream_firewall(udx_stream_t* stream, const struct sockaddr* from);
+    void on_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket,
+                               const struct sockaddr* from);
 private:
 
     // Per-session cleanup — uses configurable handshake_clear_wait
@@ -163,7 +165,8 @@ private:
 
     // Called when holepunch or direct connect succeeds
     void on_socket(server_connection::ServerConnection& conn,
-                   const compact::Ipv4Address& peer_addr);
+                   const compact::Ipv4Address& peer_addr,
+                   udx_socket_t* udx_sock = nullptr);
 };
 
 }  // namespace server

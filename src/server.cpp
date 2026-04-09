@@ -18,7 +18,7 @@ static int server_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket
                                        const struct sockaddr* from) {
     auto* ctx = static_cast<RawStreamCtx*>(stream->data);
     if (ctx && ctx->server) {
-        ctx->server->on_raw_stream_firewall(stream, from);
+        ctx->server->on_raw_stream_firewall(stream, socket, from);
     }
     return 0;  // accept (like JS returns false)
 }
@@ -387,7 +387,8 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
 // ---------------------------------------------------------------------------
 
 void Server::on_socket(server_connection::ServerConnection& conn,
-                       const compact::Ipv4Address& peer_addr) {
+                       const compact::Ipv4Address& peer_addr,
+                       udx_socket_t* udx_sock) {
     if (!on_connection_) return;
 
     ConnectionInfo info;
@@ -398,6 +399,7 @@ void Server::on_socket(server_connection::ServerConnection& conn,
     info.peer_address = peer_addr;
     info.local_udx_id = conn.local_udx_id;
     info.is_initiator = false;
+    info.udx_socket = udx_sock;
     // Transfer rawStream ownership. Clean up the Server's firewall context.
     if (conn.raw_stream && conn.raw_stream->data) {
         delete static_cast<RawStreamCtx*>(conn.raw_stream->data);
@@ -441,7 +443,8 @@ void Server::clear_session(uint32_t hp_id) {
 // rawStream firewall — client's first UDX packet arrived with real address
 // ---------------------------------------------------------------------------
 
-void Server::on_raw_stream_firewall(udx_stream_t* stream, const struct sockaddr* from) {
+void Server::on_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket,
+                                    const struct sockaddr* from) {
     if (closed_) return;
 
     // Find the pending punch for this stream's local_id
@@ -480,8 +483,9 @@ void Server::on_raw_stream_firewall(udx_stream_t* stream, const struct sockaddr*
     }
     connections_.erase(it);
 
-    // Connect with the REAL address from the UDX packet
-    on_socket(*conn_ptr, real_addr);
+    // Connect with the REAL address and the socket that received the probe
+    // JS: hs.onsocket(socket, port, host) — uses the exact socket
+    on_socket(*conn_ptr, real_addr, socket);
 }
 
 }  // namespace server

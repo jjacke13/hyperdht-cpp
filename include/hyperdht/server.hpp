@@ -97,9 +97,27 @@ public:
     // Refresh announcements
     void refresh();
 
-    // Server's listening address (JS: server.address())
+    // JS: `server.notifyOnline()` — called by the DHT when a network-update
+    // fires after coming back online. Wakes the announcer so it re-queries
+    // its relays immediately instead of waiting for the next background tick.
+    // No-op if closed, suspended, or not listening.
+    void notify_online();
+
+    // Server's listening address (JS: `server.address()`).
+    //
+    // Contract:
+    //  - Before listen(): returns an all-zero sentinel (JS returns `null`).
+    //    Callers should check `is_listening()` or `public_key != {0}`.
+    //  - After listen() but before NAT sampling: `public_key` is set but
+    //    `host` is empty and `port` is 0. The NAT sampler needs responses
+    //    from ≥1 node to fill them in, and classification takes ≥3 samples.
+    //  - After NAT sampling: `host`/`port` reflect the public address as
+    //    seen by the network (JS: `dht.host`/`dht.port` → `nat._host/_port`).
+    //
+    // The bound local socket port is intentionally NOT reported here — it
+    // would lie about reachability on NAT'd nodes.
     struct AddressInfo {
-        noise::PubKey public_key;
+        noise::PubKey public_key{};  // zero-initialized; serves as "null" sentinel
         std::string host;
         uint16_t port = 0;
     };

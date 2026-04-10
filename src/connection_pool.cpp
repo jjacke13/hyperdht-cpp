@@ -1,3 +1,7 @@
+// Connection pool implementation — deduplicates in-flight and established
+// connections by remote public key so we open only one stream per peer.
+// Matches JS hyperdht/lib/connection-pool.js.
+
 #include "hyperdht/connection_pool.hpp"
 
 #include <cstring>

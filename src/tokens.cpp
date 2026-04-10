@@ -1,3 +1,7 @@
+// DHT token implementation — dual BLAKE2b secrets rotated every 7.5s.
+// Generates tokens for a given host; accepts tokens matching either
+// the current or previous secret during the overlap window.
+
 #include "hyperdht/tokens.hpp"
 
 #include <sodium.h>

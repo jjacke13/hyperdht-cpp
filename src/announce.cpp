@@ -1,3 +1,7 @@
+// Announce store implementation — hash map keyed by 32-byte target.
+// Records are appended with a TTL and scanned/expired on access.
+// Used by the ANNOUNCE / UNANNOUNCE / FIND_PEER / LOOKUP handlers.
+
 #include "hyperdht/announce.hpp"
 
 #include <algorithm>

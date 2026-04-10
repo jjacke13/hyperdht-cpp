@@ -1,3 +1,7 @@
+// DHT RPC request handler implementations — dispatch PING, PING_NAT,
+// FIND_NODE, DOWN_HINT, DELAYED_PING (internal) and FIND_PEER, LOOKUP,
+// ANNOUNCE, UNANNOUNCE, MUTABLE/IMMUTABLE_GET/PUT (HyperDHT).
+
 #include "hyperdht/rpc_handlers.hpp"
 
 #include <cassert>
@@ -24,6 +28,19 @@ RpcHandlers::~RpcHandlers() {
                  [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
         gc_timer_ = nullptr;
     }
+
+    // Cancel any scheduled DELAYED_PING replies. Orphan each pending struct
+    // (owner=nullptr) so if the fire callback somehow races us it bails out,
+    // then uv_close the timer — the close callback deletes the struct.
+    for (auto* dr : pending_delayed_) {
+        dr->owner = nullptr;
+        uv_timer_stop(&dr->timer);
+        uv_close(reinterpret_cast<uv_handle_t*>(&dr->timer), [](uv_handle_t* h) {
+            auto* d = static_cast<DelayedReply*>(h->data);
+            delete d;
+        });
+    }
+    pending_delayed_.clear();
 }
 
 void RpcHandlers::start_gc_timer() {
@@ -60,10 +77,11 @@ void RpcHandlers::handle(const messages::Request& req) {
     }
     if (req.internal) {
         switch (req.command) {
-            case messages::CMD_PING:      handle_ping(req); break;
-            case messages::CMD_PING_NAT:  handle_ping_nat(req); break;
-            case messages::CMD_FIND_NODE: handle_find_node(req); break;
-            case messages::CMD_DOWN_HINT: handle_down_hint(req); break;
+            case messages::CMD_PING:         handle_ping(req); break;
+            case messages::CMD_PING_NAT:     handle_ping_nat(req); break;
+            case messages::CMD_FIND_NODE:    handle_find_node(req); break;
+            case messages::CMD_DOWN_HINT:    handle_down_hint(req); break;
+            case messages::CMD_DELAYED_PING: handle_delayed_ping(req); break;
             default: break;
         }
     } else {
@@ -167,12 +185,124 @@ void RpcHandlers::handle_find_node(const messages::Request& req) {
 }
 
 // ---------------------------------------------------------------------------
-// DOWN_HINT — remove a reportedly-down node from our routing table
+// DOWN_HINT — a peer tells us another node is unresponsive. We look up that
+// node in our routing table (by BLAKE2b-256 hash of its 6-byte compact ipv4
+// encoding, matching JS `peer.id()`) and schedule a PING check. If the check
+// times out, the node is evicted. Always reply with an empty response.
+// Rate-limited to MAX_CHECKS in-flight checks at once.
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_down_hint(const messages::Request& req) {
-    // No reply needed for DOWN_HINT (fire-and-forget)
-    (void)req;
+    // Reply first — JS pattern: `req.sendReply(0, null, false, false)` is
+    // unconditional after the switch case.
+    auto send_empty_reply = [&]() {
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = req.from.addr;
+        resp.id = socket_.table().id();
+        socket_.reply(resp);
+    };
+
+    if (!req.value.has_value() || req.value->size() < 6) {
+        // JS drops silently without replying when value is malformed.
+        return;
+    }
+
+    // Respect the rate limit (JS: `if (this._checks < 10)`).
+    if (socket_.checks() >= MAX_CHECKS) {
+        send_empty_reply();
+        return;
+    }
+
+    // Compute the target node id: BLAKE2b-256 of the 6-byte ipv4 compact
+    // encoding (matches JS `peer.id(host, port)`).
+    routing::NodeId target{};
+    crypto_generichash(target.data(), target.size(),
+                       req.value->data(), 6,
+                       nullptr, 0);
+
+    // Look up in our routing table. Only act if the node exists AND we
+    // haven't already pinged it this tick (or it has no down hints yet).
+    if (auto* node = socket_.table().get_mut(target)) {
+        if (node->pinged < socket_.tick() || node->down_hints == 0) {
+            node->down_hints++;
+            // Snapshot by value — check_node() will reference only
+            // id/host/port/seen so a copy is safe.
+            routing::Node snapshot = *node;
+            socket_.check_node(snapshot);
+        }
+    }
+
+    send_empty_reply();
+}
+
+// ---------------------------------------------------------------------------
+// DELAYED_PING — reply with a plain PING after `delay_ms` milliseconds.
+// Value is a 4-byte LE uint32. Matches JS dht-rpc `_ondelayedping`:
+//   - Drop silently if value < 4 bytes or delay > max_ping_delay.
+//   - Schedule a uv_timer; on fire, send empty reply.
+//   - Pending timers are cancelled in the destructor.
+// ---------------------------------------------------------------------------
+
+void RpcHandlers::handle_delayed_ping(const messages::Request& req) {
+    if (!req.value.has_value() || req.value->size() < 4) return;
+
+    const auto& v = *req.value;
+    uint32_t delay_ms =
+        static_cast<uint32_t>(v[0])
+      | (static_cast<uint32_t>(v[1]) << 8)
+      | (static_cast<uint32_t>(v[2]) << 16)
+      | (static_cast<uint32_t>(v[3]) << 24);
+
+    // Respect our own configured max (mirrors JS: `if (delayMs > this.maxPingDelay) return`)
+    if (delay_ms > socket_.max_ping_delay_ms()) return;
+
+    if (!socket_.loop()) return;
+
+    // Schedule the reply
+    auto* dr = new DelayedReply{};
+    dr->owner = this;
+    dr->tid = req.tid;
+    dr->from = req.from.addr;
+
+    uv_timer_init(socket_.loop(), &dr->timer);
+    dr->timer.data = dr;
+    uv_timer_start(&dr->timer, on_delayed_ping_fire,
+                   static_cast<uint64_t>(delay_ms), 0);
+
+    pending_delayed_.push_back(dr);
+}
+
+void RpcHandlers::on_delayed_ping_fire(uv_timer_t* timer) {
+    auto* dr = static_cast<DelayedReply*>(timer->data);
+    if (!dr) return;
+
+    if (dr->owner) {
+        // Send empty reply (matches JS: req.sendReply(0, null, false, false))
+        messages::Response resp;
+        resp.tid = dr->tid;
+        resp.from.addr = dr->from;
+        resp.id = dr->owner->socket_.table().id();
+        dr->owner->socket_.reply(resp);
+
+        // Remove from pending list (swap-and-pop)
+        auto& vec = dr->owner->pending_delayed_;
+        for (size_t i = 0; i < vec.size(); i++) {
+            if (vec[i] == dr) {
+                vec[i] = vec.back();
+                vec.pop_back();
+                break;
+            }
+        }
+    }
+
+    // Close the timer and free the struct. Safe to call uv_close from within
+    // the timer callback — libuv marks the handle closing and invokes the
+    // close callback after the current callback returns.
+    uv_close(reinterpret_cast<uv_handle_t*>(&dr->timer), [](uv_handle_t* h) {
+        auto* d = static_cast<DelayedReply*>(h->data);
+        delete d;
+    });
 }
 
 // ---------------------------------------------------------------------------

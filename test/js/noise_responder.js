@@ -18,8 +18,9 @@
  */
 
 const b4a = require('b4a')
-const NoiseHandshake = require('/home/jacke/Desktop/repos/hyperdht-cpp/.analysis/js/noise-handshake/noise.js')
-const curve = require('/home/jacke/Desktop/repos/hyperdht-cpp/.analysis/js/noise-curve-ed')
+// Resolved against test/js/node_modules (pinned in test/js/package.json).
+const NoiseHandshake = require('noise-handshake')
+const curve = require('noise-curve-ed')
 const crypto = require('hypercore-crypto')
 
 // Real HyperDHT prologue

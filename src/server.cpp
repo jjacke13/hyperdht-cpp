@@ -1,3 +1,8 @@
+// Server implementation — listens at a public key for incoming
+// HyperDHT connections. Registers with the Router, announces
+// periodically via the Announcer, and spawns a ServerConnection
+// for each accepted PEER_HANDSHAKE.
+
 #include "hyperdht/server.hpp"
 
 #include <sodium.h>
@@ -129,6 +134,17 @@ void Server::refresh() {
     if (!suspended_ && announcer_) announcer_->refresh();
 }
 
+// JS: server.notifyOnline() — wake the announcer from its "offline wait"
+// so it immediately re-announces. JS only checks `this._announcer` is
+// non-null; it does NOT gate on suspended. Suspending the announcer
+// already sets running_ = false, and Announcer::notify_online() is a no-op
+// while !running_, so the suspend case is self-handling (and harmless in
+// JS too — `online.notify()` fires but no one is waiting).
+void Server::notify_online() {
+    if (closed_ || !listening_) return;
+    if (announcer_) announcer_->notify_online();
+}
+
 void Server::suspend() {
     if (suspended_) return;
     suspended_ = true;
@@ -161,9 +177,20 @@ void Server::resume() {
 
 Server::AddressInfo Server::address() const {
     AddressInfo info;
+    // JS: `if (!this._keyPair) return null` — before listen() there is no
+    // address yet. In C++ we can't return null; the caller checks
+    // `info.public_key` being zero (or `is_listening()`).
+    if (!listening_) return info;
+
     info.public_key = keypair_.public_key;
-    info.host = "0.0.0.0";  // TODO: detect from socket
-    info.port = socket_.port();
+    // JS: `{ host: this.dht.host, port: this.dht.port }` which resolve to
+    //     `this._nat.host` and `this._nat.port`. These are the NAT-sampled
+    //     public address — empty / zero until the sampler has classified.
+    //     We intentionally do NOT fall back to the bound socket port, since
+    //     that is the local ephemeral port and not the public one (lies
+    //     about reachability).
+    info.host = socket_.nat_sampler().host();
+    info.port = socket_.nat_sampler().port();
     return info;
 }
 

@@ -86,6 +86,13 @@ blind-relay/
     └── errors.js               ❌ DEFERRED
 ```
 
+## compact-encoding-bitfield (2.0.0)
+
+```
+compact-encoding-bitfield/
+└── index.js                    ❌ DEFERRED — only used by blind-relay (flags field)
+```
+
 ## compact-encoding (2.19.0)
 
 ```

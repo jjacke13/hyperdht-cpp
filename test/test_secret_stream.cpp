@@ -532,3 +532,307 @@ TEST(SecretStreamKeepalive, EmptyMessagePassesThroughWithoutKeepalive) {
     ASSERT_TRUE(dec.has_value());
     EXPECT_TRUE(dec->empty()) << "Empty message should pass through without keepalive";
 }
+
+// ============================================================================
+// SecretStreamDuplex — full-API tests using a real pair of UDX streams
+// on a single libuv event loop.
+// ============================================================================
+
+namespace duplex_test {
+
+// Build a full handshake pair (noise) + convert into two DuplexHandshake
+// structs back-to-back.
+static std::pair<DuplexHandshake, DuplexHandshake> make_handshake_pair() {
+    Seed is{}, rs{};
+    is.fill(0x11);
+    rs.fill(0x22);
+    auto ikp = generate_keypair(is);
+    auto rkp = generate_keypair(rs);
+
+    uint8_t prologue[] = {0x00};
+    NoiseIK initiator(true,  ikp, prologue, 1, &rkp.public_key);
+    NoiseIK responder(false, rkp, prologue, 1, nullptr);
+
+    auto m1 = initiator.send();
+    auto r1 = responder.recv(m1.data(), m1.size());
+    EXPECT_TRUE(r1.has_value());
+    auto m2 = responder.send();
+    auto r2 = initiator.recv(m2.data(), m2.size());
+    EXPECT_TRUE(r2.has_value());
+
+    DuplexHandshake ih{};
+    ih.tx_key = initiator.tx_key();
+    ih.rx_key = initiator.rx_key();
+    ih.handshake_hash = initiator.handshake_hash();
+    ih.public_key = ikp.public_key;
+    ih.remote_public_key = rkp.public_key;
+    ih.is_initiator = true;
+
+    DuplexHandshake rh{};
+    rh.tx_key = responder.tx_key();
+    rh.rx_key = responder.rx_key();
+    rh.handshake_hash = responder.handshake_hash();
+    rh.public_key = rkp.public_key;
+    rh.remote_public_key = ikp.public_key;
+    rh.is_initiator = false;
+
+    return {ih, rh};
+}
+
+// Fixture that owns two UDX streams connected via two loopback sockets.
+// Mirrors `test_udx.cpp::LoopbackWriteRead` setup. The `shutdown()` method
+// tears everything down cleanly from inside a libuv callback: destroy the
+// duplexes first (which destroy the streams async), then close the sockets.
+struct DuplexLoopback {
+    uv_loop_t loop;
+    udx_t udx;
+    udx_socket_t sock1;
+    udx_socket_t sock2;
+    udx_stream_t stream1;
+    udx_stream_t stream2;
+    bool shutdown_called = false;
+
+    DuplexLoopback() {
+        uv_loop_init(&loop);
+        udx_init(&loop, &udx, nullptr);
+        udx_socket_init(&udx, &sock1, nullptr);
+        udx_socket_init(&udx, &sock2, nullptr);
+
+        struct sockaddr_in a{};
+        uv_ip4_addr("127.0.0.1", 0, &a);
+        udx_socket_bind(&sock1, reinterpret_cast<const struct sockaddr*>(&a), 0);
+        udx_socket_bind(&sock2, reinterpret_cast<const struct sockaddr*>(&a), 0);
+
+        udx_stream_init(&udx, &stream1, 1, nullptr, nullptr);
+        udx_stream_init(&udx, &stream2, 2, nullptr, nullptr);
+
+        struct sockaddr_in b1{}, b2{};
+        int len = sizeof(b1);
+        udx_socket_getsockname(&sock1, reinterpret_cast<struct sockaddr*>(&b1), &len);
+        len = sizeof(b2);
+        udx_socket_getsockname(&sock2, reinterpret_cast<struct sockaddr*>(&b2), &len);
+
+        udx_stream_connect(&stream1, &sock1, 2,
+                           reinterpret_cast<const struct sockaddr*>(&b2));
+        udx_stream_connect(&stream2, &sock2, 1,
+                           reinterpret_cast<const struct sockaddr*>(&b1));
+    }
+
+    // Call from inside a libuv callback to tear down the whole pair.
+    // Destroys both duplexes and closes both sockets so the loop drains.
+    // Called from a test to begin shutdown. Uses end() for graceful FIN.
+    // Sockets are closed later, after both streams finish closing.
+    void begin_shutdown(SecretStreamDuplex* di, SecretStreamDuplex* dr) {
+        if (shutdown_called) return;
+        shutdown_called = true;
+        if (di) di->end();
+        if (dr) dr->end();
+    }
+
+    // Call from the test's on_close handler after BOTH streams have closed.
+    void close_sockets() {
+        udx_socket_close(&sock1);
+        udx_socket_close(&sock2);
+    }
+
+    void dump_handles() {
+        fprintf(stderr, "[lb] walk handles:\n");
+        uv_walk(&loop, [](uv_handle_t* h, void*) {
+            fprintf(stderr, "  handle=%p type=%d active=%d closing=%d\n",
+                (void*)h, h->type, uv_is_active(h), uv_is_closing(h));
+        }, nullptr);
+    }
+
+    ~DuplexLoopback() {
+        // Safety net: if the test never began shutdown, force it.
+        if (!shutdown_called) {
+            udx_stream_destroy(&stream1);
+            udx_stream_destroy(&stream2);
+            udx_socket_close(&sock1);
+            udx_socket_close(&sock2);
+            uv_run(&loop, UV_RUN_DEFAULT);
+        }
+        uv_loop_close(&loop);
+    }
+};
+
+}  // namespace duplex_test
+
+// Shared ctx for the Duplex tests — kept minimal and heap-free.
+namespace duplex_test {
+struct TestCtx {
+    DuplexLoopback* lb;
+    SecretStreamDuplex* i;
+    SecretStreamDuplex* r;
+    uv_timer_t* watchdog = nullptr;  // closed on normal shutdown
+    bool i_connected = false;
+    bool r_connected = false;
+    std::vector<uint8_t> i_received;
+    std::vector<uint8_t> r_received;
+    int closes = 0;
+    bool writes_sent = false;
+    bool shutdown_triggered = false;
+
+    void try_send_writes() {
+        if (writes_sent) return;
+        if (!i->is_connected() || !r->is_connected()) return;
+        writes_sent = true;
+        const char* from_i = "hello from initiator";
+        const char* from_r = "hello from responder";
+        i->write(reinterpret_cast<const uint8_t*>(from_i), 20, nullptr);
+        r->write(reinterpret_cast<const uint8_t*>(from_r), 20, nullptr);
+    }
+
+    void try_shutdown() {
+        if (shutdown_triggered) return;
+        if (i_received.empty() || r_received.empty()) return;
+        shutdown_triggered = true;
+        if (watchdog && !uv_is_closing(reinterpret_cast<uv_handle_t*>(watchdog))) {
+            uv_close(reinterpret_cast<uv_handle_t*>(watchdog), nullptr);
+        }
+        lb->begin_shutdown(i, r);
+    }
+};
+}  // namespace duplex_test
+
+TEST(SecretStreamDuplex, HandshakeAndBidirectionalWrite) {
+    using namespace duplex_test;
+    DuplexLoopback lb;
+    auto [ih, rh] = make_handshake_pair();
+
+    SecretStreamDuplex dup_i(&lb.stream1, ih, &lb.loop);
+    SecretStreamDuplex dup_r(&lb.stream2, rh, &lb.loop);
+
+    TestCtx ctx{&lb, &dup_i, &dup_r};
+
+    dup_i.on_connect([&]() { ctx.i_connected = true; });
+    dup_r.on_connect([&]() { ctx.r_connected = true; });
+
+    dup_i.on_message([&](const uint8_t* d, size_t n) {
+        ctx.i_received.assign(d, d + n);
+        ctx.try_shutdown();
+    });
+    dup_r.on_message([&](const uint8_t* d, size_t n) {
+        ctx.r_received.assign(d, d + n);
+        ctx.try_shutdown();
+    });
+
+    dup_i.on_close([&](int) {
+        ctx.closes++;
+        if (ctx.closes == 2) ctx.lb->close_sockets();
+    });
+    dup_r.on_close([&](int) {
+        ctx.closes++;
+        if (ctx.closes == 2) ctx.lb->close_sockets();
+    });
+
+    dup_i.start();
+    dup_r.start();
+
+    // Drive writes from an idle so they happen OUTSIDE of the UDX callback
+    // chain (safer and matches how a user would drive it).
+    uv_idle_t idle;
+    uv_idle_init(&lb.loop, &idle);
+    idle.data = &ctx;
+    uv_idle_start(&idle, [](uv_idle_t* h) {
+        auto* c = static_cast<TestCtx*>(h->data);
+        c->try_send_writes();
+        if (c->writes_sent) {
+            uv_idle_stop(h);
+            uv_close(reinterpret_cast<uv_handle_t*>(h), nullptr);
+        }
+    });
+
+    // Watchdog — force shutdown after 3s.
+    uv_timer_t watchdog;
+    uv_timer_init(&lb.loop, &watchdog);
+    watchdog.data = &ctx;
+    ctx.watchdog = &watchdog;
+    uv_timer_start(&watchdog, [](uv_timer_t* t) {
+        auto* c = static_cast<TestCtx*>(t->data);
+        c->watchdog = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
+        c->lb->begin_shutdown(c->i, c->r);
+    }, 3000, 0);
+
+    uv_run(&lb.loop, UV_RUN_DEFAULT);
+
+    EXPECT_TRUE(ctx.i_connected);
+    EXPECT_TRUE(ctx.r_connected);
+    EXPECT_EQ(std::string(ctx.r_received.begin(), ctx.r_received.end()),
+              "hello from initiator");
+    EXPECT_EQ(std::string(ctx.i_received.begin(), ctx.i_received.end()),
+              "hello from responder");
+    EXPECT_GE(ctx.closes, 2) << "both sides should fire on_close";
+
+    EXPECT_GT(dup_i.raw_bytes_written(), 90u);
+    EXPECT_GT(dup_r.raw_bytes_written(), 90u);
+    EXPECT_GT(dup_i.raw_bytes_read(), 90u);
+    EXPECT_GT(dup_r.raw_bytes_read(), 90u);
+}
+
+TEST(SecretStreamDuplex, UdpMessageRoundTrip) {
+    using namespace duplex_test;
+    DuplexLoopback lb;
+    auto [ih, rh] = make_handshake_pair();
+
+    SecretStreamDuplex dup_i(&lb.stream1, ih, &lb.loop);
+    SecretStreamDuplex dup_r(&lb.stream2, rh, &lb.loop);
+
+    std::vector<uint8_t> r_got;
+    int closes = 0;
+    uv_timer_t wd;
+    uv_timer_init(&lb.loop, &wd);
+
+    dup_r.on_udp_message([&](const uint8_t* d, size_t n) {
+        r_got.assign(d, d + n);
+        // Close the watchdog so it stops keeping the loop alive.
+        if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&wd))) {
+            uv_close(reinterpret_cast<uv_handle_t*>(&wd), nullptr);
+        }
+        lb.begin_shutdown(&dup_i, &dup_r);
+    });
+
+    auto close_cb = [&](int) {
+        closes++;
+        if (closes == 2) lb.close_sockets();
+    };
+    dup_i.on_close(close_cb);
+    dup_r.on_close(close_cb);
+
+    dup_i.on_connect([&]() {
+        const char* payload = "unordered hello";
+        dup_i.send_udp(reinterpret_cast<const uint8_t*>(payload), 15);
+    });
+
+    dup_i.start();
+    dup_r.start();
+
+    struct WD2 { DuplexLoopback* lb; SecretStreamDuplex* i; SecretStreamDuplex* r; };
+    WD2 wdc{&lb, &dup_i, &dup_r};
+    wd.data = &wdc;
+    uv_timer_start(&wd, [](uv_timer_t* h) {
+        auto* w = static_cast<WD2*>(h->data);
+        uv_close(reinterpret_cast<uv_handle_t*>(h), nullptr);
+        w->lb->begin_shutdown(w->i, w->r);
+    }, 3000, 0);
+
+    uv_run(&lb.loop, UV_RUN_DEFAULT);
+
+    EXPECT_EQ(std::string(r_got.begin(), r_got.end()), "unordered hello");
+}
+
+TEST(SecretStreamDuplex, RejectsWriteBeforeConnect) {
+    using namespace duplex_test;
+    DuplexLoopback lb;
+    auto [ih, rh] = make_handshake_pair();
+
+    SecretStreamDuplex dup_i(&lb.stream1, ih, &lb.loop);
+
+    // Not started yet — not connected.
+    EXPECT_FALSE(dup_i.is_connected());
+    const char* msg = "early";
+    int rc = dup_i.write(reinterpret_cast<const uint8_t*>(msg), 5);
+    EXPECT_LT(rc, 0) << "write before connect must be rejected";
+    // lb destructor handles stream and socket cleanup.
+}

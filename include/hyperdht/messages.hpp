@@ -44,6 +44,7 @@ constexpr uint32_t CMD_PING = 0;
 constexpr uint32_t CMD_PING_NAT = 1;
 constexpr uint32_t CMD_FIND_NODE = 2;
 constexpr uint32_t CMD_DOWN_HINT = 3;
+constexpr uint32_t CMD_DELAYED_PING = 4;  // Value: 4-byte LE uint32 delayMs; server replies after delayMs ms
 
 // HyperDHT commands (FLAG_INTERNAL clear — same command IDs, different namespace)
 constexpr uint32_t CMD_PEER_HANDSHAKE = 0;

@@ -1,3 +1,6 @@
+// Announce signature implementation — Ed25519 sign/verify over the
+// 64-byte signable blob used by ANNOUNCE, UNANNOUNCE and MUTABLE_PUT.
+
 #include "hyperdht/announce_sig.hpp"
 
 #include <sodium.h>

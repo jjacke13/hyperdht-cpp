@@ -1,3 +1,7 @@
+// Iterative Kademlia query engine implementation — walks the network
+// towards a target, maintaining a sorted frontier of k closest nodes.
+// Drives FIND_NODE (and any wrapped command) with configurable parallelism.
+
 #include "hyperdht/query.hpp"
 
 #include <algorithm>
@@ -52,6 +56,9 @@ void Query::seed_from_table() {
 void Query::add_pending(const routing::NodeId& id, const compact::Ipv4Address& addr) {
     std::string key = addr.host_string() + ":" + std::to_string(addr.port);
     if (seen_.count(key) > 0) return;  // Already seen
+
+    // Honour the RpcSocket's filter_node callback (JS `_filterNode`).
+    if (!socket_.filter_accept(id, addr)) return;
 
     seen_[key] = NodeState::PENDING;
     pending_.push_back({id, addr});
@@ -134,14 +141,14 @@ void Query::on_visit_response(const PendingNode& node, const messages::Response&
         push_closest(reply);
     }
 
-    // Add closer nodes to pending
+    // Add closer nodes to pending. Compute the id from the address so we
+    // can apply the filter, deduplicate correctly, and rank honestly in
+    // `closest_replies_`. Matches JS `query.js:273-280`.
     for (const auto& closer : resp.closer_nodes) {
-        // We don't know the ID of closer nodes yet — compute from address
-        // (dht-rpc computes id = BLAKE2b(ipv4_bytes))
-        // For now, use a placeholder — the real ID comes when we query them
-        routing::NodeId placeholder{};
-        placeholder.fill(0);
-        add_pending(placeholder, closer);
+        auto closer_id = rpc::compute_peer_id(closer);
+        // Skip if equal to our own id.
+        if (closer_id == socket_.table().id()) continue;
+        add_pending(closer_id, closer);
     }
 
     // Notify caller

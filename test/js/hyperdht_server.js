@@ -6,7 +6,8 @@
  * Prints PORT and PUBKEY on stdout for the C++ client.
  */
 
-const DHT = require('/home/jacke/Desktop/repos/hyperdht-cpp/.analysis/js/hyperdht')
+// Resolved against test/js/node_modules (pinned in test/js/package.json).
+const DHT = require('hyperdht')
 
 async function main () {
   const dht = new DHT({ bootstrap: [] })

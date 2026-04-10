@@ -580,3 +580,311 @@ TEST(Protomux, OnDrainFiresOnAllChannels) {
     EXPECT_EQ(drain_a, 0);
     EXPECT_EQ(drain_b, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Cork / uncork batching — the wire format must match JS so that a batched
+// group of sends produces a single `[0x00, 0x00, <body>]` control frame that
+// the receiver's handle_batch decodes back into the original messages.
+// ---------------------------------------------------------------------------
+
+TEST(Protomux, CorkBatchingSingleChannel) {
+    LoopbackMux mux;
+
+    std::vector<std::string> received;
+
+    auto* ch_a = mux.a.create_channel("cork-one");
+    auto* ch_b = mux.b.create_channel("cork-one");
+    ch_a->add_message(MessageHandler{});
+    ch_b->add_message(MessageHandler{[&](const uint8_t* d, size_t n) {
+        received.emplace_back(reinterpret_cast<const char*>(d), n);
+    }});
+
+    ch_a->open();
+    ch_b->open();
+    ASSERT_TRUE(ch_a->is_open());
+
+    // Cork, send three messages, uncork — all three should arrive in order.
+    mux.a.cork();
+    std::string m1 = "one";
+    std::string m2 = "two";
+    std::string m3 = "three";
+    ch_a->send(0, reinterpret_cast<const uint8_t*>(m1.data()), m1.size());
+    ch_a->send(0, reinterpret_cast<const uint8_t*>(m2.data()), m2.size());
+    ch_a->send(0, reinterpret_cast<const uint8_t*>(m3.data()), m3.size());
+
+    // Before uncork, nothing should have been delivered.
+    EXPECT_EQ(received.size(), 0u);
+
+    mux.a.uncork();
+
+    ASSERT_EQ(received.size(), 3u);
+    EXPECT_EQ(received[0], m1);
+    EXPECT_EQ(received[1], m2);
+    EXPECT_EQ(received[2], m3);
+}
+
+TEST(Protomux, CorkBatchingAcrossChannels) {
+    LoopbackMux mux;
+
+    std::vector<std::string> received_a;
+    std::vector<std::string> received_b;
+
+    auto* ch_a1 = mux.a.create_channel("cork-alpha");
+    auto* ch_a2 = mux.a.create_channel("cork-beta");
+    auto* ch_b1 = mux.b.create_channel("cork-alpha");
+    auto* ch_b2 = mux.b.create_channel("cork-beta");
+
+    ch_a1->add_message(MessageHandler{});
+    ch_a2->add_message(MessageHandler{});
+    ch_b1->add_message(MessageHandler{[&](const uint8_t* d, size_t n) {
+        received_a.emplace_back(reinterpret_cast<const char*>(d), n);
+    }});
+    ch_b2->add_message(MessageHandler{[&](const uint8_t* d, size_t n) {
+        received_b.emplace_back(reinterpret_cast<const char*>(d), n);
+    }});
+
+    ch_a1->open(); ch_b1->open();
+    ch_a2->open(); ch_b2->open();
+
+    mux.a.cork();
+    // Interleave sends across channels — the JS batch format handles
+    // channel-switching via a 0x00 separator in the body.
+    ch_a1->send(0, reinterpret_cast<const uint8_t*>("a1-x"), 4);
+    ch_a2->send(0, reinterpret_cast<const uint8_t*>("a2-x"), 4);
+    ch_a1->send(0, reinterpret_cast<const uint8_t*>("a1-y"), 4);
+    ch_a2->send(0, reinterpret_cast<const uint8_t*>("a2-y"), 4);
+    mux.a.uncork();
+
+    ASSERT_EQ(received_a.size(), 2u);
+    EXPECT_EQ(received_a[0], "a1-x");
+    EXPECT_EQ(received_a[1], "a1-y");
+
+    ASSERT_EQ(received_b.size(), 2u);
+    EXPECT_EQ(received_b[0], "a2-x");
+    EXPECT_EQ(received_b[1], "a2-y");
+}
+
+TEST(Protomux, CorkIsReentrant) {
+    LoopbackMux mux;
+    std::vector<std::string> received;
+
+    auto* ch_a = mux.a.create_channel("cork-nest");
+    auto* ch_b = mux.b.create_channel("cork-nest");
+    ch_a->add_message({});
+    ch_b->add_message({[&](const uint8_t* d, size_t n) {
+        received.emplace_back(reinterpret_cast<const char*>(d), n);
+    }});
+    ch_a->open(); ch_b->open();
+
+    mux.a.cork();
+    mux.a.cork();  // nested
+    ch_a->send(0, reinterpret_cast<const uint8_t*>("inside"), 6);
+    mux.a.uncork();  // still corked by the outer cork
+    EXPECT_EQ(received.size(), 0u);
+    mux.a.uncork();  // final uncork → flush
+    ASSERT_EQ(received.size(), 1u);
+    EXPECT_EQ(received[0], "inside");
+}
+
+TEST(Protomux, ChannelCorkDelegatesToMux) {
+    LoopbackMux mux;
+    std::vector<std::string> received;
+
+    auto* ch_a = mux.a.create_channel("ch-cork");
+    auto* ch_b = mux.b.create_channel("ch-cork");
+    ch_a->add_message({});
+    ch_b->add_message({[&](const uint8_t* d, size_t n) {
+        received.emplace_back(reinterpret_cast<const char*>(d), n);
+    }});
+    ch_a->open(); ch_b->open();
+
+    ch_a->cork();  // delegates to mux.a.cork()
+    ch_a->send(0, reinterpret_cast<const uint8_t*>("via-ch"), 6);
+    EXPECT_EQ(received.size(), 0u);
+    ch_a->uncork();
+    ASSERT_EQ(received.size(), 1u);
+}
+
+// ---------------------------------------------------------------------------
+// Mux::destroy() — close all channels, drop batch state
+// ---------------------------------------------------------------------------
+
+TEST(Protomux, DestroyIsSafeWhenOnCloseFreesOtherChannels) {
+    // Regression for cpp-review HIGH #1: the destroy() loop must not
+    // hold raw pointers across iterations, because a user's on_close
+    // callback may close a sibling channel and invalidate them.
+    LoopbackMux mux;
+
+    auto* ch1 = mux.a.create_channel("sib-1", {}, false);
+    auto* ch2 = mux.a.create_channel("sib-2", {}, false);
+    auto* ch3 = mux.a.create_channel("sib-3", {}, false);
+    auto* ch_b1 = mux.b.create_channel("sib-1", {}, false);
+    auto* ch_b2 = mux.b.create_channel("sib-2", {}, false);
+    auto* ch_b3 = mux.b.create_channel("sib-3", {}, false);
+    ch1->open(); ch_b1->open();
+    ch2->open(); ch_b2->open();
+    ch3->open(); ch_b3->open();
+
+    int closes = 0;
+    ch1->on_close = [&]() {
+        closes++;
+        // Free ch3 from inside ch1's on_close — this would invalidate
+        // any pre-captured pointer to ch3 in destroy()'s snapshot.
+        ch3->close();
+    };
+    ch2->on_close = [&]() { closes++; };
+    ch3->on_close = [&]() { closes++; };
+
+    mux.a.destroy();
+    // All three channels must have had on_close fired exactly once,
+    // with no crashes / UAF.
+    EXPECT_EQ(closes, 3);
+    EXPECT_TRUE(mux.a.is_destroyed());
+}
+
+TEST(Protomux, DestroyClosesAllChannels) {
+    LoopbackMux mux;
+
+    int closes = 0;
+    auto* ch1 = mux.a.create_channel("p1", {}, false);
+    auto* ch2 = mux.a.create_channel("p2", {}, false);
+    auto* ch_b1 = mux.b.create_channel("p1", {}, false);
+    auto* ch_b2 = mux.b.create_channel("p2", {}, false);
+    ch1->open(); ch_b1->open();
+    ch2->open(); ch_b2->open();
+    ASSERT_TRUE(ch1->is_open());
+    ASSERT_TRUE(ch2->is_open());
+
+    // Register on_close on the A-side channels (we're going to destroy mux.a).
+    ch1->on_close = [&]() { closes++; };
+    ch2->on_close = [&]() { closes++; };
+
+    EXPECT_FALSE(mux.a.is_destroyed());
+    mux.a.destroy();
+    EXPECT_TRUE(mux.a.is_destroyed());
+    EXPECT_EQ(closes, 2) << "destroy() should fire on_close on every open channel";
+
+    // After destroy, create_channel returns nullptr.
+    EXPECT_EQ(mux.a.create_channel("p3"), nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Mux::opened(topic) — topic query
+// ---------------------------------------------------------------------------
+
+TEST(Protomux, OpenedQuery) {
+    LoopbackMux mux;
+
+    EXPECT_FALSE(mux.a.opened("query-test"));
+    EXPECT_FALSE(mux.a.opened("query-test", {0x01}));
+
+    auto* ch_a = mux.a.create_channel("query-test");
+    auto* ch_b = mux.b.create_channel("query-test");
+    ch_a->open(); ch_b->open();
+    ASSERT_TRUE(ch_a->is_open());
+
+    EXPECT_TRUE(mux.a.opened("query-test"));
+    EXPECT_FALSE(mux.a.opened("query-test", {0x01}))
+        << "A different id must not match";
+    EXPECT_FALSE(mux.a.opened("other"));
+
+    ch_a->close();
+    EXPECT_FALSE(mux.a.opened("query-test"));
+}
+
+// ---------------------------------------------------------------------------
+// Mux::get_last_channel
+// ---------------------------------------------------------------------------
+
+TEST(Protomux, GetLastChannelReturnsMostRecent) {
+    LoopbackMux mux;
+
+    EXPECT_EQ(mux.a.get_last_channel("lc-test"), nullptr);
+
+    auto* ch1 = mux.a.create_channel("lc-test", {}, false);
+    EXPECT_EQ(mux.a.get_last_channel("lc-test"), ch1);
+
+    // Create another on the same topic with unique=false.
+    auto* ch2 = mux.a.create_channel("lc-test", {}, false);
+    ASSERT_NE(ch2, nullptr);
+    EXPECT_EQ(mux.a.get_last_channel("lc-test"), ch2)
+        << "get_last_channel should track the most recently created";
+}
+
+// ---------------------------------------------------------------------------
+// for_each_channel iteration
+// ---------------------------------------------------------------------------
+
+TEST(Protomux, ForEachChannelVisitsAll) {
+    LoopbackMux mux;
+
+    mux.a.create_channel("one");
+    mux.a.create_channel("two");
+    mux.a.create_channel("three");
+
+    std::vector<std::string> seen;
+    mux.a.for_each_channel([&](Channel* c) {
+        seen.push_back(c->protocol());
+    });
+
+    ASSERT_EQ(seen.size(), 3u);
+    EXPECT_EQ(seen[0], "one");
+    EXPECT_EQ(seen[1], "two");
+    EXPECT_EQ(seen[2], "three");
+}
+
+// ---------------------------------------------------------------------------
+// Channel aliases — the receiver declares multiple names it responds to
+// so that an incoming OPEN under any of them matches the local channel.
+// Matches JS semantics: aliases are for matching incoming opens; the
+// outgoing open always uses the primary protocol.
+// ---------------------------------------------------------------------------
+
+TEST(Protomux, ChannelAliasMatchesIncomingOpen) {
+    // Both sides declare the same primary + alias mapping, using
+    // different primaries so that each side's outgoing OPEN announces a
+    // name that matches the OTHER side's alias list. This is the real
+    // migration scenario: renaming a protocol without breaking old peers.
+    LoopbackMux mux;
+
+    bool a_opened = false;
+    bool b_opened = false;
+
+    // A speaks primary "new" but also recognizes "old".
+    auto* ch_a = mux.a.create_channel(
+        "new",
+        std::vector<std::string>{"old"},
+        /*id=*/{}, /*unique=*/true);
+    ch_a->on_open = [&](const uint8_t*, size_t) { a_opened = true; };
+
+    // B (legacy) speaks primary "old" but also recognizes "new".
+    auto* ch_b = mux.b.create_channel(
+        "old",
+        std::vector<std::string>{"new"},
+        /*id=*/{}, /*unique=*/true);
+    ch_b->on_open = [&](const uint8_t*, size_t) { b_opened = true; };
+
+    ch_a->open();  // sends OPEN("new"); matches B's alias
+    ch_b->open();  // sends OPEN("old"); matches A's alias
+
+    EXPECT_TRUE(a_opened);
+    EXPECT_TRUE(b_opened);
+    EXPECT_TRUE(ch_a->is_open());
+    EXPECT_TRUE(ch_b->is_open());
+}
+
+TEST(Protomux, ChannelAliasRegistersInLastChannelMap) {
+    LoopbackMux mux;
+
+    auto* ch = mux.a.create_channel(
+        "canonical",
+        std::vector<std::string>{"alt-1", "alt-2"},
+        /*id=*/{}, /*unique=*/true);
+    ASSERT_NE(ch, nullptr);
+
+    // get_last_channel() should find the channel under any of its keys.
+    EXPECT_EQ(mux.a.get_last_channel("canonical"), ch);
+    EXPECT_EQ(mux.a.get_last_channel("alt-1"), ch);
+    EXPECT_EQ(mux.a.get_last_channel("alt-2"), ch);
+    EXPECT_EQ(mux.a.get_last_channel("unrelated"), nullptr);
+}

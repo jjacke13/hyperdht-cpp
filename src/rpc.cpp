@@ -1,11 +1,53 @@
+// DHT RPC socket implementation — UDP send/receive over a UDX socket,
+// TID-based response matching, retries/timeouts, per-peer adaptive RTT,
+// congestion control, and NAT probe detection.
+
 #include "hyperdht/rpc.hpp"
 
 #include <cassert>
 #include <cstring>
+#include <memory>
 #include <random>
+
+#include <sodium.h>
 
 namespace hyperdht {
 namespace rpc {
+
+// Compute a peer id from an ipv4 address — BLAKE2b-256 over the 6-byte
+// compact encoding (4 host bytes LE + 2 port bytes LE). Matches JS
+// `dht-rpc/lib/peer.js::id(host, port)`.
+routing::NodeId compute_peer_id(const compact::Ipv4Address& addr) {
+    uint8_t buf[6];
+    // Host bytes in LE order (JS: c.uint32.encode writes LE).
+    buf[0] = static_cast<uint8_t>(addr.host[0]);
+    buf[1] = static_cast<uint8_t>(addr.host[1]);
+    buf[2] = static_cast<uint8_t>(addr.host[2]);
+    buf[3] = static_cast<uint8_t>(addr.host[3]);
+    // Port LE.
+    buf[4] = static_cast<uint8_t>(addr.port & 0xFF);
+    buf[5] = static_cast<uint8_t>((addr.port >> 8) & 0xFF);
+
+    routing::NodeId id{};
+    crypto_generichash(id.data(), id.size(), buf, 6, nullptr, 0);
+    return id;
+}
+
+namespace {
+// State shared between the ping-and-swap request and its response/timeout
+// callbacks. Heap-allocated via shared_ptr so it outlives any callback path.
+struct SwapState {
+    routing::Node new_node;
+    routing::NodeId old_id{};
+    uint32_t last_seen = 0;
+};
+
+// State shared between a DOWN_HINT-driven check and its callbacks.
+struct CheckState {
+    routing::NodeId target_id{};
+    uint32_t last_seen = 0;
+};
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // CongestionWindow
@@ -62,6 +104,13 @@ RpcSocket::RpcSocket(uv_loop_t* loop, const routing::NodeId& local_id)
     bg_timer_ = new uv_timer_t;
     uv_timer_init(loop_, bg_timer_);
     bg_timer_->data = this;
+
+    // Wire the routing table's bucket-full hook to our ping-and-swap logic.
+    // Uses a weak pointer pattern: captured `this` is stable for the table's
+    // lifetime (the table is a member of this object).
+    table_.on_full([this](size_t idx, const routing::Node& new_node) {
+        on_bucket_full(idx, new_node);
+    });
 
     // Random initial tid
     std::random_device rd;
@@ -170,8 +219,11 @@ void RpcSocket::send_now(InflightRequest* req) {
     // Send the cached buffer
     udp_send(req->buffer, req->to);
 
-    // Start/restart per-request timeout timer (adaptive or default)
-    uint64_t timeout = timeout_for(req->to);
+    // Start/restart per-request timeout timer.
+    // Custom override wins (DELAYED_PING sets it to delay+grace); else adaptive/default.
+    uint64_t timeout = req->timeout_override_ms > 0
+                     ? req->timeout_override_ms
+                     : timeout_for(req->to);
     uv_timer_stop(&req->timer);
     uv_timer_start(&req->timer, on_request_timeout, timeout, 0);
 }
@@ -196,6 +248,15 @@ void RpcSocket::drain_pending() {
 uint16_t RpcSocket::request(const messages::Request& req,
                             OnResponseCallback on_response,
                             OnTimeoutCallback on_timeout) {
+    return request(req, 0, DEFAULT_RETRIES,
+                   std::move(on_response), std::move(on_timeout));
+}
+
+uint16_t RpcSocket::request(const messages::Request& req,
+                            uint64_t timeout_override_ms,
+                            int retries,
+                            OnResponseCallback on_response,
+                            OnTimeoutCallback on_timeout) {
     if (closing_) return 0;
 
     // Build request with our tid
@@ -209,6 +270,8 @@ uint16_t RpcSocket::request(const messages::Request& req,
     inflight->command = msg.command;
     inflight->on_response = std::move(on_response);
     inflight->on_timeout = std::move(on_timeout);
+    inflight->timeout_override_ms = timeout_override_ms;
+    inflight->retries = retries;
     inflight->to = msg.to.addr;
     inflight->buffer = messages::encode_request(msg);
 
@@ -225,6 +288,35 @@ uint16_t RpcSocket::request(const messages::Request& req,
     inflight_.push_back(inflight);
     send_now(inflight);
     return msg.tid;
+}
+
+uint16_t RpcSocket::delayed_ping(const compact::Ipv4Address& to,
+                                 uint32_t delay_ms,
+                                 OnResponseCallback on_response,
+                                 OnTimeoutCallback on_timeout) {
+    // Mirror JS: reject if delay exceeds max (JS throws; we return 0)
+    if (delay_ms > max_ping_delay_ms_) return 0;
+
+    // Build the request: internal DELAYED_PING with 4-byte LE uint32 value
+    messages::Request req;
+    req.to.addr = to;
+    req.command = messages::CMD_DELAYED_PING;
+    req.internal = true;
+
+    std::vector<uint8_t> value(4);
+    value[0] = static_cast<uint8_t>(delay_ms & 0xFF);
+    value[1] = static_cast<uint8_t>((delay_ms >> 8) & 0xFF);
+    value[2] = static_cast<uint8_t>((delay_ms >> 16) & 0xFF);
+    value[3] = static_cast<uint8_t>((delay_ms >> 24) & 0xFF);
+    req.value = std::move(value);
+
+    // Timeout = delay + 1s grace (matches JS: req.timeout = delayMs + 1_000).
+    // No retries: retrying a deliberately-delayed reply would duplicate work
+    // and the timeout already accounts for server-side scheduling.
+    uint64_t timeout_ms = static_cast<uint64_t>(delay_ms) + 1000;
+
+    return request(req, timeout_ms, /*retries=*/0,
+                   std::move(on_response), std::move(on_timeout));
 }
 
 void RpcSocket::reply(const messages::Response& resp) {
@@ -392,6 +484,11 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
         uv_ip4_name(addr, host, sizeof(host));
         req.from.addr = compact::Ipv4Address::from_string(host, ntohs(addr->sin_port));
 
+        // Observe the peer in the routing table (JS: _addNodeFromNetwork).
+        if (req.id.has_value()) {
+            add_node_from_network(*req.id, req.from.addr);
+        }
+
         if (on_request_) {
             on_request_(req);
         }
@@ -403,6 +500,11 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
         auto remote_addr = compact::Ipv4Address::from_string(
             remote_host, ntohs(addr->sin_port));
         nat_sampler_.add(resp.from.addr, remote_addr);
+
+        // Observe the responding peer (JS: _addNodeFromNetwork on response).
+        if (resp.id.has_value()) {
+            add_node_from_network(*resp.id, remote_addr);
+        }
 
         auto* inflight = find_inflight(resp.tid);
         if (inflight && !inflight->destroyed) {
@@ -425,6 +527,151 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
 }
 
 // ---------------------------------------------------------------------------
+// Routing table observation + ping-and-swap eviction (JS parity)
+// ---------------------------------------------------------------------------
+
+void RpcSocket::add_node_from_network(const routing::NodeId& id,
+                                      const compact::Ipv4Address& from) {
+    // Respect a user-installed filter (JS `_filterNode`).
+    if (!filter_accept(id, from)) return;
+
+    // Already in the table — just refresh metadata.
+    if (auto* existing = table_.get_mut(id)) {
+        existing->pinged = tick_;
+        existing->seen = tick_;
+        return;
+    }
+
+    // Not in the table: try to insert. If the bucket is full, on_full_
+    // fires and ping-and-swap takes over.
+    routing::Node node;
+    node.id = id;
+    node.host = from.host_string();
+    node.port = from.port;
+    node.added = tick_;
+    node.pinged = tick_;
+    node.seen = tick_;
+    table_.add(node);
+}
+
+void RpcSocket::on_bucket_full(size_t bucket_idx,
+                               const routing::Node& new_node) {
+    // JS: `if (!this.bootstrapped || this._repinging >= 3) return`.
+    // We must NOT ping-and-swap until the initial bootstrap walk has
+    // populated the table — otherwise valid nodes arriving during bootstrap
+    // get evicted before their RTT is known, degrading table quality.
+    if (!bootstrapped_) return;
+    if (repinging_ >= MAX_REPINGING) return;
+
+    // Find the oldest candidate that has NOT been pinged this tick.
+    // "Oldest" = smallest `pinged` tick, ties broken by smallest `added`.
+    auto& bucket = table_.bucket_mut(bucket_idx);
+    routing::Node* oldest = nullptr;
+    for (auto& n : bucket.nodes_mut()) {
+        if (n.pinged == tick_) continue;
+        if (!oldest
+            || oldest->pinged > n.pinged
+            || (oldest->pinged == n.pinged && oldest->added > n.added)) {
+            oldest = &n;
+        }
+    }
+    if (!oldest) return;
+
+    // Skip eviction if the candidate was seen recently AND is well
+    // established (JS: `_tick - oldest.pinged < RECENT_NODE && _tick - oldest.added > OLD_NODE`).
+    // tick_ is monotonic; guard against underflow if counters are uninitialized.
+    uint32_t since_pinged = tick_ - oldest->pinged;
+    uint32_t since_added  = tick_ - oldest->added;
+    if (since_pinged < RECENT_NODE_TICKS && since_added > OLD_NODE_TICKS) return;
+
+    reping_and_swap(new_node, *oldest);
+}
+
+void RpcSocket::reping_and_swap(const routing::Node& new_node,
+                                const routing::Node& oldest) {
+    // Snapshot the fields we need — the reference may be invalidated if the
+    // bucket's vector reallocates before our callbacks fire.
+    auto state = std::make_shared<SwapState>();
+    state->new_node = new_node;
+    state->old_id = oldest.id;
+    state->last_seen = oldest.seen;
+
+    // Mark the oldest as "pinged this tick" so we don't re-select it.
+    if (auto* o = table_.get_mut(oldest.id)) {
+        o->pinged = tick_;
+    }
+
+    repinging_++;
+
+    messages::Request req;
+    req.to.addr = compact::Ipv4Address::from_string(oldest.host, oldest.port);
+    req.command = messages::CMD_PING;
+    req.internal = true;
+
+    auto do_swap = [this, state]() {
+        table_.remove(state->old_id);
+        // The bucket now has a free slot — insert the new node.
+        table_.add(state->new_node);
+    };
+
+    // No retries — JS `_repingAndSwap` only sends once, and the retry logic
+    // would artificially delay the swap decision.
+    request(req, /*timeout_override_ms=*/0, /*retries=*/0,
+        [this, state, do_swap](const messages::Response&) {
+            // Ping succeeded. If the node's seen counter has NOT advanced
+            // in the meantime (i.e. we haven't heard from it via another
+            // path), JS still swaps. Otherwise keep the old node.
+            repinging_--;
+            if (auto* n = table_.get_mut(state->old_id)) {
+                if (n->seen <= state->last_seen) {
+                    do_swap();
+                }
+            }
+        },
+        [this, do_swap](uint16_t) {
+            // Ping timed out — evict and swap in the new node.
+            repinging_--;
+            do_swap();
+        });
+}
+
+void RpcSocket::check_node(const routing::Node& node) {
+    // Snapshot identity + last_seen before marking pinged (JS: `_check`).
+    auto state = std::make_shared<CheckState>();
+    state->target_id = node.id;
+    state->last_seen = node.seen;
+
+    if (auto* n = table_.get_mut(node.id)) {
+        n->pinged = tick_;
+    }
+
+    checks_++;
+
+    messages::Request req;
+    req.to.addr = compact::Ipv4Address::from_string(node.host, node.port);
+    req.command = messages::CMD_PING;
+    req.internal = true;
+
+    request(req, /*timeout_override_ms=*/0, /*retries=*/0,
+        [this, state](const messages::Response&) {
+            // Ping OK: if `seen` has advanced (via `add_node_from_network`
+            // firing on this same response), the node is alive and we keep
+            // it. Otherwise JS still removes it — matches `_removeStaleNode`.
+            checks_--;
+            if (auto* n = table_.get_mut(state->target_id)) {
+                if (n->seen <= state->last_seen) {
+                    table_.remove(state->target_id);
+                }
+            }
+        },
+        [this, state](uint16_t) {
+            // Ping timed out: the DOWN_HINT was right — remove the node.
+            checks_--;
+            table_.remove(state->target_id);
+        });
+}
+
+// ---------------------------------------------------------------------------
 // Background tick (5s) — health, refresh, ephemeral/persistent
 // ---------------------------------------------------------------------------
 
@@ -435,6 +682,9 @@ void RpcSocket::on_bg_tick(uv_timer_t* timer) {
 }
 
 void RpcSocket::background_tick() {
+    // Monotonic tick counter — consumed by ping-and-swap / down-hint logic.
+    tick_++;
+
     // 1. Health monitoring
     health_.update(tick_responses_, tick_timeouts_);
     tick_responses_ = 0;

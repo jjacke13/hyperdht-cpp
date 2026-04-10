@@ -1,3 +1,7 @@
+// Announcer implementation — periodically re-announces a server key.
+// Runs an iterative query to the target, then sends ANNOUNCE to the
+// k closest nodes. Signs each announcement with the server keypair.
+
 #include "hyperdht/announcer.hpp"
 
 #include <sodium.h>
@@ -95,6 +99,21 @@ void Announcer::stop(std::function<void()> on_done) {
 
 void Announcer::refresh() {
     if (!running_) return;
+    update();
+}
+
+// JS: `this.online.notify()` — wakes _background's `await this.online.wait()`
+// which then falls through into the next `_runUpdate()`. In our timer-based
+// model we have no blocked awaiter, so the semantically-equivalent action is
+// to kick an update cycle immediately. `update()` is already idempotent, so
+// this is safe to call repeatedly.
+//
+// Reset `has_reannounced_` so the relay-address re-announce step in
+// build_relays() runs again after recovery. Otherwise, stale relays from
+// before the outage would remain advertised to peers.
+void Announcer::notify_online() {
+    if (!running_) return;
+    has_reannounced_ = false;
     update();
 }
 

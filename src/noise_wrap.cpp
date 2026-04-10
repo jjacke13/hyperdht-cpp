@@ -1,3 +1,7 @@
+// Noise IK handshake implementation — initiator/responder state machines
+// for Noise_IK_Ed25519_ChaChaPoly_BLAKE2b. All crypto via libsodium;
+// Ed25519 DH uses SHA512 scalar extraction + crypto_scalarmult_ed25519_noclamp.
+
 #include "hyperdht/noise_wrap.hpp"
 
 #include <sodium.h>

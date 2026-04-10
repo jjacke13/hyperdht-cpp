@@ -1,3 +1,7 @@
+// Kademlia routing table implementation — 256 buckets of up to 20 nodes.
+// No bucket splitting: eviction is handled by the caller via ping-and-swap.
+// Matches JS kademlia-routing-table/index.js.
+
 #include "hyperdht/routing_table.hpp"
 
 #include <algorithm>
@@ -87,6 +91,14 @@ const Node* Bucket::get(const NodeId& id) const {
     return nullptr;
 }
 
+Node* Bucket::get_mut(const NodeId& id) {
+    size_t idx = find_index(id);
+    if (idx < nodes_.size() && nodes_[idx].id == id) {
+        return &nodes_[idx];
+    }
+    return nullptr;
+}
+
 const Node* Bucket::oldest() const {
     if (nodes_.empty()) return nullptr;
     return &nodes_.front();
@@ -133,6 +145,12 @@ const Node* RoutingTable::get(const NodeId& id) const {
     size_t idx = bucket_index(id_, id);
     if (idx >= ID_BITS) return nullptr;
     return buckets_[idx].get(id);
+}
+
+Node* RoutingTable::get_mut(const NodeId& id) {
+    size_t idx = bucket_index(id_, id);
+    if (idx >= ID_BITS) return nullptr;
+    return buckets_[idx].get_mut(id);
 }
 
 bool RoutingTable::has(const NodeId& id) const {

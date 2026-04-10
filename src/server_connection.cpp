@@ -1,3 +1,7 @@
+// Server-side connection state machine — handles an incoming
+// PEER_HANDSHAKE as Noise IK responder, runs PEER_HOLEPUNCH, then
+// establishes the UDX stream and SecretStream for the application.
+
 #include "hyperdht/server_connection.hpp"
 
 #include <sodium.h>

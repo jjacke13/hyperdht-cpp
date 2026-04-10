@@ -1,3 +1,7 @@
+// Router implementation — forward table for incoming PEER_HANDSHAKE
+// and PEER_HOLEPUNCH. Maps target hash → ForwardEntry (the Server
+// instance that listens at that key).
+
 #include "hyperdht/router.hpp"
 
 #include <cstring>

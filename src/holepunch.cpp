@@ -1,3 +1,8 @@
+// PEER_HOLEPUNCH implementation — UDP NAT traversal driver.
+// Runs the 4 strategies (consistent/random combinations), drives the
+// 2-round PEER_HOLEPUNCH exchange over a DHT relay, fires UDP probes,
+// and hands the resulting socket + remote address to the UDX stream.
+
 #include "hyperdht/holepunch.hpp"
 
 #include "hyperdht/async_utils.hpp"

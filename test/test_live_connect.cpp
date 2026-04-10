@@ -4,7 +4,11 @@
 //   1. findPeer — iterative walk to find the server's announcement
 //   2. PEER_HANDSHAKE — Noise IK through DHT relay
 //   3. PEER_HOLEPUNCH — 2-round relay + UDP probe exchange
-//   4. UDX stream connect + SecretStream header exchange
+//   4. UDX stream connect + SecretStreamDuplex (full-duplex wrapper)
+//
+// This test dogfoods `SecretStreamDuplex` — the wrapper that replaces
+// ~120 lines of inline framing/encrypt/decrypt glue from earlier revisions
+// with `duplex.start()` + event callbacks (`on_connect`, `on_message`).
 //
 // Requires network access. Skipped if bootstrap nodes are unreachable.
 
@@ -77,11 +81,11 @@ struct PipelineState {
 
     // stream
     bool stream_connected = false;
-    bool header_sent = false;
-    bool header_received = false;
-    std::vector<uint8_t> recv_buf;
+    bool duplex_connected = false;         // SecretStreamDuplex on_connect fired
+    bool message_received = false;         // at least one decrypted message
+    std::vector<uint8_t> first_message;    // first decrypted payload
     rpc::RpcSocket* rpc = nullptr;
-    secret_stream::SecretStream* ss = nullptr;
+    secret_stream::SecretStreamDuplex* duplex = nullptr;
 
     // UDX stream (raw C, shared socket)
     udx_stream_t* stream = nullptr;
@@ -140,7 +144,14 @@ TEST(LiveConnect, FullPipeline) {
     };
 
     // -----------------------------------------------------------------------
-    // Step 4: UDX stream + SecretStream (called after holepunch success)
+    // Step 4: UDX stream + SecretStreamDuplex
+    //
+    // We used to hand-roll the header send/receive + decrypt loop inline
+    // (~120 lines). Now the Duplex wrapper does all of it internally:
+    //   - Automatic header frame send on `start()`
+    //   - State-machine frame parser (header first, then data frames)
+    //   - `on_connect` when both sides exchange headers
+    //   - `on_message` per decrypted application payload
     // -----------------------------------------------------------------------
     auto start_stream = [&](const holepunch::HolepunchResult& hp_result) {
         state.peer_addr = hp_result.address;
@@ -154,16 +165,14 @@ TEST(LiveConnect, FullPipeline) {
 
         // Use the socket that received the holepunch probe (may be the main
         // RPC socket OR a pool socket — both share the same udx_t handle).
-        // JS equivalent: c.onsocket(ref.socket, port, host)
         udx_socket_t* punch_socket = hp_result.socket
             ? hp_result.socket : rpc_socket.socket_handle();
 
         state.stream = new udx_stream_t;
         udx_stream_init(rpc_socket.udx_handle(), state.stream, state.our_udx_id,
             nullptr, nullptr);
-        state.stream->data = &state;
 
-        // Connect to server's UDX stream ID through the punched hole
+        // Connect to server's UDX stream ID through the punched hole.
         struct sockaddr_in dest{};
         uv_ip4_addr(hp_result.address.host_string().c_str(),
                      hp_result.address.port, &dest);
@@ -171,120 +180,42 @@ TEST(LiveConnect, FullPipeline) {
                            server_udx_id,
                            reinterpret_cast<const struct sockaddr*>(&dest));
 
-        // Create SecretStream (we are the initiator)
-        auto* ss = new secret_stream::SecretStream(
-            state.hs_result.tx_key, state.hs_result.rx_key,
-            state.hs_result.handshake_hash, true);
-        state.ss = ss;
+        // Wrap the UDX stream in a SecretStreamDuplex. The Duplex takes
+        // over `stream->data` and installs its own read/close callbacks
+        // when `start()` is called.
+        secret_stream::DuplexHandshake hs{};
+        hs.tx_key = state.hs_result.tx_key;
+        hs.rx_key = state.hs_result.rx_key;
+        hs.handshake_hash = state.hs_result.handshake_hash;
+        hs.public_key = kp.public_key;
+        hs.remote_public_key = state.hs_result.remote_public_key;
+        hs.is_initiator = true;
+
+        state.duplex = new secret_stream::SecretStreamDuplex(
+            state.stream, hs, &loop, secret_stream::DuplexOptions{});
 
         printf("  Our stream ID: %s\n",
-               to_hex(ss->local_id().data(), 8).c_str());
+               to_hex(state.duplex->local_id().data(), 8).c_str());
 
-        // Send our SecretStream header
-        auto header_msg = ss->create_header_message();
-        printf("  Sending SecretStream header (%zu bytes)...\n", header_msg.size());
+        state.duplex->on_connect([&]() {
+            state.duplex_connected = true;
+            printf("  SecretStreamDuplex CONNECTED — encrypted channel up\n");
+        });
 
-        // Keep header buffer alive until write completes
-        auto* header_buf = new std::vector<uint8_t>(std::move(header_msg));
-        uv_buf_t uv_buf = uv_buf_init(
-            reinterpret_cast<char*>(header_buf->data()),
-            static_cast<unsigned int>(header_buf->size()));
+        state.duplex->on_message([&](const uint8_t* data, size_t len) {
+            if (!state.message_received) {
+                state.message_received = true;
+                state.first_message.assign(data, data + len);
+                std::string s(reinterpret_cast<const char*>(data), len);
+                printf("  MESSAGE RECEIVED (%zu bytes): %s\n", len, s.c_str());
+            }
+        });
 
-        // udx_stream_write_t has a flexible array member — must be heap-allocated
-        auto* wreq = static_cast<udx_stream_write_t*>(
-            calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
+        state.duplex->on_close([&](int err) {
+            printf("  Duplex closed (err=%d)\n", err);
+        });
 
-        struct WriteCtx { std::vector<uint8_t>* buf; PipelineState* state; };
-        wreq->data = new WriteCtx{header_buf, &state};
-
-        int wrc = udx_stream_write(wreq, state.stream, &uv_buf, 1,
-            [](udx_stream_write_t* req, int status, int) {
-                auto* ctx = static_cast<WriteCtx*>(req->data);
-                if (status >= 0) {
-                    ctx->state->header_sent = true;
-                    printf("  SecretStream header SENT\n");
-                } else {
-                    printf("  SecretStream header write FAILED: %d\n", status);
-                }
-                delete ctx->buf;
-                delete ctx;
-                free(req);
-            });
-
-        if (wrc < 0) {
-            printf("  udx_stream_write failed: %d\n", wrc);
-            delete header_buf;
-            delete static_cast<WriteCtx*>(wreq->data);
-            free(wreq);
-        }
-
-        // Start reading — wait for server's SecretStream header
-        udx_stream_read_start(state.stream,
-            [](udx_stream_t* s, ssize_t nread, const uv_buf_t* buf) {
-                auto* st = static_cast<PipelineState*>(s->data);
-                if (nread <= 0) {
-                    if (nread < 0) {
-                        printf("  Stream read error: %zd\n", nread);
-                    }
-                    return;
-                }
-
-                printf("  Received %zd bytes from server\n", nread);
-                st->recv_buf.insert(st->recv_buf.end(),
-                    reinterpret_cast<const uint8_t*>(buf->base),
-                    reinterpret_cast<const uint8_t*>(buf->base) + nread);
-
-                // SecretStream header = 3 bytes (uint24_le length) + 56 bytes payload
-                if (!st->header_received && st->recv_buf.size() >= 59) {
-                    uint32_t len = secret_stream::read_uint24_le(st->recv_buf.data());
-                    printf("  Server header length field: %u (expect 56)\n", len);
-
-                    if (len == secret_stream::ID_HEADER_BYTES &&
-                        st->recv_buf.size() >= 3 + len) {
-                        bool ok = st->ss->receive_header(
-                            st->recv_buf.data() + 3, len);
-                        if (ok) {
-                            st->header_received = true;
-                            printf("  SecretStream header RECEIVED and VERIFIED!\n");
-                            printf("  ENCRYPTED CHANNEL ESTABLISHED!\n");
-
-                            // Try to decrypt any remaining data
-                            size_t consumed = 3 + len;
-                            if (st->recv_buf.size() > consumed) {
-                                size_t remaining = st->recv_buf.size() - consumed;
-                                printf("  %zu additional bytes after header\n",
-                                       remaining);
-
-                                // Check for a framed message
-                                if (remaining >= 3) {
-                                    uint32_t msg_len = secret_stream::read_uint24_le(
-                                        st->recv_buf.data() + consumed);
-                                    printf("  Next message length: %u\n", msg_len);
-
-                                    if (remaining >= 3 + msg_len) {
-                                        auto decrypted = st->ss->decrypt(
-                                            st->recv_buf.data() + consumed + 3,
-                                            msg_len);
-                                        if (decrypted) {
-                                            printf("  Decrypted %zu bytes: %s\n",
-                                                   decrypted->size(),
-                                                   to_hex(decrypted->data(),
-                                                          std::min(decrypted->size(),
-                                                                   size_t(32))).c_str());
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            printf("  SecretStream header verification FAILED\n");
-                            printf("  Expected remote ID: %s\n",
-                                   to_hex(st->ss->remote_id().data(), 8).c_str());
-                            printf("  Got: %s\n",
-                                   to_hex(st->recv_buf.data() + 3, 8).c_str());
-                        }
-                    }
-                }
-            });
+        state.duplex->start();  // sends header, installs read callback
     };
 
     // -----------------------------------------------------------------------
@@ -412,11 +343,13 @@ TEST(LiveConnect, FullPipeline) {
         EXPECT_TRUE(state.holepunch_success) << "Holepunch should succeed";
     }
     if (state.holepunch_success) {
-        EXPECT_TRUE(state.header_sent) << "Should send SecretStream header";
-        EXPECT_TRUE(state.header_received) << "Should receive SecretStream header";
+        EXPECT_TRUE(state.duplex_connected)
+            << "SecretStreamDuplex should fire on_connect";
+        EXPECT_TRUE(state.message_received)
+            << "Server should send at least one encrypted message";
     }
 
-    delete state.ss;
+    delete state.duplex;
     if (state.stream) {
         udx_stream_destroy(state.stream);
         delete state.stream;

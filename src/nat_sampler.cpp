@@ -1,3 +1,7 @@
+// NAT sampler implementation — collects the `to` address reported by
+// remote DHT nodes and classifies our firewall as CONSISTENT or RANDOM
+// once enough samples are observed.
+
 #include "hyperdht/nat_sampler.hpp"
 #include "hyperdht/peer_connect.hpp"
 

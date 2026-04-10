@@ -1,3 +1,7 @@
+// dht-rpc message codec implementation — compact encoding for the
+// request/response envelope: type byte, TID, target, token, command,
+// value, closer nodes, and the `to` field used by the NAT sampler.
+
 #include "hyperdht/messages.hpp"
 
 #include <cstring>

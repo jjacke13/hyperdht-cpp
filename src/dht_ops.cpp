@@ -1,3 +1,7 @@
+// High-level DHT operations implementation — findPeer, lookup,
+// announce, unannounce. Each wraps the iterative query engine with
+// the appropriate HyperDHT command and result aggregation.
+
 #include "hyperdht/dht_ops.hpp"
 
 #include <sodium.h>

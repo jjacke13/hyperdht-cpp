@@ -48,6 +48,16 @@ public:
     void stop(std::function<void()> on_done = nullptr);
     void refresh();
 
+    // JS: `this.online.notify()` — wakes the _background loop from an
+    // `await this.online.wait()` when the network comes back online.
+    //
+    // In the C++ timer-based model the announcer isn't blocked on a
+    // signal, so `notify_online()` simply triggers an immediate update
+    // cycle (idempotent — a no-op while one is already in flight).
+    // Called from `Server::notify_online()`, which in turn is called
+    // from the DHT layer on a network-state transition.
+    void notify_online();
+
     bool is_running() const { return running_; }
 
     // Current relay info (for NoisePayload holepunch field)

@@ -1,3 +1,6 @@
+// Health monitor implementation — sliding window over 4 ticks of
+// successes/timeouts, classifying the socket as ONLINE/DEGRADED/OFFLINE.
+
 #include "hyperdht/health.hpp"
 
 namespace hyperdht {

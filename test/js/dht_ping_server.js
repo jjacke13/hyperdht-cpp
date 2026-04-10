@@ -6,7 +6,8 @@
  * Exits after first PING response or 10s timeout.
  */
 
-const DHT = require('/home/jacke/Desktop/repos/hyperdht-cpp/.analysis/js/dht-rpc')
+// Resolved against test/js/node_modules (pinned in test/js/package.json).
+const DHT = require('dht-rpc')
 
 async function main () {
   const node = new DHT({ bootstrap: [] })

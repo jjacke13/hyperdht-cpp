@@ -34,6 +34,15 @@ struct Node {
     std::vector<uint8_t> token;
     uint64_t round_trip_time = 0;
     uint64_t added_at = 0;  // timestamp when added
+
+    // Ping-and-swap + down-hint metadata — tick-based counters matching
+    // JS dht-rpc. `added` / `pinged` / `seen` / `sampled` are the background
+    // tick values at which each event last occurred (0 = never).
+    uint32_t added = 0;
+    uint32_t pinged = 0;
+    uint32_t seen = 0;
+    uint32_t sampled = 0;
+    uint32_t down_hints = 0;  // number of DOWN_HINT reports received for this node
 };
 
 // ---------------------------------------------------------------------------
@@ -64,13 +73,17 @@ public:
     // Get a node by ID. Returns nullptr if not found.
     const Node* get(const NodeId& id) const;
 
+    // Mutable lookup for metadata updates (pinged/seen/sampled counters).
+    Node* get_mut(const NodeId& id);
+
     // Number of nodes in the bucket
     size_t size() const { return nodes_.size(); }
     bool empty() const { return nodes_.empty(); }
     bool is_full() const { return nodes_.size() >= K; }
 
-    // Access all nodes (sorted by XOR distance from bucket prefix)
+    // Access all nodes (sorted by binary ID order).
     const std::vector<Node>& nodes() const { return nodes_; }
+    std::vector<Node>& nodes_mut() { return nodes_; }
 
     // The oldest node (first in the list — candidate for eviction)
     const Node* oldest() const;
@@ -107,6 +120,10 @@ public:
     // Get a node by ID. Returns nullptr if not found.
     const Node* get(const NodeId& id) const;
 
+    // Mutable lookup — used by the RPC layer to update per-node metadata
+    // (pinged/seen/sampled/down_hints counters).
+    Node* get_mut(const NodeId& id);
+
     // Check if a node exists
     bool has(const NodeId& id) const;
 
@@ -122,8 +139,9 @@ public:
     // Set callback for bucket-full events
     void on_full(OnFullCallback cb) { on_full_ = std::move(cb); }
 
-    // Access a specific bucket
+    // Access a specific bucket (const + mutable variants).
     const Bucket& bucket(size_t idx) const { return buckets_[idx]; }
+    Bucket& bucket_mut(size_t idx) { return buckets_[idx]; }
 
 private:
     NodeId id_;

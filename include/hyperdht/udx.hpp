@@ -1,5 +1,9 @@
 #pragma once
 
+// RAII wrappers around libudx (udx_t, udx_socket_t, udx_stream_t).
+// Owns the C handles; lifetime is tied to the wrapper objects.
+// The caller owns the uv_loop_t and must outlive these wrappers.
+
 #include <cstdint>
 #include <udx.h>
 #include <uv.h>

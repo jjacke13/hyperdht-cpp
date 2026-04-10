@@ -1,3 +1,7 @@
+// PEER_HANDSHAKE implementation — sends the initiator Noise msg1 to a
+// relay DHT node, awaits the responder msg2, and produces a handshake
+// result (keys, hash, encrypted payload) for the holepunch stage.
+
 #include "hyperdht/peer_connect.hpp"
 
 #include <sodium.h>

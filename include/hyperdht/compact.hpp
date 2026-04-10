@@ -1,5 +1,9 @@
 #pragma once
 
+// compact-encoding — binary codec for varints, buffers, IPv4/IPv6, etc.
+// C++ port of JS compact-encoding; wire-compatible with the JS reference.
+// Used by all DHT messages and HyperDHT payloads.
+
 #include <array>
 #include <cstddef>
 #include <cstdint>

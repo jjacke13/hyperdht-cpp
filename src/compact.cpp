@@ -1,3 +1,7 @@
+// compact-encoding implementation — varints, fixed-width ints,
+// raw/length-prefixed buffers, IPv4/IPv6 (compact-encoding-net).
+// Matches the JS reference wire format byte-for-byte.
+
 #include "hyperdht/compact.hpp"
 
 #include <charconv>

@@ -279,10 +279,39 @@ TEST(Server, SuspendResume) {
 }
 
 // ---------------------------------------------------------------------------
-// Address
+// Address — §14: returns NAT-sampled host/port, not bound socket port.
 // ---------------------------------------------------------------------------
 
-TEST(Server, Address) {
+TEST(Server, AddressEmptyBeforeListen) {
+    // JS: `if (!this._keyPair) return null` — in C++ we return a
+    // default-constructed AddressInfo (zero public_key + empty host).
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+
+    router::Router router;
+    Server srv(socket, router);
+
+    auto addr = srv.address();
+    EXPECT_TRUE(addr.host.empty());
+    EXPECT_EQ(addr.port, 0u);
+    // public_key is zero-initialized
+    std::array<uint8_t, 32> zero{};
+    EXPECT_EQ(addr.public_key, zero);
+
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(Server, AddressBeforeNatSample) {
+    // Without any NAT samples, host="" and port=0 — the NAT sampler has
+    // not classified us yet. The bound socket port is intentionally NOT
+    // reported (it's local, not public).
     uv_loop_t loop;
     uv_loop_init(&loop);
 
@@ -302,7 +331,133 @@ TEST(Server, Address) {
 
     auto addr = srv.address();
     EXPECT_EQ(addr.public_key, kp.public_key);
-    EXPECT_GT(addr.port, 0u);
+    EXPECT_TRUE(addr.host.empty());
+    EXPECT_EQ(addr.port, 0u);
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(Server, AddressReflectsNatSampler) {
+    // After feeding a sample into the NAT sampler, the server's address
+    // reflects the NAT-detected (public) host/port — matching JS
+    // `server.address() → { host: dht.host, port: dht.port }`.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed seed{};
+    seed.fill(0x33);
+    auto kp = noise::generate_keypair(seed);
+    srv.listen(kp, [](const ConnectionInfo&) {});
+
+    // Inject a single NAT sample: seen-by node 203.0.113.1 reports us at
+    // 198.51.100.7:55555. One sample populates host_/port_ (classification
+    // still waits for ≥3 samples, but the "current best" updates immediately).
+    auto seen_by = compact::Ipv4Address::from_string("203.0.113.1", 49737);
+    auto our_pub = compact::Ipv4Address::from_string("198.51.100.7", 55555);
+    ASSERT_TRUE(socket.nat_sampler().add(our_pub, seen_by));
+
+    auto addr = srv.address();
+    EXPECT_EQ(addr.public_key, kp.public_key);
+    EXPECT_EQ(addr.host, "198.51.100.7");
+    EXPECT_EQ(addr.port, 55555u);
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// NotifyOnline — §8: wakes the announcer's update cycle.
+// ---------------------------------------------------------------------------
+
+TEST(Server, NotifyOnlineBeforeListenNoOp) {
+    // Must not crash when called before listen() (no announcer yet).
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+
+    router::Router router;
+    Server srv(socket, router);
+
+    srv.notify_online();  // no-op; must not crash
+    EXPECT_FALSE(srv.is_listening());
+
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(Server, NotifyOnlineWhileSuspendedNoOp) {
+    // JS semantics: notifyOnline is a no-op if the server is suspended,
+    // because the announcer is stopped during suspend.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed seed{};
+    seed.fill(0x77);
+    auto kp = noise::generate_keypair(seed);
+    srv.listen(kp, [](const ConnectionInfo&) {});
+
+    srv.suspend();
+    EXPECT_TRUE(srv.is_suspended());
+
+    srv.notify_online();  // no-op while suspended; must not crash
+
+    srv.resume();
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(Server, NotifyOnlineIdempotentWhileListening) {
+    // Repeated calls while an update is already in flight must be safe.
+    // `Announcer::update()` is guarded by `updating_`, so a second call
+    // during the same cycle is a no-op.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed seed{};
+    seed.fill(0x55);
+    auto kp = noise::generate_keypair(seed);
+    srv.listen(kp, [](const ConnectionInfo&) {});
+
+    srv.notify_online();
+    srv.notify_online();
+    srv.notify_online();
+    EXPECT_TRUE(srv.is_listening());
 
     srv.close();
     socket.close();

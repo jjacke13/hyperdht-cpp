@@ -1,3 +1,7 @@
+// Async utilities implementation — Sleeper and Semaphore.
+// Sleeper wraps a uv_timer_t with a resume() waker (JS sleeper.js).
+// Semaphore serializes async sections over the libuv event loop.
+
 #include "hyperdht/async_utils.hpp"
 
 namespace hyperdht {

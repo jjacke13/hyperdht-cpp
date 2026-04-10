@@ -1,3 +1,6 @@
+// RAII libudx wrapper implementations — constructors/destructors for
+// Udx, UdxSocket and UdxStream, with thin method forwards to the C API.
+
 #include "hyperdht/udx.hpp"
 
 namespace hyperdht::udx {

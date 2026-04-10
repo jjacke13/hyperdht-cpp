@@ -1,3 +1,7 @@
+// HyperDHT main class implementation — owns the RPC socket, routing
+// table, announce store, query engine and connection pool. Provides
+// connect(), listen(), suspend()/resume() and the tick/bootstrap loop.
+
 #include "hyperdht/dht.hpp"
 
 #include <sodium.h>

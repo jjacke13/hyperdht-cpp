@@ -66,6 +66,12 @@ public:
     Channel(Mux& mux, const std::string& protocol,
             const std::vector<uint8_t>& id, uint32_t local_id);
 
+    // Constructor with aliases — the channel answers to the primary
+    // (protocol, id) pair and also to any (alias, id) pair.
+    Channel(Mux& mux, const std::string& protocol,
+            const std::vector<std::string>& aliases,
+            const std::vector<uint8_t>& id, uint32_t local_id);
+
     // Register a message type handler. Returns the message type index.
     int add_message(MessageHandler handler);
 
@@ -77,6 +83,12 @@ public:
 
     // Close the channel (sends CLOSE to remote)
     void close();
+
+    // Cork / uncork the parent mux (matches JS `Channel.cork()` which
+    // delegates to `mux.cork()`). Convenience for app code that only
+    // holds a Channel pointer.
+    void cork();
+    void uncork();
 
     // State
     bool is_open() const { return opened_; }
@@ -111,6 +123,11 @@ private:
 
     std::vector<uint8_t> local_handshake_;
     std::vector<MessageHandler> messages_;
+
+    // Pair keys for this channel — the primary key (protocol + id) plus
+    // any alias keys. Populated at construction and used by Mux to
+    // match incoming OPEN messages.
+    std::vector<std::string> pair_keys_;
 
     // Buffered messages received before channel is fully opened
     struct PendingMessage {
@@ -147,6 +164,37 @@ public:
     Channel* create_channel(const std::string& protocol,
                             const std::vector<uint8_t>& id = {},
                             bool unique = true);
+
+    // Create a channel that is also known under a set of alternative
+    // (protocol, id) keys. Matches JS `createChannel({aliases: [...]})`.
+    // All alias keys share the same id bytes — only the protocol string
+    // differs. An incoming OPEN for any alias pairs with this channel.
+    Channel* create_channel(const std::string& protocol,
+                            const std::vector<std::string>& aliases,
+                            const std::vector<uint8_t>& id,
+                            bool unique);
+
+    // Destroy the mux — closes all open channels, clears batch state,
+    // stops writing. Matches JS `mux.destroy()` which calls
+    // `stream.destroy(err)`, triggering `_shutdown` which closes every
+    // local session. In C++ the caller owns the stream, so we just
+    // close the channels and mark the mux dead.
+    void destroy();
+    bool is_destroyed() const { return destroyed_; }
+
+    // True if any channel is currently open for the given (protocol, id).
+    // Matches JS `opened({protocol, id})`.
+    bool opened(const std::string& protocol,
+                const std::vector<uint8_t>& id = {}) const;
+
+    // Return the most recently created channel for (protocol, id) or
+    // nullptr if none. Matches JS `getLastChannel({protocol, id})`.
+    Channel* get_last_channel(const std::string& protocol,
+                              const std::vector<uint8_t>& id = {});
+
+    // Iterate all non-destroyed channels. Matches JS `Symbol.iterator`.
+    // The callback receives each channel in creation order.
+    void for_each_channel(const std::function<void(Channel*)>& fn);
 
     // Feed an incoming frame (after SecretStream decryption).
     // Each call = one complete Protomux frame.
@@ -225,9 +273,34 @@ private:
     };
     std::unordered_map<std::string, PendingOpen> pending_remote_;
 
-    // Cork state
+    // Last-created channel per (protocol, id) key — for get_last_channel().
+    std::unordered_map<std::string, Channel*> last_channel_by_key_;
+
+    // Destroyed flag (JS: stream.destroyed). Once set, create_channel
+    // returns nullptr and writes are dropped.
+    bool destroyed_ = false;
+
+    // Cork state — JS batch format.
+    //
+    // When corked, each outgoing frame is split into `(localId, payload)`
+    // where localId is the frame's leading channelId varint and payload
+    // is everything after it (for control messages, payload starts with
+    // the control type byte; for data messages, with the message type
+    // varint). On uncork, the batch is serialized as one control frame:
+    //
+    //   [0x00, 0x00, <first_localId varint>,
+    //     <payload1 len varint> <payload1 bytes>,
+    //     <payload2 len varint> <payload2 bytes>,
+    //     0x00 <new_localId varint>,           // channel switch marker
+    //     <payload3 len varint> <payload3 bytes>,
+    //     ...
+    //   ]
     int cork_count_ = 0;
-    std::vector<uint8_t> cork_buffer_;
+    struct BatchEntry {
+        uint32_t local_id;
+        std::vector<uint8_t> payload;
+    };
+    std::vector<BatchEntry> batch_;
 
     // Backpressure state
     bool drained_ = true;

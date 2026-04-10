@@ -334,6 +334,11 @@ if(HYPERDHT_BUILD_TESTS)
     add_test(NAME test_protomux COMMAND test_protomux)
     gtest_discover_tests(test_protomux)
 
+    add_executable(test_protomux_secretstream test/test_protomux_secretstream.cpp)
+    target_link_libraries(test_protomux_secretstream PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_protomux_secretstream COMMAND test_protomux_secretstream)
+    gtest_discover_tests(test_protomux_secretstream)
+
     add_executable(test_health test/test_health.cpp)
     target_link_libraries(test_health PRIVATE hyperdht GTest::gtest_main)
     add_test(NAME test_health COMMAND test_health)

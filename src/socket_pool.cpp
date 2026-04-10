@@ -1,3 +1,7 @@
+// Socket pool implementation — reusable UDX sockets for holepunching.
+// Matches JS socket-pool.js: bind/release by stable key, with idle
+// timeout cleanup and refcount tracking.
+
 #include "hyperdht/socket_pool.hpp"
 
 #include <cstring>

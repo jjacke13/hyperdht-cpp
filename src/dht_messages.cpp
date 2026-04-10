@@ -1,3 +1,7 @@
+// HyperDHT message codecs — encode/decode for announce records,
+// peer records, and mutable/immutable storage values. Wire-compatible
+// with hyperdht/lib/messages.js.
+
 #include "hyperdht/dht_messages.hpp"
 
 #include <sodium.h>

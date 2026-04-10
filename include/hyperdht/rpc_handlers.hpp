@@ -1,13 +1,14 @@
 #pragma once
 
 // DHT RPC request handlers — respond to incoming dht-rpc and HyperDHT commands.
-// dht-rpc (internal): PING, PING_NAT, FIND_NODE, DOWN_HINT
-// HyperDHT (external): FIND_PEER, LOOKUP, ANNOUNCE, UNANNOUNCE
+// dht-rpc (internal): PING, PING_NAT, FIND_NODE, DOWN_HINT, DELAYED_PING
+// HyperDHT (external): FIND_PEER, LOOKUP, ANNOUNCE, UNANNOUNCE, MUTABLE/IMMUTABLE_*
 //
 // These handlers make our node a full participant in the DHT network,
 // able to answer queries and store announcements for other peers.
 
 #include <string>
+#include <vector>
 
 #include "hyperdht/announce.hpp"
 #include "hyperdht/lru_cache.hpp"
@@ -47,6 +48,7 @@ private:
     void handle_ping_nat(const messages::Request& req);
     void handle_find_node(const messages::Request& req);
     void handle_down_hint(const messages::Request& req);
+    void handle_delayed_ping(const messages::Request& req);
 
     // HyperDHT external commands
     void handle_find_peer(const messages::Request& req);
@@ -69,6 +71,19 @@ private:
     LruCache<std::string, std::vector<uint8_t>> mutables_{STORAGE_MAX_ENTRIES};
     LruCache<std::string, std::vector<uint8_t>> immutables_{STORAGE_MAX_ENTRIES};
     uv_timer_t* gc_timer_ = nullptr;
+
+    // DELAYED_PING pending replies: one heap-allocated struct per scheduled reply.
+    // Timer is embedded; on fire we send the reply and uv_close the timer (the close
+    // callback deletes the struct). On destructor, we orphan + uv_close all pending.
+    struct DelayedReply {
+        uv_timer_t timer;
+        RpcHandlers* owner;         // Null after destruction to prevent use-after-free
+        uint16_t tid;
+        compact::Ipv4Address from;
+    };
+    std::vector<DelayedReply*> pending_delayed_;
+
+    static void on_delayed_ping_fire(uv_timer_t* timer);
 
     static std::string to_hex_key(const std::array<uint8_t, 32>& t) {
         static const char h[] = "0123456789abcdef";

@@ -1,3 +1,7 @@
+// Protomux implementation — channel multiplexer over a framed stream.
+// Handles OPEN/CLOSE control messages, per-channel flow, and batching.
+// Matches JS protomux/index.js.
+
 #include "hyperdht/protomux.hpp"
 
 #include <algorithm>
@@ -133,16 +137,34 @@ static std::string to_hex(const uint8_t* data, size_t len) {
 // Channel
 // ---------------------------------------------------------------------------
 
-Channel::Channel(Mux& mux, const std::string& protocol,
-                 const std::vector<uint8_t>& id, uint32_t local_id)
-    : mux_(mux), protocol_(protocol), id_(id), local_id_(local_id) {}
-
-std::string Channel::pair_key() const {
-    std::string key = protocol_ + "##";
-    if (!id_.empty()) {
-        key += to_hex(id_.data(), id_.size());
+static std::string build_pair_key(const std::string& protocol,
+                                  const std::vector<uint8_t>& id) {
+    std::string key = protocol + "##";
+    if (!id.empty()) {
+        key += to_hex(id.data(), id.size());
     }
     return key;
+}
+
+Channel::Channel(Mux& mux, const std::string& protocol,
+                 const std::vector<uint8_t>& id, uint32_t local_id)
+    : mux_(mux), protocol_(protocol), id_(id), local_id_(local_id) {
+    pair_keys_.push_back(build_pair_key(protocol_, id_));
+}
+
+Channel::Channel(Mux& mux, const std::string& protocol,
+                 const std::vector<std::string>& aliases,
+                 const std::vector<uint8_t>& id, uint32_t local_id)
+    : mux_(mux), protocol_(protocol), id_(id), local_id_(local_id) {
+    pair_keys_.push_back(build_pair_key(protocol_, id_));
+    for (const auto& alias : aliases) {
+        pair_keys_.push_back(build_pair_key(alias, id_));
+    }
+}
+
+std::string Channel::pair_key() const {
+    // Primary key. `pair_keys_` also contains aliases after index 0.
+    return pair_keys_.empty() ? build_pair_key(protocol_, id_) : pair_keys_[0];
 }
 
 int Channel::add_message(MessageHandler handler) {
@@ -180,13 +202,17 @@ void Channel::open(const uint8_t* handshake, size_t handshake_len) {
     frame.resize(static_cast<size_t>(p - frame.data()));
     mux_.write_frame(frame.data(), frame.size());
 
-    // Check if there's already a pending remote OPEN for this channel.
-    // This happens when remote opened before we did.
-    auto key = pair_key();
-    auto it = mux_.pending_remote_.find(key);
-    if (it != mux_.pending_remote_.end()) {
-        mux_.try_pair(this, it->second);
-        mux_.pending_remote_.erase(it);
+    // Check if there's already a pending remote OPEN for any of our
+    // pair keys (primary or alias). This happens when the remote
+    // opened before we did.
+    for (const auto& k : pair_keys_) {
+        auto it = mux_.pending_remote_.find(k);
+        if (it != mux_.pending_remote_.end()) {
+            auto pending = it->second;
+            mux_.pending_remote_.erase(it);
+            mux_.try_pair(this, pending);
+            break;
+        }
     }
 }
 
@@ -212,6 +238,9 @@ bool Channel::send(int message_type, const uint8_t* data, size_t len) {
     return true;
 }
 
+void Channel::cork()   { mux_.cork(); }
+void Channel::uncork() { mux_.uncork(); }
+
 void Channel::close() {
     if (closed_ || destroyed_) return;
     closed_ = true;
@@ -224,6 +253,12 @@ void Channel::close() {
     p += varint_encode(p, local_id_);
 
     mux_.write_frame(frame, static_cast<size_t>(p - frame));
+
+    // Fire on_close first — JS `_close(false)` emits `onclose(false, this)`
+    // on the local-initiated path too. Matches remote_close() semantics.
+    auto close_cb = std::move(on_close);
+    if (close_cb) close_cb();
+
     destroy();
 }
 
@@ -263,13 +298,16 @@ void Channel::destroy() {
     destroyed_ = true;
     opened_ = false;
 
-    // Move callback out — remove_channel may deallocate us
+    // Move callback out of the member slot, then invoke it BEFORE the
+    // channel is freed. This lets user callbacks safely reference any
+    // Channel state (including `this`) while the object is still alive
+    // — just not after this method returns.
     auto destroy_cb = std::move(on_destroy);
-
-    // Clean up maps first (before callbacks can re-enter)
-    mux_.remove_channel(this);
-    // 'this' is now dangling — only call the saved callback
     if (destroy_cb) destroy_cb();
+
+    // Now it's safe to clean up and free ourselves. The `this` pointer
+    // becomes dangling after remove_channel returns.
+    mux_.remove_channel(this);
 }
 
 void Channel::dispatch(uint32_t type, const uint8_t* data, size_t len) {
@@ -287,11 +325,17 @@ Mux::Mux(WriteFn write_fn) : write_fn_(std::move(write_fn)) {}
 Channel* Mux::create_channel(const std::string& protocol,
                               const std::vector<uint8_t>& id,
                               bool unique) {
+    return create_channel(protocol, {}, id, unique);
+}
+
+Channel* Mux::create_channel(const std::string& protocol,
+                              const std::vector<std::string>& aliases,
+                              const std::vector<uint8_t>& id,
+                              bool unique) {
+    if (destroyed_) return nullptr;
+
     // Build pair key for uniqueness check
-    std::string key = protocol + "##";
-    if (!id.empty()) {
-        key += to_hex(id.data(), id.size());
-    }
+    std::string key = build_pair_key(protocol, id);
 
     // Unique check: reject if (protocol, id) already open
     if (unique) {
@@ -302,17 +346,42 @@ Channel* Mux::create_channel(const std::string& protocol,
     }
 
     uint32_t local_id = next_local_id_++;
-    auto ch = std::make_unique<Channel>(*this, protocol, id, local_id);
+    auto ch = aliases.empty()
+        ? std::make_unique<Channel>(*this, protocol, id, local_id)
+        : std::make_unique<Channel>(*this, protocol, aliases, id, local_id);
     Channel* ptr = ch.get();
     channels_.push_back(std::move(ch));
     local_to_channel_[local_id] = ptr;
+
+    // Register every pair key (primary + aliases) in the last-channel map.
+    for (const auto& k : ptr->pair_keys_) {
+        last_channel_by_key_[k] = ptr;
+    }
 
     return ptr;
 }
 
 void Mux::write_frame(const uint8_t* data, size_t len) {
+    // Refuse to touch the underlying stream after destroy — the write_fn_
+    // may reference a torn-down transport. (cpp-review HIGH #2)
+    if (destroyed_) return;
+
     if (cork_count_ > 0) {
-        cork_buffer_.insert(cork_buffer_.end(), data, data + len);
+        // Split the frame into (localId, payload) and push into the batch.
+        // JS `_pushBatch(localId, buffer)` does this by calling either
+        // `_write0(buffer.subarray(1))` (control: channelId=0 is stripped)
+        // or by building a payload without the channelId and pushing.
+        // Here we do the same: decode the leading channelId varint from
+        // the frame bytes and push the rest as the payload.
+        if (len == 0) return;
+        const uint8_t* ptr = data;
+        const uint8_t* end = data + len;
+        uint32_t local_id = static_cast<uint32_t>(varint_decode(ptr, end));
+        size_t payload_len = static_cast<size_t>(end - ptr);
+        BatchEntry e;
+        e.local_id = local_id;
+        e.payload.assign(ptr, ptr + payload_len);
+        batch_.push_back(std::move(e));
         return;
     }
     if (write_fn_) {
@@ -325,14 +394,59 @@ void Mux::cork() {
 }
 
 void Mux::uncork() {
-    if (--cork_count_ <= 0) {
+    // Guard against mismatched uncork() (underflow) — JS silently leaves
+    // corked=-1 in that case; we clamp at 0 instead.
+    if (cork_count_ <= 0) {
         cork_count_ = 0;
-        if (!cork_buffer_.empty()) {
-            if (write_fn_) {
-                drained_ = write_fn_(cork_buffer_.data(), cork_buffer_.size());
-            }
-            cork_buffer_.clear();
+        return;
+    }
+    if (--cork_count_ > 0) return;
+    if (batch_.empty()) return;
+
+    // Compute the encoded size.
+    // Header: 0x00 0x00 + varint(first_localId)
+    // Per entry: if localId switches, + 0x00 + varint(new_localId)
+    //            then + varint(payload_len) + payload_len bytes
+    size_t size = 2 + varint_size(batch_.front().local_id);
+    uint32_t prev = batch_.front().local_id;
+    for (const auto& e : batch_) {
+        if (e.local_id != prev) {
+            size += 1 + varint_size(e.local_id);  // 0x00 + switch
+            prev = e.local_id;
         }
+        size += varint_size(e.payload.size()) + e.payload.size();
+    }
+
+    std::vector<uint8_t> frame(size);
+    uint8_t* p = frame.data();
+
+    // Control frame header: channelId=0, type=BATCH(0).
+    *p++ = 0x00;
+    *p++ = 0x00;
+
+    // First localId.
+    prev = batch_.front().local_id;
+    p += varint_encode(p, prev);
+
+    for (const auto& e : batch_) {
+        if (e.local_id != prev) {
+            *p++ = 0x00;  // channel switch marker (zero-length message)
+            p += varint_encode(p, e.local_id);
+            prev = e.local_id;
+        }
+        p += varint_encode(p, e.payload.size());
+        if (!e.payload.empty()) {
+            std::memcpy(p, e.payload.data(), e.payload.size());
+            p += e.payload.size();
+        }
+    }
+
+    // Sanity — shouldn't happen, but guard against size mispredict.
+    frame.resize(static_cast<size_t>(p - frame.data()));
+
+    batch_.clear();
+    if (write_fn_) {
+        drained_ = write_fn_(frame.data(), frame.size());
     }
 }
 
@@ -510,8 +624,10 @@ void Mux::handle_data(uint32_t channel_id, const uint8_t* data, size_t len) {
 
 Channel* Mux::find_by_pair_key(const std::string& key) {
     for (auto& ch : channels_) {
-        if (!ch->destroyed_ && ch->pair_key() == key) {
-            return ch.get();
+        if (ch->destroyed_) continue;
+        // Check primary key and any alias keys.
+        for (const auto& k : ch->pair_keys_) {
+            if (k == key) return ch.get();
         }
     }
     return nullptr;
@@ -598,9 +714,14 @@ void Mux::remove_channel(Channel* ch) {
     }
     local_to_channel_.erase(ch->local_id_);
 
-    // Remove from pending
-    auto key = ch->pair_key();
-    pending_remote_.erase(key);
+    // Remove from pending + last-channel map for every key we own.
+    for (const auto& k : ch->pair_keys_) {
+        pending_remote_.erase(k);
+        auto it = last_channel_by_key_.find(k);
+        if (it != last_channel_by_key_.end() && it->second == ch) {
+            last_channel_by_key_.erase(it);
+        }
+    }
 
     // Erase from channels_ vector — deallocates the Channel.
     // Caller must not use 'ch' after this returns.
@@ -610,6 +731,68 @@ void Mux::remove_channel(Channel* ch) {
                            return p.get() == ch;
                        }),
         channels_.end());
+}
+
+// ---------------------------------------------------------------------------
+// destroy / opened / get_last_channel / for_each_channel
+// ---------------------------------------------------------------------------
+
+void Mux::destroy() {
+    if (destroyed_) return;
+    destroyed_ = true;
+
+    // Close every live channel. JS calls stream.destroy() → `_shutdown()`
+    // → iterates _local and `_close(true)` on each. The tricky part in
+    // C++ is that each close may synchronously free OTHER channels
+    // (e.g. if a user `on_close` callback calls `close()` on a sibling).
+    // A pre-captured snapshot of raw pointers becomes unsafe the moment
+    // one of those siblings is freed.
+    //
+    // Instead: re-scan `channels_` on every iteration, find the first
+    // still-live channel, and close it. Terminate when no live channels
+    // remain. This is O(n²) but n is tiny and correctness wins.
+    while (true) {
+        Channel* next = nullptr;
+        for (auto& ch : channels_) {
+            if (!ch->destroyed_) { next = ch.get(); break; }
+        }
+        if (!next) break;
+        next->remote_close();  // may free `next` and potentially others
+    }
+
+    batch_.clear();
+    cork_count_ = 0;
+}
+
+bool Mux::opened(const std::string& protocol,
+                 const std::vector<uint8_t>& id) const {
+    std::string key = build_pair_key(protocol, id);
+    for (auto& ch : channels_) {
+        if (ch->destroyed_ || !ch->opened_) continue;
+        for (const auto& k : ch->pair_keys_) {
+            if (k == key) return true;
+        }
+    }
+    return false;
+}
+
+Channel* Mux::get_last_channel(const std::string& protocol,
+                               const std::vector<uint8_t>& id) {
+    std::string key = build_pair_key(protocol, id);
+    auto it = last_channel_by_key_.find(key);
+    return it == last_channel_by_key_.end() ? nullptr : it->second;
+}
+
+void Mux::for_each_channel(const std::function<void(Channel*)>& fn) {
+    // Snapshot first — fn may call close() which mutates channels_.
+    std::vector<Channel*> snapshot;
+    snapshot.reserve(channels_.size());
+    for (auto& ch : channels_) {
+        if (!ch->destroyed_) snapshot.push_back(ch.get());
+    }
+    for (auto* ch : snapshot) {
+        fn(ch);
+    }
 }
 
 }  // namespace protomux

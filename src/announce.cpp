@@ -1,6 +1,21 @@
 // Announce store implementation — hash map keyed by 32-byte target.
 // Records are appended with a TTL and scanned/expired on access.
 // Used by the ANNOUNCE / UNANNOUNCE / FIND_PEER / LOOKUP handlers.
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:16-24 (Persistent ctor —
+//     creates `records = new RecordCache(opts.records)`)
+//     .analysis/js/hyperdht/lib/persistent.js:26-37 (onlookup uses
+//     `this.records.get(k, 20)`)
+//     .analysis/js/hyperdht/lib/persistent.js:100-150 (onannounce uses
+//     `this.records.add(k, peer.publicKey, record)`)
+//     .analysis/js/hyperdht/lib/persistent.js:45-51 (unannounce uses
+//     `this.records.remove(k, publicKey)`)
+//
+// C++ diffs from JS:
+//   - JS uses the npm `record-cache` package (TTL + per-key max + LRU).
+//   - C++ implementation is a plain unordered_map<TargetKey, vector>
+//     with manual gc(). Eviction is oldest-by-created_at on overflow.
+//   - JS keys remove() by publicKey; C++ removes by source `from` address.
 
 #include "hyperdht/announce.hpp"
 

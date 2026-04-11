@@ -1,6 +1,28 @@
 // NAT sampler implementation — collects the `to` address reported by
 // remote DHT nodes and classifies our firewall as CONSISTENT or RANDOM
 // once enough samples are observed.
+//
+// JS: .analysis/js/nat-sampler/index.js:1-64 (whole NatSampler class)
+//
+// C++ diffs from JS:
+//   - JS uses a single fixed-size ring (`_samples` of length 32) and
+//     bumps two ranks (`_a` = host+port, `_b` = host) per sample.
+//     C++ uses two separate sorted-by-hits vectors (samples_full_ for
+//     host+port, samples_host_ for host-only) — no ring eviction.
+//   - JS dynamically adjusts `_threshold` based on `size` (size-1/2/3
+//     depending on bucket count). C++ keys decisions on a fixed `>=3`
+//     sample minimum and a max-hits ladder.
+//   - JS picks the winner via `_threshold` against `_a.hits` /
+//     `_b.hits`. C++ uses an explicit `update_firewall()` ladder
+//     mirroring `nat.js _updateFirewall` from hyperdht (NOT the
+//     nat-sampler package — JS DHT actually consumes the simpler
+//     nat-sampler output and runs its own firewall classification on
+//     top in hyperdht/lib/nat.js).
+//   - C++ adds `visited_` set so the same source node doesn't
+//     contribute multiple samples (JS allows it because the ring will
+//     eventually evict duplicates).
+//   - C++ also tracks `frozen_` and exposes `unfreeze()` — used after
+//     a holepunch round to lock in classification.
 
 #include "hyperdht/nat_sampler.hpp"
 #include "hyperdht/peer_connect.hpp"
@@ -17,6 +39,10 @@ constexpr uint32_t FW_RANDOM = peer_connect::FIREWALL_RANDOM;
 // ---------------------------------------------------------------------------
 // add_sample — insert or increment a sample in a sorted-by-hits list
 // (internal helper, not exposed in header)
+//
+// JS: .analysis/js/nat-sampler/index.js:52-63 (_bump) — JS only walks
+// the most recent 4 entries in the ring. C++ scans the full vector and
+// bubbles up to maintain descending sort by hits.
 // ---------------------------------------------------------------------------
 
 static void add_sample(std::vector<Sample>& samples,
@@ -65,6 +91,9 @@ void NatSampler::unfreeze() {
     update_addresses();
 }
 
+// JS: .analysis/js/nat-sampler/index.js:14-50 (add)
+// JS treats every call as a fresh sample (with ring eviction). C++
+// dedups by source node so a single peer can't skew the classification.
 bool NatSampler::add(const compact::Ipv4Address& addr,
                      const compact::Ipv4Address& from) {
     // Deduplicate by source node — don't sample the same node twice
@@ -93,6 +122,11 @@ bool NatSampler::add(const compact::Ipv4Address& addr,
 
 // ---------------------------------------------------------------------------
 // Firewall classification (from nat.js _updateFirewall)
+//
+// JS: .analysis/js/hyperdht/lib/nat.js _updateFirewall (NOT nat-sampler;
+//     hyperdht layers its own classifier on top of nat-sampler's host/port
+//     winner). The ladder: max_hits>=3 → CONSISTENT, max_hits==1 → RANDOM,
+//     max_hits==2 → edge cases on sample count + bucket distribution.
 // ---------------------------------------------------------------------------
 
 void NatSampler::update_firewall() {
@@ -131,6 +165,11 @@ void NatSampler::update_firewall() {
 
 // ---------------------------------------------------------------------------
 // Address extraction (from nat.js _updateAddresses)
+//
+// JS: .analysis/js/hyperdht/lib/nat.js _updateAddresses
+//   - RANDOM: emit a single host:0 (port unpredictable).
+//   - CONSISTENT: emit up to 4 entries; require >=2 hits except for the
+//     first 2 entries which are always included.
 // ---------------------------------------------------------------------------
 
 void NatSampler::update_addresses() {

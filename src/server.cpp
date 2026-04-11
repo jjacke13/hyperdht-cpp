@@ -2,6 +2,18 @@
 // HyperDHT connections. Registers with the Router, announces
 // periodically via the Announcer, and spawns a ServerConnection
 // for each accepted PEER_HANDSHAKE.
+//
+// JS: .analysis/js/hyperdht/lib/server.js:18-686 (whole Server class)
+//
+// C++ diffs from JS:
+//   - Per-session timers stored in `session_timers_` map<id,uv_timer_t*>
+//     vs JS clearing setTimeouts on the `hs` object directly.
+//   - Handshake dedup uses `handshake_dedup_` map<noise_hex, hp_id>
+//     vs JS `_connects` Map<noise_hex, Promise<hs>>.
+//   - rawStream firewall ctx is heap-allocated `RawStreamCtx*` so the
+//     C callback can route back to `Server::on_raw_stream_firewall`.
+//   - Holepunch state lives in unique_ptr<ServerConnection> in
+//     `connections_` (no JS-style sparse array of `_holepunches`).
 
 #include "hyperdht/server.hpp"
 
@@ -52,6 +64,16 @@ Server::~Server() {
 
 // ---------------------------------------------------------------------------
 // listen
+//
+// JS: .analysis/js/hyperdht/lib/server.js:143-196 (listen + _listen)
+//     .analysis/js/hyperdht/lib/server.js:166-175 (target + _router.set)
+//
+// C++ diffs from JS:
+//   - Synchronous: no Promise — caller must already have bound socket.
+//   - We do not run the JS dedup loop checking other listening servers
+//     for the same publicKey (KEYPAIR_ALREADY_USED) — caller's contract.
+//   - Computes target = BLAKE2b-256(publicKey) directly via libsodium
+//     instead of JS `unslabbedHash`.
 // ---------------------------------------------------------------------------
 
 void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection) {
@@ -92,6 +114,16 @@ void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection)
 
 // ---------------------------------------------------------------------------
 // close
+//
+// JS: .analysis/js/hyperdht/lib/server.js:88-129 (close + _close + _gc)
+//     .analysis/js/hyperdht/lib/server.js:131-141 (_clearAll)
+//
+// C++ diffs from JS:
+//   - Each session timer in `session_timers_` is uv_timer_stop'd and
+//     uv_close'd individually; JS just clearTimeouts on hs objects.
+//   - `handshake_dedup_` (map) replaces JS `_connects` Map.
+//   - Connections cleared via std::map.clear() — destructors handle
+//     raw_stream cleanup; JS calls hs.rawStream.destroy() in _clearAll.
 // ---------------------------------------------------------------------------
 
 void Server::close(std::function<void()> on_done) {
@@ -150,6 +182,12 @@ void Server::notify_online() {
     if (announcer_) announcer_->notify_online();
 }
 
+// JS: server.js:63-76 (suspend + resume)
+// JS suspend awaits _listening, then sets `suspended = true`, calls
+// `_clearAll()`, and awaits `_announcer.suspend()`. We mirror that
+// synchronously: stop the announcer, walk our session_timers_ map and
+// uv_close each, clear connection / dedup state. Resume restarts the
+// announcer (no JS-style `_resumed` Signal needed in our timer model).
 void Server::suspend() {
     if (suspended_) return;
     suspended_ = true;
@@ -180,6 +218,7 @@ void Server::resume() {
     if (announcer_) announcer_->start();
 }
 
+// JS: server.js:78-86 (address)
 Server::AddressInfo Server::address() const {
     AddressInfo info;
     // JS: `if (!this._keyPair) return null` — before listen() there is no
@@ -207,6 +246,18 @@ const std::vector<peer_connect::RelayInfo>& Server::relay_addresses() const {
 
 // ---------------------------------------------------------------------------
 // on_peer_handshake — handle incoming Noise IK msg1
+//
+// JS: .analysis/js/hyperdht/lib/server.js:464-481 (_onpeerhandshake)
+//     .analysis/js/hyperdht/lib/server.js:210-443 (_addHandshake — the
+//                                                  full handshake state machine)
+//
+// C++ diffs from JS:
+//   - Dedup uses `handshake_dedup_` map<noise_hex, hp_id> resending the
+//     cached `reply_noise`. JS reuses the in-flight Promise via `_connects`.
+//   - rawStream is created (`udx_stream_init` + firewall callback) before
+//     punching, mirroring JS:280-292 `dht.createRawStream({firewall})`.
+//   - Per-session expiry timer stored in `session_timers_[hp_id]`,
+//     replacing JS:447 `_clearLater(hs, id, k)` setTimeout chain.
 // ---------------------------------------------------------------------------
 
 void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
@@ -217,7 +268,8 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     if (closed_ || suspended_) return;
 
     // Dedup: same noise bytes = same client via different relay.
-    // JS: k = noise.toString('hex'); if (_connects.has(k)) reuse session.
+    // JS: server.js:464-473 (_onpeerhandshake) k = noise.toString('hex');
+    //     if (_connects.has(k)) reuse session. We resend cached reply_noise.
     auto noise_key = to_hex(noise.data(), noise.size());
     auto dedup_it = handshake_dedup_.find(noise_key);
     if (dedup_it != handshake_dedup_.end()) {
@@ -273,7 +325,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     }
 
     // Create rawStream NOW (during handshake, before holepunch starts).
-    // Matches JS: hs.rawStream = this.dht.createRawStream({firewall})
+    // JS: server.js:280-292 (hs.rawStream = this.dht.createRawStream({firewall}))
     // The stream is registered on the socket so the client's first UDX
     // packet triggers the firewall callback with the real address.
     auto* raw = new udx_stream_t;
@@ -303,7 +355,9 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     connections_[hp_id] = std::move(conn_ptr);
     handshake_dedup_[noise_key] = hp_id;
 
-    // Per-session timeout — matches JS _clearLater(hs, id, k)
+    // Per-session timeout — JS: server.js:445-462 (_clearLater + _clear)
+    //   JS uses `hs.clearing = setTimeout(() => _clear(...), handshakeClearWait)`
+    //   We store the uv_timer_t* in session_timers_ keyed by hp_id.
     auto* timer = new uv_timer_t;
     uv_timer_init(socket_.loop(), timer);
     auto* ctx = new std::pair<Server*, uint32_t>(this, hp_id);
@@ -324,6 +378,17 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
 
 // ---------------------------------------------------------------------------
 // on_peer_holepunch — handle incoming holepunch rounds
+//
+// JS: .analysis/js/hyperdht/lib/server.js:483-600 (_onpeerholepunch)
+//     .analysis/js/hyperdht/lib/server.js:602-623 (_abort — error path)
+//
+// C++ diffs from JS:
+//   - Connections lookup is `connections_[hp_msg.id]` (a map) vs JS
+//     `_holepunches[id]` (sparse array reused on null slots).
+//   - We instantiate `Holepuncher` lazily on first round here, JS does
+//     it inside `_addHandshake` (server.js:436).
+//   - JS analyzer (`p.analyze(false)` etc.) is replaced by simpler
+//     "client says punching → start probes" logic in handle_holepunch.
 // ---------------------------------------------------------------------------
 
 void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
@@ -372,7 +437,8 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                 hp_msg.id, reply.remote_firewall,
                 reply.remote_addresses.size());
 
-        // JS: opts.holepunch callback to veto (server.js:544)
+        // JS: server.js:544 — `if (!this.holepunch(remoteFirewall, ourFirewall,
+        //                          remoteAddresses, ourAddresses)) return _abort()`
         if (holepunch_cb_) {
             auto local_addrs = socket_.nat_sampler().addresses();
             if (!holepunch_cb_(reply.remote_firewall, our_fw,
@@ -416,6 +482,16 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
 
 // ---------------------------------------------------------------------------
 // on_socket — connection established
+//
+// JS: .analysis/js/hyperdht/lib/server.js:305-342 (hs.onsocket closure)
+//     .analysis/js/hyperdht/lib/server.js:59-61 (onconnection emit)
+//
+// C++ diffs from JS:
+//   - We pass the actual `udx_socket_t*` (the one that received the
+//     probe) through ConnectionInfo so the caller can wire the stream
+//     to that exact socket. JS passes (socket, port, host) directly.
+//   - rawStream ownership is transferred via raw pointer + nulling
+//     `conn.raw_stream`; JS sets `hs.rawStream = null` after connect.
 // ---------------------------------------------------------------------------
 
 void Server::on_socket(server_connection::ServerConnection& conn,
@@ -453,6 +529,8 @@ void Server::on_socket(server_connection::ServerConnection& conn,
 
 // ---------------------------------------------------------------------------
 // Per-session cleanup — matches JS _clear(hs, id, k)
+//
+// JS: .analysis/js/hyperdht/lib/server.js:450-462 (_clear)
 // ---------------------------------------------------------------------------
 
 void Server::clear_session(uint32_t hp_id) {
@@ -473,6 +551,9 @@ void Server::clear_session(uint32_t hp_id) {
 
 // ---------------------------------------------------------------------------
 // rawStream firewall — client's first UDX packet arrived with real address
+//
+// JS: .analysis/js/hyperdht/lib/server.js:282-291 (firewall callback inside
+//     createRawStream — calls hs.onsocket with socket/port/host)
 // ---------------------------------------------------------------------------
 
 void Server::on_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket,

@@ -127,6 +127,8 @@ HyperDHT::~HyperDHT() {
 
 // ---------------------------------------------------------------------------
 // bind
+//
+// JS: .analysis/js/dht-rpc/index.js:157-159 (DHT.bind delegates to io.bind)
 // ---------------------------------------------------------------------------
 
 int HyperDHT::bind() {
@@ -142,7 +144,18 @@ void HyperDHT::ensure_bound() {
 }
 
 // ---------------------------------------------------------------------------
-// connect — client connection to a remote peer
+// connect — client connection to a remote peer.
+//
+// JS: .analysis/js/hyperdht/lib/connect.js:32-115 (module.exports = connect)
+//
+// C++ diffs from JS:
+//   - JS returns the encryptedSocket synchronously and runs the connect
+//     pipeline in the background; C++ takes a completion callback and runs
+//     the same pipeline through nested lambdas.
+//   - JS attaches the encryptedSocket to the pool inside connect() itself
+//     (connect.js:54). C++ leaves pool wiring to ConnectionPool helpers.
+//   - The 3 overloads collapse JS's `opts.keyPair` and pool/duplicate handling
+//     (connect.js:33-52) into one fast-path branch each.
 // ---------------------------------------------------------------------------
 
 void HyperDHT::connect(const noise::PubKey& remote_public_key,
@@ -208,6 +221,31 @@ void HyperDHT::connect(const noise::PubKey& remote_public_key,
     do_connect(remote_public_key, keypair, ConnectOptions{}, std::move(on_done));
 }
 
+// ---------------------------------------------------------------------------
+// do_connect — orchestrates findPeer → handshake → holepunch → ready.
+//
+// JS: .analysis/js/hyperdht/lib/connect.js:176-194 (connectAndHolepunch)
+//     .analysis/js/hyperdht/lib/connect.js:318-384 (findAndConnect)
+//     .analysis/js/hyperdht/lib/connect.js:386-503 (connectThroughNode)
+//     .analysis/js/hyperdht/lib/connect.js:205-316 (holepunch)
+//
+// C++ diffs from JS:
+//   - No async/await: a ConnState shared_ptr is threaded through nested
+//     lambdas. JS's `isDone(c)` (connect.js:138-153) check becomes
+//     `state->completed`.
+//   - JS uses Semaphore(2) over an async iterator (connect.js:336-368).
+//     C++ implements a sequential retry loop (`try_relay_fn`) that fires
+//     two attempts up front but otherwise advances on failure.
+//   - `alive` weak_ptr sentinel replaces JS's `dht.destroyed` and
+//     `c.encryptedSocket.destroying` checks.
+//   - Client rawStream + firewall callback are created lazily (after the
+//     handshake completes) rather than at connect() time as in JS
+//     (connect.js:73). The firewall hook still mirrors JS's behaviour:
+//     fire `c.onsocket` when the server's first packet arrives.
+//   - LAN shortcut (§6) and holepunch run in parallel — first to complete
+//     wins via `state->completed`. JS aborts on LAN ping failure
+//     (connect.js:243-246); we fall through to holepunch instead.
+// ---------------------------------------------------------------------------
 void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                            const noise::Keypair& keypair,
                            const ConnectOptions& opts,
@@ -283,6 +321,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
 
     // Step 1: findPeer — collect all relays that have the peer record.
     // JS: findAndConnect tries connectThroughNode for each result.
+    // JS: connect.js:341-368 — for-await over findPeer query, semaphore(2)
     state->query = dht_ops::find_peer(*socket_, remote_pk,
         [state](const query::QueryReply& reply) {
             if (reply.value.has_value() && !reply.value->empty()) {
@@ -433,6 +472,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
 
                     // JS: if our firewall is OPEN, wait passively for server
                     // to probe us (via rawStream firewall callback). 10s timeout.
+                    // JS: connect.js:228-231 — passive wait when our firewall is OPEN
                     if (fw == peer_connect::FIREWALL_OPEN) {
                         DHT_LOG("  [connect] Our firewall is OPEN, waiting passively (10s)\n");
                         auto* passive_timer = new uv_timer_t;
@@ -619,6 +659,15 @@ std::shared_ptr<query::Query> HyperDHT::announce(
 
 // ---------------------------------------------------------------------------
 // lookupAndUnannounce
+//
+// JS: .analysis/js/hyperdht/index.js:197-238 (lookupAndUnannounce — does
+//     a LOOKUP query with a commit fn that signs and sends UNANNOUNCE to
+//     each replying node)
+//
+// C++ diffs from JS:
+//   - Not yet fully ported: C++ currently delegates to plain `dht_ops::lookup`
+//     and the unannounce commit happens in `dht_ops` (TODO). A proper port
+//     would sign an UNANNOUNCE payload per-reply via a commit callback.
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<query::Query> HyperDHT::lookup_and_unannounce(
@@ -641,7 +690,10 @@ std::shared_ptr<query::Query> HyperDHT::lookup_and_unannounce(
 }
 
 // ---------------------------------------------------------------------------
-// ping
+// ping — PING an arbitrary address and fire a bool callback.
+//
+// JS: .analysis/js/dht-rpc/index.js:260-299 (dht.ping — wraps io.createRequest
+//     with PING cmd and returns a Promise)
 // ---------------------------------------------------------------------------
 
 void HyperDHT::ping(const compact::Ipv4Address& addr,
@@ -665,12 +717,28 @@ void HyperDHT::ping(const compact::Ipv4Address& addr,
 // Mutable / Immutable storage — thin wrappers around dht_ops that surface
 // JS-shaped result structs through the public HyperDHT class.
 //
+// JS: .analysis/js/hyperdht/index.js:266-279 (immutableGet)
+//     .analysis/js/hyperdht/index.js:281-300 (immutablePut)
+//     .analysis/js/hyperdht/index.js:302-353 (mutableGet)
+//     .analysis/js/hyperdht/index.js:355-390 (mutablePut)
+//
 // These match the JS reference in `hyperdht/index.js` (immutablePut,
 // immutableGet, mutablePut, mutableGet). The underlying dht_ops functions
 // handle signing, target computation, query+commit. We add a small shim
 // on top that (a) produces the JS-style result struct with `closest_nodes`,
 // (b) forwards streaming per-result callbacks for get operations, and
 // (c) tracks best-seen results for mutable_get so the caller gets the latest.
+//
+// C++ diffs from JS:
+//   - JS `mutableGet` consumes the query as an async iterator and tracks
+//     the best-seen result inline (index.js:319-328). C++ uses an
+//     `on_value` reply callback that mutates a shared_ptr<MutableGetResult>.
+//   - JS `immutableGet` returns the first reply whose hash matches the
+//     target (index.js:272-275). C++ does the same check inside dht_ops
+//     and just aggregates here.
+//   - JS computes the signature inside the query commit; C++ pre-signs
+//     in `dht_ops::mutable_put` so the result struct can be returned
+//     immediately on completion.
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<query::Query> HyperDHT::immutable_put(
@@ -864,7 +932,15 @@ connection_pool::ConnectionPool HyperDHT::pool() {
 }
 
 // ---------------------------------------------------------------------------
-// suspend / resume
+// suspend / resume — pause/restart RPC ticks and any servers.
+//
+// JS: .analysis/js/hyperdht/index.js:97 (resume re-seeds _lastRandomPunch)
+//     dht-rpc's `dht.suspend()` / `dht.resume()` (suspends socket + tick)
+//
+// C++ diffs from JS:
+//   - JS suspend rejects new connect() calls via `_connectable` flag at
+//     the connect entry. We mirror that with the `suspended_` check in
+//     each connect overload (connect.js:49-51).
 // ---------------------------------------------------------------------------
 
 void HyperDHT::suspend() {

@@ -146,6 +146,20 @@ static std::string build_pair_key(const std::string& protocol,
     return key;
 }
 
+// ---------------------------------------------------------------------------
+// Channel
+//
+// JS: .analysis/js/protomux/index.js:11-47 (Channel constructor — stores
+//     protocol/aliases/id, hooks message handlers)
+//     .analysis/js/protomux/index.js:751-753 (toKey helper — same
+//     "protocol##<hex(id)>" format we use in build_pair_key)
+//
+// C++ diffs from JS:
+//   - JS keeps a separate `_info` object per (protocol,id) tuple in the Mux
+//     and references it from each Channel; C++ flattens this into per-channel
+//     pair_keys_ + a Mux-level last_channel_by_key_ map.
+// ---------------------------------------------------------------------------
+
 Channel::Channel(Mux& mux, const std::string& protocol,
                  const std::vector<uint8_t>& id, uint32_t local_id)
     : mux_(mux), protocol_(protocol), id_(id), local_id_(local_id) {
@@ -173,6 +187,9 @@ int Channel::add_message(MessageHandler handler) {
     return index;
 }
 
+// JS: index.js:70-101 — Channel.open(): builds a control OPEN frame
+//     [0, 1, localId, protocol, id, handshake] and writes it via
+//     this._mux._write0(buffer).
 void Channel::open(const uint8_t* handshake, size_t handshake_len) {
     if (open_sent_ || closed_ || destroyed_) return;
     open_sent_ = true;
@@ -216,6 +233,9 @@ void Channel::open(const uint8_t* handshake, size_t handshake_len) {
     }
 }
 
+// JS: index.js:253-282 — m.send() in addMessage(): if mux is corked it
+//     pushes via _pushBatch(localId, payload), otherwise it builds a full
+//     [localId, type, payload] frame and writes directly to the stream.
 bool Channel::send(int message_type, const uint8_t* data, size_t len) {
     if (!opened_ || closed_ || remote_id_ == 0) return false;
 
@@ -241,6 +261,9 @@ bool Channel::send(int message_type, const uint8_t* data, size_t len) {
 void Channel::cork()   { mux_.cork(); }
 void Channel::uncork() { mux_.uncork(); }
 
+// JS: index.js:217-232 — Channel.close(): builds a [0, 3, localId] control
+//     frame, calls _close(false) which fires onclose(false, this) and
+//     finally _write0()s the frame.
 void Channel::close() {
     if (closed_ || destroyed_) return;
     closed_ = true;
@@ -262,6 +285,9 @@ void Channel::close() {
     destroy();
 }
 
+// JS: index.js:117-131 — _fullyOpen(): flips opened, calls onopen with the
+//     remote handshake, drains any pending messages buffered while we
+//     waited for the local Channel to appear.
 void Channel::fully_open(const uint8_t* remote_handshake, size_t len) {
     if (opened_ || destroyed_) return;
     opened_ = true;
@@ -269,6 +295,9 @@ void Channel::fully_open(const uint8_t* remote_handshake, size_t len) {
     drain_pending();
 }
 
+// JS: index.js:147-156 — _drain(remote): replays r.pending while
+//     decrementing the mux-level _buffered counter, then resumeMaybe()s
+//     the underlying stream if backpressure had paused it.
 void Channel::drain_pending() {
     // Process any messages that arrived before channel was fully opened
     auto pending = std::move(pending_messages_);
@@ -284,6 +313,9 @@ void Channel::drain_pending() {
     }
 }
 
+// JS: index.js:167-191 — _close(isRemote): tears down local/remote slot
+//     mappings, frees the local id slot, fires onclose(isRemote, this)
+//     and resolves the open promise to false.
 void Channel::remote_close() {
     if (destroyed_) return;
     closed_ = true;
@@ -318,6 +350,24 @@ void Channel::dispatch(uint32_t type, const uint8_t* data, size_t len) {
 
 // ---------------------------------------------------------------------------
 // Mux
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Mux
+//
+// JS: .analysis/js/protomux/index.js:305-345 (Protomux constructor — wires
+//     stream 'data'/'drain'/'end'/'close', initialises _local/_remote/_free
+//     slot tables and the _infos map)
+//     .analysis/js/protomux/index.js:393-415 (createChannel — auto-pair if a
+//     remote OPEN is already pending in info.incoming)
+//
+// C++ diffs from JS:
+//   - JS slot-allocates local ids from a `_free` recycle pool plus a `_local`
+//     vector; C++ uses a monotonically incrementing `next_local_id_` and a
+//     hash map. Functionally equivalent for the wire protocol.
+//   - JS owns the underlying stream and forwards drain/close events through
+//     mux methods; C++ takes a WriteFn callback and exposes
+//     on_stream_drain() for the caller to invoke.
 // ---------------------------------------------------------------------------
 
 Mux::Mux(WriteFn write_fn) : write_fn_(std::move(write_fn)) {}
@@ -360,6 +410,33 @@ Channel* Mux::create_channel(const std::string& protocol,
 
     return ptr;
 }
+
+// ---------------------------------------------------------------------------
+// write_frame / cork / uncork — batched control framing
+//
+// JS: .analysis/js/protomux/index.js:357-370 (cork / uncork — flip _batch
+//     between null and []; uncork triggers _sendBatch)
+//     .analysis/js/protomux/index.js:417-430 (_pushBatch — strips the leading
+//     channelId varint and groups consecutive entries by localId)
+//     .analysis/js/protomux/index.js:432-453 (_sendBatch — encodes
+//     [0x00, 0x00, varint(first_localId), (varint(payload_len), payload | 0x00,
+//     varint(new_localId))*] and writes it as a single control frame)
+//     .analysis/js/protomux/index.js:724-731 (_write0 — control frames with
+//     channelId=0 are stripped of their leading 0 byte before pushing into
+//     the batch)
+//     .analysis/js/protomux/index.js:565-593 (_onbatch — the decode side: a
+//     msg_len of 0 acts as the channel-switch marker)
+//
+// C++ diffs from JS:
+//   - cpp-reviewer fix: the original C++ implementation was wire-incompatible.
+//     This implementation matches JS at the byte level — verified against
+//     the on-wire format produced by `_sendBatch` above.
+//   - JS pre-encodes the batch state incrementally (`_pushBatch` calls
+//     `c.uint.preencode` / `c.buffer.preencode` to grow `state.end` as it
+//     queues entries); C++ accumulates raw entries and computes the size in
+//     uncork() before encoding. Same wire output.
+//   - JS uses `_alloc(state.end)` for the buffer; C++ allocates a vector.
+// ---------------------------------------------------------------------------
 
 void Mux::write_frame(const uint8_t* data, size_t len) {
     // Refuse to touch the underlying stream after destroy — the write_fn_
@@ -452,6 +529,14 @@ void Mux::uncork() {
 
 // ---------------------------------------------------------------------------
 // Incoming frame dispatch
+//
+// JS: .analysis/js/protomux/index.js:482-490 (_ondata — entry point, kicks
+//     _decode after reading the leading channelId varint)
+//     .analysis/js/protomux/index.js:504-522 (_decode — splits control vs
+//     data path; ignores messages for closed channels; buffers if the
+//     remote channel is still pending pairing)
+//     .analysis/js/protomux/index.js:524-544 (_oncontrolsession dispatch
+//     table: 0=batch, 1=open, 2=reject, 3=close)
 // ---------------------------------------------------------------------------
 
 void Mux::on_data(const uint8_t* data, size_t len) {
@@ -484,6 +569,20 @@ void Mux::on_data(const uint8_t* data, size_t len) {
 
 // ---------------------------------------------------------------------------
 // Control handlers
+//
+// JS: .analysis/js/protomux/index.js:595-646 (_onopensession — decodes
+//     remoteId/protocol/id, hooks an existing local channel via
+//     info.outgoing or queues into info.incoming and runs _requestSession)
+//     .analysis/js/protomux/index.js:648-668 (_onrejectsession)
+//     .analysis/js/protomux/index.js:670-681 (_onclosesession)
+//     .analysis/js/protomux/index.js:565-593 (_onbatch — the decode loop;
+//     msg_len==0 means "switch channel id")
+//
+// C++ diffs from JS:
+//   - JS handles sessions using a per-info `incoming` queue and lazily
+//     allocates `_remote[rid] = { state, pending: [], session }`. C++ uses
+//     a flat `pending_remote_` map keyed by pair-key — equivalent state.
+//   - JS REJECTs control session opens (remoteId=0); C++ silently ignores.
 // ---------------------------------------------------------------------------
 
 void Mux::handle_open(const uint8_t* data, size_t len) {
@@ -620,6 +719,12 @@ void Mux::handle_data(uint32_t channel_id, const uint8_t* data, size_t len) {
 
 // ---------------------------------------------------------------------------
 // Pairing
+//
+// JS: .analysis/js/protomux/index.js:619-633 (the "outgoing.shift()" path
+//     in _onopensession — links a pending local channel to the freshly
+//     decoded remote slot and calls session._fullyOpen())
+//     .analysis/js/protomux/index.js:117-131 (_fullyOpen — wires the remote
+//     session pointer and decodes the remote handshake)
 // ---------------------------------------------------------------------------
 
 Channel* Mux::find_by_pair_key(const std::string& key) {
@@ -643,7 +748,13 @@ void Mux::try_pair(Channel* local, const PendingOpen& remote) {
 }
 
 // ---------------------------------------------------------------------------
-// Pair/Unpair
+// Pair/Unpair — notify hooks for unsolicited remote OPENs
+//
+// JS: .analysis/js/protomux/index.js:379-385 (pair / unpair — register a
+//     `notify(id)` callback in the _notify map keyed by toKey(protocol,id))
+//     .analysis/js/protomux/index.js:683-695 (_requestSession — looks up the
+//     specific (protocol,id) notify, then falls back to the protocol-only
+//     entry, awaits it, then either keeps or rejects the queued incoming)
 // ---------------------------------------------------------------------------
 
 void Mux::pair(const std::string& protocol, const std::vector<uint8_t>& id,
@@ -693,6 +804,9 @@ void Mux::dispatch_notify(const std::string& protocol,
 
 // ---------------------------------------------------------------------------
 // Drain
+//
+// JS: .analysis/js/protomux/index.js:492-498 (_ondrain — sets drained=true
+//     and calls each session's ondrain hook)
 // ---------------------------------------------------------------------------
 
 void Mux::on_stream_drain() {
@@ -735,6 +849,21 @@ void Mux::remove_channel(Channel* ch) {
 
 // ---------------------------------------------------------------------------
 // destroy / opened / get_last_channel / for_each_channel
+//
+// JS: .analysis/js/protomux/index.js:733-746 (destroy / _safeDestroy /
+//     _shutdown — _shutdown iterates _local and _close(true)s every live
+//     session)
+//     .analysis/js/protomux/index.js:372-391 (getLastChannel / pair /
+//     unpair / opened — info.lastChannel is updated by Channel.open())
+//     .analysis/js/protomux/index.js:347-355 (Symbol.iterator / isIdle —
+//     iterates non-null _local entries)
+//
+// C++ diffs from JS:
+//   - JS's _shutdown captures _local once and iterates; if a sibling close
+//     callback frees another channel, JS just sees the slot become null on
+//     the next iteration. C++ vector ownership means we re-scan on every
+//     iteration so we never dereference a freed unique_ptr — see the
+//     comment block inside destroy() for the rationale.
 // ---------------------------------------------------------------------------
 
 void Mux::destroy() {

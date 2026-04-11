@@ -1,5 +1,19 @@
 // Announce signature implementation — Ed25519 sign/verify over the
 // 64-byte signable blob used by ANNOUNCE, UNANNOUNCE and MUTABLE_PUT.
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:236-256 (static signMutable
+//                                                       / signAnnounce /
+//                                                       signUnannounce)
+//     .analysis/js/hyperdht/lib/persistent.js:259-267 (verifyMutable)
+//     .analysis/js/hyperdht/lib/persistent.js:269-284 (annSignable)
+//     .analysis/js/hyperdht/lib/persistent.js:286-294 (sign helper)
+//
+// C++ diffs from JS:
+//   - JS calls `crypto_generichash_batch` over the array
+//     [target, id, token, encode(peer), refresh||EMPTY]. C++ uses
+//     incremental BLAKE2b via crypto_generichash_init/update/final;
+//     equivalent output. Empty refresh is handled by skipping the
+//     update call (no-op for hash).
 
 #include "hyperdht/announce_sig.hpp"
 
@@ -12,6 +26,11 @@ namespace announce_sig {
 
 // ---------------------------------------------------------------------------
 // ann_signable — build the 64-byte signable buffer
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:269-284 (annSignable)
+//
+// Layout: [0..32) = namespace, [32..64) = BLAKE2b-256(target || id ||
+// token || encoded_peer || refresh).
 // ---------------------------------------------------------------------------
 
 std::array<uint8_t, 64> ann_signable(
@@ -81,6 +100,9 @@ static std::array<uint8_t, 64> build_ann_signable(
 
 // ---------------------------------------------------------------------------
 // Sign announce / unannounce
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:250-256 (static
+//     signAnnounce / signUnannounce — both call sign(annSignable(...)))
 // ---------------------------------------------------------------------------
 
 std::array<uint8_t, 64> sign_announce(
@@ -119,6 +141,10 @@ std::array<uint8_t, 64> sign_unannounce(
 
 // ---------------------------------------------------------------------------
 // Verify announce / unannounce
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:64 (onunannounce verify)
+//     .analysis/js/hyperdht/lib/persistent.js:115 (onannounce verify)
+//     Both use `crypto_sign_verify_detached(signature, signable, peer.publicKey)`.
 // ---------------------------------------------------------------------------
 
 bool verify_announce(
@@ -138,6 +164,12 @@ bool verify_announce(
 
 // ---------------------------------------------------------------------------
 // Mutable storage signatures
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:236-244 (static signMutable)
+//     .analysis/js/hyperdht/lib/persistent.js:259-267 (verifyMutable)
+//
+// Layout: [0..32) = NS_MUTABLE_PUT, [32..64) = BLAKE2b-256(encode(
+// mutableSignable, {seq, value})).
 // ---------------------------------------------------------------------------
 
 static std::array<uint8_t, 64> mutable_signable(

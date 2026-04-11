@@ -42,7 +42,10 @@ static std::array<uint8_t, 32> compute_prologue() {
 static const auto PROLOGUE = compute_prologue();
 
 // ---------------------------------------------------------------------------
-// NoisePayload encoding
+// NoisePayload encoding — the inner payload that travels inside the
+// Noise IK ciphertext (peer firewall, addresses, UDX info, relay hints).
+//
+// JS: .analysis/js/hyperdht/lib/messages.js:156-226 (noisePayload codec)
 // ---------------------------------------------------------------------------
 
 std::vector<uint8_t> encode_noise_payload(const NoisePayload& p) {
@@ -222,7 +225,14 @@ NoisePayload decode_noise_payload(const uint8_t* data, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
-// Handshake message encoding (DHT RPC value wrapper)
+// Handshake message encoding (DHT RPC value wrapper).
+//
+// JS: .analysis/js/hyperdht/lib/messages.js:30-55 (exports.handshake)
+//
+// This is the outer wrapper that sits in `req.value` for PEER_HANDSHAKE.
+// It carries the Noise message bytes plus optional peer/relay addresses
+// used by the relaying node, with a `mode` discriminator for from-client
+// vs from-relay direction.
 // ---------------------------------------------------------------------------
 
 std::vector<uint8_t> encode_handshake_msg(const HandshakeMessage& m) {
@@ -279,7 +289,21 @@ HandshakeMessage decode_handshake_msg(const uint8_t* data, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
-// PEER_HANDSHAKE — initiate Noise IK through DHT relay
+// PEER_HANDSHAKE — initiate Noise IK through a DHT relay node.
+//
+// JS: .analysis/js/hyperdht/lib/noise-wrap.js:13-52 (NoiseWrap class)
+//     .analysis/js/hyperdht/lib/connect.js:386-449 (connectThroughNode —
+//        builds noisePayload, calls handshake.send, sends via _router)
+//
+// C++ diffs from JS:
+//   - JS NoiseWrap stores per-connection state on a class instance;
+//     we capture a shared_ptr<NoiseIK> in the response/timeout lambdas.
+//   - JS computes `holepunchSecret` inside `NoiseWrap.final()`
+//     (noise-wrap.js:36-38); we leave that derivation to holepunch_connect
+//     so the handshake module stays free of holepunch knowledge.
+//   - JS sends the request through `dht._router.peerHandshake` which adds
+//     mode-flipping for relay forwarding. The C++ socket goes direct, so
+//     we always emit `MODE_FROM_CLIENT`.
 // ---------------------------------------------------------------------------
 
 void peer_handshake(rpc::RpcSocket& socket,

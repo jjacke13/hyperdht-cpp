@@ -37,7 +37,9 @@ static void add_default_bootstrap(query::Query& q, const rpc::RpcSocket& socket)
 }
 
 // ---------------------------------------------------------------------------
-// findPeer
+// findPeer — Kademlia walk for FIND_PEER. Target = BLAKE2b(public_key).
+//
+// JS: .analysis/js/hyperdht/index.js:186-190 (findPeer)
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
@@ -65,7 +67,9 @@ std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
 }
 
 // ---------------------------------------------------------------------------
-// lookup
+// lookup — Kademlia walk for LOOKUP. Caller supplies the target hash.
+//
+// JS: .analysis/js/hyperdht/index.js:192-195 (lookup)
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<query::Query> lookup(rpc::RpcSocket& socket,
@@ -81,7 +85,22 @@ std::shared_ptr<query::Query> lookup(rpc::RpcSocket& socket,
 }
 
 // ---------------------------------------------------------------------------
-// announce
+// announce — LOOKUP walk + commit phase that sends ANNOUNCE to each
+// closest node with the issued token.
+//
+// JS: .analysis/js/hyperdht/index.js:244-264 (announce — wraps lookup with
+//     a commit fn that calls _requestAnnounce)
+//     .analysis/js/hyperdht/index.js:_requestAnnounce (signed `m.announce`
+//     payload — target/token/id signed with NS.ANNOUNCE)
+//
+// C++ diffs from JS:
+//   - JS builds the signed `m.announce` payload (peer + signature + bump)
+//     inside `_requestAnnounce` and uses Persistent.signAnnounce. This
+//     C++ wrapper is intentionally low-level: callers pass the already-
+//     encoded `value` and we send it as-is. Higher-level signing lives
+//     in `announce_sig.cpp` / `dht_messages.cpp`.
+//   - JS optionally routes through `lookupAndUnannounce` when `opts.clear`
+//     is set (index.js:250). Not yet ported — see docs/JS-PARITY-GAPS.md.
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<query::Query> announce(rpc::RpcSocket& socket,
@@ -115,7 +134,10 @@ std::shared_ptr<query::Query> announce(rpc::RpcSocket& socket,
 }
 
 // ---------------------------------------------------------------------------
-// immutable_put — target = BLAKE2b(value), query IMMUTABLE_GET, commit IMMUTABLE_PUT
+// immutable_put — target = BLAKE2b(value), query IMMUTABLE_GET to find
+// the closest nodes, then commit IMMUTABLE_PUT to each.
+//
+// JS: .analysis/js/hyperdht/index.js:281-300 (immutablePut)
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<query::Query> immutable_put(rpc::RpcSocket& socket,
@@ -151,7 +173,16 @@ std::shared_ptr<query::Query> immutable_put(rpc::RpcSocket& socket,
 }
 
 // ---------------------------------------------------------------------------
-// immutable_get — query IMMUTABLE_GET, verify hash on each reply
+// immutable_get — query IMMUTABLE_GET, verify BLAKE2b(value) == target on
+// every reply, surface verified values via `on_result`.
+//
+// JS: .analysis/js/hyperdht/index.js:266-279 (immutableGet — for-await loop
+//     with crypto_generichash check before returning the first match)
+//
+// C++ diffs from JS:
+//   - JS returns the first verified node and stops iterating; we keep
+//     the query running but only fire `on_result` on verified replies.
+//     Caller-side aggregation lives in HyperDHT::immutable_get.
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<query::Query> immutable_get(rpc::RpcSocket& socket,
@@ -184,7 +215,17 @@ std::shared_ptr<query::Query> immutable_get(rpc::RpcSocket& socket,
 }
 
 // ---------------------------------------------------------------------------
-// mutable_put — sign, query MUTABLE_GET, commit MUTABLE_PUT
+// mutable_put — Ed25519-sign (seq, value), query MUTABLE_GET (with seq=0)
+// to locate closest nodes, commit MUTABLE_PUT to each.
+//
+// JS: .analysis/js/hyperdht/index.js:355-390 (mutablePut)
+//     .analysis/js/hyperdht/lib/persistent.js:236-244 (Persistent.signMutable)
+//
+// C++ diffs from JS:
+//   - JS supports `opts.signMutable` so callers can plug in custom signers
+//     (HSM, hardware keys, etc). C++ always uses libsodium directly via
+//     `announce_sig::sign_mutable`. A signer-injection hook is tracked
+//     under docs/JS-PARITY-GAPS.md.
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<query::Query> mutable_put(rpc::RpcSocket& socket,
@@ -241,7 +282,17 @@ std::shared_ptr<query::Query> mutable_put(rpc::RpcSocket& socket,
 }
 
 // ---------------------------------------------------------------------------
-// mutable_get — query MUTABLE_GET, verify signature, track highest seq
+// mutable_get — query MUTABLE_GET with min_seq, verify Ed25519 signature
+// and `seq >= min_seq` on every reply, fire `on_result` for each.
+//
+// JS: .analysis/js/hyperdht/index.js:302-353 (mutableGet)
+//     .analysis/js/hyperdht/lib/persistent.js:259-267 (verifyMutable)
+//
+// C++ diffs from JS:
+//   - JS aggregates the best result (`latest=true`) inline in the
+//     for-await loop (index.js:319-328). C++ surfaces every verified
+//     result via `on_result`; the latest-seq tracking lives in
+//     `HyperDHT::mutable_get` to keep the dht_ops layer stateless.
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<query::Query> mutable_get(rpc::RpcSocket& socket,

@@ -1,6 +1,21 @@
 // Announcer implementation — periodically re-announces a server key.
 // Runs an iterative query to the target, then sends ANNOUNCE to the
 // k closest nodes. Signs each announcement with the server keypair.
+//
+// JS: .analysis/js/hyperdht/lib/announcer.js:12-277 (whole Announcer class)
+//
+// C++ diffs from JS:
+//   - JS runs an async `_background()` loop that pings relays every 3s
+//     and re-announces every ~5min, awaiting on a `Sleeper`/`Signal`.
+//     C++ uses two libuv timers: bg_timer_ (REANNOUNCE_MS = 5 min) and
+//     ping_timer_ (RELAY_PING_MS = 5 s).
+//   - JS keeps three rotating Maps in `_serverRelays[3]`. C++ keeps a
+//     single `active_relays_` vector and replaces entries on commit.
+//   - JS picks 3 best replies via `pickBest`. C++ commits to all
+//     find_peer replies that have a token (capped by query results).
+//   - `notify_online()` resets has_reannounced_ so build_relays() runs
+//     again after recovery; JS just notifies the `online` Signal which
+//     unblocks `_background`.
 
 #include "hyperdht/announcer.hpp"
 
@@ -140,6 +155,11 @@ void Announcer::on_ping_timer(uv_timer_t* timer) {
 
 // ---------------------------------------------------------------------------
 // Ping relay nodes — keep NAT mappings alive + detect lost relays
+//
+// JS: .analysis/js/hyperdht/lib/announcer.js:105-141 (_background ping loop)
+//     JS pings every 3s, then sleeps. We use a periodic uv_timer at 5s.
+//     If fewer than MIN_ACTIVE responses come back we trigger refresh()
+//     (matches JS:119-121).
 // ---------------------------------------------------------------------------
 
 void Announcer::ping_relays() {
@@ -182,6 +202,15 @@ void Announcer::ping_relays() {
 
 // ---------------------------------------------------------------------------
 // Update: find k closest → announce to each
+//
+// JS: .analysis/js/hyperdht/lib/announcer.js:143-197 (_runUpdate + _update)
+//     .analysis/js/hyperdht/lib/announcer.js:298-301 (pickBest)
+//
+// JS calls `dht.findPeer(target)`, awaits the iterative query, picks
+// the 3 best closestReplies, signs+commits each, then unannounces any
+// stale relays from the previous cycle (`_serverRelays[1]` slot).
+// We don't yet do the unannounce diff — we just commit on each query
+// reply that yields a token.
 // ---------------------------------------------------------------------------
 
 void Announcer::update() {
@@ -203,6 +232,12 @@ void Announcer::update() {
 
 // ---------------------------------------------------------------------------
 // Commit: sign and send ANNOUNCE to a single node
+//
+// JS: .analysis/js/hyperdht/lib/announcer.js:240-268 (_commit)
+//     C++ also tracks per-relay peer_addr (the `to` field on the
+//     ANNOUNCE response) so build_relays() can advertise the address
+//     each relay actually saw — important for CGNAT where different
+//     relays observe different ports.
 // ---------------------------------------------------------------------------
 
 void Announcer::commit(const query::QueryReply& node) {
@@ -278,6 +313,11 @@ void Announcer::commit(const query::QueryReply& node) {
 
 // ---------------------------------------------------------------------------
 // Unannounce from a single relay node
+//
+// JS: .analysis/js/hyperdht/lib/announcer.js:205-238 (_unannounce)
+//     JS first issues a FIND_PEER to acquire a fresh token from the
+//     relay, then sends UNANNOUNCE. C++ reuses the token captured at
+//     commit() time, so it skips the extra round-trip.
 // ---------------------------------------------------------------------------
 
 void Announcer::unannounce_node(const RelayNode& relay) {
@@ -305,6 +345,9 @@ void Announcer::unannounce_node(const RelayNode& relay) {
 
 // ---------------------------------------------------------------------------
 // Build relay info from active relays
+//
+// JS: .analysis/js/hyperdht/lib/announcer.js:175-189 (the relays/relayAddresses
+//     assembly block at the end of _update — also re-encodes record).
 // ---------------------------------------------------------------------------
 
 void Announcer::build_relays() {

@@ -9,6 +9,28 @@
 namespace hyperdht {
 namespace query {
 
+// ---------------------------------------------------------------------------
+// Query — construction, bootstrap, start
+//
+// JS: .analysis/js/dht-rpc/lib/query.js:9-70 (Query extends Readable —
+//     concurrency, retries, _seen map, optional commit hook, seeded with
+//     opts.nodes / opts.replies if provided)
+//     .analysis/js/dht-rpc/lib/query.js:122-131 (_open — _addFromTable then
+//     resolveBootstrapNodes)
+//     .analysis/js/dht-rpc/lib/query.js:111-120 (_addFromTable)
+//
+// C++ diffs from JS:
+//   - JS Query is a streamx Readable that pushes replies via this.push(data)
+//     and exposes a `finished()` Promise. C++ uses three explicit callbacks
+//     (on_reply / on_done / on_commit) and `maybe_finish()` is the
+//     equivalent of JS's `_flush` / "drain to end" logic.
+//   - JS's `_seen` map tracks DONE/DOWN/[refs]; C++ uses a NodeState enum
+//     and does NOT track refs (no DOWN_HINT propagation yet — see the
+//     gaps doc).
+//   - JS holds an explicit `_session` (with auto-destroy); C++ has none —
+//     the RpcSocket layer owns request lifecycles.
+// ---------------------------------------------------------------------------
+
 std::shared_ptr<Query> Query::create(rpc::RpcSocket& socket,
                                       const routing::NodeId& target,
                                       uint32_t command,
@@ -38,6 +60,9 @@ void Query::add_bootstrap(const compact::Ipv4Address& addr) {
 
 // ---------------------------------------------------------------------------
 // Seeding
+//
+// JS: .analysis/js/dht-rpc/lib/query.js:111-120 (_addFromTable — picks the
+//     k closest from the routing table and adds them in natural order)
 // ---------------------------------------------------------------------------
 
 void Query::seed_from_table() {
@@ -51,6 +76,15 @@ void Query::seed_from_table() {
 
 // ---------------------------------------------------------------------------
 // Pending management
+//
+// JS: .analysis/js/dht-rpc/lib/query.js:140-169 (_addPending — checks
+//     _seen[addr] for DONE/DOWN/refs and dedupes; rejects nodes that are
+//     not closer than the current k-th closest)
+//
+// C++ diffs from JS:
+//   - C++ does the closeness check inside read_more() instead of inside
+//     add_pending(); add_pending here only does the seen-set + filter check.
+//   - The DOWN/refs path is not implemented (no DOWN_HINT yet).
 // ---------------------------------------------------------------------------
 
 void Query::add_pending(const routing::NodeId& id, const compact::Ipv4Address& addr) {
@@ -66,6 +100,24 @@ void Query::add_pending(const routing::NodeId& id, const compact::Ipv4Address& a
 
 // ---------------------------------------------------------------------------
 // Iteration
+//
+// JS: .analysis/js/dht-rpc/lib/query.js:171-209 (_read / _readMore — pops up
+//     to `concurrency + _slow` pending nodes per tick, skips ones no longer
+//     closer than the kth, and `_flush()`es when nothing remains in flight)
+//     .analysis/js/dht-rpc/lib/query.js:362-383 (_visit — fires
+//     this.dht._request with the visit/error callbacks and a configurable
+//     retry count)
+//
+// C++ diffs from JS:
+//   - JS implements a "slowdown" optimisation: after the first readMore tick
+//     it caps concurrency at 3 until the first node replies, to give the
+//     true closest node a head start. C++ does NOT implement this — every
+//     iteration uses the static `concurrency_` value.
+//   - JS retries failed visits up to opts.retries (default 5). C++ relies on
+//     the RpcSocket-level retry policy and treats any timeout as a single
+//     failure.
+//   - JS marks unresponsive nodes DOWN and propagates a DOWN_HINT back to
+//     the original ref. C++ marks DOWN but does not gossip the hint.
 // ---------------------------------------------------------------------------
 
 void Query::read_more() {
@@ -90,6 +142,9 @@ void Query::read_more() {
     maybe_finish();
 }
 
+// JS: query.js:362-383 — _visit(to): increments inflight, calls
+//     dht._request with the bound _onvisit / _onerror callbacks, sets
+//     req.retries / req.oncycle for slowdown tracking.
 void Query::visit(const PendingNode& node) {
     inflight_++;
 
@@ -116,6 +171,10 @@ void Query::visit(const PendingNode& node) {
         });
 }
 
+// JS: query.js:259-296 — _onvisit(m, req): marks DONE in _seen, pushes onto
+//     closestReplies if it has an id and is closer than the kth, then
+//     iterates m.closerNodes (filtering with dht._filterNode + skipping our
+//     own id) and pushes into the pending queue.
 void Query::on_visit_response(const PendingNode& node, const messages::Response& resp) {
     // Mark as done
     std::string key = node.addr.host_string() + ":" + std::to_string(node.addr.port);
@@ -160,6 +219,9 @@ void Query::on_visit_response(const PendingNode& node, const messages::Response&
     read_more();
 }
 
+// JS: query.js:298-310 — _onerror(err, req): marks DOWN if the error code
+//     is REQUEST_TIMEOUT, fires DOWN_HINTs at every ref of this addr, then
+//     decrements inflight and calls _readMore().
 void Query::on_visit_timeout(const PendingNode& node) {
     std::string key = node.addr.host_string() + ":" + std::to_string(node.addr.port);
     seen_[key] = NodeState::DOWN;
@@ -169,6 +231,13 @@ void Query::on_visit_timeout(const PendingNode& node) {
 
 // ---------------------------------------------------------------------------
 // Closest replies management
+//
+// JS: .analysis/js/dht-rpc/lib/query.js:334-351 (_pushClosest — insertion
+//     sort by XOR distance to target, dedupes equal-id entries, caps at k)
+//     .analysis/js/dht-rpc/lib/query.js:133-138 (_isCloser — true while we
+//     have fewer than k replies, otherwise compare against the kth)
+//     .analysis/js/dht-rpc/lib/query.js:353-360 (_compare — XOR distance
+//     comparator against `this.target`)
 // ---------------------------------------------------------------------------
 
 void Query::push_closest(const QueryReply& reply) {
@@ -206,6 +275,25 @@ int Query::compare(const routing::NodeId& a, const routing::NodeId& b) const {
 
 // ---------------------------------------------------------------------------
 // Completion
+//
+// JS: .analysis/js/dht-rpc/lib/query.js:211-223 (_flush — sets _commiting,
+//     either pushes null to end the readable or kicks the commit pass)
+//     .analysis/js/dht-rpc/lib/query.js:225-248 (_endAfterCommit — awaits
+//     all commit promises, ends the stream on success, errors out if every
+//     commit failed)
+//     .analysis/js/dht-rpc/lib/query.js:392-403 (autoCommit — the default
+//     commit fn: re-issues the original command with the per-reply token)
+//
+// C++ diffs from JS:
+//   - C++'s do_commit() hands a continuation callback to the caller's
+//     on_commit_, fires on_done_ when commit_inflight_ reaches zero. JS uses
+//     Promise.all over the per-reply commit promises and either push(null)s
+//     or destroy()s on failure.
+//   - JS treats "no nodes responded" (`!ps.length`) as a destroy error;
+//     C++ treats an empty closest set as success and fires on_done_ with
+//     an empty vector.
+//   - JS's commit only triggers when `this._commit !== null`. C++ behaves
+//     identically by guarding on `if (on_commit_)`.
 // ---------------------------------------------------------------------------
 
 void Query::maybe_finish() {

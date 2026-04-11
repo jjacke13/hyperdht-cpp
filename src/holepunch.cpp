@@ -27,7 +27,17 @@ using compact::Ipv4Address;
 using compact::Array;
 
 // ---------------------------------------------------------------------------
-// SecurePayload
+// SecurePayload — XSalsa20-Poly1305 envelope for the holepunch payload,
+// keyed by `holepunchSecret = BLAKE2b(NS_PEER_HOLEPUNCH, handshake_hash)`.
+//
+// JS: .analysis/js/hyperdht/lib/secure-payload.js:5-52 (HolepunchPayload)
+//
+// C++ diffs from JS:
+//   - JS uses crypto_secretbox_open_easy with subarrays into a single
+//     buffer (secure-payload.js:13-29). We allocate a fresh plaintext
+//     vector to keep ownership obvious.
+//   - The `token` helper hashes the host string with BLAKE2b keyed by
+//     a per-instance random secret — same as JS (secure-payload.js:47-51).
 // ---------------------------------------------------------------------------
 
 SecurePayload::SecurePayload(const std::array<uint8_t, 32>& key)
@@ -77,7 +87,10 @@ std::array<uint8_t, 32> SecurePayload::token(const std::string& host) {
 }
 
 // ---------------------------------------------------------------------------
-// HolepunchPayload encoding
+// HolepunchPayload encoding — the encrypted payload exchanged inside
+// PEER_HOLEPUNCH messages (firewall, addresses, tokens, punching state).
+//
+// JS: .analysis/js/hyperdht/lib/messages.js:254-302 (holepunchPayload codec)
 // ---------------------------------------------------------------------------
 
 std::vector<uint8_t> encode_holepunch_payload(const HolepunchPayload& p) {
@@ -156,7 +169,11 @@ HolepunchPayload decode_holepunch_payload(const uint8_t* data, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
-// OPEN firewall shortcut
+// OPEN firewall shortcut — if the server says it's OPEN, skip holepunching
+// and use the first advertised address directly.
+//
+// JS: .analysis/js/hyperdht/lib/connect.js:212-221 (FIREWALL.OPEN branch
+//     inside holepunch())
 // ---------------------------------------------------------------------------
 
 bool try_direct_connect(const peer_connect::HandshakeResult& hs,
@@ -177,7 +194,20 @@ bool try_direct_connect(const peer_connect::HandshakeResult& hs,
 }
 
 // ---------------------------------------------------------------------------
-// Holepuncher
+// Holepuncher — drives the UDP probe loop once the relay-side handshake
+// has agreed on firewalls and addresses. Picks one of four strategies
+// based on the (local, remote) firewall combination.
+//
+// JS: .analysis/js/hyperdht/lib/holepuncher.js:12-323 (Holepuncher class)
+//
+// C++ diffs from JS:
+//   - JS owns its socket via `dht._socketPool.acquire()` inside the
+//     constructor (holepuncher.js:14). C++ takes the socket pool by
+//     pointer and lets the caller (holepunch_connect) supply probe
+//     send functions, so the puncher itself is socket-agnostic.
+//   - JS coalesces OPEN into CONSISTENT (holepuncher.js:333-335). C++
+//     does the same by treating any non-RANDOM firewall as consistent.
+//   - All async sleeps in JS (`_sleeper.pause`) become uv_timer reschedules.
 // ---------------------------------------------------------------------------
 
 Holepuncher::Holepuncher(uv_loop_t* loop, bool is_initiator,
@@ -223,6 +253,7 @@ void Holepuncher::close(std::function<void()> on_closed) {
     punch_timer_ = nullptr;
 }
 
+// JS: holepuncher.js:161-212 (_punch — picks strategy from firewall combo)
 bool Holepuncher::punch() {
     using namespace peer_connect;
 
@@ -304,6 +335,7 @@ void Holepuncher::open_session(const compact::Ipv4Address& addr) {
     }
 }
 
+// JS: holepuncher.js:124-146 (_onholepunchmessage)
 void Holepuncher::on_message(const compact::Ipv4Address& from,
                              udx_socket_t* recv_socket,
                              socket_pool::SocketRef* ref) {
@@ -347,7 +379,12 @@ void Holepuncher::on_message(const compact::Ipv4Address& from,
 }
 
 // ---------------------------------------------------------------------------
-// CONSISTENT+CONSISTENT: 10 rounds, 1s apart
+// CONSISTENT+CONSISTENT: 10 rounds, 1s apart.
+//
+// JS: .analysis/js/hyperdht/lib/holepuncher.js:215-231 (_consistentProbe)
+//
+// C++ diffs: JS uses an async while-loop with await sleeper.pause(1000);
+// we re-schedule the same function via uv_timer_start to drive each round.
 // ---------------------------------------------------------------------------
 
 void Holepuncher::consistent_probe() {
@@ -378,7 +415,9 @@ void Holepuncher::consistent_probe() {
 }
 
 // ---------------------------------------------------------------------------
-// CONSISTENT+RANDOM: 1750 probes to random ports, 20ms apart
+// CONSISTENT+RANDOM: 1750 probes to random ports, 20ms apart.
+//
+// JS: .analysis/js/hyperdht/lib/holepuncher.js:234-244 (_randomProbes)
 // ---------------------------------------------------------------------------
 
 void Holepuncher::random_probes() {
@@ -405,6 +444,10 @@ void Holepuncher::random_probes() {
 
 // ---------------------------------------------------------------------------
 // NAT stability analysis (JS: analyze, _unstable, _reopen)
+//
+// JS: .analysis/js/hyperdht/lib/holepuncher.js:85-93 (analyze)
+//     .analysis/js/hyperdht/lib/holepuncher.js:95-102 (_unstable)
+//     .analysis/js/hyperdht/lib/holepuncher.js:152-160 (_reopen)
 // ---------------------------------------------------------------------------
 
 bool Holepuncher::is_unstable() const {
@@ -490,7 +533,16 @@ void Holepuncher::destroy() {
 }
 
 // ---------------------------------------------------------------------------
-// RANDOM+CONSISTENT: Birthday paradox — open up to 256 sockets
+// RANDOM+CONSISTENT: Birthday paradox — open up to 256 sockets so one of
+// our random source ports collides with the remote's expected mapping.
+//
+// JS: .analysis/js/hyperdht/lib/holepuncher.js:271-276 (_openBirthdaySockets)
+//     .analysis/js/hyperdht/lib/holepuncher.js:247-269 (_keepAliveRandomNat)
+//
+// C++ diffs: JS bursts all 256 acquisitions in a single while-loop and
+// awaits each `holepunch(...)` send. C++ acquires one socket per timer
+// tick to avoid blocking the loop, then enters the cycling phase via
+// `keep_alive_random_nat`.
 // ---------------------------------------------------------------------------
 
 void Holepuncher::open_birthday_sockets() {
@@ -535,7 +587,9 @@ void Holepuncher::open_birthday_sockets() {
 }
 
 // ---------------------------------------------------------------------------
-// RANDOM+CONSISTENT: Cycle through birthday sockets sending probes
+// RANDOM+CONSISTENT: Cycle through birthday sockets sending probes.
+//
+// JS: .analysis/js/hyperdht/lib/holepuncher.js:247-269 (_keepAliveRandomNat)
 // ---------------------------------------------------------------------------
 
 void Holepuncher::keep_alive_random_nat() {
@@ -594,7 +648,14 @@ void Holepuncher::on_punch_timer(uv_timer_t* timer) {
 }
 
 // ---------------------------------------------------------------------------
-// PoolSocket — lightweight UDP socket for holepunch probing
+// PoolSocket — lightweight UDP socket for holepunch probing.
+//
+// JS: .analysis/js/hyperdht/lib/socket-pool.js (SocketPool.acquire — JS
+//     manages a pool of UDX sockets keyed by port and hands them out
+//     via ref-counted handles). C++ has a simpler single-socket model
+//     inside the puncher — the pool socket is created per holepunch_connect
+//     invocation, lives for the duration of the punch, and is released
+//     when PunchState is destroyed.
 // ---------------------------------------------------------------------------
 
 PoolSocket::PoolSocket(uv_loop_t* loop, udx_t* udx)
@@ -792,7 +853,12 @@ void PoolSocket::close() {
 }
 
 // ---------------------------------------------------------------------------
-// discover_pool_addresses — PING DHT nodes from pool socket for NAT discovery
+// discover_pool_addresses — PING DHT nodes from pool socket for NAT discovery.
+//
+// JS: .analysis/js/nat-sampler/index.js (Nat.autoSample, invoked from
+//     Holepuncher constructor at holepuncher.js:20 — fires background PINGs
+//     to populate the NatSampler before the first punch round). C++ makes
+//     this explicit as a synchronous PING campaign before Round 1.
 // ---------------------------------------------------------------------------
 
 void discover_pool_addresses(
@@ -859,7 +925,10 @@ void discover_pool_addresses(
 }
 
 // ---------------------------------------------------------------------------
-// PEER_HOLEPUNCH message encoding
+// PEER_HOLEPUNCH message encoding — outer wrapper that sits in req.value
+// for PEER_HOLEPUNCH, carrying mode + id + encrypted payload + peer addr.
+//
+// JS: .analysis/js/hyperdht/lib/messages.js:58-120 (exports.holepunch)
 // ---------------------------------------------------------------------------
 
 std::vector<uint8_t> encode_holepunch_msg(const HolepunchMessage& m) {
@@ -908,7 +977,13 @@ HolepunchMessage decode_holepunch_msg(const uint8_t* data, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
-// PunchState — shared state for the async holepunch flow
+// PunchState — shared state for the async holepunch flow.
+//
+// C++-only construct. JS tracks the equivalent state inline on the
+// connect closure (`c.puncher`, `c.payload`, `c.round`, etc. from
+// connect.js:57-93). C++ needs an explicit shared_ptr to thread state
+// through the nested response/timeout lambdas, since we don't have
+// async/await's closed-over stack frame.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -968,7 +1043,33 @@ struct PunchState {
 }  // anonymous namespace
 
 // ---------------------------------------------------------------------------
-// holepunch_connect — full 2-round relay + UDP probe flow
+// holepunch_connect — full 2-round relay exchange + UDP probe flow.
+//
+// JS: .analysis/js/hyperdht/lib/connect.js:205-316 (holepunch — top level)
+//     .analysis/js/hyperdht/lib/connect.js:555-629 (probeRound — round 1)
+//     .analysis/js/hyperdht/lib/connect.js:631-711 (roundPunch  — round 2)
+//     .analysis/js/hyperdht/lib/connect.js:505-553 (updateHolepunch — relay
+//        send/recv with payload encrypt/decrypt)
+//
+// C++ diffs from JS:
+//   - JS schedules an async pipeline of probeRound → roundPunch via
+//     await. C++ uses a PunchState shared_ptr threaded through nested
+//     response/timeout lambdas plus an overall 15s timeout timer.
+//   - C++ derives `holepunchSecret` here (BLAKE2b(NS_PEER_HOLEPUNCH,
+//     handshake_hash)). JS computes the same value inside NoiseWrap.final()
+//     and passes it via `c.payload = new SecurePayload(hs.holepunchSecret)`.
+//   - C++ runs `discover_pool_addresses` (PINGs from the pool socket) to
+//     learn the pool socket's external address before round 1 — JS does
+//     this lazily inside `Nat.autoSample()` started from the puncher ctor.
+//   - JS uses a `Sleeper` for the UNKNOWN-firewall delay (connect.js:594-597).
+//     C++ uses `async_utils::Sleeper::pause` which is the same idea.
+//   - JS calls `puncher.openSession(serverAddress)` from probeRound BEFORE
+//     sending round 1 (connect.js:556-559). C++ ports that as the
+//     `fast_open` low-TTL probe issued from the pool socket.
+//   - Round 2 in JS is sent via `c.dht._router.peerHolepunch` from the
+//     puncher's socket. C++ sends it from the main RPC socket because
+//     the relay routing context (token, node IDs) lives there; probes
+//     still come from the pool socket.
 // ---------------------------------------------------------------------------
 
 void holepunch_connect(rpc::RpcSocket& socket,
@@ -1124,7 +1225,8 @@ void holepunch_connect(rpc::RpcSocket& socket,
                 return;
             }
 
-            // JS: probeRound (connect.js:596-612)
+            // JS: probeRound (connect.js:593-598) — sleeper.pause(1000)
+            //     when remoteFirewall is UNKNOWN
             // If remote firewall is UNKNOWN, treat as CONSISTENT but delay
             // Round 2 by 1s to give the server time to sample its own NAT.
             // This is the fix for the NAT-to-NAT failure.
@@ -1356,7 +1458,9 @@ void holepunch_connect(rpc::RpcSocket& socket,
 }
 
 // ---------------------------------------------------------------------------
-// localAddresses — enumerate local IPv4 addresses
+// localAddresses — enumerate non-internal local IPv4 interfaces.
+//
+// JS: .analysis/js/hyperdht/lib/holepuncher.js:337-354 (localAddresses)
 // ---------------------------------------------------------------------------
 
 std::vector<Ipv4Address> local_addresses(uint16_t port) {
@@ -1388,7 +1492,9 @@ std::vector<Ipv4Address> local_addresses(uint16_t port) {
 }
 
 // ---------------------------------------------------------------------------
-// matchAddress — find best LAN address match by IP prefix
+// matchAddress — find best LAN address match by IP prefix.
+//
+// JS: .analysis/js/hyperdht/lib/holepuncher.js:356-386 (matchAddress)
 // ---------------------------------------------------------------------------
 
 std::optional<Ipv4Address> match_address(

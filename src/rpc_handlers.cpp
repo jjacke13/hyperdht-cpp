@@ -1,6 +1,18 @@
 // DHT RPC request handler implementations — dispatch PING, PING_NAT,
 // FIND_NODE, DOWN_HINT, DELAYED_PING (internal) and FIND_PEER, LOOKUP,
 // ANNOUNCE, UNANNOUNCE, MUTABLE/IMMUTABLE_GET/PUT (HyperDHT).
+//
+// JS: .analysis/js/dht-rpc/index.js:632-687 (_onrequest — internal cmds)
+//     .analysis/js/hyperdht/lib/persistent.js:16-257 (Persistent class —
+//                                                     all HyperDHT cmds)
+//
+// C++ diffs from JS:
+//   - JS Persistent has separate caches for `bumps`, `refreshes`,
+//     `mutables`, `immutables` (record-cache + xache packages).
+//     C++ uses simpler `RecordCache` for mutables/immutables and
+//     `AnnounceStore` for the record cache. No bump/refresh handling.
+//   - Mutable/immutable size split is half-and-half (matches JS,
+//     persistent.js constructor).
 
 #include "hyperdht/rpc_handlers.hpp"
 
@@ -130,6 +142,9 @@ void RpcHandlers::handle(const messages::Request& req) {
 
 // ---------------------------------------------------------------------------
 // Helper: build a response with our ID, token, and closer nodes
+//
+// JS: .analysis/js/dht-rpc/lib/io.js:485-518 (_sendReply — assembles
+//     response with id/token/closerNodes/error/value flags)
 // ---------------------------------------------------------------------------
 
 messages::Response RpcHandlers::make_query_response(const messages::Request& req) {
@@ -155,6 +170,8 @@ messages::Response RpcHandlers::make_query_response(const messages::Request& req
 
 // ---------------------------------------------------------------------------
 // PING — reply with our node ID and a token for the sender
+//
+// JS: .analysis/js/dht-rpc/index.js:640-643 (_onrequest case PING)
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_ping(const messages::Request& req) {
@@ -165,6 +182,8 @@ void RpcHandlers::handle_ping(const messages::Request& req) {
 
 // ---------------------------------------------------------------------------
 // PING_NAT — reply to the sender's specified port (for NAT detection)
+//
+// JS: .analysis/js/dht-rpc/index.js:649-655 (_onrequest case PING_NAT)
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_ping_nat(const messages::Request& req) {
@@ -184,6 +203,8 @@ void RpcHandlers::handle_ping_nat(const messages::Request& req) {
 
 // ---------------------------------------------------------------------------
 // FIND_NODE — return the k closest nodes to the target
+//
+// JS: .analysis/js/dht-rpc/index.js:658-662 (_onrequest case FIND_NODE)
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_find_node(const messages::Request& req) {
@@ -197,6 +218,9 @@ void RpcHandlers::handle_find_node(const messages::Request& req) {
 // encoding, matching JS `peer.id()`) and schedule a PING check. If the check
 // times out, the node is evicted. Always reply with an empty response.
 // Rate-limited to MAX_CHECKS in-flight checks at once.
+//
+// JS: .analysis/js/dht-rpc/index.js:664-676 (_onrequest case DOWN_HINT)
+//     .analysis/js/dht-rpc/index.js:737-762 (_check — the actual ping)
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_down_hint(const messages::Request& req) {
@@ -249,6 +273,10 @@ void RpcHandlers::handle_down_hint(const messages::Request& req) {
 //   - Drop silently if value < 4 bytes or delay > max_ping_delay.
 //   - Schedule a uv_timer; on fire, send empty reply.
 //   - Pending timers are cancelled in the destructor.
+//
+// JS: .analysis/js/dht-rpc/index.js:693-703 (_ondelayedping — uses
+//     setTimeout, tracks via `_pendingTimers` Set; we use a vector of
+//     uv_timer_t* heap structs cleaned up in the destructor.)
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_delayed_ping(const messages::Request& req) {
@@ -314,6 +342,11 @@ void RpcHandlers::on_delayed_ping_fire(uv_timer_t* timer) {
 
 // ---------------------------------------------------------------------------
 // FIND_PEER — return a single stored peer record for the target
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:39-43 (onfindpeer)
+//     JS only checks `dht._router.get(target).record`. C++ also falls
+//     back to the AnnounceStore so we can return any cached peer record
+//     even if no Server is locally listening for `target`.
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_find_peer(const messages::Request& req) {
@@ -346,6 +379,11 @@ void RpcHandlers::handle_find_peer(const messages::Request& req) {
 
 // ---------------------------------------------------------------------------
 // LOOKUP — return all stored peer records for the target (up to 20)
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:26-37 (onlookup)
+//     JS uses `records.get(k, 20)` from the record-cache package and
+//     wraps in `lookupRawReply { peers, bump }`. We don't track bumps;
+//     value is just a varint count + length-prefixed peer records.
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_lookup(const messages::Request& req) {
@@ -389,6 +427,17 @@ void RpcHandlers::handle_lookup(const messages::Request& req) {
 
 // ---------------------------------------------------------------------------
 // ANNOUNCE — validate token and store peer announcement
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:100-150 (onannounce)
+//     .analysis/js/hyperdht/lib/persistent.js:269-284 (annSignable)
+//
+// C++ diffs from JS:
+//   - No `bumps` cache (JS:140-142). We just store the announcement.
+//   - No `refresh` cache plumbing (JS:145-147). The refresh-only path
+//     replies but doesn't yet hook up `_onrefresh`.
+//   - JS treats announceSelf (TMP == target, persistent.js:128) by
+//     populating `_router`; C++ uses the AnnounceStore unconditionally.
+//   - Relay-address cap of 3 matches JS:121-123.
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_announce(const messages::Request& req) {
@@ -462,6 +511,14 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
 
 // ---------------------------------------------------------------------------
 // UNANNOUNCE — validate token and remove peer announcement
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:53-70 (onunannounce)
+//     .analysis/js/hyperdht/lib/persistent.js:45-51 (unannounce helper)
+//
+// C++ diffs from JS:
+//   - JS removes from `dht._router` if the announcer is the publisher
+//     (TMP equals target). C++ only removes from AnnounceStore — the
+//     Router entry is removed by Server::close().
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_unannounce(const messages::Request& req) {
@@ -510,6 +567,9 @@ void RpcHandlers::handle_unannounce(const messages::Request& req) {
 
 // ---------------------------------------------------------------------------
 // MUTABLE_PUT — signed key-value storage with seq ordering
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:174-205 (onmutableput)
+//     .analysis/js/hyperdht/lib/persistent.js:259-267 (verifyMutable)
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_mutable_put(const messages::Request& req) {
@@ -591,6 +651,8 @@ void RpcHandlers::handle_mutable_put(const messages::Request& req) {
 
 // ---------------------------------------------------------------------------
 // MUTABLE_GET — return stored mutable value if seq >= requested
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:152-172 (onmutableget)
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_mutable_get(const messages::Request& req) {
@@ -622,6 +684,8 @@ void RpcHandlers::handle_mutable_get(const messages::Request& req) {
 
 // ---------------------------------------------------------------------------
 // IMMUTABLE_PUT — content-addressed storage (target = BLAKE2b(value))
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:216-227 (onimmutableput)
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_immutable_put(const messages::Request& req) {
@@ -654,6 +718,8 @@ void RpcHandlers::handle_immutable_put(const messages::Request& req) {
 
 // ---------------------------------------------------------------------------
 // IMMUTABLE_GET — return stored value by content hash
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:207-214 (onimmutableget)
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_immutable_get(const messages::Request& req) {

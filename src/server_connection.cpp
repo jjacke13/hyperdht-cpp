@@ -68,6 +68,25 @@ ServerConnection& ServerConnection::operator=(ServerConnection&& other) noexcept
     return *this;
 }
 
+// ---------------------------------------------------------------------------
+// handle_handshake — Noise IK responder + build NoisePayload reply
+//
+// JS: .analysis/js/hyperdht/lib/server.js:237-388 (_addHandshake — the
+//                                                  recv→firewall→error→
+//                                                  payload→handshake.send block)
+//     .analysis/js/hyperdht/lib/noise-wrap.js (createHandshake helper)
+//
+// C++ diffs from JS:
+//   - Synchronous (no Promise) — firewall callback is sync; JS awaits.
+//   - We always report FIREWALL_CONSISTENT (never OPEN) to force the
+//     holepunch path; JS checks `dht.remoteAddress()` and may report OPEN.
+//   - Holepunch secret derivation lives at the bottom of this fn rather
+//     than in the caller (JS: `new SecurePayload(h.holepunchSecret)`
+//     server.js:435).
+//   - relay_addresses are inserted into the response payload; JS does
+//     this at server.js:368.
+// ---------------------------------------------------------------------------
+
 std::optional<ServerConnection> handle_handshake(
     const noise::Keypair& server_keypair,
     const std::vector<uint8_t>& noise_msg1,
@@ -197,6 +216,18 @@ std::optional<ServerConnection> handle_handshake(
 
 // ---------------------------------------------------------------------------
 // handle_holepunch — server-side PEER_HOLEPUNCH processing
+//
+// JS: .analysis/js/hyperdht/lib/server.js:483-600 (_onpeerholepunch body —
+//     decrypt → check error → update round → analyze → fast-path ping →
+//     decide to punch → encrypt response)
+//     .analysis/js/hyperdht/lib/server.js:602-623 (_abort — error response)
+//
+// C++ diffs from JS:
+//   - No `p.analyze(false/true)` step. We treat client.punching as
+//     authoritative ("they say they're punching → we should punch too").
+//   - Token echo verification matches JS: `echoed = isServerRelay &&
+//     remoteToken && equals(token, remoteToken)` (server.js:506).
+//   - Always returns a response (JS does too unless we _abort with null).
 // ---------------------------------------------------------------------------
 
 HolepunchReply handle_holepunch(

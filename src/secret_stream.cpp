@@ -65,6 +65,17 @@ uint32_t read_uint24_le(const uint8_t* buf) {
 
 // ---------------------------------------------------------------------------
 // SecretStream
+//
+// JS: .analysis/js/@hyperswarm/secret-stream/index.js:373-397 (_setupSecretStream
+//     — wraps Push/Pull, computes stream id, writes header frame)
+//     .analysis/js/@hyperswarm/secret-stream/index.js:629-632 (streamId helper)
+//
+// C++ diffs from JS:
+//   - JS combines header generation + raw write in _setupSecretStream; C++
+//     splits into create_header_message() (caller writes it) so the duplex
+//     wrapper owns the actual UDX write.
+//   - JS uses a streamx Push/Pull pair; C++ uses raw libsodium
+//     crypto_secretstream_xchacha20poly1305 state.
 // ---------------------------------------------------------------------------
 
 SecretStream::SecretStream(const Key& tx_key, const Key& rx_key,
@@ -99,6 +110,8 @@ std::vector<uint8_t> SecretStream::create_header_message() {
     return msg;
 }
 
+// JS: index.js:304-326 — _incoming() in setup phase: verifies remoteId,
+//     calls _decrypt.init(header), then flips _setup = false.
 bool SecretStream::receive_header(const uint8_t* data, size_t len) {
     if (len != ID_HEADER_BYTES) return false;
 
@@ -121,6 +134,9 @@ bool SecretStream::is_ready() const {
     return header_sent_ && header_received_;
 }
 
+// JS: index.js:471-501 — _write(): wraps payload with uint24 length prefix +
+//     ABYTES, calls _encrypt.next(plain, wrapped.subarray(3)), refreshes
+//     keepalive timer.
 std::vector<uint8_t> SecretStream::encrypt(const uint8_t* data, size_t len) {
     if (!is_ready()) return {};  // Runtime guard (assert stripped in release)
 
@@ -157,6 +173,8 @@ std::vector<uint8_t> SecretStream::encrypt(const uint8_t* data, size_t len) {
     return msg;
 }
 
+// JS: index.js:328-350 — _incoming() data path: refreshes timeout, calls
+//     _decrypt.next, suppresses empty keepalive frames.
 std::optional<std::vector<uint8_t>> SecretStream::decrypt(const uint8_t* data, size_t len) {
     if (!is_ready()) return std::nullopt;  // Runtime guard (assert stripped in release)
 
@@ -191,6 +209,18 @@ std::optional<std::vector<uint8_t>> SecretStream::decrypt(const uint8_t* data, s
 
 // ---------------------------------------------------------------------------
 // Timer management
+//
+// JS: .analysis/js/@hyperswarm/secret-stream/index.js:93-116 (setTimeout / setKeepAlive
+//     — uses the `timeout-refresh` package, which `refresh()`es on each I/O)
+//     .analysis/js/@hyperswarm/secret-stream/index.js:520-532 (_clearTimeout / _clearKeepAlive)
+//     .analysis/js/@hyperswarm/secret-stream/index.js:638-645 (destroyTimeout / sendKeepAlive)
+//
+// C++ diffs from JS:
+//   - JS leans on `timeout-refresh` (refs/unrefs the libuv handle for free);
+//     C++ uses raw uv_timer_t and emulates "refresh on I/O" via uv_timer_again.
+//   - C++ nulls timer->data in stop_timer() to defend against late callbacks
+//     after destruction (single-threaded libuv makes this very unlikely but
+//     the check is cheap).
 // ---------------------------------------------------------------------------
 
 void SecretStream::set_timeout(uint64_t ms, OnTimeoutCallback cb) {
@@ -293,6 +323,23 @@ struct DuplexSendCtx {
     std::vector<uint8_t> buf;
 };
 
+// ---------------------------------------------------------------------------
+// SecretStreamDuplex — constructor + destructor
+//
+// JS: .analysis/js/@hyperswarm/secret-stream/index.js:15-83 (NoiseSecretStream
+//     constructor — sets handshake state, parser state, opens promise)
+//     .analysis/js/@hyperswarm/secret-stream/index.js:534-539 (_destroy)
+//
+// C++ diffs from JS:
+//   - JS extends streamx Duplex and tracks liveness via the `destroyed`/
+//     `destroying` flags inherited from streamx; C++ uses
+//     `std::shared_ptr<bool> alive_` + weak_ptr in every write context so
+//     in-flight UDX ack callbacks bail out cleanly when the duplex dies.
+//   - JS clears `rawStream` reference in `_predestroy`; C++ nulls
+//     raw_stream_->data so any late on_udx_read/on_udx_close fires through
+//     `if (!self) return`.
+// ---------------------------------------------------------------------------
+
 SecretStreamDuplex::SecretStreamDuplex(udx_stream_t* raw_stream,
                                        const DuplexHandshake& hs,
                                        uv_loop_t* loop,
@@ -332,6 +379,9 @@ SecretStreamDuplex::~SecretStreamDuplex() {
 // is the dual. We also pick a random 8-byte counter initial for nonces.
 // ---------------------------------------------------------------------------
 
+// JS: index.js:399-421 — _setupSecretSend(): derives encrypt/decrypt secrets
+//     via crypto_generichash_batch over [NS_(INI|RES), NS_SEND] keyed by the
+//     handshake hash, then randomises the 8-byte nonce counter.
 void SecretStreamDuplex::setup_secret_send() {
     // JS uses crypto_generichash_batch which hashes a sequence of inputs.
     // Equivalent: init state, update with each input, finalize.
@@ -368,6 +418,16 @@ void SecretStreamDuplex::setup_secret_send() {
 
 // ---------------------------------------------------------------------------
 // start() — install read + close callbacks, send our header frame
+//
+// JS: .analysis/js/@hyperswarm/secret-stream/index.js:123-153 (start — wires
+//     'data'/'end'/'drain'/'message' listeners, kicks the handshake)
+//     .analysis/js/@hyperswarm/secret-stream/index.js:423-444 (_open — installs
+//     listeners, fires _onhandshakert(send()) for the initiator)
+//
+// C++ diffs from JS:
+//   - JS performs the Noise handshake here for the streamx Duplex; C++
+//     receives an already-completed handshake (DuplexHandshake) so this
+//     reduces to wiring UDX callbacks and emitting the 59-byte header frame.
 // ---------------------------------------------------------------------------
 
 void SecretStreamDuplex::start() {
@@ -399,6 +459,10 @@ void SecretStreamDuplex::start() {
     }
 }
 
+// JS: index.js:373-397 — _setupSecretStream() also writes the header buffer
+//     directly via this._rawStream.write(buf). C++ instead enqueues a
+//     udx_stream_write request whose ack flips header_sent_ and may fire
+//     on_connect via maybe_fire_connect().
 void SecretStreamDuplex::send_header_frame() {
     auto header = crypto_.create_header_message();
     header_sent_ = false;  // will flip in the ack callback
@@ -440,6 +504,18 @@ void SecretStreamDuplex::send_header_frame() {
 
 // ---------------------------------------------------------------------------
 // write() — encrypt a plaintext payload and submit as a UDX write
+//
+// JS: .analysis/js/@hyperswarm/secret-stream/index.js:471-501 (_write — wraps
+//     and encrypts in place, refreshes keepalive, parks cb in _drainDone if
+//     the raw stream returns false)
+//
+// C++ diffs from JS:
+//   - JS uses streamx's _write(data, cb) and parks the cb in `_drainDone`
+//     for backpressure. C++ does NOT do streamx-style backpressure — every
+//     write gets its own DuplexWriteCtx + udx_stream_write request and the
+//     user cb fires directly from the ack callback.
+//   - The DuplexWriteCtx::alive weak_ptr ensures the user cb is not invoked
+//     after destroy(); see UAF safety note on the constructor.
 // ---------------------------------------------------------------------------
 
 int SecretStreamDuplex::write(const uint8_t* data, size_t len,
@@ -490,6 +566,9 @@ int SecretStreamDuplex::write(const uint8_t* data, size_t len,
 // end() — send a UDX write_end (empty body) to gracefully close the stream
 // ---------------------------------------------------------------------------
 
+// JS: index.js:503-508 — _final(cb): clears keepalive, decrements _ended,
+//     calls this._rawStream.end(). C++ submits a udx_stream_write_end
+//     request with no payload and lets UDX flush in-flight writes first.
 void SecretStreamDuplex::end() {
     if (ended_ || destroyed_) return;
     ended_ = true;
@@ -513,6 +592,10 @@ void SecretStreamDuplex::end() {
 // destroy() — immediate close. Fires on_close exactly once.
 // ---------------------------------------------------------------------------
 
+// JS: index.js:446-469 (_predestroy — cancels pending callbacks, destroys
+//     rawStream) and index.js:534-539 (_destroy — clears timers, resolves
+//     opened promise to false). C++ folds both into destroy() and lets the
+//     UDX on_close callback fire fire_close().
 void SecretStreamDuplex::destroy(int error) {
     if (destroyed_) return;
     destroyed_ = true;
@@ -536,6 +619,23 @@ void SecretStreamDuplex::fire_close(int err) {
 
 // ---------------------------------------------------------------------------
 // Incoming data — frame parser state machine
+//
+// JS: .analysis/js/@hyperswarm/secret-stream/index.js:219-277 (_onrawdata —
+//     two-state parser: state 0 reads uint24 length, state 1 accumulates
+//     body, calls _incoming when complete)
+//     .analysis/js/@hyperswarm/secret-stream/index.js:296-350 (_incoming —
+//     dispatches to handshake/header/decrypt depending on _setup flag)
+//
+// C++ diffs from JS:
+//   - JS uses a (state, len, tmp, message) FSM that interleaves length bytes
+//     with body bytes; C++ uses a single accumulating recv_buf_ and a much
+//     simpler "have we got 3 bytes? have we got the body?" loop in
+//     try_extract_frame(). Behaviour matches at the byte level.
+//   - C++ matches JS's split-message convention via the boolean
+//     header_received_ — first frame is the 56-byte header, every subsequent
+//     frame is encrypted payload.
+//   - C++ enforces an explicit upper bound (MAX_ATOMIC_WRITE + ABYTES) and
+//     rejects zero-length frames; JS just lets the secretstream auth fail.
 // ---------------------------------------------------------------------------
 
 void SecretStreamDuplex::process_incoming_bytes(const uint8_t* data, size_t len) {
@@ -617,6 +717,13 @@ void SecretStreamDuplex::maybe_fire_connect() {
 
 // ---------------------------------------------------------------------------
 // Unordered secretbox send/recv
+//
+// JS: .analysis/js/@hyperswarm/secret-stream/index.js:541-562 (_boxMessage —
+//     increments counter, fails on wrap-to-initial, builds 8B counter +
+//     16B MAC + ciphertext envelope)
+//     .analysis/js/@hyperswarm/secret-stream/index.js:564-579 (send / trySend)
+//     .analysis/js/@hyperswarm/secret-stream/index.js:580-601 (_onmessage —
+//     reverses the envelope and emits 'message')
 // ---------------------------------------------------------------------------
 
 std::vector<uint8_t> SecretStreamDuplex::box_message(const uint8_t* data,
@@ -711,6 +818,11 @@ int SecretStreamDuplex::try_send_udp(const uint8_t* data, size_t len) {
 
 // ---------------------------------------------------------------------------
 // Timer forwarding
+//
+// JS: .analysis/js/@hyperswarm/secret-stream/index.js:93-121 (setTimeout /
+//     setKeepAlive / sendKeepAlive — keepAlive sends an empty alloc()'d frame)
+//     .analysis/js/@hyperswarm/secret-stream/index.js:638-645 (destroyTimeout /
+//     sendKeepAlive helpers)
 // ---------------------------------------------------------------------------
 
 void SecretStreamDuplex::set_timeout(uint64_t ms) {
@@ -729,6 +841,12 @@ void SecretStreamDuplex::set_keep_alive(uint64_t ms) {
 
 // ---------------------------------------------------------------------------
 // UDX callbacks
+//
+// JS: .analysis/js/@hyperswarm/secret-stream/index.js:211-294 (_onrawerror /
+//     _onrawclose / _onrawdata / _onrawend / _onrawdrain — streamx event
+//     handlers attached in _open)
+//     .analysis/js/@hyperswarm/secret-stream/index.js:580-601 (_onmessage —
+//     handler for the unordered UDP message channel)
 // ---------------------------------------------------------------------------
 
 void SecretStreamDuplex::on_udx_read(udx_stream_t* s, ssize_t nread,

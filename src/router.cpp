@@ -1,6 +1,17 @@
 // Router implementation — forward table for incoming PEER_HANDSHAKE
 // and PEER_HOLEPUNCH. Maps target hash → ForwardEntry (the Server
 // instance that listens at that key).
+//
+// JS: .analysis/js/hyperdht/lib/router.js:20-249 (whole Router class)
+//
+// C++ diffs from JS:
+//   - JS uses xache `Cache` with TTL-based eviction. C++ uses a plain
+//     std::unordered_map keyed by 32-byte target.
+//   - JS Router both forwards AND originates client requests
+//     (peerHandshake / peerHolepunch). C++ only handles the server side
+//     (forwarding); client side lives in src/peer_connect.cpp.
+//   - FROM_SECOND_RELAY is partially handled — we send back to req.from,
+//     not the embedded relayAddress (see TODO in handle_peer_handshake).
 
 #include "hyperdht/router.hpp"
 
@@ -43,6 +54,15 @@ void Router::clear() {
 
 // ---------------------------------------------------------------------------
 // Handle incoming PEER_HANDSHAKE
+//
+// JS: .analysis/js/hyperdht/lib/router.js:81-172 (onpeerhandshake)
+//
+// JS dispatches on `mode` (FROM_CLIENT/FROM_RELAY/FROM_SECOND_RELAY):
+//   - FROM_CLIENT: req.reply with REPLY mode
+//   - FROM_RELAY:  req.relay back with FROM_SERVER mode
+//   - FROM_SECOND_RELAY: req.relay to embedded relayAddress
+// C++ accepts all three but treats FROM_RELAY and FROM_SECOND_RELAY
+// identically (sends back to req.from with mode FROM_SERVER).
 // ---------------------------------------------------------------------------
 
 bool Router::handle_peer_handshake(const messages::Request& req,
@@ -137,6 +157,16 @@ bool Router::handle_peer_handshake(const messages::Request& req,
 
 // ---------------------------------------------------------------------------
 // Handle incoming PEER_HOLEPUNCH
+//
+// JS: .analysis/js/hyperdht/lib/router.js:202-248 (onpeerholepunch)
+//
+// JS dispatches on `mode`:
+//   - FROM_CLIENT: relay to peerAddress or known forward target
+//   - FROM_RELAY:  call state.onpeerholepunch then relay back FROM_SERVER
+//   - FROM_SERVER: req.reply with REPLY mode + the embedded peerAddress
+// C++ handles only the server-side path (the relay-only forward case is
+// not yet implemented — incoming non-FROM_CLIENT messages are processed
+// by the local Server entry directly).
 // ---------------------------------------------------------------------------
 
 bool Router::handle_peer_holepunch(const messages::Request& req,

@@ -1,6 +1,24 @@
 // DHT RPC socket implementation — UDP send/receive over a UDX socket,
 // TID-based response matching, retries/timeouts, per-peer adaptive RTT,
 // congestion control, and NAT probe detection.
+//
+// JS: .analysis/js/dht-rpc/index.js:32-1003 (DHT class)
+//     .analysis/js/dht-rpc/lib/io.js:15-349  (IO class — wire send/recv)
+//     .analysis/js/dht-rpc/lib/io.js:351-554 (Request class)
+//     .analysis/js/dht-rpc/lib/io.js:556-591 (CongestionWindow class)
+//
+// C++ diffs from JS:
+//   - JS splits responsibilities across DHT (lifecycle, ticking) + IO
+//     (sockets, congestion, requests). C++ collapses both into RpcSocket.
+//   - Single UDP socket vs JS's two (clientSocket + serverSocket). The
+//     PING_NAT firewall probe (JS DHT::_checkIfFirewalled) is therefore
+//     not implemented here.
+//   - bind() takes an explicit `host` param vs JS's default `0.0.0.0`.
+//   - Per-peer RTT stored in `peer_rtt_` map (EMA via record_rtt) vs
+//     JS using the `adaptive-timeout` package.
+//   - Drain timer fires every 750ms (matches JS io.js:286) handling
+//     congestion window rotation + token rotation in one tick.
+//   - Background tick at 5s matches JS index.js:18 (TICK_INTERVAL).
 
 #include "hyperdht/rpc.hpp"
 
@@ -15,8 +33,8 @@ namespace hyperdht {
 namespace rpc {
 
 // Compute a peer id from an ipv4 address — BLAKE2b-256 over the 6-byte
-// compact encoding (4 host bytes LE + 2 port bytes LE). Matches JS
-// `dht-rpc/lib/peer.js::id(host, port)`.
+// compact encoding (4 host bytes LE + 2 port bytes LE).
+// JS: .analysis/js/dht-rpc/lib/peer.js (id function)
 routing::NodeId compute_peer_id(const compact::Ipv4Address& addr) {
     uint8_t buf[6];
     // Host bytes in LE order (JS: c.uint32.encode writes LE).
@@ -51,6 +69,12 @@ struct CheckState {
 
 // ---------------------------------------------------------------------------
 // CongestionWindow
+//
+// JS: .analysis/js/dht-rpc/lib/io.js:556-591 (CongestionWindow class)
+//
+// 4-bucket sliding window: drain() rotates the index, oldest bucket
+// becomes "current" and is cleared. is_full() guards both per-bucket
+// and total inflight requests.
 // ---------------------------------------------------------------------------
 
 CongestionWindow::CongestionWindow(int max_window) : max_window_(max_window) {}
@@ -86,6 +110,17 @@ void CongestionWindow::clear() {
 
 // ---------------------------------------------------------------------------
 // RpcSocket
+//
+// JS: .analysis/js/dht-rpc/index.js:33-100 (DHT constructor — sets up
+//                                            io, table, nat, ticks)
+//     .analysis/js/dht-rpc/lib/io.js:16-79  (IO constructor)
+//
+// C++ diffs from JS:
+//   - Random initial tid via std::random_device (JS uses Math.random).
+//   - Drain + bg timers heap-allocated so they outlive RpcSocket close
+//     (uv_close async dance).
+//   - on_full hook installed at construction; JS does it via
+//     `table.on('row', _onrow)` per-row.
 // ---------------------------------------------------------------------------
 
 RpcSocket::RpcSocket(uv_loop_t* loop, const routing::NodeId& local_id)
@@ -124,6 +159,8 @@ RpcSocket::~RpcSocket() {
     if (bg_timer_) bg_timer_->data = nullptr;
 }
 
+// JS: io.js:224-228 (bind) + io.js:230-295 (_bindSockets — JS binds two
+//     sockets here, server + client. C++ binds just one.)
 int RpcSocket::bind(uint16_t port, const std::string& host) {
     struct sockaddr_in addr{};
     // uv_ip4_addr rejects malformed IPv4 strings; pass through the caller's
@@ -255,6 +292,9 @@ uint16_t RpcSocket::request(const messages::Request& req,
                    std::move(on_response), std::move(on_timeout));
 }
 
+// JS: io.js:315-348 (createRequest) + io.js:431-445 (Request.send)
+//     C++ collapses createRequest+send into one entry point and skips
+//     the JS `session` object that detaches/reattaches inflight reqs.
 uint16_t RpcSocket::request(const messages::Request& req,
                             uint64_t timeout_override_ms,
                             int retries,
@@ -293,6 +333,9 @@ uint16_t RpcSocket::request(const messages::Request& req,
     return msg.tid;
 }
 
+// JS: dht-rpc/index.js:278-299 (delayedPing) — creates a DELAYED_PING
+// request with `req.timeout = delayMs + 1_000`. C++ returns 0 instead of
+// throwing on overflow.
 uint16_t RpcSocket::delayed_ping(const compact::Ipv4Address& to,
                                  uint32_t delay_ms,
                                  OnResponseCallback on_response,
@@ -381,6 +424,9 @@ void RpcSocket::close() {
 
 // ---------------------------------------------------------------------------
 // Timer callbacks
+//
+// JS: .analysis/js/dht-rpc/lib/io.js:286-313 (_drain interval at 750ms)
+//     .analysis/js/dht-rpc/lib/io.js:595-606 (oncycle — request timeout)
 // ---------------------------------------------------------------------------
 
 void RpcSocket::on_drain_tick(uv_timer_t* timer) {
@@ -425,6 +471,9 @@ void RpcSocket::on_request_timeout(uv_timer_t* timer) {
 
 // ---------------------------------------------------------------------------
 // UDP receive callback
+//
+// JS: .analysis/js/dht-rpc/lib/io.js:83-146 (onmessage — REQUEST_ID and
+//     RESPONSE_ID dispatch, RTT recording, congestion.recv, inflight pop)
 // ---------------------------------------------------------------------------
 
 void RpcSocket::on_recv(udx_socket_t* socket, ssize_t nread, const uv_buf_t* buf,
@@ -461,6 +510,10 @@ void RpcSocket::send_probe_ttl(const compact::Ipv4Address& to, int ttl) {
                         });
 }
 
+// JS: io.js:83-146 (onmessage). JS rejects 1-byte payloads at io.js:84
+// (`buffer.byteLength < 2`). C++ uses 1-byte 0x00 as a holepunch probe
+// (matching DHT::onmessage at index.js:153 which only forwards >1 byte
+// payloads to io.js — leaving 1-byte for holepunch detection).
 void RpcSocket::handle_message(const uint8_t* data, size_t len,
                                const struct sockaddr_in* addr) {
     if (closing_) return;
@@ -531,6 +584,11 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
 
 // ---------------------------------------------------------------------------
 // Routing table observation + ping-and-swap eviction (JS parity)
+//
+// JS: .analysis/js/dht-rpc/index.js:483-521 (_addNodeFromNetwork)
+//     .analysis/js/dht-rpc/index.js:523-537 (_addNode)
+//     .analysis/js/dht-rpc/index.js:575-594 (_onfullrow — bucket-full hook)
+//     .analysis/js/dht-rpc/index.js:601-630 (_repingAndSwap)
 // ---------------------------------------------------------------------------
 
 void RpcSocket::add_node_from_network(const routing::NodeId& id,
@@ -638,6 +696,9 @@ void RpcSocket::reping_and_swap(const routing::Node& new_node,
         });
 }
 
+// JS: dht-rpc/index.js:737-762 (_check). Sends a single PING and either
+// removes-if-stale on success or removes outright on failure. Used by
+// DOWN_HINT and _pingSome.
 void RpcSocket::check_node(const routing::Node& node) {
     // Snapshot identity + last_seen before marking pinged (JS: `_check`).
     auto state = std::make_shared<CheckState>();
@@ -676,6 +737,12 @@ void RpcSocket::check_node(const routing::Node& node) {
 
 // ---------------------------------------------------------------------------
 // Background tick (5s) — health, refresh, ephemeral/persistent
+//
+// JS: .analysis/js/dht-rpc/index.js:764-799 (_ontick) — runs at 5s
+//     interval (TICK_INTERVAL). Bumps tick, runs _pingSome every 8th
+//     tick, refresh on _refreshTicks expiry, health.update at end.
+//     C++ skips JS's wakeup detection (`_lastTick` drift) since we
+//     don't have a sleeping interval semantic yet.
 // ---------------------------------------------------------------------------
 
 void RpcSocket::on_bg_tick(uv_timer_t* timer) {
@@ -705,6 +772,10 @@ void RpcSocket::background_tick() {
     }
 }
 
+// JS: dht-rpc/index.js:801-875 (_updateNetworkState). Our version is
+// simplified: we trust the NAT sampler's classification rather than
+// running a separate PING_NAT firewall probe (JS:916-963 _checkIfFirewalled
+// requires the dual-socket setup we don't have).
 void RpcSocket::check_persistent() {
     auto current_host = nat_sampler_.host();
 
@@ -727,6 +798,16 @@ void RpcSocket::check_persistent() {
 
 // ---------------------------------------------------------------------------
 // Adaptive timeout — per-peer RTT tracking
+//
+// JS: .analysis/js/dht-rpc/lib/io.js:78 (this._adt = new AdaptiveTimeout)
+//     .analysis/js/dht-rpc/lib/io.js:116-118 (_adt.put on response)
+//     .analysis/js/dht-rpc/lib/io.js:457-460 (_adt.get for next timeout)
+//
+// C++ diffs from JS:
+//   - JS uses the `adaptive-timeout` package (per-peer hash table).
+//   - We re-implement: per-peer EMA `(old*3 + sample + 2) / 4`,
+//     timeout = 2x smoothed clamped to [200ms, 5000ms].
+//   - LRU cap of 1024 entries; JS package has its own eviction.
 // ---------------------------------------------------------------------------
 
 void RpcSocket::record_rtt(const compact::Ipv4Address& peer, uint64_t rtt_ms) {

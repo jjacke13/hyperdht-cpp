@@ -126,8 +126,9 @@ public:
     RpcSocket(const RpcSocket&) = delete;
     RpcSocket& operator=(const RpcSocket&) = delete;
 
-    // Bind to a port (0 = ephemeral)
-    int bind(uint16_t port = 0);
+    // Bind to a port (0 = ephemeral) on a specific host (default 0.0.0.0).
+    // JS: io.js:244 — `serverSocket.bind(port, host)`.
+    int bind(uint16_t port = 0, const std::string& host = "0.0.0.0");
 
     // Get the bound port
     uint16_t port() const;

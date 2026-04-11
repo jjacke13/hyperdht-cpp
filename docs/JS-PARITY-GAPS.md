@@ -11,17 +11,35 @@ Actionable audit of what's still missing in `hyperdht-cpp` versus the JavaScript
 
 ## Pending manual live tests
 
-Only one scenario left that requires a specific network topology:
+### §7 DhtOptions — pre-commit validation
 
-- **§6 `local_connection` LAN shortcut** — both ends must share the same NAT
-  / public IP (same home network). Run:
+- **`seed` → deterministic keypair** — not strictly a live test; unit test
+  `SeedDerivesDeterministicKeypair` covers it. But worth running at least
+  one live connect where the C++ side uses `DhtOptions::seed` (via
+  `CLIENT_SEED=<hex>` env) and verifying the JS server logs the expected
+  pubkey.
+
+- **`host = "127.0.0.1"`** — `HostLoopbackBind` test covers this locally.
+  No network cross-test required.
+
+- **`nodes` pre-seeding** — needs a live run where `opts.nodes` contains
+  a real bootstrap node address. After `bind()`, verify the routing table
+  is non-empty before any query kicks in.
+
+- **`random_punch_interval` / `defer_random_punch`** — hard to verify
+  without a RANDOM-NAT peer. Debug log (`[hp] random-punch: throttled`)
+  should fire when the interval is short enough to trigger during a
+  holepunch round. Low priority.
+
+### §6 `local_connection` LAN shortcut — still pending
+
+Requires both ends on the same NAT / public IP (same home network):
   1. `./test_server_live` on machine A
   2. `SERVER_KEY=<hex> LOCAL_CONNECTION=1 ./test_hyperdht --gtest_filter='*LiveConnect*'`
-     on machine B (debug build so the `[connect] LAN shortcut: target ...`
-     line is visible)
-  3. Confirm the log line appears and either `LAN ping OK` (success) or
-     `LAN ping failed, falling back to holepunch` (wiring verified, LAN
-     shortcut tried but the local address didn't ping back)
+     on machine B (debug build so `[connect] LAN shortcut: target ...`
+     is visible)
+  3. Confirm either `LAN ping OK` (success) or `LAN ping failed, falling
+     back to holepunch` (wiring verified)
 
 ---
 
@@ -34,7 +52,7 @@ Only one scenario left that requires a specific network topology:
 | `@hyperswarm/secret-stream` crypto primitive + user-facing `SecretStreamDuplex` | ✓ COMPLETE |
 | protomux (channel mux, cork/uncork batching, aliases, destroy, opened, get_last_channel, for_each_channel) | ✓ COMPLETE |
 | server / router / announcer / server_connection | ✓ COMPLETE |
-| `HyperDHT` class (public API) | ⚠️ partial — §6, §7, §13, §15, §16 |
+| `HyperDHT` class (public API) | ⚠️ partial — §13, §15, §16 (§6, §7 DONE) |
 | C FFI (`hyperdht.h`) | ⚠️ partial — §10 refactor follow-up |
 
 **The bottom five layers are done.** Remaining work is strictly at the `HyperDHT` class layer and above.
@@ -74,23 +92,22 @@ Listed bottom-up by layer.
 - LAN shortcut: C++ uses NAT-sampler host vs JS `clientAddress.host` (from
   peerHandshake reply's `to` field). Close enough but not identical.
 
-#### §7 — `DhtOptions` missing JS constructor options   *(HyperDHT-class layer)*
+#### §7 — `DhtOptions` DONE (polish follow-ups remain)
 
-**Currently present:** `port`, `bootstrap`, `default_keypair`, `ephemeral`.
+**Present:** `port`, `host`, `bootstrap`, `nodes`, `default_keypair`,
+`seed`, `ephemeral`, `connection_keep_alive`, `random_punch_interval`,
+`defer_random_punch`, `max_size`, `max_age_ms`, `storage_ttl_ms`.
 
-**Missing:**
-
-| Option | JS line | Purpose |
-|---|---|---|
-| `host` | 52 | Bind host |
-| `seed` | 36 | Derive keypair from 32-byte seed |
-| `nodes` | 30 | Known-good bootstrap hints |
-| `connectionKeepAlive` | 38-41 | Per-connection default keepalive |
-| `randomPunchInterval` | 60 | Override 20s random-punch throttle |
-| `deferRandomPunch` | 57 | Defer random punches |
-| `maxSize` / `maxAge` | 598-599 | Storage cache tuning |
-
-The random-punch tuning knobs matter — currently hardcoded in `holepunch.hpp:202-203`.
+**§7 polish follow-ups:**
+- `connection_keep_alive` is stored + exposed via accessor but NOT
+  auto-applied to any `SecretStreamDuplex` — C++ callers wrap streams
+  themselves. Follow-up: auto-wrap client streams in a Duplex and pass
+  the DHT's default keep-alive at construction.
+- `max_age_ms` governs non-storage caches (router forwards, records,
+  refreshes, bumps). None of those exist in C++ yet — the field is stored
+  for forward compatibility. When those caches land, they should read
+  `opts_.max_age_ms`. Storage TTL is controlled independently via
+  `storage_ttl_ms` (default 48h, matching JS parity).
 
 ---
 

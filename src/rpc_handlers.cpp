@@ -15,8 +15,15 @@
 namespace hyperdht {
 namespace rpc {
 
-RpcHandlers::RpcHandlers(RpcSocket& socket, router::Router* router)
-    : socket_(socket), router_(router) {
+RpcHandlers::RpcHandlers(RpcSocket& socket, router::Router* router,
+                         StorageCacheConfig cache_config)
+    : socket_(socket),
+      router_(router),
+      storage_ttl_ms_(cache_config.ttl_ms),
+      // JS: index.js:610-615 — mutable/immutable each get maxSize/2 entries.
+      // Guard against max_size=0 by using at least 1 entry per cache.
+      mutables_(std::max<size_t>(1, cache_config.max_size / 2)),
+      immutables_(std::max<size_t>(1, cache_config.max_size / 2)) {
     start_gc_timer();
 }
 
@@ -57,8 +64,8 @@ void RpcHandlers::on_gc_tick(uv_timer_t* timer) {
     auto* self = static_cast<RpcHandlers*>(timer->data);
     if (!self) return;
     auto now = uv_now(self->socket_.loop());
-    self->mutables_.gc(now, STORAGE_TTL_MS);
-    self->immutables_.gc(now, STORAGE_TTL_MS);
+    self->mutables_.gc(now, self->storage_ttl_ms_);
+    self->immutables_.gc(now, self->storage_ttl_ms_);
     self->store_.gc(now);
 }
 

@@ -48,21 +48,75 @@ namespace hyperdht {
 HyperDHT::HyperDHT(uv_loop_t* loop, DhtOptions opts)
     : loop_(loop), opts_(std::move(opts)) {
 
-    // Generate default keypair if not provided
+    // Resolve the default keypair — JS `opts.keyPair || createKeyPair(opts.seed)`.
+    // Priority:
+    //   1. If the caller pre-populated `default_keypair`, use as-is.
+    //   2. Otherwise if `seed` is set, derive deterministically (§7).
+    //   3. Otherwise generate random.
     auto zero_pk = noise::PubKey{};
     if (opts_.default_keypair.public_key == zero_pk) {
-        opts_.default_keypair = noise::generate_keypair();
+        if (opts_.seed.has_value()) {
+            opts_.default_keypair = noise::generate_keypair(*opts_.seed);
+        } else {
+            opts_.default_keypair = noise::generate_keypair();
+        }
+    } else if (opts_.seed.has_value()) {
+        // Both explicit keypair AND seed set — the keypair wins, seed is
+        // silently ignored by JS too. Log a warning so the caller notices.
+        DHT_LOG("  [dht] WARNING: both default_keypair and seed set; "
+                "seed ignored (keypair takes priority)\n");
     }
 
-    // Create RPC socket with our public key as node ID
+    // Create RPC socket with our public key as node ID.
+    // Both NodeId and PubKey are 32-byte arrays — assert the invariant
+    // so any future divergence fails at compile time.
+    static_assert(sizeof(routing::NodeId) == sizeof(noise::PubKey),
+                  "NodeId must be the same size as PubKey");
     routing::NodeId our_id{};
     std::copy(opts_.default_keypair.public_key.begin(),
               opts_.default_keypair.public_key.end(),
               our_id.begin());
 
     socket_ = std::make_unique<rpc::RpcSocket>(loop_, our_id);
-    handlers_ = std::make_unique<rpc::RpcHandlers>(*socket_, &router_);
+
+    // §7: thread storage cache tuning into the handlers.
+    // max_size governs entry count (JS: opts.maxSize); ttl_ms is the
+    // storage-specific 48h default (JS: hyperdht/index.js:611,615 —
+    // `opts.maxAge || 48h` for mutable/immutable). max_age_ms is used
+    // by other caches once they're added, not the storage caches.
+    rpc::StorageCacheConfig cache_config;
+    cache_config.max_size = opts_.max_size;
+    cache_config.ttl_ms = opts_.storage_ttl_ms;
+    handlers_ = std::make_unique<rpc::RpcHandlers>(
+        *socket_, &router_, cache_config);
     handlers_->install();
+
+    // §7: pre-seed the routing table with known-good nodes so the DHT
+    // starts with a non-empty table and doesn't need the initial bootstrap
+    // query to be useful. JS: `dht-rpc/index.js:95-99` iterates REVERSE;
+    // `_addNode` at index.js:526 populates `added`/`pinged`/`seen` with
+    // `this._tick`. Without the tick fields, ping-and-swap would immediately
+    // evict these nodes (they'd look like "never seen" relative to any
+    // node with a non-zero sampled tick). Use the current RPC tick.
+    const uint32_t seed_tick = socket_->tick();
+    for (auto it = opts_.nodes.rbegin(); it != opts_.nodes.rend(); ++it) {
+        routing::Node node;
+        node.id = rpc::compute_peer_id(*it);
+        node.host = it->host_string();
+        node.port = it->port;
+        node.added = seed_tick;
+        node.pinged = seed_tick;
+        node.seen = seed_tick;
+        socket_->table().add(node);
+    }
+
+    // §7: random-punch tuning and defer flag.
+    punch_stats_.random_punch_interval = opts_.random_punch_interval;
+    if (opts_.defer_random_punch) {
+        // Seed `last_random_punch` with "now" so the first random punch
+        // has to wait the full interval. JS: index.js:58.
+        punch_stats_.last_random_punch = uv_now(loop_);
+    }
 }
 
 HyperDHT::~HyperDHT() {
@@ -77,7 +131,8 @@ HyperDHT::~HyperDHT() {
 
 int HyperDHT::bind() {
     if (bound_) return 0;
-    int rc = socket_->bind(opts_.port);
+    // §7: pass opts.host so multi-homed or specific-interface binds work.
+    int rc = socket_->bind(opts_.port, opts_.host);
     if (rc == 0) bound_ = true;
     return rc;
 }
@@ -138,7 +193,15 @@ void HyperDHT::connect(const noise::PubKey& remote_public_key,
                         const noise::Keypair& keypair,
                         ConnectCallback on_done) {
     if (destroyed_) {
+        DHT_LOG("  [dht] connect (keypair): rejected (destroyed)\n");
         on_done(-1, {});
+        return;
+    }
+    // §6/§7 parity: suspended DHT must reject connect from all overloads,
+    // matching JS `connect.js:49-51` (`dht.suspended || !dht._connectable`).
+    if (suspended_) {
+        DHT_LOG("  [dht] connect (keypair): rejected (suspended)\n");
+        on_done(-8, {});  // SUSPENDED
         return;
     }
     ensure_bound();
@@ -822,6 +885,13 @@ void HyperDHT::suspend() {
 void HyperDHT::resume() {
     if (!suspended_) return;
     suspended_ = false;
+
+    // JS: hyperdht/index.js:97 — when `deferRandomPunch` is set, resume
+    // re-seeds `_lastRandomPunch = Date.now()` so the interval restarts
+    // from resume rather than carrying over the pre-suspend counter.
+    if (opts_.defer_random_punch) {
+        punch_stats_.last_random_punch = uv_now(loop_);
+    }
 
     // Resume all servers
     for (auto& srv : servers_) {

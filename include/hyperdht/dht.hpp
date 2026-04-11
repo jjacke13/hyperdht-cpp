@@ -47,9 +47,72 @@ namespace hyperdht {
 // ---------------------------------------------------------------------------
 
 struct DhtOptions {
-    uint16_t port = 0;                               // 0 = ephemeral
-    std::vector<compact::Ipv4Address> bootstrap;     // Empty = use public bootstrap
-    noise::Keypair default_keypair;                   // Auto-generated if zero
+    // Local bind — ipv4 host + port. JS: `opts.host || '0.0.0.0'`, `opts.port || 49737`.
+    // C++ differs on the port default: `0` = ephemeral (kernel picks free port).
+    // Setting `port = 49737` matches JS for "known port" deployments.
+    uint16_t port = 0;
+    std::string host = "0.0.0.0";
+
+    // Bootstrap node addresses (JS: opts.bootstrap). Empty = use public defaults.
+    std::vector<compact::Ipv4Address> bootstrap;
+
+    // Known-good bootstrap hints pre-seeded into the routing table.
+    // JS: `opts.nodes || KNOWN_NODES`. Unlike `bootstrap` (queried during
+    // bootstrap), these are added directly to the table so the DHT already
+    // knows some live peers at construction time. Used by long-running
+    // deployments to preserve routing state across restarts.
+    std::vector<compact::Ipv4Address> nodes;
+
+    // Default signing keypair (auto-generated from `seed` or random).
+    // If `seed` is set, `default_keypair` is derived deterministically at
+    // HyperDHT construction. Otherwise, if `default_keypair` is already
+    // populated, it's used as-is. Otherwise, a random one is generated.
+    // JS: `opts.keyPair || createKeyPair(opts.seed)`.
+    noise::Keypair default_keypair;
+    std::optional<noise::Seed> seed;
+
+    // Default keep-alive ms for outgoing connections (JS: opts.connectionKeepAlive,
+    // default 5000). JS applies this to every `NoiseSecretStream` at stream
+    // construction time (connect.js:45).
+    //
+    // IMPORTANT: C++ does NOT automatically wrap the connected rawStream
+    // in a `SecretStreamDuplex` — callers construct the Duplex themselves
+    // (see `test/test_live_connect.cpp`). To match JS keep-alive behavior,
+    // callers must read `HyperDHT::connection_keep_alive()` and pass it
+    // to `SecretStreamDuplex::set_keep_alive()` after construction.
+    //
+    // Tracked as a §7 polish follow-up: auto-wrap clients in a Duplex
+    // with the DHT's default keep-alive. See docs/JS-PARITY-GAPS.md.
+    uint64_t connection_keep_alive = 5000;
+
+    // Throttling for random-NAT holepunch attempts. JS defaults:
+    //   randomPunchInterval: 20000ms (min gap between random punches)
+    //   deferRandomPunch: false (if true, initial last_random_punch = now,
+    //                            so the first random punch is gated)
+    uint64_t random_punch_interval = 20000;
+    bool defer_random_punch = false;
+
+    // LRU storage cache tuning (JS: opts.maxSize, opts.maxAge).
+    //
+    // `max_size` (JS: opts.maxSize || 65536) is the overall cache budget.
+    // Mutable + immutable caches each get `max_size/2` entries, matching
+    // JS `hyperdht/index.js:610-615`.
+    //
+    // `max_age_ms` (JS: opts.maxAge || 20*60*1000 = 20 min) governs the
+    // OTHER caches (router forwards, records, refreshes, bumps). It does
+    // NOT govern mutable/immutable storage — JS uses 48h there regardless
+    // of `maxAge` unless the caller explicitly overrides via `storage_ttl_ms`.
+    // JS parity: `mutables: { maxAge: opts.maxAge || 48h }`.
+    //
+    // Currently only the storage caches are configurable in C++, so
+    // `max_age_ms` is stored for forward compatibility but isn't wired
+    // anywhere yet. Set `storage_ttl_ms` to tune mutable/immutable TTL.
+    size_t max_size = 65536;
+    uint64_t max_age_ms = 20 * 60 * 1000;
+    uint64_t storage_ttl_ms = 48ULL * 60 * 60 * 1000;  // 48h (JS default)
+
+    // Ephemeral mode (JS: opts.ephemeral). Ephemeral nodes are never
+    // announced as persistent and are evicted more aggressively.
     bool ephemeral = true;
 };
 
@@ -329,6 +392,16 @@ public:
     const noise::Keypair& default_keypair() const { return opts_.default_keypair; }
     uint16_t port() const { return socket_ ? socket_->port() : 0; }
     bool is_bound() const { return bound_; }
+
+    // §7 accessors — read the tuning knobs that consumer apps may need
+    // to apply to stream wrappers / connection setup.
+    const std::string& host() const { return opts_.host; }
+    uint64_t connection_keep_alive() const { return opts_.connection_keep_alive; }
+    uint64_t random_punch_interval() const { return opts_.random_punch_interval; }
+    bool defer_random_punch() const { return opts_.defer_random_punch; }
+    size_t max_size() const { return opts_.max_size; }
+    uint64_t max_age_ms() const { return opts_.max_age_ms; }
+    uint64_t storage_ttl_ms() const { return opts_.storage_ttl_ms; }
 
 private:
     uv_loop_t* loop_;

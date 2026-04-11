@@ -124,9 +124,12 @@ RpcSocket::~RpcSocket() {
     if (bg_timer_) bg_timer_->data = nullptr;
 }
 
-int RpcSocket::bind(uint16_t port) {
+int RpcSocket::bind(uint16_t port, const std::string& host) {
     struct sockaddr_in addr{};
-    uv_ip4_addr("0.0.0.0", port, &addr);
+    // uv_ip4_addr rejects malformed IPv4 strings; pass through the caller's
+    // host (JS default "0.0.0.0", but apps may want to bind a specific
+    // interface for multi-homed hosts or dev/testing isolation).
+    if (uv_ip4_addr(host.c_str(), port, &addr) != 0) return UV_EINVAL;
     int rc = udx_socket_bind(&socket_, reinterpret_cast<const struct sockaddr*>(&addr), 0);
     if (rc == 0) {
         socket_bound_ = true;

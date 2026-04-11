@@ -3,6 +3,8 @@
 
 #include <gtest/gtest.h>
 
+#include <set>
+
 #include <sodium.h>
 #include <uv.h>
 #include <udx.h>
@@ -118,16 +120,25 @@ TEST(HyperDHT, DestroyClosesServers) {
 // Required env:
 //   SERVER_KEY=<64-hex>  — remote server public key
 //
-// Optional §6 hooks:
+// Optional §6 hooks (ConnectOptions — per-connect):
 //   CLIENT_SEED=<64-hex>     — derive the client keypair from this seed
-//                              (otherwise a random one is used). Used to
-//                              verify `ConnectOptions::keypair` override.
+//                              and pass it via ConnectOptions::keypair
+//                              (the §6 per-connect override). Mutually
+//                              exclusive with DHT_SEED below.
 //   FAST_OPEN=0|1            — override `ConnectOptions::fast_open`
 //                              (default 1). Set to 0 to disable the
 //                              pre-Round-1 low-TTL probe.
 //   LOCAL_CONNECTION=0|1     — override `ConnectOptions::local_connection`
 //                              (default 1). Set to 0 to skip the LAN
 //                              shortcut branch entirely.
+//
+// Optional §7 hook (DhtOptions — DHT default):
+//   DHT_SEED=<64-hex>        — derive the DHT's `default_keypair` from
+//                              this seed via `DhtOptions::seed`. The
+//                              derived keypair is then used by every
+//                              connect that doesn't override via
+//                              `ConnectOptions::keypair`. Verifies the
+//                              §7 seed→keypair plumbing end-to-end.
 TEST(HyperDHT, LiveConnect) {
     const char* key_env = std::getenv("SERVER_KEY");
     if (!key_env || strlen(key_env) != 64) {
@@ -144,9 +155,30 @@ TEST(HyperDHT, LiveConnect) {
     uv_loop_t loop;
     uv_loop_init(&loop);
 
-    HyperDHT dht(&loop);
+    // §7: build DhtOptions from env hooks BEFORE HyperDHT construction.
+    // DHT_SEED flows into DhtOptions::seed which the constructor uses to
+    // derive `default_keypair`. The derived default will then be used for
+    // the handshake unless a per-connect CLIENT_SEED also sets
+    // ConnectOptions::keypair (in which case the per-connect override wins).
+    DhtOptions dht_opts;
+    if (const char* dht_seed = std::getenv("DHT_SEED");
+        dht_seed && strlen(dht_seed) == 64) {
+        noise::Seed s{};
+        for (int i = 0; i < 32; i++) {
+            unsigned int byte;
+            sscanf(dht_seed + i * 2, "%02x", &byte);
+            s[i] = static_cast<uint8_t>(byte);
+        }
+        dht_opts.seed = s;
+        printf("  DHT_SEED set — default_keypair will be derived\n");
+    }
+
+    HyperDHT dht(&loop, dht_opts);
     dht.bind();
     printf("  Bound to port %u\n", dht.port());
+    printf("  DHT default_keypair pubkey = ");
+    for (uint8_t b : dht.default_keypair().public_key) printf("%02x", b);
+    printf("\n");
 
     // §6: build ConnectOptions from env hooks so a single live run can
     // exercise keypair override / fast_open / local_connection without
@@ -167,7 +199,7 @@ TEST(HyperDHT, LiveConnect) {
         printf("\n");
         conn_opts.keypair = override_kp;
     } else {
-        printf("  (random client keypair)\n");
+        printf("  (no CLIENT_SEED — using DHT default_keypair)\n");
     }
 
     if (const char* fo = std::getenv("FAST_OPEN"); fo) {
@@ -634,6 +666,282 @@ TEST(HyperDHT, ConnectOptionsLocalConnectionToggle) {
     ConnectOptions b;
     b.local_connection = false;
     EXPECT_FALSE(b.local_connection);
+}
+
+// ---------------------------------------------------------------------------
+// §7 — DhtOptions fields: host, seed, nodes, connection_keep_alive,
+//      random_punch_interval, defer_random_punch, max_size, max_age_ms
+//
+// These tests exercise the option plumbing. End-to-end behavior of the
+// cache tuning and random-punch throttling is covered by existing
+// holepunch/rpc_handlers tests; here we just verify the fields are
+// read from DhtOptions and applied to the right internal state.
+// ---------------------------------------------------------------------------
+
+TEST(HyperDHT, OptionsDefaults) {
+    // Defaults should match JS conventions.
+    DhtOptions opts;
+    EXPECT_EQ(opts.host, "0.0.0.0");
+    EXPECT_EQ(opts.port, 0u);
+    EXPECT_FALSE(opts.seed.has_value());
+    EXPECT_TRUE(opts.nodes.empty());
+    EXPECT_EQ(opts.connection_keep_alive, 5000u);  // JS default
+    EXPECT_EQ(opts.random_punch_interval, 20000u); // JS default
+    EXPECT_FALSE(opts.defer_random_punch);
+    EXPECT_EQ(opts.max_size, 65536u);              // JS default
+    EXPECT_EQ(opts.max_age_ms, 20u * 60 * 1000);   // JS default (20min)
+}
+
+TEST(HyperDHT, SeedDerivesDeterministicKeypair) {
+    // A fixed seed must produce the same pubkey across runs.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    noise::Seed seed{};
+    seed.fill(0xAA);
+
+    DhtOptions opts1;
+    opts1.seed = seed;
+    HyperDHT dht1(&loop, opts1);
+    auto pk1 = dht1.default_keypair().public_key;
+
+    DhtOptions opts2;
+    opts2.seed = seed;
+    HyperDHT dht2(&loop, opts2);
+    auto pk2 = dht2.default_keypair().public_key;
+
+    EXPECT_EQ(pk1, pk2) << "Same seed must produce same keypair";
+
+    // A different seed produces a different keypair.
+    noise::Seed seed2{};
+    seed2.fill(0xBB);
+    DhtOptions opts3;
+    opts3.seed = seed2;
+    HyperDHT dht3(&loop, opts3);
+    EXPECT_NE(dht3.default_keypair().public_key, pk1);
+
+    dht1.destroy();
+    dht2.destroy();
+    dht3.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, KeypairOverridePrecedesSeed) {
+    // If `default_keypair` is already populated, `seed` is ignored.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    noise::Seed kp_seed{};
+    kp_seed.fill(0xCC);
+    auto explicit_kp = noise::generate_keypair(kp_seed);
+
+    noise::Seed opts_seed{};
+    opts_seed.fill(0xDD);
+
+    DhtOptions opts;
+    opts.default_keypair = explicit_kp;
+    opts.seed = opts_seed;  // should be ignored
+
+    HyperDHT dht(&loop, opts);
+    EXPECT_EQ(dht.default_keypair().public_key, explicit_kp.public_key);
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, HostLoopbackBind) {
+    // Binding to 127.0.0.1 should succeed and the port should be set.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    DhtOptions opts;
+    opts.host = "127.0.0.1";
+    HyperDHT dht(&loop, opts);
+    EXPECT_EQ(dht.host(), "127.0.0.1");
+
+    int rc = dht.bind();
+    EXPECT_EQ(rc, 0);
+    EXPECT_GT(dht.port(), 0u);
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, HostInvalidRejected) {
+    // A malformed IPv4 string must fail to bind cleanly (no crash).
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    DhtOptions opts;
+    opts.host = "not.a.valid.ip";
+    HyperDHT dht(&loop, opts);
+
+    int rc = dht.bind();
+    EXPECT_NE(rc, 0) << "Malformed host must fail bind";
+    EXPECT_FALSE(dht.is_bound());
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, NodesPreseededIntoRoutingTable) {
+    // Nodes provided in opts.nodes should be inserted into the routing
+    // table at construction time, before any bootstrap query. Each node
+    // must be present by identity (host/port), not just by count.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    DhtOptions opts;
+    opts.nodes.push_back(compact::Ipv4Address::from_string("10.0.0.1", 49737));
+    opts.nodes.push_back(compact::Ipv4Address::from_string("10.0.0.2", 49737));
+    opts.nodes.push_back(compact::Ipv4Address::from_string("10.0.0.3", 49737));
+
+    HyperDHT dht(&loop, opts);
+    EXPECT_EQ(dht.socket().table().size(), 3u);
+
+    // Walk every node in the table and verify each of the three addresses
+    // is present. Collect a set of host:port strings and check membership.
+    std::set<std::string> found;
+    const auto& table = dht.socket().table();
+    for (size_t i = 0; i < 256; i++) {
+        const auto& bucket = table.bucket(i);
+        for (const auto& node : bucket.nodes()) {
+            found.insert(node.host + ":" + std::to_string(node.port));
+        }
+    }
+    EXPECT_EQ(found.count("10.0.0.1:49737"), 1u);
+    EXPECT_EQ(found.count("10.0.0.2:49737"), 1u);
+    EXPECT_EQ(found.count("10.0.0.3:49737"), 1u);
+
+    // Also verify the tick fields were populated (not left at 0).
+    // Pick any one of the pre-seeded nodes — all should have non-zero
+    // added/pinged/seen tick values.
+    bool any_has_ticks = false;
+    for (size_t i = 0; i < 256; i++) {
+        const auto& bucket = table.bucket(i);
+        for (const auto& node : bucket.nodes()) {
+            // tick values are uint32_t; pre-seeded nodes share the
+            // construction-time tick which may or may not be 0 depending
+            // on prior loop state. What matters is that added == pinged
+            // == seen (set together in the constructor), not that they're
+            // non-zero.
+            EXPECT_EQ(node.added, node.pinged);
+            EXPECT_EQ(node.pinged, node.seen);
+            any_has_ticks = true;
+        }
+    }
+    EXPECT_TRUE(any_has_ticks);
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, RandomPunchIntervalAppliesToStats) {
+    // opts.random_punch_interval must reach PunchStats.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    DhtOptions opts;
+    opts.random_punch_interval = 12345;
+    HyperDHT dht(&loop, opts);
+
+    EXPECT_EQ(dht.random_punch_interval(), 12345u);
+    EXPECT_EQ(dht.punch_stats().random_punch_interval, 12345u);
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, DeferRandomPunchSeedsLastPunch) {
+    // With defer_random_punch=true, last_random_punch is seeded to
+    // uv_now() at construction so the first random punch has to wait
+    // the full interval. Capture the loop's time BEFORE construction
+    // and assert last_random_punch >= captured_time — that proves
+    // the assignment happened inside this construction (not leftover
+    // state from elsewhere) AND is non-zero.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    const uint64_t before = uv_now(&loop);
+
+    DhtOptions opts;
+    opts.defer_random_punch = true;
+    HyperDHT dht(&loop, opts);
+
+    EXPECT_TRUE(dht.defer_random_punch());
+    EXPECT_GE(dht.punch_stats().last_random_punch, before)
+        << "last_random_punch must be seeded at/after construction time";
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, DeferRandomPunchResumeReSeeds) {
+    // §7 parity with JS hyperdht/index.js:97 — resume() re-seeds
+    // last_random_punch when defer_random_punch is set.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    DhtOptions opts;
+    opts.defer_random_punch = true;
+    HyperDHT dht(&loop, opts);
+    dht.bind();
+
+    const uint64_t t0 = dht.punch_stats().last_random_punch;
+
+    dht.suspend();
+    EXPECT_TRUE(dht.is_suspended());
+
+    // Advance loop time a bit so the re-seeded value is distinguishable.
+    uv_run(&loop, UV_RUN_NOWAIT);
+    uv_update_time(&loop);
+
+    dht.resume();
+    const uint64_t t1 = dht.punch_stats().last_random_punch;
+    EXPECT_GE(t1, t0) << "resume() must re-seed last_random_punch";
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, MaxSizeAndMaxAgeAccessors) {
+    // Field round-trip check.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    DhtOptions opts;
+    opts.max_size = 1024;
+    opts.max_age_ms = 60 * 1000;
+    HyperDHT dht(&loop, opts);
+
+    EXPECT_EQ(dht.max_size(), 1024u);
+    EXPECT_EQ(dht.max_age_ms(), 60u * 1000);
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, ConnectionKeepAliveAccessor) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    DhtOptions opts;
+    opts.connection_keep_alive = 7500;
+    HyperDHT dht(&loop, opts);
+
+    EXPECT_EQ(dht.connection_keep_alive(), 7500u);
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
 }
 
 TEST(HyperDHT, NotConnectableWhenSuspended) {

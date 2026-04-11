@@ -20,13 +20,36 @@ namespace hyperdht {
 namespace rpc {
 
 // ---------------------------------------------------------------------------
+// Storage cache config (JS: hyperdht/index.js:597 defaultCacheOpts)
+// ---------------------------------------------------------------------------
+
+struct StorageCacheConfig {
+    // Max entries in the mutable/immutable caches. JS splits mutable and
+    // immutable into `maxSize/2` each (index.js:610-615). We follow that
+    // split internally — callers pass one `max_size` and we halve it.
+    //
+    // NOTE: values < 2 are clamped to a per-cache minimum of 1 entry
+    // (so `max_size == 0` does NOT disable storage — it degenerates to
+    // 1-entry LRUs). Pass a much larger value or bypass the cache in
+    // other ways if you need storage disabled.
+    size_t max_size = 65536;
+
+    // Max entry age in ms. JS uses 48h for mutable/immutable specifically
+    // (index.js:611,615) while other caches use 20 min. We expose one
+    // `ttl_ms` for the storage caches — default 48h to match JS behavior.
+    uint64_t ttl_ms = 48ULL * 60 * 60 * 1000;
+};
+
+// ---------------------------------------------------------------------------
 // RpcHandlers — processes incoming dht-rpc and HyperDHT commands
 // ---------------------------------------------------------------------------
 
 class RpcHandlers {
 public:
     // router is optional — if null, PEER_HANDSHAKE/HOLEPUNCH are not dispatched
-    explicit RpcHandlers(RpcSocket& socket, router::Router* router = nullptr);
+    explicit RpcHandlers(RpcSocket& socket,
+                         router::Router* router = nullptr,
+                         StorageCacheConfig cache_config = {});
 
     // Install the handler on the RpcSocket (calls socket.on_request)
     void install();
@@ -63,13 +86,13 @@ private:
     // Build a response with closer nodes to the target
     messages::Response make_query_response(const messages::Request& req);
 
-    // Mutable/immutable storage — LRU cache, 32K max entries, 48h TTL
-    static constexpr size_t STORAGE_MAX_ENTRIES = 32768;
-    static constexpr uint64_t STORAGE_TTL_MS = 48ULL * 60 * 60 * 1000;  // 48 hours
+    // Mutable/immutable storage — LRU caches. Max entries split in half
+    // between the two caches to match JS `hyperdht/index.js:610-615`.
     static constexpr uint64_t GC_INTERVAL_MS = 60000;  // 1 minute
 
-    LruCache<std::string, std::vector<uint8_t>> mutables_{STORAGE_MAX_ENTRIES};
-    LruCache<std::string, std::vector<uint8_t>> immutables_{STORAGE_MAX_ENTRIES};
+    uint64_t storage_ttl_ms_;
+    LruCache<std::string, std::vector<uint8_t>> mutables_;
+    LruCache<std::string, std::vector<uint8_t>> immutables_;
     uv_timer_t* gc_timer_ = nullptr;
 
     // DELAYED_PING pending replies: one heap-allocated struct per scheduled reply.

@@ -38,8 +38,11 @@ using Seed = std::array<uint8_t, SEEDLEN>;
 // ---------------------------------------------------------------------------
 
 struct Keypair {
-    PubKey public_key;
-    SecKey secret_key;
+    // Value-initialized so default-constructed Keypairs are zero rather
+    // than indeterminate stack garbage. The `public_key == zero` check
+    // in HyperDHT's constructor depends on this to detect "not set".
+    PubKey public_key{};
+    SecKey secret_key{};
 };
 
 // Generate Ed25519 signing keypair from seed (deterministic)

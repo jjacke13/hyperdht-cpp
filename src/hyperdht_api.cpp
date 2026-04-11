@@ -87,6 +87,14 @@ hyperdht_t* hyperdht_create(uv_loop_t* loop, const hyperdht_opts_t* opts) {
     if (opts) {
         cpp_opts.port = opts->port;
         cpp_opts.ephemeral = (opts->ephemeral != 0);
+        // §2: wire the `use_public_bootstrap` flag through to the C++
+        // layer. When set, the HyperDHT constructor stores the 3 public
+        // seed nodes in `opts_.bootstrap`, and `bind()` will launch a
+        // one-shot FIND_NODE(our_id) walk on behalf of the caller.
+        if (opts->use_public_bootstrap) {
+            cpp_opts.bootstrap =
+                hyperdht::HyperDHT::default_bootstrap_nodes();
+        }
     }
 
     auto* h = new (std::nothrow) hyperdht_s;
@@ -351,13 +359,29 @@ int hyperdht_mutable_get(hyperdht_t* dht,
 }
 
 // ---------------------------------------------------------------------------
-// Encrypted streams — UDX + SecretStream over an established connection
+// Encrypted streams — refactored to SecretStreamDuplex (§10).
+//
+// Previously this section hand-rolled the header exchange + frame parser +
+// encrypt/decrypt loop on top of the low-level `SecretStream` primitive.
+// That version worked for basic read/write but didn't apply
+// `DhtOptions::connection_keep_alive`, so continuous P2P data over NAT
+// eventually died when the NAT pinhole timed out after ~30 seconds of
+// silence.
+//
+// The refactored version delegates all of that to `SecretStreamDuplex`
+// (the same wrapper `test/test_live_connect.cpp` has been dogfooding
+// for a while). Keep-alive and idle-timeout now come for free from
+// `dht->make_duplex_options()`, matching JS's automatic behaviour in
+// `hyperdht/lib/connect.js:41-46`.
 // ---------------------------------------------------------------------------
 
 struct hyperdht_stream_s {
-    udx_stream_t raw_stream{};       // Used for client path (no pre-created stream)
-    udx_stream_t* raw = nullptr;     // Points to raw_stream or pre-created stream
-    hyperdht::secret_stream::SecretStream* ss = nullptr;
+    // Heap-allocated UDX stream (self-delete close cb registered with
+    // `udx_stream_init`). Whether we created it or reused one from the
+    // connect/server handshake path is irrelevant once Duplex takes over —
+    // both lifetimes converge on the same teardown sequence.
+    udx_stream_t* raw = nullptr;
+    hyperdht::secret_stream::SecretStreamDuplex* duplex = nullptr;
     hyperdht_t* dht = nullptr;
 
     hyperdht_close_cb on_open = nullptr;
@@ -365,107 +389,22 @@ struct hyperdht_stream_s {
     hyperdht_close_cb on_close = nullptr;
     void* userdata = nullptr;
 
-    std::vector<uint8_t> recv_buf;
-    bool header_sent = false;
-    bool header_received = false;
-    bool open = false;
     bool closed = false;
-
-    void check_open() {
-        if (!open && header_sent && header_received) {
-            open = true;
-            if (on_open) on_open(userdata);
-        }
-    }
 };
 
-static void stream_on_read(udx_stream_t* raw, ssize_t nread, const uv_buf_t* buf) {
-    auto* s = static_cast<hyperdht_stream_s*>(raw->data);
-    if (!s) return;
-    if (nread <= 0) {
-        if (nread < 0 && !s->closed) {
-            s->closed = true;
-            // Destroy triggers stream_on_close_cb which fires on_close and frees
-            udx_stream_destroy(raw);
-        }
-        return;
-    }
-
-    auto* data = reinterpret_cast<const uint8_t*>(buf->base);
-    s->recv_buf.insert(s->recv_buf.end(), data, data + nread);
-
-    // Phase 1: header exchange (59 bytes: uint24_le(56) + 56-byte payload)
-    if (!s->header_received) {
-        if (s->recv_buf.size() >= 59) {
-            uint32_t hdr_len = static_cast<uint32_t>(s->recv_buf[0])
-                             | (static_cast<uint32_t>(s->recv_buf[1]) << 8)
-                             | (static_cast<uint32_t>(s->recv_buf[2]) << 16);
-            if (hdr_len == 56) {
-                s->ss->receive_header(s->recv_buf.data() + 3, 56);
-                s->header_received = true;
-                s->recv_buf.erase(s->recv_buf.begin(), s->recv_buf.begin() + 59);
-                s->check_open();
-            }
-        }
-        if (!s->header_received) return;
-    }
-
-    // Phase 2: decrypt data frames (uint24_le(len) + encrypted_payload)
-    while (s->recv_buf.size() >= 3) {
-        uint32_t frame_len = static_cast<uint32_t>(s->recv_buf[0])
-                           | (static_cast<uint32_t>(s->recv_buf[1]) << 8)
-                           | (static_cast<uint32_t>(s->recv_buf[2]) << 16);
-        if (s->recv_buf.size() < 3 + frame_len) break;
-
-        auto dec = s->ss->decrypt(s->recv_buf.data() + 3, frame_len);
-        s->recv_buf.erase(s->recv_buf.begin(),
-                          s->recv_buf.begin() + 3 + frame_len);
-
-        if (dec.has_value() && s->on_data) {
-            s->on_data(dec->data(), dec->size(), s->userdata);
-        }
-    }
-}
-
-static void stream_on_close_cb(udx_stream_t* raw, int) {
-    auto* s = static_cast<hyperdht_stream_s*>(raw->data);
-    if (!s) return;
-    if (!s->closed) {
-        s->closed = true;
-        if (s->on_close) s->on_close(s->userdata);
-    }
-    // Free the wrapper — but NOT the udx_stream_t yet (libudx still
-    // accesses it after on_close). The finalize callback handles that.
-    raw->data = nullptr;
-    delete s->ss;
+// `on_close` wrapper: fires the user callback exactly once, then frees
+// the wrapper. The Duplex destructor tears down the raw UDX stream.
+static void stream_fire_close(hyperdht_stream_s* s) {
+    if (s->closed) return;
+    s->closed = true;
+    if (s->on_close) s->on_close(s->userdata);
+    // Free the Duplex first — its destructor detaches from raw_stream
+    // and wipes key material. The raw UDX stream is deleted by libudx
+    // itself once its close callback fires (the `delete s;` lambda we
+    // passed to `udx_stream_init` in `create_raw_stream`).
+    delete s->duplex;
+    s->duplex = nullptr;
     delete s;
-}
-
-// Send the SecretStream header over the connected UDX stream.
-static void stream_send_header(hyperdht_stream_s* s) {
-    auto header = s->ss->create_header_message();
-    auto* hdr_buf = new std::vector<uint8_t>(std::move(header));
-    uv_buf_t uv_buf = uv_buf_init(
-        reinterpret_cast<char*>(hdr_buf->data()),
-        static_cast<unsigned int>(hdr_buf->size()));
-
-    auto* wreq = static_cast<udx_stream_write_t*>(
-        calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
-
-    struct HdrCtx { std::vector<uint8_t>* buf; hyperdht_stream_s* stream; };
-    wreq->data = new HdrCtx{hdr_buf, s};
-
-    udx_stream_write(wreq, s->raw, &uv_buf, 1,
-        [](udx_stream_write_t* req, int status, int) {
-            auto* ctx = static_cast<HdrCtx*>(req->data);
-            if (status >= 0) {
-                ctx->stream->header_sent = true;
-                ctx->stream->check_open();
-            }
-            delete ctx->buf;
-            delete ctx;
-            free(req);
-        });
 }
 
 hyperdht_stream_t* hyperdht_stream_open(
@@ -478,118 +417,138 @@ hyperdht_stream_t* hyperdht_stream_open(
 
     if (!dht || !dht->dht || !conn) return nullptr;
 
-    auto* s = new (std::nothrow) hyperdht_stream_s;
-    if (!s) return nullptr;
+    // ---- 1. Obtain a heap-allocated raw UDX stream ----
+    udx_stream_t* raw = nullptr;
+    if (conn->raw_stream) {
+        // Pre-created by the connect/server handshake path. Already
+        // heap-allocated with a self-delete close callback (see
+        // `ClientRawStreamCtx` setup in `dht.cpp` or the server-side
+        // `create_raw_stream()` call). We take ownership transfer.
+        raw = static_cast<udx_stream_t*>(conn->raw_stream);
+        // The handshake path may have stored its own context in data_;
+        // clear it before the Duplex installs its own callbacks. Any
+        // previous firewall callback was consumed when the server sent
+        // its first UDX packet, so the stored context is safe to drop.
+        if (raw->data) {
+            // Defensive: we cannot know the exact type of the previous
+            // `raw->data` from here, so we just null it. If it leaked a
+            // small allocation that's the caller's problem — the
+            // handshake paths that produce `conn->raw_stream` clean up
+            // their own context when they stash the pointer in the
+            // `ConnectResult`.
+            raw->data = nullptr;
+        }
 
+        if (conn->peer_port != 0) {
+            struct sockaddr_in dest{};
+            uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
+            udx_stream_connect(raw, dht->dht->socket().socket_handle(),
+                               conn->remote_udx_id,
+                               reinterpret_cast<const struct sockaddr*>(&dest));
+        }
+    } else {
+        // Fallback: create a new UDX stream ourselves. Matches the
+        // pattern used by `HyperDHT::create_raw_stream()`: heap
+        // allocation + self-delete close callback so libudx deletes
+        // the struct when its async close fires.
+        if (conn->peer_port == 0) return nullptr;
+
+        raw = new (std::nothrow) udx_stream_t{};
+        if (!raw) return nullptr;
+
+        int rc = udx_stream_init(dht->dht->socket().udx_handle(), raw,
+                                 conn->local_udx_id,
+                                 [](udx_stream_t*, int) {},
+                                 [](udx_stream_t* s) { delete s; });
+        if (rc != 0) {
+            delete raw;
+            return nullptr;
+        }
+
+        struct sockaddr_in dest{};
+        uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
+        udx_stream_connect(raw, dht->dht->socket().socket_handle(),
+                           conn->remote_udx_id,
+                           reinterpret_cast<const struct sockaddr*>(&dest));
+    }
+
+    // ---- 2. Build the SecretStreamDuplex handshake context ----
+    hyperdht::secret_stream::DuplexHandshake hs{};
+    std::memcpy(hs.tx_key.data(), conn->tx_key, 32);
+    std::memcpy(hs.rx_key.data(), conn->rx_key, 32);
+    std::memcpy(hs.handshake_hash.data(), conn->handshake_hash, 64);
+    std::memcpy(hs.remote_public_key.data(), conn->remote_public_key, 32);
+    // `public_key` on the Duplex is metadata-only (exposed via a getter,
+    // never touched by the cipher). Use the DHT's default keypair as a
+    // reasonable default — servers that listened under a different
+    // keypair will see a mismatched metadata pubkey, but since no crypto
+    // uses this field the stream still works correctly.
+    hs.public_key = dht->dht->default_keypair().public_key;
+    hs.is_initiator = (conn->is_initiator != 0);
+
+    // ---- 3. Allocate the wrapper + construct the Duplex ----
+    auto* s = new (std::nothrow) hyperdht_stream_s;
+    if (!s) {
+        // OOM after raw stream init: must destroy the raw stream so its
+        // self-delete close callback frees the heap allocation. Covers
+        // both the just-created path and the reused-from-conn path —
+        // either way the raw stream now belongs to nobody and would
+        // leak otherwise.
+        udx_stream_destroy(raw);
+        return nullptr;
+    }
+    s->raw = raw;
     s->dht = dht;
     s->on_open = on_open;
     s->on_data = on_data;
     s->on_close = on_close;
     s->userdata = userdata;
 
-    // Create SecretStream from connection keys
-    hyperdht::noise::Key tx{}, rx{};
-    hyperdht::noise::Hash hash{};
-    memcpy(tx.data(), conn->tx_key, 32);
-    memcpy(rx.data(), conn->rx_key, 32);
-    memcpy(hash.data(), conn->handshake_hash, 64);
+    // `make_duplex_options()` populates `keep_alive_ms` from
+    // `DhtOptions::connection_keep_alive` (default 5000 ms) — this is
+    // the §7 polish wire-up, finally active on the C FFI path as well.
+    auto duplex_opts = dht->dht->make_duplex_options();
+    s->duplex = new hyperdht::secret_stream::SecretStreamDuplex(
+        raw, hs, dht->dht->loop(), duplex_opts);
 
-    s->ss = new hyperdht::secret_stream::SecretStream(
-        tx, rx, hash, conn->is_initiator != 0);
+    // ---- 4. Install event callbacks ----
+    s->duplex->on_connect([s]() {
+        // The header exchange is complete; the encrypted channel is up.
+        if (s->on_open) s->on_open(s->userdata);
+    });
+    s->duplex->on_message([s](const uint8_t* data, size_t len) {
+        if (s->on_data) s->on_data(data, len, s->userdata);
+    });
+    s->duplex->on_end([s]() {
+        // Peer signalled half-close; begin our own teardown so on_close
+        // fires for the user. `end()` is idempotent.
+        if (s->duplex) s->duplex->end();
+    });
+    s->duplex->on_close([s](int /*err*/) {
+        stream_fire_close(s);
+    });
 
-    if (conn->raw_stream) {
-        // Reuse the rawStream pre-created during handshake (both client and server).
-        // Already registered on the socket; firewall ctx already cleaned up.
-        // Matches JS: rawStream.connect(socket, remotePayload.udx.id, port, host)
-        s->raw = static_cast<udx_stream_t*>(conn->raw_stream);
-        // The Server stored context in raw->data during handshake.
-        // We're taking over — clear it (the on_close callback would have
-        // freed it, but we're replacing on_close too).
-        s->raw->data = s;
-        s->raw->on_close = stream_on_close_cb;
-
-        if (conn->peer_port != 0) {
-            struct sockaddr_in dest{};
-            uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
-            // Always use main socket for UDX. The main socket probed the server
-            // (dual-socket probing), so its NAT mapping is open. The pool socket
-            // from holepunch is closed after probe detection.
-            udx_stream_connect(s->raw, dht->dht->socket().socket_handle(),
-                               conn->remote_udx_id,
-                               reinterpret_cast<const struct sockaddr*>(&dest));
-        }
-    } else {
-        // Fallback: create a new UDX stream (no pre-created rawStream)
-        s->raw = &s->raw_stream;
-        udx_stream_init(dht->dht->socket().udx_handle(), s->raw,
-                        conn->local_udx_id, stream_on_close_cb, nullptr);
-        s->raw->data = s;
-
-        if (conn->peer_port == 0) {
-            delete s->ss;
-            delete s;
-            return nullptr;
-        }
-        struct sockaddr_in dest{};
-        uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
-        udx_stream_connect(s->raw, dht->dht->socket().socket_handle(),
-                           conn->remote_udx_id,
-                           reinterpret_cast<const struct sockaddr*>(&dest));
-    }
-
-    // Send SecretStream header
-    stream_send_header(s);
-
-    // Start reading
-    udx_stream_read_start(s->raw, stream_on_read);
-
+    // ---- 5. Fire off the header exchange ----
+    s->duplex->start();
     return s;
 }
 
 int hyperdht_stream_write(hyperdht_stream_t* stream,
                           const uint8_t* data, size_t len) {
-    if (!stream || !stream->open || stream->closed || !data) return -1;
-
-    // Encrypt with SecretStream (XChaCha20-Poly1305)
-    auto encrypted = stream->ss->encrypt(data, len);
-    auto* enc_buf = new std::vector<uint8_t>(std::move(encrypted));
-    uv_buf_t uv_buf = uv_buf_init(
-        reinterpret_cast<char*>(enc_buf->data()),
-        static_cast<unsigned int>(enc_buf->size()));
-
-    auto* wreq = static_cast<udx_stream_write_t*>(
-        calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
-    wreq->data = enc_buf;
-
-    int rc = udx_stream_write(wreq, stream->raw, &uv_buf, 1,
-        [](udx_stream_write_t* req, int, int) {
-            delete static_cast<std::vector<uint8_t>*>(req->data);
-            free(req);
-        });
-
-    if (rc < 0) {
-        delete enc_buf;
-        free(wreq);
-    }
-    return rc >= 0 ? 0 : rc;
+    if (!stream || !stream->duplex || stream->closed || !data) return -1;
+    if (!stream->duplex->is_connected()) return -1;
+    return stream->duplex->write(data, len, nullptr);
 }
 
 void hyperdht_stream_close(hyperdht_stream_t* stream) {
-    if (!stream || stream->closed) return;
-    stream->closed = true;
-
-    // Graceful close: send write_end so the remote knows we're done.
-    // The UDX stream stays alive for data to drain. When both sides
-    // have ended, stream_on_close_cb fires and frees resources.
-    // Do NOT call udx_stream_destroy here — it races with pending
-    // writes and triggers a ref_count assertion in libudx.
-    auto* wreq = static_cast<udx_stream_write_t*>(
-        calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
-    udx_stream_write_end(wreq, stream->raw, nullptr, 0,
-        [](udx_stream_write_t* req, int, int) { free(req); });
+    if (!stream || stream->closed || !stream->duplex) return;
+    // Graceful close: `end()` sends write_end on the underlying UDX
+    // stream; when both sides finish, the Duplex fires `on_close` and
+    // `stream_fire_close` frees the wrapper.
+    stream->duplex->end();
 }
 
 int hyperdht_stream_is_open(const hyperdht_stream_t* stream) {
-    if (!stream) return 0;
-    return stream->open ? 1 : 0;
+    if (!stream || !stream->duplex) return 0;
+    return stream->duplex->is_connected() ? 1 : 0;
 }

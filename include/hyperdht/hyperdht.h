@@ -79,6 +79,22 @@ typedef struct {
 typedef struct {
     uint16_t port;          /**< Bind port (0 = ephemeral) */
     int ephemeral;          /**< 1 = ephemeral node (default), 0 = persistent */
+
+    /**
+     * §2: auto-bootstrap against the 3 canonical public HyperDHT nodes
+     * (88.99.3.86, 142.93.90.113, 138.68.147.8 — all on port 49737).
+     *
+     * 1 = run a one-shot FIND_NODE(our_id) walk at bind() time seeded
+     *     from the public nodes. Populates the routing table with real
+     *     peers so subsequent lookup/announce calls have something to
+     *     walk from. Matches JS `new DHT()` default behaviour.
+     *
+     * 0 = skip the walk. Caller is responsible for populating the
+     *     routing table some other way (pre-seeded `opts.nodes`,
+     *     loopback test peers, etc.). This is the existing default and
+     *     preserves offline-test behaviour.
+     */
+    int use_public_bootstrap;
 } hyperdht_opts_t;
 
 /** Connection info — passed to connect and server callbacks */

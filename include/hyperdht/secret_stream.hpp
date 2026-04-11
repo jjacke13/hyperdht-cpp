@@ -284,6 +284,11 @@ public:
     uint64_t raw_bytes_read()    const { return raw_bytes_read_; }
     uint64_t raw_bytes_written() const { return raw_bytes_written_; }
 
+    // Current timer values (delegates to internal SecretStream). Useful
+    // for tests that verify `DuplexOptions::keep_alive_ms` was applied.
+    uint64_t keep_alive_ms() const { return crypto_.keep_alive(); }
+    uint64_t timeout_ms()    const { return crypto_.timeout(); }
+
     // Access the underlying raw UDX stream (read-only). Caller should NOT
     // install their own callbacks while the Duplex owns the stream.
     udx_stream_t* raw_stream() { return raw_stream_; }

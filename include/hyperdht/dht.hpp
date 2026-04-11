@@ -37,10 +37,25 @@
 #include "hyperdht/router.hpp"
 #include "hyperdht/rpc.hpp"
 #include "hyperdht/rpc_handlers.hpp"
+#include "hyperdht/secret_stream.hpp"
 #include "hyperdht/server.hpp"
 #include "hyperdht/socket_pool.hpp"
 
 namespace hyperdht {
+
+// ---------------------------------------------------------------------------
+// JS-default constants exposed so tests and callers can reference the
+// same values without hardcoding literals across multiple files.
+// ---------------------------------------------------------------------------
+
+// JS: `NoiseSecretStream` default keep-alive (5 s) — derived from the
+// `dht.connectionKeepAlive` field in `dht-rpc/index.js:73` /
+// `@hyperswarm/secret-stream/index.js` defaults. The `DhtOptions`
+// default below sources from this constant so test code that bypasses
+// `HyperDHT` (e.g. `test/test_live_connect.cpp` which drives
+// `rpc::RpcSocket` directly) can reference the same value without
+// drifting when the default changes.
+inline constexpr uint64_t DEFAULT_CONNECTION_KEEP_ALIVE_MS = 5000;
 
 // ---------------------------------------------------------------------------
 // Options for HyperDHT construction
@@ -75,15 +90,16 @@ struct DhtOptions {
     // default 5000). JS applies this to every `NoiseSecretStream` at stream
     // construction time (connect.js:45).
     //
-    // IMPORTANT: C++ does NOT automatically wrap the connected rawStream
-    // in a `SecretStreamDuplex` — callers construct the Duplex themselves
-    // (see `test/test_live_connect.cpp`). To match JS keep-alive behavior,
-    // callers must read `HyperDHT::connection_keep_alive()` and pass it
-    // to `SecretStreamDuplex::set_keep_alive()` after construction.
+    // C++ does NOT auto-wrap the raw stream in a `SecretStreamDuplex` —
+    // callers construct the Duplex themselves (see
+    // `test/test_live_connect.cpp`). The canonical way to preserve JS
+    // parity for keep-alive is:
     //
-    // Tracked as a §7 polish follow-up: auto-wrap clients in a Duplex
-    // with the DHT's default keep-alive. See docs/JS-PARITY-GAPS.md.
-    uint64_t connection_keep_alive = 5000;
+    //     auto duplex_opts = dht.make_duplex_options();
+    //     auto* duplex = new SecretStreamDuplex(raw, hs, loop, duplex_opts);
+    //
+    // which populates `DuplexOptions::keep_alive_ms` from this field.
+    uint64_t connection_keep_alive = DEFAULT_CONNECTION_KEEP_ALIVE_MS;
 
     // Throttling for random-NAT holepunch attempts. JS defaults:
     //   randomPunchInterval: 20000ms (min gap between random punches)
@@ -453,6 +469,19 @@ public:
     uint64_t max_age_ms() const { return opts_.max_age_ms; }
     uint64_t storage_ttl_ms() const { return opts_.storage_ttl_ms; }
 
+    // §7 polish: returns a `SecretStreamDuplex::DuplexOptions` populated
+    // from this DHT's configuration. Callers that construct a Duplex
+    // from a connect() result should use this helper instead of building
+    // `DuplexOptions{}` themselves — doing so automatically applies the
+    // DHT's `connection_keep_alive` setting, matching JS's
+    // `NoiseSecretStream({..., keepAlive: dht.connectionKeepAlive})` in
+    // `hyperdht/lib/connect.js:41-46`.
+    secret_stream::DuplexOptions make_duplex_options() const {
+        secret_stream::DuplexOptions opts;
+        opts.keep_alive_ms = opts_.connection_keep_alive;
+        return opts;
+    }
+
 private:
     uv_loop_t* loop_;
     DhtOptions opts_;
@@ -466,9 +495,6 @@ private:
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);  // Sentinel for async safety
     holepunch::PunchStats punch_stats_;
     std::unique_ptr<socket_pool::SocketPool> socket_pool_;
-
-    // Relay address cache for reconnect (JS: _relayAddressesCache)
-    std::unordered_map<std::string, std::vector<compact::Ipv4Address>> relay_cache_;
 
     // §2 bootstrap walk state. `bootstrap_query_` holds a strong reference
     // so the shared_ptr<Query> stays alive until its on_done fires.

@@ -1181,3 +1181,58 @@ TEST(HyperDHT, RefreshStartsBackgroundQueryWithoutCrashing) {
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }
+
+// ---------------------------------------------------------------------------
+// §7 polish — `connection_keep_alive` auto-apply helper.
+//
+// `HyperDHT::make_duplex_options()` returns a `DuplexOptions` populated
+// with `keep_alive_ms = connection_keep_alive()`. JS parity: creating a
+// `NoiseSecretStream` in `hyperdht/lib/connect.js:41-46` passes
+// `{ keepAlive: dht.connectionKeepAlive }` directly.
+// ---------------------------------------------------------------------------
+
+TEST(HyperDHT, MakeDuplexOptionsReflectsConnectionKeepAlive) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    DhtOptions opts;
+    opts.connection_keep_alive = 7500;
+    HyperDHT dht(&loop, opts);
+
+    auto duplex_opts = dht.make_duplex_options();
+    EXPECT_EQ(duplex_opts.keep_alive_ms, 7500u);
+    EXPECT_EQ(duplex_opts.timeout_ms, 0u);  // Left at default, JS also leaves timeout out of the connect-time opts
+
+    // Default construction should round-trip the JS default of 5000 ms.
+    HyperDHT dht_default(&loop);
+    EXPECT_EQ(dht_default.make_duplex_options().keep_alive_ms, 5000u);
+
+    dht.destroy();
+    dht_default.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// §7 polish — `HyperDHT::HyperDHT(opts)` passes `opts.max_age_ms` into
+// `StorageCacheConfig::ann_ttl_ms` when constructing the internal
+// RpcHandlers. The end-to-end store TTL propagation is verified at the
+// handler layer in test_rpc_handlers.cpp; here we just assert the
+// DhtOptions field round-trips through the public accessor.
+// ---------------------------------------------------------------------------
+
+TEST(HyperDHT, MaxAgeMsAccessorMatchesConfiguredValue) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    DhtOptions opts;
+    opts.max_age_ms = 60 * 1000;  // 1 minute, distinct from JS default 20 min.
+    HyperDHT dht(&loop, opts);
+
+    EXPECT_EQ(dht.max_age_ms(), 60u * 1000)
+        << "DhtOptions::max_age_ms did not round-trip through the accessor";
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}

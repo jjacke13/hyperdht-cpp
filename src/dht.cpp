@@ -84,11 +84,15 @@ HyperDHT::HyperDHT(uv_loop_t* loop, DhtOptions opts)
     // §7: thread storage cache tuning into the handlers.
     // max_size governs entry count (JS: opts.maxSize); ttl_ms is the
     // storage-specific 48h default (JS: hyperdht/index.js:611,615 —
-    // `opts.maxAge || 48h` for mutable/immutable). max_age_ms is used
-    // by other caches once they're added, not the storage caches.
+    // `opts.maxAge || 48h` for mutable/immutable); ann_ttl_ms is the
+    // per-announcement TTL that JS sources from `opts.maxAge` for the
+    // `persistent.records` cache (hyperdht/index.js:607, defaultMaxAge
+    // = 20 min). Our `max_age_ms` option is the same knob, so plumb it
+    // through here to close the §7 polish gap.
     rpc::StorageCacheConfig cache_config;
     cache_config.max_size = opts_.max_size;
     cache_config.ttl_ms = opts_.storage_ttl_ms;
+    cache_config.ann_ttl_ms = opts_.max_age_ms;
     handlers_ = std::make_unique<rpc::RpcHandlers>(
         *socket_, &router_, cache_config);
     handlers_->install();

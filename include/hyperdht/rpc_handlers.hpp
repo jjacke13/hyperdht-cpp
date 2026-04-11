@@ -38,6 +38,18 @@ struct StorageCacheConfig {
     // (index.js:611,615) while other caches use 20 min. We expose one
     // `ttl_ms` for the storage caches — default 48h to match JS behavior.
     uint64_t ttl_ms = 48ULL * 60 * 60 * 1000;
+
+    // Per-announce TTL in ms. JS `persistent.records` uses `opts.maxAge`
+    // (default 20 min — `defaultMaxAge` in hyperdht/index.js:595) rather
+    // than the 48h storage TTL. Matches the `HyperDHT::max_age_ms`
+    // option knob so a caller that tunes `opts.max_age_ms` has their
+    // announce store honour it instead of the hardcoded constant in
+    // `announce::DEFAULT_TTL_MS`. §7 polish follow-up.
+    //
+    // Default sourced from `announce::DEFAULT_TTL_MS` so the raw literal
+    // is only defined in one place — changing either constant keeps them
+    // in lockstep automatically.
+    uint64_t ann_ttl_ms = announce::DEFAULT_TTL_MS;
 };
 
 // ---------------------------------------------------------------------------
@@ -91,6 +103,7 @@ private:
     static constexpr uint64_t GC_INTERVAL_MS = 60000;  // 1 minute
 
     uint64_t storage_ttl_ms_;
+    uint64_t ann_ttl_ms_;
     LruCache<std::string, std::vector<uint8_t>> mutables_;
     LruCache<std::string, std::vector<uint8_t>> immutables_;
     uv_timer_t* gc_timer_ = nullptr;

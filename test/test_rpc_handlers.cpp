@@ -351,6 +351,70 @@ TEST(RpcHandlers, AnnounceValidSignatureAccepted) {
     EXPECT_TRUE(ctx.announce_accepted) << "Valid signature should be accepted";
 }
 
+// ---------------------------------------------------------------------------
+// §7 polish — `StorageCacheConfig::ann_ttl_ms` is honoured by
+// `handle_announce`: each stored `PeerAnnouncement.ttl` reflects the
+// config value rather than the hardcoded `announce::DEFAULT_TTL_MS`.
+// This matches JS `persistent.records: { maxAge: opts.maxAge }` in
+// `hyperdht/index.js:607`, where the per-entry TTL comes from the
+// caller's `opts.maxAge`.
+// ---------------------------------------------------------------------------
+
+TEST(RpcHandlers, AnnTtlMsPropagatesToStoredEntry) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    NodeId server_id{};
+    server_id.fill(0x11);
+    RpcSocket server(&loop, server_id);
+    server.bind(0);
+
+    // Pick a distinctive non-default value. The hardcoded fallback is
+    // 20 minutes (announce::DEFAULT_TTL_MS); if the plumbing regressed
+    // we'd see that instead of 12345.
+    StorageCacheConfig cfg;
+    cfg.ann_ttl_ms = 12345;
+    RpcHandlers handlers(server, nullptr, cfg);
+    handlers.install();
+
+    NodeId client_id{};
+    client_id.fill(0x22);
+    RpcSocket client(&loop, client_id);
+    client.bind(0);
+
+    hyperdht::noise::Seed seed{};
+    seed.fill(0x99);
+    auto kp = hyperdht::noise::generate_keypair(seed);
+
+    AnnounceCtx ctx;
+    ctx.server = &server;
+    ctx.client = &client;
+    ctx.handlers = &handlers;
+
+    std::array<uint8_t, 32> target{};
+    target.fill(0xAA);
+
+    run_announce_test(ctx, loop, [&kp, &target](AnnounceCtx* c) {
+        auto value = build_signed_announce(kp, target, c->server_id, c->token);
+        send_announce(c, value);
+    });
+
+    ASSERT_TRUE(ctx.announce_accepted)
+        << "signed announce should have been accepted";
+
+    // Read the stored entry back via the handlers' announce store accessor
+    // and verify its TTL reflects our config value.
+    hyperdht::announce::TargetKey key{};
+    std::copy(target.begin(), target.end(), key.begin());
+    auto stored = handlers.store().get(key);
+    ASSERT_EQ(stored.size(), 1u)
+        << "exactly one stored entry expected after one ANNOUNCE";
+    EXPECT_EQ(stored[0].ttl, 12345u)
+        << "RpcHandlers did not honour StorageCacheConfig::ann_ttl_ms — "
+           "the announce TTL should come from the config, not the hardcoded "
+           "announce::DEFAULT_TTL_MS";
+}
+
 TEST(RpcHandlers, AnnounceTamperedSignatureRejected) {
     uv_loop_t loop;
     uv_loop_init(&loop);

@@ -32,6 +32,7 @@ RpcHandlers::RpcHandlers(RpcSocket& socket, router::Router* router,
     : socket_(socket),
       router_(router),
       storage_ttl_ms_(cache_config.ttl_ms),
+      ann_ttl_ms_(cache_config.ann_ttl_ms),
       // JS: index.js:610-615 — mutable/immutable each get maxSize/2 entries.
       // Guard against max_size=0 by using at least 1 entry per cache.
       mutables_(std::max<size_t>(1, cache_config.max_size / 2)),
@@ -490,13 +491,17 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
     announce::TargetKey target{};
     std::copy(req.target->begin(), req.target->end(), target.begin());
 
-    // Store the announcement
+    // Store the announcement. `ann_ttl_ms_` is plumbed from
+    // `DhtOptions::max_age_ms` via `StorageCacheConfig`, matching the JS
+    // `persistent.records: { maxAge: opts.maxAge }` pattern in
+    // `hyperdht/index.js:607,599`. Defaults to 20 min when the caller
+    // leaves the option at its default value.
     assert(socket_.loop() != nullptr);
     announce::PeerAnnouncement stored;
     stored.from = req.from.addr;
     stored.value = *req.value;
     stored.created_at = uv_now(socket_.loop());
-    stored.ttl = announce::DEFAULT_TTL_MS;
+    stored.ttl = ann_ttl_ms_;
 
     store_.put(target, stored);
 

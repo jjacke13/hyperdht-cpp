@@ -85,29 +85,16 @@ Listed bottom-up by layer.
 | `createSecretStream` | 41, 827-829 | LOW priority factory hook; C FFI doesn't expose |
 | `createHandshake` | 68, 823-825 | LOW priority factory hook; direct call is clearer |
 
-**§6 polish follow-ups:**
-- LAN shortcut: apply `isReserved`-style filter to server addresses before
-  matching (currently passes addresses through as-is — worst case is a
-  wasted ping to a reserved address).
-- LAN shortcut: C++ uses NAT-sampler host vs JS `clientAddress.host` (from
-  peerHandshake reply's `to` field). Close enough but not identical.
+**§6 polish follow-ups: verified non-impactful, not implementing** — see
+"Deferred as non-impactful" below.
 
-#### §7 — `DhtOptions` DONE (polish follow-ups remain)
+#### §7 — `DhtOptions` DONE
 
 **Present:** `port`, `host`, `bootstrap`, `nodes`, `default_keypair`,
 `seed`, `ephemeral`, `connection_keep_alive`, `random_punch_interval`,
 `defer_random_punch`, `max_size`, `max_age_ms`, `storage_ttl_ms`.
 
-**§7 polish follow-ups:**
-- `connection_keep_alive` is stored + exposed via accessor but NOT
-  auto-applied to any `SecretStreamDuplex` — C++ callers wrap streams
-  themselves. Follow-up: auto-wrap client streams in a Duplex and pass
-  the DHT's default keep-alive at construction.
-- `max_age_ms` governs non-storage caches (router forwards, records,
-  refreshes, bumps). None of those exist in C++ yet — the field is stored
-  for forward compatibility. When those caches land, they should read
-  `opts_.max_age_ms`. Storage TTL is controlled independently via
-  `storage_ttl_ms` (default 48h, matching JS parity).
+**Both §7 polish follow-ups are complete** — see "Completed" section.
 
 ---
 
@@ -153,6 +140,30 @@ Listed bottom-up by layer.
 - **§4 `FROM_SECOND_RELAY`** — rare two-hop relay edge case. `src/router.cpp:110-116` comments "NOT yet implemented". Never observed in any real test.
 - **`refresh-chain.js`** — unused in hyperdht 6.29.1.
 
+## Deferred as non-impactful (verified safe to skip)
+
+- **§6 LAN shortcut `isReserved` filter** — JS uses `bogon.isReserved` to
+  drop multicast / TEST-NET / broadcast entries from the server's advertised
+  addresses before `match_address`. C++ doesn't filter. Verified safe:
+  (a) `holepunch::local_addresses()` already skips `is_internal` interfaces
+  so the client never has loopback in its local list, and
+  (b) `match_address` is best-octet-prefix matching — reserved ranges can't
+  match real client interfaces anyway. Worst case is a wasted PING to a
+  malicious/buggy server's garbage address, which then times out and falls
+  through to holepunch. Zero observable bug.
+- **§6 LAN shortcut `clientAddress.host` vs NAT sampler** — JS reads
+  `clientAddress.host` from THIS peerHandshake response's `to` field
+  (`connect.js:234`); C++ reads the NAT sampler's top-voted host instead
+  (`dht.cpp:732-735`). Verified functionally equivalent in practice:
+  `RpcSocket::handle_message` feeds every response's wire `to` field into
+  `NatSampler::add` BEFORE firing `on_response` (`src/rpc.cpp:558-579`),
+  and `NatSampler::add` updates `host_` on the very first sample
+  (`src/nat_sampler.cpp:115-118`). So by the time the LAN shortcut check
+  runs, the sampler has already absorbed the current peer's observation.
+  The only divergence is a rare multi-peer edge case where previous
+  samples from OTHER peers voted for a different top IP — which falls
+  through to holepunch with no correctness impact.
+
 ---
 
 ## Architectural differences that are FINE (not gaps)
@@ -179,6 +190,7 @@ Bottom-up through the stack:
 
 - **§1 query engine minor gaps** — `closest_nodes()` convenience getter + cold-start slowdown (`_slowdown` + `_fromTable`) + `<K/4`-success table-retry + `add_seed_node()` API for `opts.nodes` / `opts.closestReplies` parity. Fixed a latent `std::optional<uint32_t> == 0` bug that counted every successful reply as an error, and fixed a `push_closest` duplicate-erase bug that removed the wrong element when the duplicate wasn't at the tail. Deferred: the additive `_slow` oncycle counter (requires new RpcSocket hook) and `_open` bootstrap top-up (callers must use `add_bootstrap()`). 5 new GoogleTests + live bootstrap walk against real HyperDHT public nodes (49 replies, 980 closer nodes, 20 final). JS refs: `dht-rpc/lib/query.js:32-36, 47-67, 72-80, 111-120, 122-131, 179, 189-191, 200-205, 259-296, 283-285, 334-351`.
 - **§2 bootstrap walk activation** — `HyperDHT::bind()` now kicks off a one-shot `FIND_NODE(our_id)` background walk seeded from `opts.bootstrap` (empty ⇒ no walk, preserving existing offline-test contract). On completion the underlying `RpcSocket` is marked bootstrapped, enabling ping-and-swap, and an optional `on_bootstrapped(cb)` fires. `HyperDHT::refresh()` is wired to `RpcSocket::on_refresh_` so the background tick drives a periodic background query. New `HyperDHT::default_bootstrap_nodes()` returns the 3 public peers. Live smoke test against the real public HyperDHT returns 20 closest replies and populates the routing table with 53 real peers in ~5 seconds. 5 new offline GoogleTests + 1 new live smoke test. JS refs: `dht-rpc/lib/index.js:379-433, 435-438, 965-979`, `hyperdht/lib/constants.js:16-20`.
+- **§7 polish (both items)** — (1) `connection_keep_alive` auto-apply: new `HyperDHT::make_duplex_options()` helper returns `DuplexOptions{ keep_alive_ms = connection_keep_alive() }` so callers constructing a `SecretStreamDuplex` from a connect result get the configured value automatically. New `DEFAULT_CONNECTION_KEEP_ALIVE_MS = 5000` constant shared between `DhtOptions::connection_keep_alive` default and `test_live_connect.cpp`. New `SecretStreamDuplex::keep_alive_ms()` / `timeout_ms()` const getters for introspection. (2) `max_age_ms` for announce store: `StorageCacheConfig` gains an `ann_ttl_ms` field (default `announce::DEFAULT_TTL_MS`), `RpcHandlers` stores it in `ann_ttl_ms_` and applies it when populating `PeerAnnouncement.ttl` in `handle_announce`. `HyperDHT` constructor plumbs `opts_.max_age_ms → cache_config.ann_ttl_ms`. Dead `HyperDHT::relay_cache_` member deleted. 3 new GoogleTests (helper round-trip, max_age accessor round-trip, end-to-end announce→stored TTL via real signed ANNOUNCE over loopback). JS refs: `hyperdht/lib/connect.js:41-46`, `hyperdht/index.js:594-620`.
 
 ---
 

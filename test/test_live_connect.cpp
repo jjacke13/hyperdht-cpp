@@ -25,6 +25,7 @@
 #include <uv.h>
 
 #include "hyperdht/compact.hpp"
+#include "hyperdht/dht.hpp"  // DEFAULT_CONNECTION_KEEP_ALIVE_MS constant
 #include "hyperdht/dht_ops.hpp"
 #include "hyperdht/holepunch.hpp"
 #include "hyperdht/noise_wrap.hpp"
@@ -191,8 +192,17 @@ TEST(LiveConnect, FullPipeline) {
         hs.remote_public_key = state.hs_result.remote_public_key;
         hs.is_initiator = true;
 
+        // §7 polish: apply the JS-default connection keep-alive to the
+        // constructed Duplex. In normal HyperDHT usage callers should
+        // call `dht.make_duplex_options()` to get this populated from
+        // the DHT's `DhtOptions::connection_keep_alive`. This test
+        // bypasses HyperDHT entirely (it drives `rpc::RpcSocket`
+        // directly), so we source the same constant used by the
+        // DhtOptions default to avoid drift.
+        secret_stream::DuplexOptions duplex_opts;
+        duplex_opts.keep_alive_ms = hyperdht::DEFAULT_CONNECTION_KEEP_ALIVE_MS;
         state.duplex = new secret_stream::SecretStreamDuplex(
-            state.stream, hs, &loop, secret_stream::DuplexOptions{});
+            state.stream, hs, &loop, duplex_opts);
 
         printf("  Our stream ID: %s\n",
                to_hex(state.duplex->local_id().data(), 8).c_str());

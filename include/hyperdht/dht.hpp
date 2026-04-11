@@ -209,8 +209,58 @@ public:
     HyperDHT(const HyperDHT&) = delete;
     HyperDHT& operator=(const HyperDHT&) = delete;
 
-    // Bind the UDP socket (called automatically by connect/listen if needed)
+    // Bind the UDP socket (called automatically by connect/listen if needed).
+    //
+    // When `opts.bootstrap` is non-empty, `bind()` additionally kicks off a
+    // one-shot background `FIND_NODE(our_id)` walk seeded from the supplied
+    // bootstrap nodes (JS `_bootstrap()` in dht-rpc/index.js:379-433). On
+    // completion the underlying `RpcSocket` is marked bootstrapped — this
+    // is what enables ping-and-swap for full buckets, and it is what
+    // `on_bootstrapped(cb)` fires on. When `opts.bootstrap` is empty the
+    // walk is skipped and callers are responsible for populating the
+    // routing table some other way (pre-seeded `opts.nodes`, manual
+    // `add_bootstrap()` on individual queries, loopback test peers, etc.).
     int bind();
+
+    // The 3 canonical public HyperDHT bootstrap nodes (JS `BOOTSTRAP_NODES`
+    // in `hyperdht/lib/constants.js:16-20`). Callers that want JS's default
+    // auto-bootstrap behaviour should set `opts.bootstrap =
+    // HyperDHT::default_bootstrap_nodes()` before construction.
+    static const std::vector<compact::Ipv4Address>& default_bootstrap_nodes();
+
+    // Callback fired once when the initial bootstrap walk completes (the
+    // RpcSocket is now marked bootstrapped and ping-and-swap is enabled).
+    //
+    // JS reference: `dht-rpc/index.js:404` emits `'ready'` on the DHT's
+    // EventEmitter. Two deliberate divergences from JS:
+    //   1. **Late install fires synchronously.** Node's EventEmitter does
+    //      not replay past events, so a `.once('ready', cb)` installed
+    //      *after* the emit never fires in JS. C++ instead fires the
+    //      callback synchronously from inside `on_bootstrapped()` if the
+    //      walk has already completed. This is a convenience extension,
+    //      not JS parity. Callers that care about the ordering should
+    //      install the callback BEFORE `bind()`.
+    //   2. **Single slot, last-writer-wins.** `on_bootstrapped` stores
+    //      exactly one callback. Installing a second callback silently
+    //      replaces the first. (This matches the one-listener use case
+    //      that JS `once('ready')` is typically used for; if you need
+    //      a broadcast, maintain your own listener list in userspace.)
+    //
+    // No-op if `opts.bootstrap` is empty — without seeds there is no
+    // walk to complete and the flag stays false.
+    using BootstrappedCallback = std::function<void()>;
+    void on_bootstrapped(BootstrappedCallback cb);
+    bool is_bootstrapped() const {
+        return socket_ && socket_->is_bootstrapped();
+    }
+
+    // Run a one-shot background refresh query (JS `refresh()` in
+    // dht-rpc/index.js:435-438). Targets a random node from the routing
+    // table, falling back to our own id if the table is empty. Called
+    // automatically every REFRESH_TICKS by the RpcSocket background tick
+    // once `bind()` has wired the callback. Public so callers can force
+    // an extra refresh if they need one.
+    void refresh();
 
     // --- Client API ---
 
@@ -420,11 +470,25 @@ private:
     // Relay address cache for reconnect (JS: _relayAddressesCache)
     std::unordered_map<std::string, std::vector<compact::Ipv4Address>> relay_cache_;
 
+    // §2 bootstrap walk state. `bootstrap_query_` holds a strong reference
+    // so the shared_ptr<Query> stays alive until its on_done fires.
+    // `on_bootstrapped_` is called once when the walk completes.
+    // `refresh_queries_` collects the periodic refresh walks; entries are
+    // pruned when their on_done fires.
+    BootstrappedCallback on_bootstrapped_;
+    std::shared_ptr<query::Query> bootstrap_query_;
+    std::vector<std::shared_ptr<query::Query>> refresh_queries_;
+
     void ensure_bound();
     void do_connect(const noise::PubKey& remote_pk,
                     const noise::Keypair& keypair,
                     const ConnectOptions& opts,
                     ConnectCallback on_done);
+
+    // §2: one-shot background FIND_NODE(our_id) seeded from
+    // opts_.bootstrap. Caller is bind(); see JS _bootstrap()/
+    // _backgroundQuery() in dht-rpc/index.js:379-433, 965-979.
+    void start_bootstrap_walk();
 };
 
 }  // namespace hyperdht

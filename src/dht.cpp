@@ -6,12 +6,14 @@
 
 #include <sodium.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 
 #include "hyperdht/announce_sig.hpp"
 #include "hyperdht/debug.hpp"
 #include "hyperdht/holepunch.hpp"
+#include "hyperdht/messages.hpp"
 #include "hyperdht/peer_connect.hpp"
 
 // Context stored in client rawStream->data during handshake→connection window.
@@ -129,18 +131,227 @@ HyperDHT::~HyperDHT() {
 // bind
 //
 // JS: .analysis/js/dht-rpc/index.js:157-159 (DHT.bind delegates to io.bind)
+//     .analysis/js/dht-rpc/index.js:82-84 (DHT ctor kicks off `_bootstrap`
+//         immediately — C++ defers the walk to bind() since bind is
+//         explicit in the C++ API rather than implicit in the ctor).
+//     .analysis/js/dht-rpc/index.js:379-433 (`_bootstrap` — runs
+//         `_backgroundQuery(table.id)` then flips `bootstrapped = true`).
+//     .analysis/js/dht-rpc/index.js:965-979 (`_backgroundQuery`).
+//
+// C++ diffs from JS:
+//   - JS DHT auto-bootstraps at construction against the built-in public
+//     BOOTSTRAP_NODES unless the caller passes `opts.bootstrap === false`.
+//     C++ instead keeps the bootstrap list empty by default (preserving
+//     the contract that existing offline tests rely on) and only runs the
+//     walk when `opts.bootstrap` is non-empty. Callers who want JS's
+//     default behaviour pass `opts.bootstrap =
+//     HyperDHT::default_bootstrap_nodes()` explicitly.
+//   - JS runs up to two bootstrap passes to drive NAT detection in the
+//     same flow. C++ runs exactly one; NAT detection is the separate §15
+//     follow-up.
 // ---------------------------------------------------------------------------
 
 int HyperDHT::bind() {
     if (bound_) return 0;
     // §7: pass opts.host so multi-homed or specific-interface binds work.
     int rc = socket_->bind(opts_.port, opts_.host);
-    if (rc == 0) bound_ = true;
-    return rc;
+    if (rc != 0) return rc;
+    bound_ = true;
+
+    // §2: wire the refresh timer callback. RpcSocket decrements
+    // REFRESH_TICKS on its background tick and fires this callback when
+    // the counter reaches zero. Installing unconditionally mirrors JS:
+    // `refresh()` is a no-op when the table is empty (the walk finds no
+    // seeds and completes immediately).
+    socket_->on_refresh([this]() { this->refresh(); });
+
+    // §2: kick off the initial bootstrap walk if we have seeds. The walk
+    // runs in the background; callers that need a barrier can install an
+    // `on_bootstrapped()` callback.
+    if (!opts_.bootstrap.empty()) {
+        start_bootstrap_walk();
+    }
+
+    return 0;
 }
 
 void HyperDHT::ensure_bound() {
     if (!bound_) bind();
+}
+
+// ---------------------------------------------------------------------------
+// §2: default bootstrap nodes — the 3 canonical public HyperDHT peers.
+//
+// JS: .analysis/js/hyperdht/lib/constants.js:16-20 (`BOOTSTRAP_NODES`).
+// The `@`-prefixed IP hint is a pinning shortcut for `_resolveBootstrapNodes`
+// (dht-rpc/index.js:877-898); C++ stores pre-resolved addresses so the
+// fallback-host fields are flattened into the IP half of each entry.
+// ---------------------------------------------------------------------------
+
+const std::vector<compact::Ipv4Address>& HyperDHT::default_bootstrap_nodes() {
+    static const std::vector<compact::Ipv4Address> nodes = {
+        compact::Ipv4Address::from_string("88.99.3.86", 49737),
+        compact::Ipv4Address::from_string("142.93.90.113", 49737),
+        compact::Ipv4Address::from_string("138.68.147.8", 49737),
+    };
+    return nodes;
+}
+
+// ---------------------------------------------------------------------------
+// §2: on_bootstrapped — register the "bootstrap walk finished" callback.
+//
+// JS: .analysis/js/dht-rpc/index.js:404 (`this.emit('ready')`). In JS this
+// fires at most once, after `_bootstrap()` flips `bootstrapped = true`.
+// C++ preserves the same once-only semantic and additionally fires the
+// callback synchronously if the walk has already completed by the time
+// the caller installs the hook.
+// ---------------------------------------------------------------------------
+
+void HyperDHT::on_bootstrapped(BootstrappedCallback cb) {
+    on_bootstrapped_ = std::move(cb);
+    if (on_bootstrapped_ && socket_ && socket_->is_bootstrapped()) {
+        // Walk already finished — fire immediately so callers don't
+        // miss the event due to late registration.
+        auto once = std::move(on_bootstrapped_);
+        once();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §2: start_bootstrap_walk — one-shot FIND_NODE(our_id) seeded from
+// `opts_.bootstrap`. On success the RpcSocket is flagged bootstrapped.
+//
+// JS: .analysis/js/dht-rpc/index.js:379-433 (`_bootstrap`).
+//     .analysis/js/dht-rpc/index.js:965-979 (`_backgroundQuery`).
+//
+// C++ diffs from JS:
+//   - JS uses the async-iterator `_resolveBootstrapNodes()` to DNS-resolve
+//     hostnames and fall back between pinned IP / DNS lookup. C++ expects
+//     pre-resolved IPs in `opts_.bootstrap`; no async resolve step.
+//   - JS's `_bootstrap` also drives the quick NAT heuristic (PING_NAT on
+//     the first responder) and loops up to twice if NAT sampling is
+//     pending. C++ currently runs a single pass — NAT detection is a §15
+//     follow-up.
+// ---------------------------------------------------------------------------
+
+void HyperDHT::start_bootstrap_walk() {
+    // Target = our own id (JS `_backgroundQuery(this.table.id)`). Walking
+    // toward ourselves fills the routing table with the k closest nodes
+    // to us, which is what every downstream query depends on.
+    auto target = socket_->table().id();
+
+    auto q = query::Query::create(*socket_, target, messages::CMD_FIND_NODE);
+    q->set_internal(true);
+
+    // JS `_backgroundQuery:968`: `Math.min(concurrency, Math.max(2,
+    // concurrency/8))`. With the default concurrency=10 that collapses to
+    // `max(2, 1) = 2`. Keeping background queries narrow prevents the
+    // bootstrap traffic from hogging the congestion window.
+    const int background_concurrency =
+        std::max(2, query::DEFAULT_CONCURRENCY / 8);
+    q->set_concurrency(background_concurrency);
+
+    // Seed the walk from the supplied bootstrap list. `add_bootstrap`
+    // inserts with a zeroed id so the pop-loop always visits them even
+    // though they never land in `closest_replies_`. Matches JS's
+    // `_resolveBootstrapNodes → _addPending(node, null)` flow.
+    for (const auto& addr : opts_.bootstrap) {
+        q->add_bootstrap(addr);
+    }
+
+    DHT_LOG("  [dht] bootstrap: walking with %zu seed node(s), concurrency=%d\n",
+            opts_.bootstrap.size(), background_concurrency);
+
+    // Capture alive sentinel so the on_done lambda is a no-op if the DHT
+    // has been destroyed by the time the walk finishes.
+    std::weak_ptr<bool> weak_alive = alive_;
+    q->on_done([this, weak_alive](const std::vector<query::QueryReply>& closest) {
+        if (weak_alive.expired()) return;
+        // JS `_bootstrap:402` — flip the flag, then emit `ready`.
+        socket_->set_bootstrapped(true);
+        DHT_LOG("  [dht] bootstrap: walk complete, %zu closest replies, "
+                "routing table size=%zu\n",
+                closest.size(), socket_->table().size());
+
+        // Drop our strong ref BEFORE firing the user callback. This way,
+        // if the user's `on_bootstrapped` callback re-enters HyperDHT
+        // (e.g. calls `destroy()` or starts a new query), it never sees
+        // a non-null `bootstrap_query_` after the walk has conceptually
+        // finished. The Query itself is pinned for the duration of this
+        // callback by Query's internal `shared_from_this()` self-capture,
+        // so dropping our reference here is safe.
+        bootstrap_query_.reset();
+
+        if (on_bootstrapped_) {
+            auto once = std::move(on_bootstrapped_);
+            once();
+        }
+    });
+
+    bootstrap_query_ = q;
+    q->start();
+}
+
+// ---------------------------------------------------------------------------
+// §2: refresh — periodic background FIND_NODE walk against a random
+// routing-table entry, falling back to our own id if the table is empty.
+//
+// JS: .analysis/js/dht-rpc/index.js:435-438 (`refresh`).
+//
+// C++ diffs from JS:
+//   - JS attaches a noop error handler to the stream (`.on('error', noop)`).
+//     C++ Query has no error channel at this layer — failures are silent
+//     by design.
+//   - JS does NOT gate on bootstrapped; neither do we. An unbootstrapped
+//     refresh will find zero seeds and complete immediately, which is
+//     harmless.
+// ---------------------------------------------------------------------------
+
+void HyperDHT::refresh() {
+    if (destroyed_ || !bound_) return;
+
+    // JS: `const node = this.table.random();
+    //       ...backgroundQuery(node ? node.id : this.table.id)`.
+    routing::NodeId target;
+    if (auto* rnd = socket_->table().random()) {
+        target = rnd->id;
+    } else {
+        target = socket_->table().id();
+    }
+
+    auto q = query::Query::create(*socket_, target, messages::CMD_FIND_NODE);
+    q->set_internal(true);
+    const int background_concurrency =
+        std::max(2, query::DEFAULT_CONCURRENCY / 8);
+    q->set_concurrency(background_concurrency);
+
+    DHT_LOG("  [dht] refresh: background query, table size=%zu\n",
+            socket_->table().size());
+
+    std::weak_ptr<bool> weak_alive = alive_;
+    // Capture the query so we can locate-and-erase it from refresh_queries_
+    // when it finishes. Using a raw Query* here is safe because the shared
+    // ptr is owned by refresh_queries_ for the duration.
+    query::Query* q_raw = q.get();
+    q->on_done([this, weak_alive, q_raw](const std::vector<query::QueryReply>&) {
+        // Belt-and-suspenders: both the alive sentinel and the explicit
+        // destroyed_ flag must allow the erase. If the DHT has been
+        // destroyed mid-refresh, `refresh_queries_` has already been
+        // cleared by `destroy()` and touching it is a no-op, but we
+        // skip it entirely to keep the lambda body defensively inert.
+        if (weak_alive.expired() || destroyed_) return;
+        // Prune the completed query from the retention list so long-lived
+        // DHTs don't grow an unbounded refresh history.
+        auto& rq = refresh_queries_;
+        rq.erase(std::remove_if(rq.begin(), rq.end(),
+                                [q_raw](const std::shared_ptr<query::Query>& p) {
+                                    return p.get() == q_raw;
+                                }),
+                 rq.end());
+    });
+
+    refresh_queries_.push_back(q);
+    q->start();
 }
 
 // ---------------------------------------------------------------------------
@@ -991,6 +1202,18 @@ void HyperDHT::destroy(std::function<void()> on_done) {
     }
     destroyed_ = true;
     *alive_ = false;
+
+    // §2: drop strong references to any outstanding background queries
+    // BEFORE closing the socket. The queries hold `rpc::RpcSocket&`
+    // references and the socket's inflight lambdas capture each query's
+    // `self = shared_from_this()`. If we closed the socket first and then
+    // let the shared_ptrs go, a pending request callback could still fire
+    // against an already-`closing_` socket. Clearing first guarantees
+    // each Query is destructed while the socket is still fully alive,
+    // and each InflightRequest is torn down by `socket_->close()` below
+    // with no dangling references.
+    bootstrap_query_.reset();
+    refresh_queries_.clear();
 
     // Close all servers (don't clear vector yet — let ~HyperDHT handle deallocation
     // after the event loop processes the close callbacks)

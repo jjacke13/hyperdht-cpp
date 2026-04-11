@@ -976,3 +976,208 @@ TEST(HyperDHT, NotConnectableWhenSuspended) {
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }
+
+// ---------------------------------------------------------------------------
+// §2 — bootstrap walk activation.
+//
+// Tests cover four cases:
+//   1. Empty `opts.bootstrap` → no walk, `is_bootstrapped()` stays false.
+//   2. Loopback bootstrap server → walk runs, flag flips, callback fires.
+//   3. `on_bootstrapped` installed AFTER completion → fires immediately.
+//   4. `default_bootstrap_nodes()` returns the 3 canonical public peers.
+//
+// JS parity: dht-rpc/lib/index.js:379-433 (_bootstrap), 965-979
+// (_backgroundQuery), 435-438 (refresh). hyperdht constants:
+// .analysis/js/hyperdht/lib/constants.js:16-20 (BOOTSTRAP_NODES).
+// ---------------------------------------------------------------------------
+
+TEST(HyperDHT, BootstrapWalkSkippedWhenBootstrapEmpty) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    // Default DhtOptions has empty bootstrap — C++ must NOT start a walk.
+    HyperDHT dht(&loop);
+    EXPECT_EQ(dht.bind(), 0);
+
+    // Give the loop a tick for any stray callback to fire (there shouldn't
+    // be one, but we want the assertion to catch a regression).
+    uv_run(&loop, UV_RUN_NOWAIT);
+
+    EXPECT_FALSE(dht.is_bootstrapped())
+        << "no walk should run when opts.bootstrap is empty";
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, BootstrapWalkAgainstLoopbackServer) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    // Stand up a loopback RPC server that responds to FIND_NODE via the
+    // real RpcHandlers. We deliberately leave its routing table EMPTY:
+    // the server will reply with an empty `closer_nodes` list, the walk
+    // will run out of peers to visit, and `maybe_finish` fires. The
+    // client's routing table still absorbs the responder's own id from
+    // the FIND_NODE response (`from.id`), which is what we assert below
+    // to prove the walk wasn't a vacuous timeout-based completion.
+    routing::NodeId bootstrap_id{};
+    bootstrap_id.fill(0xBB);
+    rpc::RpcSocket bootstrap_server(&loop, bootstrap_id);
+    ASSERT_EQ(bootstrap_server.bind(0, "127.0.0.1"), 0);
+    rpc::RpcHandlers bootstrap_handlers(bootstrap_server);
+    bootstrap_handlers.install();
+
+    // Client DHT pointed at the loopback bootstrap node.
+    DhtOptions opts;
+    opts.bootstrap.push_back(
+        compact::Ipv4Address::from_string("127.0.0.1", bootstrap_server.port()));
+    HyperDHT dht(&loop, opts);
+
+    bool bootstrapped_cb_fired = false;
+    dht.on_bootstrapped([&]() { bootstrapped_cb_fired = true; });
+
+    EXPECT_FALSE(dht.is_bootstrapped());
+    EXPECT_EQ(dht.bind(), 0);
+
+    // Drive the loop until the walk completes or timeout.
+    uv_timer_t deadline;
+    uv_timer_init(&loop, &deadline);
+    bool deadline_fired = false;
+    deadline.data = &deadline_fired;
+    uv_timer_start(&deadline, [](uv_timer_t* t) {
+        *static_cast<bool*>(t->data) = true;
+        uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
+    }, 3000, 0);
+
+    while (!dht.is_bootstrapped() && !deadline_fired) {
+        uv_run(&loop, UV_RUN_ONCE);
+    }
+    // Drop the deadline timer as soon as we're done so teardown doesn't
+    // block on it.
+    if (!deadline_fired) {
+        uv_timer_stop(&deadline);
+        uv_close(reinterpret_cast<uv_handle_t*>(&deadline), nullptr);
+    }
+
+    EXPECT_TRUE(dht.is_bootstrapped())
+        << "walk did not flip the bootstrapped flag within 3s";
+    EXPECT_TRUE(bootstrapped_cb_fired)
+        << "on_bootstrapped callback did not fire";
+
+    // Quality check: the client's routing table must have actually
+    // absorbed at least one closer peer from the bootstrap reply. This
+    // distinguishes a real walk from a vacuous completion where every
+    // seed timed out and `bootstrapped_` got flipped on an empty result.
+    EXPECT_GT(dht.socket().table().size(), 0u)
+        << "routing table stayed empty — walk did not receive real replies";
+
+    bootstrap_server.close();
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, OnBootstrappedFiresImmediatelyIfAlreadyDone) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId bootstrap_id{};
+    bootstrap_id.fill(0xCC);
+    rpc::RpcSocket bootstrap_server(&loop, bootstrap_id);
+    ASSERT_EQ(bootstrap_server.bind(0, "127.0.0.1"), 0);
+    rpc::RpcHandlers bootstrap_handlers(bootstrap_server);
+    bootstrap_handlers.install();
+
+    DhtOptions opts;
+    opts.bootstrap.push_back(
+        compact::Ipv4Address::from_string("127.0.0.1", bootstrap_server.port()));
+    HyperDHT dht(&loop, opts);
+
+    // No callback installed up front — just bind and wait for the walk.
+    EXPECT_EQ(dht.bind(), 0);
+
+    uv_timer_t deadline;
+    uv_timer_init(&loop, &deadline);
+    bool deadline_fired = false;
+    deadline.data = &deadline_fired;
+    uv_timer_start(&deadline, [](uv_timer_t* t) {
+        *static_cast<bool*>(t->data) = true;
+        uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
+    }, 3000, 0);
+
+    while (!dht.is_bootstrapped() && !deadline_fired) {
+        uv_run(&loop, UV_RUN_ONCE);
+    }
+    // Drop the deadline timer as soon as we're done so teardown doesn't
+    // block on it.
+    if (!deadline_fired) {
+        uv_timer_stop(&deadline);
+        uv_close(reinterpret_cast<uv_handle_t*>(&deadline), nullptr);
+    }
+    ASSERT_TRUE(dht.is_bootstrapped());
+
+    // Now install the callback AFTER the walk already finished. It must
+    // fire synchronously so callers don't miss the event on late install.
+    bool late_cb_fired = false;
+    dht.on_bootstrapped([&]() { late_cb_fired = true; });
+    EXPECT_TRUE(late_cb_fired)
+        << "late-installed on_bootstrapped did not fire immediately";
+
+    bootstrap_server.close();
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, DefaultBootstrapNodesMatchJsConstants) {
+    // JS .analysis/js/hyperdht/lib/constants.js:16-20:
+    //   '88.99.3.86@node1.hyperdht.org:49737'
+    //   '142.93.90.113@node2.hyperdht.org:49737'
+    //   '138.68.147.8@node3.hyperdht.org:49737'
+    const auto& nodes = HyperDHT::default_bootstrap_nodes();
+    ASSERT_EQ(nodes.size(), 3u);
+    EXPECT_EQ(nodes[0].host_string(), "88.99.3.86");
+    EXPECT_EQ(nodes[0].port, 49737);
+    EXPECT_EQ(nodes[1].host_string(), "142.93.90.113");
+    EXPECT_EQ(nodes[1].port, 49737);
+    EXPECT_EQ(nodes[2].host_string(), "138.68.147.8");
+    EXPECT_EQ(nodes[2].port, 49737);
+}
+
+TEST(HyperDHT, RefreshStartsBackgroundQueryWithoutCrashing) {
+    // Sanity: refresh() before or after bind must not crash, must be a
+    // no-op when the DHT hasn't bound, and must start a background query
+    // against our own id when the table is empty.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+
+    // Before bind → refresh is a no-op (guarded by `!bound_`).
+    dht.refresh();
+    EXPECT_FALSE(dht.is_bound());
+    EXPECT_FALSE(dht.is_destroyed());
+
+    EXPECT_EQ(dht.bind(), 0);
+    // After bind with an empty routing table → refresh walks against our
+    // own id. No seeds, so the query's iterative walk completes as soon
+    // as read_more() finds nothing to visit. We drive the loop until the
+    // refresh has clearly settled.
+    dht.refresh();
+
+    // Drive a short NOWAIT loop to drain the refresh. The query has no
+    // pending requests, so its on_done fires on the first read_more tick.
+    for (int i = 0; i < 8; i++) uv_run(&loop, UV_RUN_NOWAIT);
+
+    // The DHT must remain healthy after the refresh: still bound, not
+    // destroyed, not suspended.
+    EXPECT_TRUE(dht.is_bound());
+    EXPECT_FALSE(dht.is_destroyed());
+    EXPECT_FALSE(dht.is_suspended());
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}

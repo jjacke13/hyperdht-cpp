@@ -373,4 +373,11 @@ if(HYPERDHT_BUILD_TESTS)
     target_link_libraries(test_storage_live PRIVATE hyperdht GTest::gtest_main)
     add_test(NAME test_storage_live COMMAND test_storage_live)
     gtest_discover_tests(test_storage_live)
+
+    # §2 live smoke: full bootstrap walk against the public HyperDHT.
+    # Skips automatically when the public network is unreachable.
+    add_executable(test_live_bootstrap_smoke test/test_live_bootstrap_smoke.cpp)
+    target_link_libraries(test_live_bootstrap_smoke PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_live_bootstrap_smoke COMMAND test_live_bootstrap_smoke)
+    gtest_discover_tests(test_live_bootstrap_smoke)
 endif()

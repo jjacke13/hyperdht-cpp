@@ -78,11 +78,27 @@ public:
     void on_reply(OnReplyCallback cb) { on_reply_ = std::move(cb); }
     void on_done(OnDoneCallback cb) { on_done_ = std::move(cb); }
 
-    // Start the query — seeds from routing table and begins iteration
+    // Start the query — seeds from routing table (if caller has not already
+    // pre-filled pending via add_seed_node()) and begins iteration.
+    // Matches JS `_open()` in dht-rpc/lib/query.js:122-131.
     void start();
 
     // Add bootstrap nodes (call before start if routing table is sparse)
     void add_bootstrap(const compact::Ipv4Address& addr);
+
+    // Pre-seed the pending frontier with a specific node (equivalent to JS
+    // `opts.nodes` / `opts.closestReplies` in dht-rpc/lib/query.js:47-67).
+    // Must be called BEFORE start().
+    //
+    // **Order matters.** Call in CLOSEST-FIRST order (same convention JS
+    // takes from `opts.nodes`): the collected seeds are pushed onto the
+    // pending stack in reverse at `start()` time, so the first seed added
+    // ends up on top and is visited first. This mirrors JS query.js:52-62.
+    //
+    // When the caller seeds enough nodes to satisfy the k-frontier, the
+    // table-seed is skipped and the cold-start slowdown
+    // (SLOWDOWN_CONCURRENCY) kicks in for the first responses.
+    void add_seed_node(const routing::NodeId& id, const compact::Ipv4Address& addr);
 
     // Is the query finished?
     bool is_done() const { return done_; }
@@ -90,8 +106,20 @@ public:
     // Access results
     const std::vector<QueryReply>& closest_replies() const { return closest_replies_; }
 
+    // Convenience: the `from` address of every closest reply, in XOR-distance order.
+    // JS: dht-rpc/lib/query.js:72-80 (`get closestNodes()`).
+    std::vector<compact::Ipv4Address> closest_nodes() const;
+
     // Socket accessor (for commit lambdas that need lifetime-safe access)
     rpc::RpcSocket& socket() { return socket_; }
+
+    // State introspection (used by tests and for observability). These
+    // mirror the JS query.js internal flags described in the slowdown /
+    // table-retry comments below.
+    bool from_table() const { return from_table_; }
+    bool slowdown_engaged() const { return slowdown_; }
+    int successes() const { return successes_; }
+    int errors() const { return errors_; }
 
 private:
     rpc::RpcSocket& socket_;
@@ -109,6 +137,24 @@ private:
     int inflight_ = 0;
     int commit_inflight_ = 0;
 
+    // JS parity: slowdown optimisation + table-fallback.
+    //   from_table_: set true when the frontier was filled from the routing
+    //                table. When it stays false (caller pre-seeded), both
+    //                the cold-start slowdown and the <k/4-success table
+    //                retry activate. JS: query.js:36, 111-120.
+    //   slowdown_  : binary cold-start throttle. While true, read_more()
+    //                caps concurrency at SLOWDOWN_CONCURRENCY (3). Turned
+    //                on before the first reply, off once we have heard
+    //                back from `concurrency_` peers. JS: query.js:33,
+    //                189-191, 283-285.
+    //   successes_ /
+    //   errors_    : tick-scoped response counters used by the slowdown
+    //                and table-retry heuristics. JS: query.js:23-24.
+    bool from_table_ = false;
+    bool slowdown_ = false;
+    int successes_ = 0;
+    int errors_ = 0;
+
     // Closest k replies sorted by XOR distance
     std::vector<QueryReply> closest_replies_;
 
@@ -118,6 +164,12 @@ private:
         compact::Ipv4Address addr;
     };
     std::vector<PendingNode> pending_;
+
+    // Seeds collected via add_seed_node() before start(). Stored in
+    // caller-order (closest-first) and reverse-inserted into pending_ at
+    // start() time so the closest node sits on top of the stack.
+    // Matches JS query.js:47-67.
+    std::vector<PendingNode> pre_seeds_;
 
     // Seen nodes: address → state
     enum class NodeState { PENDING, DONE, DOWN };

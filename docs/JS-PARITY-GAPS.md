@@ -136,7 +136,8 @@ Listed bottom-up by layer.
 - **`mutable_get(latest=false)` early termination (§5 follow-up):** JS `mutableGet` returns from the async for-loop on the first valid reply when `opts.latest === false`. C++ still walks the full query and freezes the first result — functionally correct but higher latency. Proper fix requires query-engine early-termination support (tracked as the broader §9 follow-up below).
 - **Bootstrap-walk activation (§2 follow-up):** `RpcSocket::bootstrapped_` starts false and ping-and-swap is a no-op until `set_bootstrapped(true)`. Infrastructure is tested in isolation. `HyperDHT::bind()` needs a one-shot `FIND_NODE(our_id)` that flips the flag on success. Until then, full-bucket events silently reject (same as before §2 was added — strictly additive).
 - **`hyperdht_api.cpp` refactor (§10 follow-up):** `hyperdht_stream_s` still uses the low-level `SecretStream` primitive with inline glue. `test_live_connect.cpp` already uses `SecretStreamDuplex` — the C FFI can be refactored to match.
-- **Query engine minor gaps:** JS `SLOWDOWN_CONCURRENCY = 3` until the first response arrives (cold-cache optimization). C++ has the constant but always uses `DEFAULT_CONCURRENCY = 10`. Also missing: `closest_nodes()` convenience getter, `_addFromTable` retry when > 3/4 of cached nodes fail.
+- **Query engine `_slow` oncycle counter (§1 follow-up):** JS `_slow` is bumped every time a request's timeout fires and it's about to retry, and is added to the effective concurrency so slow retries are compensated by extra new sends. Also drives JS's secondary `_readMore` flush path (`_slow === inflight && closestReplies.length >= k`), which lets queries finish without waiting for every retry to exhaust. C++ `RpcSocket::InflightRequest` does not expose a per-retry hook yet — adding `OnCycleCallback` to `request()` overloads + plumbing through `on_request_timeout` would unblock the port. Behavior gap: retry-heavy queries have slightly lower concurrency bandwidth and wait longer before flushing than JS peers. Latency only, correctness unaffected. `read_more()` has an inline comment at `src/query.cpp` pointing at this note.
+- **Query engine `_open` bootstrap top-up (§1 follow-up):** JS `_open` tops the frontier up from `dht._resolveBootstrapNodes()` when `seed_from_table()` leaves pending under k. C++ requires callers with a sparse routing table to prime the query by calling `add_bootstrap()` before `start()`. Ergonomics only, no wire gap.
 - No static helpers: `HyperDHT::key_pair()`, `HyperDHT::hash()`, `BOOTSTRAP` / `FIREWALL` public constants.
 - No `Session` class for batched request cancellation.
 - `HANDSHAKE_INITIAL_TIMEOUT` (10s prepunch timeout in JS `server.js:16`) — verify `server_connection.cpp` has an equivalent.
@@ -169,7 +170,13 @@ Bottom-up through the stack:
 2. **§15** — `network-change` callback hooks.
 3. **§16** — `createRawStream` / `validateLocalAddresses`.
 4. **§13** — parallel relay attempts (performance).
-5. **LOW polish** — bootstrap walk, `hyperdht_api.cpp` refactor, query slowdown, static helpers, etc.
+5. **LOW polish** — bootstrap walk, `hyperdht_api.cpp` refactor, static helpers, etc.
+
+---
+
+## Completed
+
+- **§1 query engine minor gaps** — `closest_nodes()` convenience getter + cold-start slowdown (`_slowdown` + `_fromTable`) + `<K/4`-success table-retry + `add_seed_node()` API for `opts.nodes` / `opts.closestReplies` parity. Fixed a latent `std::optional<uint32_t> == 0` bug that counted every successful reply as an error, and fixed a `push_closest` duplicate-erase bug that removed the wrong element when the duplicate wasn't at the tail. Deferred: the additive `_slow` oncycle counter (requires new RpcSocket hook) and `_open` bootstrap top-up (callers must use `add_bootstrap()`). 5 new GoogleTests + live bootstrap walk against real HyperDHT public nodes (49 replies, 980 closer nodes, 20 final). JS refs: `dht-rpc/lib/query.js:32-36, 47-67, 72-80, 111-120, 122-131, 179, 189-191, 200-205, 259-296, 283-285, 334-351`.
 
 ---
 

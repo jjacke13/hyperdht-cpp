@@ -169,6 +169,20 @@ int HyperDHT::bind() {
     // seeds and completes immediately).
     socket_->on_refresh([this]() { this->refresh(); });
 
+    // §15: wire the health-state and persistent transitions. The
+    // RpcSocket background tick fires `on_health_change_` on every
+    // ONLINE/DEGRADED/OFFLINE transition; we forward it to the
+    // network-update fan-out. `on_persistent_` fires once when the NAT
+    // classifier flips `ephemeral_` to false — same path as JS
+    // `dht-rpc/index.js:870-872`.
+    socket_->on_health_change([this]() { fire_network_update(); });
+    socket_->on_persistent([this]() { fire_persistent(); });
+
+    // §15: start polling for network interface changes. libudx's
+    // `udx_interface_event` wraps `uv_interface_addresses()` behind a
+    // periodic timer + diff, matching JS `udx.watchNetworkInterfaces()`.
+    start_interface_watcher();
+
     // §2: kick off the initial bootstrap walk if we have seeds. The walk
     // runs in the background; callers that need a barrier can install an
     // `on_bootstrapped()` callback.
@@ -356,6 +370,135 @@ void HyperDHT::refresh() {
 
     refresh_queries_.push_back(q);
     q->start();
+}
+
+// ---------------------------------------------------------------------------
+// §15: network-change / network-update / persistent event fan-out.
+//
+// JS: .analysis/js/dht-rpc/index.js:596-599 (`_onnetworkchange` emits
+//     both `network-change` and `network-update`).
+//     .analysis/js/hyperdht/index.js:64-75 (HyperDHT subscribes to all
+//     three events to auto-refresh servers + spin up persistent store).
+// ---------------------------------------------------------------------------
+
+void HyperDHT::fire_network_change() {
+    if (destroyed_) return;
+    DHT_LOG("  [dht] network-change: refreshing %zu listening server(s)\n",
+            servers_.size());
+
+    // JS hyperdht/index.js:68-70 — refresh every listening server so it
+    // re-announces on the new network topology.
+    for (auto& srv : servers_) {
+        if (srv) srv->refresh();
+    }
+
+    // Fire the user's hook.
+    if (on_network_change_) {
+        on_network_change_();
+    }
+
+    // JS always emits `network-update` immediately after `network-change`
+    // (dht-rpc/index.js:596-599 emits both in the same call frame).
+    fire_network_update();
+}
+
+void HyperDHT::fire_network_update() {
+    if (destroyed_) return;
+
+    // JS hyperdht/index.js:72-75 — only poke servers while we're online.
+    if (is_online()) {
+        for (auto& srv : servers_) {
+            if (srv) srv->notify_online();
+        }
+    }
+
+    if (on_network_update_) {
+        on_network_update_();
+    }
+}
+
+void HyperDHT::fire_persistent() {
+    if (destroyed_) return;
+    DHT_LOG("  [dht] persistent: node has transitioned ephemeral -> persistent\n");
+    if (on_persistent_) {
+        on_persistent_();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §15: libudx interface event watcher lifecycle.
+//
+// libudx `udx_interface_event_t` (deps/libudx/src/udx.c:2796-2905) wraps
+// `uv_interface_addresses()` behind a periodic `uv_timer_t` that diffs
+// the current interface list against the previous one and invokes the
+// callback when the set changes. Matches JS `udx.watchNetworkInterfaces()`
+// in `dht-rpc/lib/io.js:39`.
+//
+// Frequency: 5 seconds, same cadence as the RpcSocket background tick —
+// slow enough to be free, fast enough to react to WiFi / VPN toggles.
+// ---------------------------------------------------------------------------
+
+static constexpr uint64_t INTERFACE_POLL_MS = 5000;
+
+void HyperDHT::start_interface_watcher() {
+    if (interface_watcher_ != nullptr) return;  // Already running
+
+    interface_watcher_ = new udx_interface_event_t;
+    interface_watcher_->data = this;
+
+    int rc = udx_interface_event_init(socket_->udx_handle(),
+                                      interface_watcher_,
+                                      on_udx_interface_close);
+    if (rc != 0) {
+        DHT_LOG("  [dht] network-change: udx_interface_event_init failed: %d\n", rc);
+        delete interface_watcher_;
+        interface_watcher_ = nullptr;
+        return;
+    }
+
+    rc = udx_interface_event_start(interface_watcher_,
+                                   on_udx_interface_event,
+                                   INTERFACE_POLL_MS);
+    if (rc != 0) {
+        DHT_LOG("  [dht] network-change: udx_interface_event_start failed: %d\n", rc);
+        // Null the user data BEFORE the async close so the close callback
+        // (which runs on a later loop iteration) cannot dispatch against a
+        // partially-constructed HyperDHT if destroy() runs before drain.
+        interface_watcher_->data = nullptr;
+        // Close the handle — its close callback will free our allocation.
+        udx_interface_event_close(interface_watcher_);
+        interface_watcher_ = nullptr;  // Ownership transferred to the close cb
+        return;
+    }
+
+    interface_watcher_active_ = true;
+    DHT_LOG("  [dht] network-change: watcher started (%lu ms poll)\n",
+            static_cast<unsigned long>(INTERFACE_POLL_MS));
+}
+
+void HyperDHT::stop_interface_watcher() {
+    if (interface_watcher_ == nullptr) return;
+    if (interface_watcher_active_) {
+        udx_interface_event_stop(interface_watcher_);
+        interface_watcher_active_ = false;
+    }
+    // Null the data pointer BEFORE uv_close so a late fire (queued timer
+    // callback) doesn't dispatch against a HyperDHT that's being destroyed.
+    interface_watcher_->data = nullptr;
+    udx_interface_event_close(interface_watcher_);
+    // Ownership transfers to the close callback which deletes the handle.
+    interface_watcher_ = nullptr;
+}
+
+void HyperDHT::on_udx_interface_event(udx_interface_event_t* handle, int status) {
+    if (handle->data == nullptr) return;  // DHT is tearing down.
+    if (status != 0) return;  // Error — libudx couldn't enumerate.
+    auto* self = static_cast<HyperDHT*>(handle->data);
+    self->fire_network_change();
+}
+
+void HyperDHT::on_udx_interface_close(udx_interface_event_t* handle) {
+    delete handle;
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,6 +1361,21 @@ void HyperDHT::destroy(std::function<void()> on_done) {
     // with no dangling references.
     bootstrap_query_.reset();
     refresh_queries_.clear();
+
+    // §15: stop the interface watcher. Its close callback (`on_udx_interface_close`)
+    // deletes the heap allocation asynchronously after the timer has
+    // drained. Stopping here before `socket_->close()` ensures the watcher
+    // cannot fire a `network-change` against a closing DHT.
+    //
+    // IMPORTANT: callers MUST run `uv_run(loop, UV_RUN_DEFAULT)` after
+    // `destroy()` before destructing this HyperDHT. The interface
+    // watcher's close callback path reads `event->udx` (a pointer into
+    // `RpcSocket::udx_` which is an embedded struct member, not heap);
+    // once the RpcSocket is destructed that pointer is dangling. Draining
+    // the loop lets libudx's internal `on_interface_event_close` fire
+    // while the socket is still alive, so `ref_dec(event->udx)` writes
+    // to a valid struct.
+    stop_interface_watcher();
 
     // Close all servers (don't clear vector yet — let ~HyperDHT handle deallocation
     // after the event loop processes the close callbacks)

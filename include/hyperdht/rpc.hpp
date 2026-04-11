@@ -203,8 +203,32 @@ public:
     void on_refresh(OnRefreshCallback cb) { on_refresh_ = std::move(cb); }
     void on_persistent(OnStateCallback cb) { on_persistent_ = std::move(cb); }
 
+    // §15: fires whenever `health_.state()` transitions (ONLINE <-> DEGRADED
+    // <-> OFFLINE) during a background tick. JS fires `network-update` on
+    // every `_online()` / `_degraded()` / `_offline()` transition. C++
+    // caller wires this to `HyperDHT::fire_network_update()`.
+    void on_health_change(OnStateCallback cb) { on_health_change_ = std::move(cb); }
+
     // Reset the refresh timer (called by query engine when queries are active)
     void reset_refresh_timer() { refresh_ticks_ = REFRESH_TICKS; }
+
+    // Force an immediate ephemeral → persistent re-evaluation. Exposed
+    // so tests can drive the `on_persistent_` callback deterministically
+    // without waiting for `STABLE_TICKS_INIT` to elapse; production code
+    // reaches this path through the background tick countdown. Safe to
+    // call repeatedly: the target `check_persistent()` is idempotent —
+    // once `ephemeral_` has flipped to false, further calls are no-ops.
+    void force_check_persistent() { check_persistent(); }
+
+    // Directly fire the `on_health_change_` callback. Test-only hook used
+    // to verify §15 network-update wiring without driving four background
+    // ticks worth of synthetic timeouts through the health monitor.
+    // Production code never reaches this — the background tick path
+    // compares pre/post `health_.state()` and fires the callback only on
+    // a real transition.
+    void force_fire_health_change_for_test() {
+        if (on_health_change_) on_health_change_();
+    }
 
     // Get adaptive timeout for a peer (returns DEFAULT_TIMEOUT_MS if unknown)
     uint64_t timeout_for(const compact::Ipv4Address& peer) const;
@@ -319,6 +343,7 @@ private:
     OnProbeCallback on_probe_;
     OnRefreshCallback on_refresh_;
     OnStateCallback on_persistent_;
+    OnStateCallback on_health_change_;
     FilterNodeCallback filter_node_;
 
     // Generate next transaction ID

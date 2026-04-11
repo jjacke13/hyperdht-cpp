@@ -755,10 +755,18 @@ void RpcSocket::background_tick() {
     // Monotonic tick counter — consumed by ping-and-swap / down-hint logic.
     tick_++;
 
-    // 1. Health monitoring
+    // 1. Health monitoring. JS emits `network-update` on every
+    // `_online()` / `_degraded()` / `_offline()` transition
+    // (dht-rpc/index.js:982-1002). We fire `on_health_change_` on any
+    // observed state transition so the HyperDHT layer can derive
+    // `network-update` from it (see §15 in docs/JS-PARITY-GAPS.md).
+    const health::State prev_health = health_.state();
     health_.update(tick_responses_, tick_timeouts_);
     tick_responses_ = 0;
     tick_timeouts_ = 0;
+    if (health_.state() != prev_health && on_health_change_) {
+        on_health_change_();
+    }
 
     // 2. Routing table refresh
     if (--refresh_ticks_ <= 0) {
@@ -776,7 +784,15 @@ void RpcSocket::background_tick() {
 // simplified: we trust the NAT sampler's classification rather than
 // running a separate PING_NAT firewall probe (JS:916-963 _checkIfFirewalled
 // requires the dual-socket setup we don't have).
+//
+// Idempotency: once `ephemeral_` has flipped to false, this is a no-op.
+// The production background tick already guards the call with
+// `if (ephemeral_ && --stable_ticks_ <= 0)`, but `force_check_persistent()`
+// is publicly callable and the JS parity semantic is "emit once".
+// Re-entering after the flip would fire `on_persistent_` a second time.
 void RpcSocket::check_persistent() {
+    if (!ephemeral_) return;
+
     auto current_host = nat_sampler_.host();
 
     if (current_host.empty() || nat_sampler_.port() == 0) {

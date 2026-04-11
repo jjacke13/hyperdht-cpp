@@ -26,6 +26,7 @@
 #include <optional>
 #include <vector>
 
+#include <udx.h>
 #include <uv.h>
 
 #include "hyperdht/compact.hpp"
@@ -278,6 +279,63 @@ public:
     // an extra refresh if they need one.
     void refresh();
 
+    // --- §15: network-change / network-update / persistent event hooks ---
+    //
+    // JS reference: `dht-rpc/index.js:596-599` (`_onnetworkchange`),
+    // `dht-rpc/index.js:982-1002` (`_online`/`_degraded`/`_offline`), and
+    // `dht-rpc/index.js:870-872` (`emit('persistent')`).
+    //
+    // `network-change` fires when the OS reports a network interface change
+    // (via the libudx interface-event watcher, polling every 5 seconds —
+    // matches `udx.watchNetworkInterfaces()` in JS `dht-rpc/lib/io.js:39`).
+    // The HyperDHT layer auto-refreshes every active `Server` on change
+    // (`hyperdht/index.js:68-70`).
+    //
+    // `network-update` fires on every `network-change` AND whenever the
+    // health monitor transitions between ONLINE / DEGRADED / OFFLINE.
+    // HyperDHT auto-calls `Server::notify_online()` on every listening
+    // server when the update fires while online
+    // (`hyperdht/index.js:72-75`).
+    //
+    // `persistent` fires once when the node transitions from ephemeral to
+    // persistent after the NAT classifier has decided we're reachable
+    // (`dht-rpc/index.js:870-872`). `hyperdht/index.js:64-66` uses this
+    // hook to spin up the persistent store — C++ doesn't have the
+    // persistent store yet, but exposing the hook lets callers observe
+    // the transition today.
+    //
+    // Each callback slot is single-shot replaceable (`last writer wins`),
+    // matching the existing `on_bootstrapped` convention. Install BEFORE
+    // `bind()` to avoid missing early events.
+    using NetworkChangeCallback = std::function<void()>;
+    using NetworkUpdateCallback = std::function<void()>;
+    using PersistentCallback    = std::function<void()>;
+    void on_network_change(NetworkChangeCallback cb) {
+        on_network_change_ = std::move(cb);
+    }
+    void on_network_update(NetworkUpdateCallback cb) {
+        on_network_update_ = std::move(cb);
+    }
+    void on_persistent(PersistentCallback cb) {
+        on_persistent_ = std::move(cb);
+    }
+
+    // Observable health state — mirrors JS `this.online` / `this.degraded`.
+    bool is_online() const {
+        return socket_ && socket_->health().is_online();
+    }
+    bool is_degraded() const {
+        return socket_ && socket_->health().is_degraded();
+    }
+    bool is_persistent() const {
+        return socket_ && !socket_->is_ephemeral();
+    }
+
+    // Test hook: invoke the network-change fan-out directly without
+    // waiting for a real interface event. Used by unit tests to
+    // exercise the server-refresh + user-callback path deterministically.
+    void fire_network_change_for_test() { fire_network_change(); }
+
     // --- Client API ---
 
     // Connect to a remote peer by public key.
@@ -505,6 +563,18 @@ private:
     std::shared_ptr<query::Query> bootstrap_query_;
     std::vector<std::shared_ptr<query::Query>> refresh_queries_;
 
+    // §15 event callback slots.
+    NetworkChangeCallback on_network_change_;
+    NetworkUpdateCallback on_network_update_;
+    PersistentCallback    on_persistent_;
+
+    // §15 libudx interface watcher. Polls `uv_interface_addresses()` and
+    // fires `on_udx_interface_event` when the set changes. Heap-allocated
+    // because `udx_interface_event_close` is async — the handle must
+    // outlive its owner until the close callback fires.
+    udx_interface_event_t* interface_watcher_ = nullptr;
+    bool interface_watcher_active_ = false;
+
     void ensure_bound();
     void do_connect(const noise::PubKey& remote_pk,
                     const noise::Keypair& keypair,
@@ -515,6 +585,35 @@ private:
     // opts_.bootstrap. Caller is bind(); see JS _bootstrap()/
     // _backgroundQuery() in dht-rpc/index.js:379-433, 965-979.
     void start_bootstrap_walk();
+
+    // §15: event-hook internals.
+    //
+    // `fire_network_change`: runs the JS `_onnetworkchange` fan-out
+    // (hyperdht/index.js:68-70) — refreshes every active server, then
+    // fires the user's `on_network_change_` callback, then falls through
+    // to `fire_network_update()` (JS emits both events in sequence).
+    //
+    // `fire_network_update`: runs the JS `_online/_degraded/_offline`
+    // fan-out (hyperdht/index.js:72-75) — if `is_online()` returns true,
+    // it pokes `notify_online()` on every listening server, then fires
+    // the user's `on_network_update_` callback.
+    //
+    // `fire_persistent`: fires the user's `on_persistent_` callback (the
+    // ephemeral → persistent transition is detected inside the RpcSocket
+    // background tick and wired to us via `on_persistent` callback
+    // registration in `bind()`).
+    //
+    // `start_interface_watcher` / `stop_interface_watcher`: lifecycle
+    // helpers for the libudx interface event handle. Start is called
+    // from `bind()` after the socket is up; stop is called from
+    // `destroy()` before the RpcSocket is torn down.
+    void fire_network_change();
+    void fire_network_update();
+    void fire_persistent();
+    void start_interface_watcher();
+    void stop_interface_watcher();
+    static void on_udx_interface_event(udx_interface_event_t* handle, int status);
+    static void on_udx_interface_close(udx_interface_event_t* handle);
 };
 
 }  // namespace hyperdht

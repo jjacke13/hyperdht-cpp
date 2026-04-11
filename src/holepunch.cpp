@@ -978,7 +978,8 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        uint32_t holepunch_id,
                        uint32_t local_firewall,
                        const std::vector<compact::Ipv4Address>& local_addresses,
-                       OnHolepunchCallback on_done) {
+                       OnHolepunchCallback on_done,
+                       bool fast_open) {
 
     // Derive holepunchSecret from handshake hash
     // holepunchSecret = BLAKE2b-256(NS_PEER_HOLEPUNCH, key=handshake_hash)
@@ -997,6 +998,20 @@ void holepunch_connect(rpc::RpcSocket& socket,
     // Create pool socket (JS: dht._socketPool.acquire())
     state->pool = std::make_shared<PoolSocket>(socket.loop(), socket.udx_handle());
     state->pool->bind();
+
+    // JS: connect.js:269 — probeRound(c, opts.fastOpen === false ? null : serverAddress, ...)
+    //     probeRound calls `c.puncher.openSession(serverAddress)` before
+    //     sending round 1. The puncher's socket in JS == the pool socket.
+    //     We send the TTL=5 probe from the POOL socket (not main) so it
+    //     primes the same NAT pinhole that subsequent probes will use.
+    //     The server expects probes to arrive on the pool socket's port
+    //     (advertised in Round 1 addresses), so priming the main socket
+    //     would open the wrong pinhole and have zero practical effect.
+    if (fast_open && peer_addr.port != 0) {
+        DHT_LOG("  [hp] fast-open: low-TTL probe to %s:%u (from pool)\n",
+                peer_addr.host_string().c_str(), peer_addr.port);
+        state->pool->send_probe_ttl(peer_addr, 5);  // HOLEPUNCH_TTL = 5
+    }
 
     // Compute target hash (reused for both rounds)
     std::array<uint8_t, 32> target{};
@@ -1376,11 +1391,11 @@ std::vector<Ipv4Address> local_addresses(uint16_t port) {
 // matchAddress — find best LAN address match by IP prefix
 // ---------------------------------------------------------------------------
 
-const Ipv4Address* match_address(
+std::optional<Ipv4Address> match_address(
     const std::vector<Ipv4Address>& my_addresses,
     const std::vector<Ipv4Address>& remote_addresses) {
 
-    if (remote_addresses.empty()) return nullptr;
+    if (remote_addresses.empty()) return std::nullopt;
 
     int best_segment = 0;
     const Ipv4Address* best_addr = nullptr;
@@ -1406,12 +1421,14 @@ const Ipv4Address* match_address(
 
             if (local.host[2] != remote.host[2]) continue;
 
-            // 3-octet match — immediate return (best possible)
-            return &remote;
+            // 3-octet match — immediate return (best possible).
+            // Copy by value so callers don't depend on remote_addresses lifetime.
+            return remote;
         }
     }
 
-    return best_addr;
+    if (best_addr) return *best_addr;
+    return std::nullopt;
 }
 
 }  // namespace holepunch

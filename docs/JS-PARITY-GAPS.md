@@ -9,6 +9,22 @@ Actionable audit of what's still missing in `hyperdht-cpp` versus the JavaScript
 
 ---
 
+## Pending manual live tests
+
+Only one scenario left that requires a specific network topology:
+
+- **§6 `local_connection` LAN shortcut** — both ends must share the same NAT
+  / public IP (same home network). Run:
+  1. `./test_server_live` on machine A
+  2. `SERVER_KEY=<hex> LOCAL_CONNECTION=1 ./test_hyperdht --gtest_filter='*LiveConnect*'`
+     on machine B (debug build so the `[connect] LAN shortcut: target ...`
+     line is visible)
+  3. Confirm the log line appears and either `LAN ping OK` (success) or
+     `LAN ping failed, falling back to holepunch` (wiring verified, LAN
+     shortcut tried but the local address didn't ping back)
+
+---
+
 ## Progress by layer
 
 | Layer | Status |
@@ -18,8 +34,8 @@ Actionable audit of what's still missing in `hyperdht-cpp` versus the JavaScript
 | `@hyperswarm/secret-stream` crypto primitive + user-facing `SecretStreamDuplex` | ✓ COMPLETE |
 | protomux (channel mux, cork/uncork batching, aliases, destroy, opened, get_last_channel, for_each_channel) | ✓ COMPLETE |
 | server / router / announcer / server_connection | ✓ COMPLETE |
-| `HyperDHT` class (public API) | ⚠️ partial — §5, §6, §7, §13, §15, §16 |
-| C FFI (`hyperdht.h`) | ⚠️ partial — follow-ups on §5, §10 refactor |
+| `HyperDHT` class (public API) | ⚠️ partial — §6, §7, §13, §15, §16 |
+| C FFI (`hyperdht.h`) | ⚠️ partial — §10 refactor follow-up |
 
 **The bottom five layers are done.** Remaining work is strictly at the `HyperDHT` class layer and above.
 
@@ -27,9 +43,7 @@ Actionable audit of what's still missing in `hyperdht-cpp` versus the JavaScript
 
 ## What blocks a real production DHT client
 
-1. **§5** *(HyperDHT-class layer)* — `mutablePut/Get`, `immutablePut/Get` not exposed on `HyperDHT` (wire + `dht_ops` exist, just not wired to the public class). Biggest functional gap by impact.
-
-Everything else is performance / polish / options.
+Nothing functional. All storage methods are now on the public class (§5 done). Remaining items are ergonomics/options (§6, §7), performance (§13), and event hooks (§15, §16).
 
 ---
 
@@ -39,28 +53,26 @@ Everything else is performance / polish / options.
 
 Listed bottom-up by layer.
 
-#### §5 — `mutablePut` / `mutableGet` / `immutablePut` / `immutableGet` not on `HyperDHT`   *(HyperDHT-class layer)*
+#### §6 — `ConnectOptions` remaining items   *(HyperDHT-class layer)*
 
-- **JS:** `hyperdht/index.js:266-390` — 4 public methods.
-- **C++:** `include/hyperdht/dht.hpp` public API has `connect`, `create_server`, `find_peer`, `lookup`, `announce`, `lookup_and_unannounce`, `ping`, `pool`, `suspend`, `resume`, `destroy` — but **not** the 4 storage methods.
-- **Note:** `CMD_MUTABLE_PUT/GET`, `CMD_IMMUTABLE_PUT/GET` are defined in `messages.hpp` and `dht_ops` has the lower-level implementations. Just needs plumbing to the public class + C FFI.
-- **Impact:** biggest user-visible functional gap.
+**Present:** `pool`, `reusable_socket`, `holepunch_veto`, `relay_addresses`,
+`keypair`, `fast_open`, `local_connection`.
 
-#### §6 — `ConnectOptions` missing JS `connect.js` features   *(HyperDHT-class layer)*
+**Not added by design (see header comment in `include/hyperdht/dht.hpp`):**
 
-**Currently present:** `pool`, `reusable_socket`, `holepunch_veto`, `cached_relay_addresses`, `udx_socket`.
+| Option | JS line | Why skipped |
+|---|---|---|
+| `relayThrough` / `relayToken` | 40, 87-92, 489-490 | Blind-relay path — tied to §4 which is DEFERRED |
+| `relayKeepAlive` | 92 | Only used with `relayThrough`, deferred with it |
+| `createSecretStream` | 41, 827-829 | LOW priority factory hook; C FFI doesn't expose |
+| `createHandshake` | 68, 823-825 | LOW priority factory hook; direct call is clearer |
 
-**Missing:**
-
-| Option | JS line | Purpose | Priority |
-|---|---|---|---|
-| `relayThrough` / `relayToken` | 40, 87-92, 489-490 | Blind relay fallback | **DEFERRED** |
-| `fastOpen` | 269 | Skip probe round for CONSISTENT+CONSISTENT | HIGH |
-| `localConnection` | 71 | LAN shortcut toggle | HIGH |
-| `relayKeepAlive` | 92 | Keepalive on relay socket | MEDIUM |
-| `createSecretStream` | 41, 827-829 | Factory hook for custom stream wrapper | LOW |
-| `createHandshake` | 68, 823-825 | Factory hook for custom Noise | LOW |
-| Per-connect `keyPair` | 39 | Override default keypair per connect | MEDIUM |
+**§6 polish follow-ups:**
+- LAN shortcut: apply `isReserved`-style filter to server addresses before
+  matching (currently passes addresses through as-is — worst case is a
+  wasted ping to a reserved address).
+- LAN shortcut: C++ uses NAT-sampler host vs JS `clientAddress.host` (from
+  peerHandshake reply's `to` field). Close enough but not identical.
 
 #### §7 — `DhtOptions` missing JS constructor options   *(HyperDHT-class layer)*
 
@@ -104,6 +116,7 @@ Listed bottom-up by layer.
 
 ### LOW — polish / follow-ups
 
+- **`mutable_get(latest=false)` early termination (§5 follow-up):** JS `mutableGet` returns from the async for-loop on the first valid reply when `opts.latest === false`. C++ still walks the full query and freezes the first result — functionally correct but higher latency. Proper fix requires query-engine early-termination support (tracked as the broader §9 follow-up below).
 - **Bootstrap-walk activation (§2 follow-up):** `RpcSocket::bootstrapped_` starts false and ping-and-swap is a no-op until `set_bootstrapped(true)`. Infrastructure is tested in isolation. `HyperDHT::bind()` needs a one-shot `FIND_NODE(our_id)` that flips the flag on success. Until then, full-bucket events silently reject (same as before §2 was added — strictly additive).
 - **`hyperdht_api.cpp` refactor (§10 follow-up):** `hyperdht_stream_s` still uses the low-level `SecretStream` primitive with inline glue. `test_live_connect.cpp` already uses `SecretStreamDuplex` — the C FFI can be refactored to match.
 - **Query engine minor gaps:** JS `SLOWDOWN_CONCURRENCY = 3` until the first response arrives (cold-cache optimization). C++ has the constant but always uses `DEFAULT_CONCURRENCY = 10`. Also missing: `closest_nodes()` convenience getter, `_addFromTable` retry when > 3/4 of cached nodes fail.
@@ -135,12 +148,11 @@ Listed bottom-up by layer.
 
 Bottom-up through the stack:
 
-1. **§5** — Expose storage API on `HyperDHT` + C FFI. **Biggest user-visible win.**
-2. **§6 / §7** — Missing option fields. `fastOpen` and `localConnection` first.
-3. **§15** — `network-change` callback hooks.
-4. **§16** — `createRawStream` / `validateLocalAddresses`.
-5. **§13** — parallel relay attempts (performance).
-6. **LOW polish** — bootstrap walk, `hyperdht_api.cpp` refactor, query slowdown, static helpers, etc.
+1. **§6 / §7** — Missing option fields. `fastOpen` and `localConnection` first.
+2. **§15** — `network-change` callback hooks.
+3. **§16** — `createRawStream` / `validateLocalAddresses`.
+4. **§13** — parallel relay attempts (performance).
+5. **LOW polish** — bootstrap walk, `hyperdht_api.cpp` refactor, query slowdown, static helpers, etc.
 
 ---
 

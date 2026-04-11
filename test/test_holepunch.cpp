@@ -531,8 +531,8 @@ TEST(Holepunch, MatchAddress3Octet) {
         Ipv4Address::from_string("10.0.0.1", 3000),
         Ipv4Address::from_string("192.168.1.50", 4000),
     };
-    auto* result = match_address(my, remote);
-    ASSERT_NE(result, nullptr);
+    auto result = match_address(my, remote);
+    ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->host_string(), "192.168.1.50");  // 3-octet match
 }
 
@@ -543,8 +543,8 @@ TEST(Holepunch, MatchAddress2Octet) {
     auto remote = std::vector<Ipv4Address>{
         Ipv4Address::from_string("192.168.2.50", 4000),
     };
-    auto* result = match_address(my, remote);
-    ASSERT_NE(result, nullptr);
+    auto result = match_address(my, remote);
+    ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->host_string(), "192.168.2.50");  // 2-octet match
 }
 
@@ -555,8 +555,8 @@ TEST(Holepunch, MatchAddressNoMatch) {
     auto remote = std::vector<Ipv4Address>{
         Ipv4Address::from_string("10.0.0.1", 3000),
     };
-    auto* result = match_address(my, remote);
-    EXPECT_EQ(result, nullptr);  // No octet match
+    auto result = match_address(my, remote);
+    EXPECT_FALSE(result.has_value());  // No octet match
 }
 
 TEST(Holepunch, MatchAddressEmpty) {
@@ -564,8 +564,8 @@ TEST(Holepunch, MatchAddressEmpty) {
         Ipv4Address::from_string("192.168.1.100", 5000)
     };
     std::vector<Ipv4Address> remote;
-    auto* result = match_address(my, remote);
-    EXPECT_EQ(result, nullptr);
+    auto result = match_address(my, remote);
+    EXPECT_FALSE(result.has_value());
 }
 
 TEST(Holepunch, MatchAddressPrefers3Over2) {
@@ -576,9 +576,27 @@ TEST(Holepunch, MatchAddressPrefers3Over2) {
         Ipv4Address::from_string("192.168.2.50", 4000),   // 2-octet
         Ipv4Address::from_string("192.168.1.200", 4001),  // 3-octet
     };
-    auto* result = match_address(my, remote);
-    ASSERT_NE(result, nullptr);
+    auto result = match_address(my, remote);
+    ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->host_string(), "192.168.1.200");  // 3-octet wins
+}
+
+TEST(Holepunch, MatchAddressLifetimeIndependent) {
+    // Verify the returned value is a copy, not a pointer into either input.
+    // This ensures callers can't trip on a use-after-free if either vector
+    // is destroyed after the call.
+    auto result = []() {
+        std::vector<Ipv4Address> my{
+            Ipv4Address::from_string("10.20.30.40", 1)
+        };
+        std::vector<Ipv4Address> remote{
+            Ipv4Address::from_string("10.20.30.99", 2)
+        };
+        return match_address(my, remote);
+    }();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->host_string(), "10.20.30.99");
+    EXPECT_EQ(result->port, 2);
 }
 
 TEST(Holepunch, PunchStatsThrottling) {

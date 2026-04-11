@@ -141,7 +141,12 @@ void Server::refresh() {
 // while !running_, so the suspend case is self-handling (and harmless in
 // JS too — `online.notify()` fires but no one is waiting).
 void Server::notify_online() {
-    if (closed_ || !listening_) return;
+    if (closed_ || !listening_) {
+        DHT_LOG("  [server] notify_online: ignored (closed=%d listening=%d)\n",
+                closed_ ? 1 : 0, listening_ ? 1 : 0);
+        return;
+    }
+    DHT_LOG("  [server] notify_online: waking announcer\n");
     if (announcer_) announcer_->notify_online();
 }
 

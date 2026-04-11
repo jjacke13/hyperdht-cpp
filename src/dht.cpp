@@ -6,8 +6,10 @@
 
 #include <sodium.h>
 
+#include <cassert>
 #include <cstdio>
 
+#include "hyperdht/announce_sig.hpp"
 #include "hyperdht/debug.hpp"
 #include "hyperdht/holepunch.hpp"
 #include "hyperdht/peer_connect.hpp"
@@ -97,7 +99,14 @@ void HyperDHT::connect(const noise::PubKey& remote_public_key,
                         const ConnectOptions& opts,
                         ConnectCallback on_done) {
     if (destroyed_) {
+        DHT_LOG("  [dht] connect: rejected (destroyed)\n");
         on_done(-1, {});
+        return;
+    }
+    // JS: connect.js:49-51 — `dht.suspended || !dht._connectable` rejects.
+    if (suspended_) {
+        DHT_LOG("  [dht] connect: rejected (suspended)\n");
+        on_done(-8, {});  // SUSPENDED
         return;
     }
     ensure_bound();
@@ -105,11 +114,24 @@ void HyperDHT::connect(const noise::PubKey& remote_public_key,
     // JS: if pool has existing connection, return it
     if (opts.pool && opts.pool->has(remote_public_key)) {
         // Connection already exists — caller should use pool.get() directly
+        DHT_LOG("  [dht] connect: rejected (duplicate in pool)\n");
         on_done(-7, {});  // DUPLICATE
         return;
     }
 
-    do_connect(remote_public_key, opts_.default_keypair, opts, std::move(on_done));
+    // JS: `opts.keyPair || dht.defaultKeyPair` — per-connect override.
+    const noise::Keypair& keypair = opts.keypair.has_value()
+        ? *opts.keypair
+        : opts_.default_keypair;
+
+    DHT_LOG("  [dht] connect: remote=%02x%02x%02x%02x... "
+            "(keypair=%s, fast_open=%d, local_connection=%d)\n",
+            remote_public_key[0], remote_public_key[1],
+            remote_public_key[2], remote_public_key[3],
+            opts.keypair.has_value() ? "override" : "default",
+            opts.fast_open ? 1 : 0, opts.local_connection ? 1 : 0);
+
+    do_connect(remote_public_key, keypair, opts, std::move(on_done));
 }
 
 void HyperDHT::connect(const noise::PubKey& remote_public_key,
@@ -141,10 +163,15 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
         std::shared_ptr<std::function<void()>> try_relay_fn;  // Relay retry loop
         std::weak_ptr<bool> alive;  // Sentinel — expired if HyperDHT destroyed
         rpc::RpcSocket* socket = nullptr;  // Raw pointer, guarded by alive
+        HyperDHT* dht = nullptr;  // Raw pointer, guarded by alive
         bool found = false;
         uint32_t our_udx_id = 0;
         udx_stream_t* raw_stream = nullptr;  // Client rawStream (like JS)
         bool completed = false;
+        // §6 ConnectOptions snapshot (copied, not referenced — opts may
+        // outlive the original scope once we enter async territory).
+        bool fast_open = true;
+        bool local_connection = true;
 
         ~ConnState() {
             // Clean up rawStream if not transferred to ConnectResult
@@ -184,6 +211,9 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
     state->on_done = std::move(on_done);
     state->alive = alive_;
     state->socket = socket_.get();
+    state->dht = this;
+    state->fast_open = opts.fast_open;
+    state->local_connection = opts.local_connection;
 
     // Generate random UDX stream ID
     randombytes_buf(&state->our_udx_id, sizeof(state->our_udx_id));
@@ -358,6 +388,94 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                         return;
                     }
 
+                    // --- §6: localConnection LAN shortcut ------------------
+                    // JS: connect.js:234-251 — if (a) the connection went
+                    // through a relay (server's address differs from the
+                    // relay's), AND (b) our public IP matches the server's
+                    // public IP (both behind the same NAT), AND (c) the
+                    // server advertises addresses we can match against,
+                    // pick the best match (fall back to addresses[0] when
+                    // no octet match), ping it, and short-circuit holepunch.
+                    //
+                    // Differences from JS:
+                    //   - JS uses `clientAddress.host === serverAddress.host`
+                    //     where clientAddress is from the peerHandshake reply's
+                    //     `to` field. We approximate with the NAT-sampler host
+                    //     (our public IP as seen by other nodes). Close enough:
+                    //     both represent "our public-facing IP".
+                    //   - JS filters by `isReserved()` (loopback/multicast/etc).
+                    //     We pass server addresses through as-is. Worst case
+                    //     is a wasted ping to 127.0.0.1 — defensive filtering
+                    //     can be a follow-up if it ever bites in production.
+                    //     Tracked in docs/JS-PARITY-GAPS.md §6 polish.
+                    //   - On ping failure, JS aborts the connect. We fall
+                    //     through to the holepunch path instead (more robust
+                    //     when the LAN link is flaky but the public path works).
+                    {
+                        const bool relayed = !hs.remote_payload.addresses4.empty() &&
+                            (hs.remote_payload.addresses4[0] != state->relay_addr);
+
+                        if (state->local_connection && relayed &&
+                            !state->socket->nat_sampler().host().empty() &&
+                            state->socket->nat_sampler().host() ==
+                                hs.remote_payload.addresses4[0].host_string()) {
+
+                            // Port=0: only the host octets matter for matching.
+                            // local_addresses() walks libuv interface enumeration.
+                            auto my_local = holepunch::local_addresses(0);
+                            auto matched = holepunch::match_address(
+                                my_local, hs.remote_payload.addresses4);
+
+                            // JS fallback (connect.js:239):
+                            //   const addr = matchAddress(...) || serverAddresses[0]
+                            // Use the first server address when no octet match.
+                            auto lan_addr = matched.value_or(
+                                hs.remote_payload.addresses4[0]);
+
+                            DHT_LOG("  [connect] LAN shortcut: target %s:%u "
+                                    "(matched=%s)\n",
+                                    lan_addr.host_string().c_str(), lan_addr.port,
+                                    matched.has_value() ? "yes" : "fallback");
+
+                            // state->dht is set unconditionally in do_connect
+                            // setup, so the assert documents the invariant.
+                            assert(state->dht && "ConnState::dht must be set");
+                            state->dht->ping(lan_addr,
+                                [state, lan_addr](bool ok) {
+                                    if (state->completed) return;
+                                    if (!ok) {
+                                        DHT_LOG("  [connect] LAN ping failed, "
+                                                "falling back to holepunch\n");
+                                        return;  // holepunch path runs in parallel
+                                    }
+                                    DHT_LOG("  [connect] LAN ping OK — "
+                                            "short-circuiting connect\n");
+                                    ConnectResult result;
+                                    result.success = true;
+                                    result.tx_key = state->hs_result.tx_key;
+                                    result.rx_key = state->hs_result.rx_key;
+                                    result.handshake_hash =
+                                        state->hs_result.handshake_hash;
+                                    result.remote_public_key =
+                                        state->hs_result.remote_public_key;
+                                    result.peer_address = lan_addr;
+                                    result.local_udx_id = state->our_udx_id;
+                                    if (state->hs_result.remote_payload.udx
+                                            .has_value()) {
+                                        result.remote_udx_id =
+                                            state->hs_result.remote_payload.udx->id;
+                                    }
+                                    state->take_raw_stream(result);
+                                    state->complete(0, result);
+                                });
+                            // Note: we do NOT return here. The holepunch below
+                            // runs in parallel so a slow LAN ping doesn't block
+                            // the connect — whichever path completes first wins
+                            // via `state->completed`.
+                        }
+                    }
+                    // --- end §6 LAN shortcut ------------------------------
+
                     holepunch::holepunch_connect(*state->socket, hs,
                         hp_relay, hp_peer, hp_info.id, fw, addrs,
                         [state](const holepunch::HolepunchResult& hp) {
@@ -381,7 +499,8 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                             }
                             state->take_raw_stream(result);
                             state->complete(0, result);
-                        });
+                        },
+                        state->fast_open);  // §6 opts.fast_open
                 });
             };
             // Fire first attempt
@@ -476,6 +595,200 @@ void HyperDHT::ping(const compact::Ipv4Address& addr,
         },
         [on_done](uint16_t) {
             if (on_done) on_done(false);
+        });
+}
+
+// ---------------------------------------------------------------------------
+// Mutable / Immutable storage — thin wrappers around dht_ops that surface
+// JS-shaped result structs through the public HyperDHT class.
+//
+// These match the JS reference in `hyperdht/index.js` (immutablePut,
+// immutableGet, mutablePut, mutableGet). The underlying dht_ops functions
+// handle signing, target computation, query+commit. We add a small shim
+// on top that (a) produces the JS-style result struct with `closest_nodes`,
+// (b) forwards streaming per-result callbacks for get operations, and
+// (c) tracks best-seen results for mutable_get so the caller gets the latest.
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<query::Query> HyperDHT::immutable_put(
+    const std::vector<uint8_t>& value,
+    ImmutablePutCallback on_done) {
+    // JS: empty values are rejected server-side. Reject at the class layer
+    // so callers get an immediate nullptr instead of a silent failed query.
+    if (value.empty()) {
+        DHT_LOG("  [dht] immutable_put: rejected (empty value)\n");
+        return nullptr;
+    }
+    ensure_bound();
+
+    // Target is BLAKE2b(value) — compute here so we can hand it to the caller.
+    // `dht_ops::immutable_put` also computes the hash internally; this minor
+    // double-work is acceptable to keep the wrapper layer self-contained.
+    ImmutablePutResult result;
+    crypto_generichash(result.hash.data(), 32,
+                       value.data(), value.size(), nullptr, 0);
+
+    DHT_LOG("  [dht] immutable_put: value=%zu bytes, "
+            "hash=%02x%02x%02x%02x...\n",
+            value.size(),
+            result.hash[0], result.hash[1], result.hash[2], result.hash[3]);
+
+    return dht_ops::immutable_put(*socket_, value,
+        [on_done = std::move(on_done), result = std::move(result)](
+                const std::vector<query::QueryReply>& closest) mutable {
+            DHT_LOG("  [dht] immutable_put done: %zu closest nodes\n",
+                    closest.size());
+            result.closest_nodes = closest;
+            if (on_done) on_done(result);
+        });
+}
+
+std::shared_ptr<query::Query> HyperDHT::immutable_get(
+    const std::array<uint8_t, 32>& target,
+    ImmutableGetCallback on_done) {
+    return immutable_get(target, /*on_value=*/nullptr, std::move(on_done));
+}
+
+std::shared_ptr<query::Query> HyperDHT::immutable_get(
+    const std::array<uint8_t, 32>& target,
+    ImmutableValueCallback on_value,
+    ImmutableGetCallback on_done) {
+    ensure_bound();
+
+    DHT_LOG("  [dht] immutable_get: target=%02x%02x%02x%02x...\n",
+            target[0], target[1], target[2], target[3]);
+
+    // Accumulate the first verified reply. `dht_ops::immutable_get` already
+    // verifies BLAKE2b(value) === target, so any callback invocation is good.
+    // Share state between on_result and on_done via a shared_ptr so they
+    // can both safely mutate it across the async query lifetime.
+    auto result = std::make_shared<ImmutableGetResult>();
+
+    return dht_ops::immutable_get(*socket_, target,
+        [result, on_value = std::move(on_value)](
+                const std::vector<uint8_t>& value) {
+            // Forward streaming callback (if any) on every verified reply.
+            if (on_value) on_value(value);
+            // Aggregate the first match for the on_done summary.
+            if (!result->found) {
+                DHT_LOG("  [dht] immutable_get: first verified value "
+                        "(%zu bytes)\n", value.size());
+                result->found = true;
+                result->value = value;
+            }
+        },
+        [on_done = std::move(on_done), result](
+                const std::vector<query::QueryReply>&) {
+            DHT_LOG("  [dht] immutable_get done: found=%d\n",
+                    result->found ? 1 : 0);
+            if (on_done) on_done(*result);
+        });
+}
+
+std::shared_ptr<query::Query> HyperDHT::mutable_put(
+    const noise::Keypair& keypair,
+    const std::vector<uint8_t>& value,
+    uint64_t seq,
+    MutablePutCallback on_done) {
+    if (value.empty()) {
+        DHT_LOG("  [dht] mutable_put: rejected (empty value)\n");
+        return nullptr;
+    }
+    ensure_bound();
+
+    // Pre-compute the result we'll hand back. Signature is deterministic
+    // from (seq, value, secret_key), so we can produce it locally without
+    // waiting for the commit phase.
+    MutablePutResult result;
+    result.public_key = keypair.public_key;
+    result.seq = seq;
+    result.signature = announce_sig::sign_mutable(
+        seq, value.data(), value.size(), keypair);
+
+    DHT_LOG("  [dht] mutable_put: pk=%02x%02x%02x%02x... seq=%llu "
+            "value=%zu bytes\n",
+            keypair.public_key[0], keypair.public_key[1],
+            keypair.public_key[2], keypair.public_key[3],
+            static_cast<unsigned long long>(seq), value.size());
+
+    return dht_ops::mutable_put(*socket_, keypair, value, seq,
+        [on_done = std::move(on_done), result = std::move(result)](
+                const std::vector<query::QueryReply>& closest) mutable {
+            DHT_LOG("  [dht] mutable_put done: %zu closest nodes\n",
+                    closest.size());
+            result.closest_nodes = closest;
+            if (on_done) on_done(result);
+        });
+}
+
+std::shared_ptr<query::Query> HyperDHT::mutable_get(
+    const noise::PubKey& public_key,
+    uint64_t min_seq,
+    bool latest,
+    MutableGetCallback on_done) {
+    return mutable_get(public_key, min_seq, latest,
+                       /*on_value=*/nullptr, std::move(on_done));
+}
+
+std::shared_ptr<query::Query> HyperDHT::mutable_get(
+    const noise::PubKey& public_key,
+    uint64_t min_seq,
+    bool latest,
+    MutableValueCallback on_value,
+    MutableGetCallback on_done) {
+    ensure_bound();
+
+    DHT_LOG("  [dht] mutable_get: pk=%02x%02x%02x%02x... "
+            "min_seq=%llu latest=%d\n",
+            public_key[0], public_key[1], public_key[2], public_key[3],
+            static_cast<unsigned long long>(min_seq), latest ? 1 : 0);
+
+    // Track the best-seen result across all replies. `dht_ops::mutable_get`
+    // already verifies signatures and filters by `min_seq`, so any result
+    // arriving here is valid.
+    //
+    // JS semantics (hyperdht/index.js:319-328):
+    //   - With `latest=true` (default): return the highest-seq valid reply.
+    //   - With `latest=false`: return the FIRST valid reply. Early query
+    //     termination is a §9 follow-up; until then the walk continues but
+    //     the result is frozen after the first match.
+    auto result = std::make_shared<MutableGetResult>();
+
+    return dht_ops::mutable_get(*socket_, public_key, min_seq,
+        [result, latest, on_value = std::move(on_value)](
+                const dht_ops::MutableResult& r) {
+            // Streaming callback first (if any) — receives every verified reply.
+            if (on_value) on_value(r);
+
+            if (!result->found) {
+                DHT_LOG("  [dht] mutable_get: first verified reply "
+                        "seq=%llu (%zu bytes)\n",
+                        static_cast<unsigned long long>(r.seq),
+                        r.value.size());
+                result->found = true;
+                result->seq = r.seq;
+                result->value = r.value;
+                result->signature = r.signature;
+                return;
+            }
+            // Already have one. If `latest==false`, keep the first.
+            if (!latest) return;
+            // Otherwise prefer the highest seq seen so far.
+            if (r.seq > result->seq) {
+                DHT_LOG("  [dht] mutable_get: newer seq=%llu replaces %llu\n",
+                        static_cast<unsigned long long>(r.seq),
+                        static_cast<unsigned long long>(result->seq));
+                result->seq = r.seq;
+                result->value = r.value;
+                result->signature = r.signature;
+            }
+        },
+        [on_done = std::move(on_done), result](
+                const std::vector<query::QueryReply>&) {
+            DHT_LOG("  [dht] mutable_get done: found=%d seq=%llu\n",
+                    result->found ? 1 : 0,
+                    static_cast<unsigned long long>(result->seq));
+            if (on_done) on_done(*result);
         });
 }
 

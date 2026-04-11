@@ -112,7 +112,12 @@ void Announcer::refresh() {
 // build_relays() runs again after recovery. Otherwise, stale relays from
 // before the outage would remain advertised to peers.
 void Announcer::notify_online() {
-    if (!running_) return;
+    if (!running_) {
+        DHT_LOG("  [announcer] notify_online: ignored (not running)\n");
+        return;
+    }
+    DHT_LOG("  [announcer] notify_online: triggering update cycle "
+            "(reset has_reannounced_)\n");
     has_reannounced_ = false;
     update();
 }

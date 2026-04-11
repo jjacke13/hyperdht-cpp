@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <uv.h>
@@ -91,6 +92,46 @@ struct ConnectOptions {
 
     // Cached relay addresses for faster reconnect (JS: opts.relayAddresses)
     std::vector<compact::Ipv4Address> relay_addresses;
+
+    // JS: opts.keyPair — override the default DHT keypair for this single
+    // connection. If unset, `HyperDHT::default_keypair()` is used. Useful
+    // for clients that want to rotate their identity per connection.
+    std::optional<noise::Keypair> keypair;
+
+    // JS: opts.fastOpen !== false (default true). When true, primes our
+    // NAT mapping by sending a low-TTL (5) probe to the server's relay-
+    // reported address BEFORE holepunch round 1. Shaves one round-trip
+    // for CONSISTENT+CONSISTENT NAT combinations. Safe to leave at true;
+    // set to false only for debugging.
+    bool fast_open = true;
+
+    // JS: opts.localConnection !== false (default true). When true and
+    // our public IP matches the server's public IP (both nodes behind the
+    // same NAT), try a LAN shortcut: find a matching local address and
+    // ping it directly before falling back to holepunch. Disable to skip
+    // the LAN path and go straight to the public-internet flow.
+    bool local_connection = true;
+
+    // --- Deferred JS options NOT exposed here ---
+    //
+    // The following JS `connect.js` options are intentionally absent from
+    // this struct. Do NOT add them without first reading the deferred
+    // section in docs/JS-PARITY-GAPS.md §6:
+    //
+    //  - `relayThrough` / `relayToken`: blind-relay fallback. Tied to §4
+    //    (`FROM_SECOND_RELAY`) which is deliberately DEFERRED.
+    //  - `relayKeepAlive`: keepalive on the blind-relay socket. Only used
+    //    when `relayThrough` is active, so also deferred with §4.
+    //  - `createSecretStream`: factory hook for a custom secret-stream
+    //    wrapper. LOW priority — the C FFI doesn't expose this and C++
+    //    callers construct `SecretStreamDuplex` over the returned
+    //    `rawStream` directly.
+    //  - `createHandshake`: factory hook for a custom Noise handshake.
+    //    LOW priority — `peer_connect::peer_handshake` is called directly
+    //    instead of going through a factory.
+    //
+    // (Note: `relay_addresses` ABOVE is the cached "which relays found this
+    //  peer last time" hint, distinct from `relayThrough` blind-relay.)
 };
 
 // ---------------------------------------------------------------------------
@@ -166,6 +207,101 @@ public:
     // Ping a specific node (JS: dht.ping(addr))
     void ping(const compact::Ipv4Address& addr,
               std::function<void(bool ok)> on_done);
+
+    // --- Mutable / Immutable storage (JS: dht.{immutable,mutable}{Put,Get}) ---
+
+    // Immutable put: stores `value` at target = BLAKE2b(value).
+    // JS: dht.immutablePut(value) → { hash, closestNodes }
+    // `on_done` fires after the commit phase completes. Returns nullptr if
+    // `value` is empty (matches JS: empty values are rejected server-side).
+    struct ImmutablePutResult {
+        std::array<uint8_t, 32> hash{};
+        std::vector<query::QueryReply> closest_nodes;
+    };
+    using ImmutablePutCallback = std::function<void(const ImmutablePutResult&)>;
+    std::shared_ptr<query::Query> immutable_put(
+        const std::vector<uint8_t>& value,
+        ImmutablePutCallback on_done);
+
+    // Immutable get: retrieves the value whose content hash is `target`.
+    // JS: dht.immutableGet(target) → { value } | null
+    //
+    // `on_value` (optional) fires once per verified reply during the walk,
+    // matching the streaming semantics of JS `for await (const node of query)`.
+    // Callers can use the streaming callback to act on the first match
+    // without waiting for the full walk.
+    //
+    // `on_done` fires when the query completes. Its result struct contains
+    // the FIRST verified value (if any).
+    struct ImmutableGetResult {
+        bool found = false;
+        std::vector<uint8_t> value;
+    };
+    using ImmutableValueCallback = std::function<void(const std::vector<uint8_t>&)>;
+    using ImmutableGetCallback = std::function<void(const ImmutableGetResult&)>;
+    std::shared_ptr<query::Query> immutable_get(
+        const std::array<uint8_t, 32>& target,
+        ImmutableGetCallback on_done);
+    std::shared_ptr<query::Query> immutable_get(
+        const std::array<uint8_t, 32>& target,
+        ImmutableValueCallback on_value,
+        ImmutableGetCallback on_done);
+
+    // Mutable put: signs `value` with `keypair` at seq `seq` and stores it
+    // at target = BLAKE2b(keypair.public_key).
+    // JS: dht.mutablePut(keyPair, value, { seq }) → { publicKey, closestNodes, seq, signature }
+    // Returns nullptr if `value` is empty.
+    struct MutablePutResult {
+        noise::PubKey public_key{};
+        uint64_t seq = 0;
+        std::array<uint8_t, 64> signature{};
+        std::vector<query::QueryReply> closest_nodes;
+    };
+    using MutablePutCallback = std::function<void(const MutablePutResult&)>;
+    std::shared_ptr<query::Query> mutable_put(
+        const noise::Keypair& keypair,
+        const std::vector<uint8_t>& value,
+        uint64_t seq,
+        MutablePutCallback on_done);
+
+    // Mutable get: retrieves the latest signed value for `public_key`.
+    // JS: dht.mutableGet(publicKey, { seq, latest }) → { seq, value, signature } | null
+    //
+    // `min_seq` filters out results with lower seq (JS `opts.seq`).
+    // `latest == true` (default): returns the highest-seq valid reply.
+    // `latest == false`: returns the first valid reply. NOTE: deferred early
+    // termination — the C++ version still walks the full query. Tracked as
+    // a §9 query-engine follow-up in docs/JS-PARITY-GAPS.md.
+    //
+    // The optional `on_value` callback fires once per verified reply during
+    // the walk, matching JS `for await (const node of query)`.
+    struct MutableGetResult {
+        bool found = false;
+        uint64_t seq = 0;
+        std::vector<uint8_t> value;
+        std::array<uint8_t, 64> signature{};
+    };
+    using MutableValueCallback =
+        std::function<void(const dht_ops::MutableResult&)>;
+    using MutableGetCallback = std::function<void(const MutableGetResult&)>;
+    std::shared_ptr<query::Query> mutable_get(
+        const noise::PubKey& public_key,
+        uint64_t min_seq,
+        bool latest,
+        MutableGetCallback on_done);
+    std::shared_ptr<query::Query> mutable_get(
+        const noise::PubKey& public_key,
+        uint64_t min_seq,
+        bool latest,
+        MutableValueCallback on_value,
+        MutableGetCallback on_done);
+
+    // Overload: mutable_get with defaults (min_seq=0, latest=true).
+    std::shared_ptr<query::Query> mutable_get(
+        const noise::PubKey& public_key,
+        MutableGetCallback on_done) {
+        return mutable_get(public_key, 0, true, std::move(on_done));
+    }
 
     // --- Connection Pool ---
 

@@ -263,7 +263,13 @@ void hyperdht_server_refresh(hyperdht_server_t* srv) {
 }
 
 // ---------------------------------------------------------------------------
-// Mutable/Immutable storage
+// Mutable/Immutable storage — delegate to the HyperDHT class methods so
+// both C++ and C consumers hit the same code path.
+//
+// Get operations use the new streaming `on_value` overload so the C `cb`
+// fires once per verified reply (matching the documented contract of
+// `cb` being "called for each verified result") rather than aggregated
+// at query completion. `done_cb` fires once at the end of the query.
 // ---------------------------------------------------------------------------
 
 int hyperdht_immutable_put(hyperdht_t* dht,
@@ -272,8 +278,8 @@ int hyperdht_immutable_put(hyperdht_t* dht,
     if (!dht || !dht->dht || !value || len == 0) return -1;
 
     std::vector<uint8_t> val(value, value + len);
-    hyperdht::dht_ops::immutable_put(dht->dht->socket(), val,
-        [cb, userdata](const std::vector<hyperdht::query::QueryReply>&) {
+    dht->dht->immutable_put(val,
+        [cb, userdata](const hyperdht::HyperDHT::ImmutablePutResult&) {
             if (cb) cb(0, userdata);
         });
     return 0;
@@ -289,11 +295,13 @@ int hyperdht_immutable_get(hyperdht_t* dht,
     std::array<uint8_t, 32> t{};
     memcpy(t.data(), target, 32);
 
-    hyperdht::dht_ops::immutable_get(dht->dht->socket(), t,
+    dht->dht->immutable_get(t,
+        // on_value — streaming per-reply
         [cb, userdata](const std::vector<uint8_t>& value) {
             if (cb) cb(value.data(), value.size(), userdata);
         },
-        [done_cb, userdata](const std::vector<hyperdht::query::QueryReply>&) {
+        // on_done — once at completion
+        [done_cb, userdata](const hyperdht::HyperDHT::ImmutableGetResult&) {
             if (done_cb) done_cb(0, userdata);
         });
     return 0;
@@ -311,8 +319,8 @@ int hyperdht_mutable_put(hyperdht_t* dht,
     memcpy(cpp_kp.secret_key.data(), kp->secret_key, 64);
 
     std::vector<uint8_t> val(value, value + len);
-    hyperdht::dht_ops::mutable_put(dht->dht->socket(), cpp_kp, val, seq,
-        [cb, userdata](const std::vector<hyperdht::query::QueryReply>&) {
+    dht->dht->mutable_put(cpp_kp, val, seq,
+        [cb, userdata](const hyperdht::HyperDHT::MutablePutResult&) {
             if (cb) cb(0, userdata);
         });
     return 0;
@@ -326,15 +334,17 @@ int hyperdht_mutable_get(hyperdht_t* dht,
                          void* userdata) {
     if (!dht || !dht->dht || !public_key) return -1;
 
-    std::array<uint8_t, 32> pk{};
+    hyperdht::noise::PubKey pk{};
     memcpy(pk.data(), public_key, 32);
 
-    hyperdht::dht_ops::mutable_get(dht->dht->socket(), pk, min_seq,
-        [cb, userdata](const hyperdht::dht_ops::MutableResult& result) {
-            if (cb) cb(result.seq, result.value.data(), result.value.size(),
-                       result.signature.data(), userdata);
+    dht->dht->mutable_get(pk, min_seq, /*latest=*/true,
+        // on_value — streaming per-reply
+        [cb, userdata](const hyperdht::dht_ops::MutableResult& r) {
+            if (cb) cb(r.seq, r.value.data(), r.value.size(),
+                       r.signature.data(), userdata);
         },
-        [done_cb, userdata](const std::vector<hyperdht::query::QueryReply>&) {
+        // on_done — once at completion
+        [done_cb, userdata](const hyperdht::HyperDHT::MutableGetResult&) {
             if (done_cb) done_cb(0, userdata);
         });
     return 0;

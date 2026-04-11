@@ -391,10 +391,11 @@ HolepunchMessage decode_holepunch_msg(const uint8_t* data, size_t len);
 // ---------------------------------------------------------------------------
 
 // Performs the PEER_HOLEPUNCH relay flow:
-// 1. Send probe round (our firewall + addresses) via relay
-// 2. Receive server's firewall + addresses
-// 3. If server is reachable, start UDP probing
-// 4. Call on_done with the result
+// 1. (optional) Fast-open: low-TTL probe to peer_addr to prime NAT mapping
+// 2. Send probe round (our firewall + addresses) via relay
+// 3. Receive server's firewall + addresses
+// 4. If server is reachable, start UDP probing
+// 5. Call on_done with the result
 //
 // hs_result: completed PEER_HANDSHAKE result
 // relay_addr: the DHT node that relayed the handshake
@@ -403,6 +404,9 @@ HolepunchMessage decode_holepunch_msg(const uint8_t* data, size_t len);
 // peer_addr: the server's address as seen by the relay (from holepunch relays info)
 // local_firewall: our firewall type from NAT sampling (or FIREWALL_UNKNOWN)
 // local_addresses: our detected public addresses (from NAT sampler)
+// fast_open: if true, send a low-TTL (5) probe to peer_addr before Round 1.
+//            Primes our NAT mapping so the first round-trip is closer to
+//            immediate on CONSISTENT+CONSISTENT NATs. Matches JS opts.fastOpen.
 void holepunch_connect(rpc::RpcSocket& socket,
                        const peer_connect::HandshakeResult& hs_result,
                        const compact::Ipv4Address& relay_addr,
@@ -410,7 +414,8 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        uint32_t holepunch_id,
                        uint32_t local_firewall,
                        const std::vector<compact::Ipv4Address>& local_addresses,
-                       OnHolepunchCallback on_done);
+                       OnHolepunchCallback on_done,
+                       bool fast_open = true);
 
 // ---------------------------------------------------------------------------
 // Utility functions (JS: Holepuncher.localAddresses, Holepuncher.matchAddress)
@@ -423,8 +428,11 @@ std::vector<compact::Ipv4Address> local_addresses(uint16_t port);
 
 // Find the best matching remote address for LAN connections.
 // Matches by IP prefix: 3-octet match (same /24) > 2-octet > 1-octet.
-// Returns nullptr if no match found.
-const compact::Ipv4Address* match_address(
+// Returns std::nullopt if no match found.
+//
+// Returns by value (not pointer) so callers don't need to reason about
+// the lifetime of the input vectors. The returned address is a copy.
+std::optional<compact::Ipv4Address> match_address(
     const std::vector<compact::Ipv4Address>& my_addresses,
     const std::vector<compact::Ipv4Address>& remote_addresses);
 

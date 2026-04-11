@@ -24,6 +24,8 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <udx.h>
@@ -336,6 +338,38 @@ public:
     // exercise the server-refresh + user-callback path deterministically.
     void fire_network_change_for_test() { fire_network_change(); }
 
+    // --- §16: createRawStream + validateLocalAddresses ---
+    //
+    // JS references: `hyperdht/index.js:460-462` (createRawStream) and
+    // `hyperdht/index.js:135-184` (validateLocalAddresses).
+    //
+    // `create_raw_stream()` returns a newly-allocated `udx_stream_t*`
+    // with a random stream ID on the underlying RpcSocket's udx handle.
+    // The caller takes ownership and is responsible for destroying the
+    // stream (or handing it to a SecretStreamDuplex which takes over
+    // lifetime management). Optional firewall callback can be installed
+    // by the caller via `udx_stream_firewall` after construction.
+    //
+    // `validate_local_addresses(list)` filters the input list to only
+    // those addresses whose host can be successfully bound by this
+    // machine — catches addresses not owned by this host (e.g., stale
+    // DHCP leases, addresses from a different network namespace). Does
+    // NOT run the 500 ms self-loopback probe that JS does — JS's own
+    // comment at `hyperdht/index.js:160` calls that "semi terrible
+    // heuristic". Results are cached per host. Synchronous.
+    udx_stream_t* create_raw_stream();
+
+    std::vector<compact::Ipv4Address> validate_local_addresses(
+        const std::vector<compact::Ipv4Address>& addresses);
+
+    // Returns the cached list of local addresses that passed
+    // `validate_local_addresses()` at bind time. The server side reads
+    // this to populate `addresses4` in the Noise payload when
+    // `share_local_address=true`. Matches JS `server._localAddresses()`.
+    const std::vector<compact::Ipv4Address>& validated_local_addresses() const {
+        return validated_local_addresses_;
+    }
+
     // --- Client API ---
 
     // Connect to a remote peer by public key.
@@ -574,6 +608,14 @@ private:
     // outlive its owner until the close callback fires.
     udx_interface_event_t* interface_watcher_ = nullptr;
     bool interface_watcher_active_ = false;
+
+    // §16 validation cache for local addresses. Populated by
+    // `validate_local_addresses()` — the `validated_host_cache_` maps
+    // host string → bind result so repeated validations are O(1). The
+    // `validated_local_addresses_` list is the cached result of running
+    // validation once at bind() time across all available interfaces.
+    std::unordered_map<std::string, bool> validated_host_cache_;
+    std::vector<compact::Ipv4Address> validated_local_addresses_;
 
     void ensure_bound();
     void do_connect(const noise::PubKey& remote_pk,

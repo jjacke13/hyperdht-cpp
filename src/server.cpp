@@ -17,6 +17,8 @@
 
 #include "hyperdht/server.hpp"
 
+#include "hyperdht/dht.hpp"  // §16: Server reads validated_local_addresses() from HyperDHT
+
 #include <sodium.h>
 
 #include <cstdio>
@@ -55,6 +57,9 @@ static std::string to_hex(const uint8_t* data, size_t len) {
 
 Server::Server(rpc::RpcSocket& socket, router::Router& router)
     : socket_(socket), router_(router) {}
+
+Server::Server(rpc::RpcSocket& socket, router::Router& router, HyperDHT* dht)
+    : socket_(socket), router_(router), dht_(dht) {}
 
 Server::~Server() {
     if (listening_ && !closed_) {
@@ -287,8 +292,31 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
 
     uint32_t hp_id = next_hp_id_++;
 
-    // Get our addresses and relay info
+    // Get our addresses and relay info.
+    //
+    // `addresses4` layout in the Noise payload (JS `hyperdht/lib/server.js:270-277`):
+    //   [0]       = our remote (public) address, from NAT sampler
+    //   [1..n]    = validated LAN interface addresses, if
+    //               `share_local_address == true` (JS default: true)
+    //
+    // The client's LAN shortcut (`connect.js:234-251`) walks addresses4
+    // looking for an octet-match against its own local interfaces, so
+    // populating [1..n] is what enables same-NAT connections without
+    // holepunch. Without a HyperDHT back-pointer we can't reach the
+    // cached validated list and the LAN advertisement silently no-ops.
     auto our_addrs = socket_.nat_sampler().addresses();
+    if (share_local_address && dht_ != nullptr) {
+        // Copy the vector by value (not by `const&`) so the append loop
+        // cannot observe a mid-flight modification if the cache is
+        // reconstructed on a network-change event in between. The
+        // single-threaded event loop makes this moot today, but the
+        // by-value copy documents intent and is cheap — the LAN list
+        // is a handful of entries.
+        const auto lan = dht_->validated_local_addresses();
+        for (const auto& addr : lan) {
+            our_addrs.push_back(addr);
+        }
+    }
     std::vector<peer_connect::RelayInfo> relay_infos;
     if (announcer_) {
         relay_infos = announcer_->relays();

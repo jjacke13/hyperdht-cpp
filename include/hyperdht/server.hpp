@@ -33,6 +33,12 @@
 #include "hyperdht/server_connection.hpp"
 
 namespace hyperdht {
+
+// Forward declaration — Server holds a non-owning `HyperDHT*`
+// back-pointer (§16) but can't include `dht.hpp` to avoid a circular
+// include. Full type is included in `src/server.cpp` where needed.
+class HyperDHT;
+
 namespace server {
 
 // ---------------------------------------------------------------------------
@@ -64,7 +70,15 @@ public:
         const peer_connect::NoisePayload& payload,
         const compact::Ipv4Address& client_addr)>;
 
+    // Forward declaration — server can call back into the DHT for the
+    // cached validated local-address list (§16).
     Server(rpc::RpcSocket& socket, router::Router& router);
+
+    // §16: constructor overload with a HyperDHT back-pointer so the
+    // server can read `dht->validated_local_addresses()` when building
+    // its handshake reply. Without the back-pointer, `share_local_address`
+    // silently drops the LAN addrs.
+    Server(rpc::RpcSocket& socket, router::Router& router, HyperDHT* dht);
     ~Server();
 
     Server(const Server&) = delete;
@@ -137,6 +151,18 @@ public:
 private:
     rpc::RpcSocket& socket_;
     router::Router& router_;
+    // §16 non-owning back-pointer: optional, may be null for tests that
+    // construct Server directly without a HyperDHT owner. When non-null
+    // the server queries `dht_->validated_local_addresses()` during
+    // handshake reply construction if `share_local_address == true`.
+    //
+    // Lifetime invariant: every Server that carries a non-null `dht_`
+    // must outlive its parent HyperDHT's `servers_` vector (the
+    // `unique_ptr` ownership guarantees this in normal usage because
+    // HyperDHT::destroy() only finishes after all servers have been
+    // closed). Standalone test Servers always pass the 2-arg ctor and
+    // get `dht_ == nullptr`.
+    HyperDHT* dht_ = nullptr;
 
     noise::Keypair keypair_;
     std::array<uint8_t, 32> target_{};

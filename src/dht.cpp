@@ -183,6 +183,20 @@ int HyperDHT::bind() {
     // periodic timer + diff, matching JS `udx.watchNetworkInterfaces()`.
     start_interface_watcher();
 
+    // §16: validate the machine's local interface addresses once at
+    // bind time so the server-side handshake path (`share_local_address`)
+    // has a cached list ready. JS runs this from `server._localAddresses`
+    // on every handshake with its own per-host cache; we do the work
+    // once up front and serve every subsequent handshake from the cache.
+    //
+    // Use the ACTUAL bound port (`socket_->port()`) — `opts_.port` may
+    // be 0 for ephemeral binds, which would give peers a dead address.
+    auto raw_locals = holepunch::local_addresses(socket_->port());
+    validated_local_addresses_ = validate_local_addresses(raw_locals);
+    DHT_LOG("  [dht] §16: %zu validated local interface(s) "
+            "(from %zu enumerated)\n",
+            validated_local_addresses_.size(), raw_locals.size());
+
     // §2: kick off the initial bootstrap walk if we have seeds. The walk
     // runs in the background; callers that need a barrier can install an
     // `on_bootstrapped()` callback.
@@ -499,6 +513,118 @@ void HyperDHT::on_udx_interface_event(udx_interface_event_t* handle, int status)
 
 void HyperDHT::on_udx_interface_close(udx_interface_event_t* handle) {
     delete handle;
+}
+
+// ---------------------------------------------------------------------------
+// §16: createRawStream — return a UDX stream with a random ID.
+//
+// JS: .analysis/js/hyperdht/index.js:460-462 delegates to
+//     `this.rawStreams.add(opts)` which generates a random u32 id,
+//     calls `udx.createStream(id, opts)`, and tracks the stream in a
+//     set for cleanup on destroy.
+//
+// C++ diffs from JS:
+//   - No tracking set. The existing connect/holepunch paths manage raw
+//     stream lifetime through their own state structs; a global tracking
+//     set would duplicate that work without a clear benefit.
+//   - The caller owns the returned `udx_stream_t*` and must destroy it
+//     (either directly or by handing it to a `SecretStreamDuplex`).
+// ---------------------------------------------------------------------------
+
+udx_stream_t* HyperDHT::create_raw_stream() {
+    ensure_bound();
+
+    auto* stream = new udx_stream_t{};
+
+    // `randombytes_buf` can produce 0 (probability 1/2^32). A zero
+    // local_id is a legal hash key in libudx's cirbuf but some peers
+    // treat 0 as a sentinel for "unassigned", and the test assertion
+    // `local_id != 0` would flake at that frequency. Retry until
+    // non-zero — matches JS RawStreamSet which rolls IDs starting from 1.
+    uint32_t id = 0;
+    do {
+        randombytes_buf(&id, sizeof(id));
+    } while (id == 0);
+
+    int rc = udx_stream_init(socket_->udx_handle(), stream, id,
+                             [](udx_stream_t*, int) {},
+                             [](udx_stream_t* s) { delete s; });
+    if (rc != 0) {
+        DHT_LOG("  [dht] create_raw_stream: udx_stream_init failed: %d\n", rc);
+        delete stream;
+        return nullptr;
+    }
+    return stream;
+}
+
+// ---------------------------------------------------------------------------
+// §16: validateLocalAddresses — filter to bind-able hosts only.
+//
+// JS: .analysis/js/hyperdht/index.js:135-184 tries to bind a probe
+//     socket on each host AND then sends a 1-byte self-loopback packet
+//     with a 500 ms deadline. The loopback probe is documented by JS
+//     itself as "semi terrible heuristic" (line 160). C++ implements
+//     only the bind half: if `udx_socket_bind(host, 0)` succeeds the
+//     address is considered valid.
+//
+// Per-host result cache lives on the HyperDHT instance so repeated
+// calls from different code paths (e.g. server _localAddresses on
+// each handshake) are O(1) after the first call per host.
+// ---------------------------------------------------------------------------
+
+std::vector<compact::Ipv4Address> HyperDHT::validate_local_addresses(
+    const std::vector<compact::Ipv4Address>& addresses) {
+
+    std::vector<compact::Ipv4Address> result;
+    result.reserve(addresses.size());
+
+    for (const auto& addr : addresses) {
+        const std::string host = addr.host_string();
+
+        // Cache lookup.
+        auto it = validated_host_cache_.find(host);
+        if (it != validated_host_cache_.end()) {
+            if (it->second) result.push_back(addr);
+            continue;
+        }
+
+        // Fresh probe: try a temporary UDP bind on this host.
+        //
+        // The probe socket must be HEAP-allocated: `udx_socket_close()`
+        // schedules an async `uv_close()` on the underlying `uv_udp_t`,
+        // and the close callback runs on a later event-loop turn.
+        // Stack-allocating would free the struct before the close
+        // callback fires, causing a UAF inside `on_uv_close` (libudx
+        // src/udx.c:137-147 dereferences `socket->udx` + `socket->on_close`).
+        // We pass a self-delete close callback to libudx so ownership
+        // transfers cleanly at close time.
+        auto* probe = new udx_socket_t{};
+        bool ok = (udx_socket_init(socket_->udx_handle(), probe,
+                                   [](udx_socket_t* s) { delete s; }) == 0);
+        if (ok) {
+            struct sockaddr_in sin{};
+            if (uv_ip4_addr(host.c_str(), 0, &sin) != 0) {
+                ok = false;
+            } else if (udx_socket_bind(probe,
+                                       reinterpret_cast<struct sockaddr*>(&sin),
+                                       0) != 0) {
+                ok = false;
+            }
+            // Clean up: close transfers ownership to the async callback.
+            udx_socket_close(probe);
+        } else {
+            // `udx_socket_init` failed — the handle was never registered
+            // with libuv, so we must delete it ourselves.
+            delete probe;
+        }
+
+        validated_host_cache_[host] = ok;
+        DHT_LOG("  [dht] validate_local_addresses: %s -> %s\n",
+                host.c_str(), ok ? "ok" : "rejected");
+        if (ok) result.push_back(addr);
+    }
+
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -979,7 +1105,10 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
 
 server::Server* HyperDHT::create_server() {
     ensure_bound();
-    auto srv = std::make_unique<server::Server>(*socket_, router_);
+    // §16: pass `this` so the server can call back into
+    // `validated_local_addresses()` when building its handshake reply
+    // under `share_local_address == true`.
+    auto srv = std::make_unique<server::Server>(*socket_, router_, this);
     auto* ptr = srv.get();
     servers_.push_back(std::move(srv));
     return ptr;

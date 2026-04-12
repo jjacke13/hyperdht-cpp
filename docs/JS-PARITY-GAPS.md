@@ -175,13 +175,31 @@ See "Completed" section below.
 
 ## Recommended order of remaining work
 
-Bottom-up through the stack:
+1. **§13** — parallel relay attempts (`Semaphore(2)` in connect.js:336). Performance only, not correctness.
+2. **LOW polish** — static helpers (`key_pair()`, `hash()`, `BOOTSTRAP`/`FIREWALL` constants), `Session` class, `HANDSHAKE_INITIAL_TIMEOUT` verify, `relaying` stats.
+3. **C FFI follow-ups** — expose `on_network_change`/`on_network_update`/`on_persistent` user callbacks, `create_raw_stream`/`validate_local_addresses` public methods, additional `hyperdht_opts_t` fields (`host`, `seed`, `connection_keep_alive`, `max_age_ms`).
 
-1. **§6 / §7** — Missing option fields. `fastOpen` and `localConnection` first.
-2. **§15** — `network-change` callback hooks.
-3. **§16** — `createRawStream` / `validateLocalAddresses`.
-4. **§13** — parallel relay attempts (performance).
-5. **LOW polish** — bootstrap walk, `hyperdht_api.cpp` refactor, static helpers, etc.
+## Future: thorough JS API surface audit
+
+Before declaring "full JS parity", run a systematic top-to-bottom audit of
+the **entire public JS API** — every method, property, option, and event
+on `HyperDHT`, `Server`, `NoiseSecretStream`, and `dht-rpc/DHT` — and map
+each to its C++ / C FFI equivalent. The per-§ approach we've followed so
+far was driven by the JS-PARITY-GAPS doc (which was itself an audit from
+2026-04-10), but as features land the doc can drift. A fresh pass should:
+
+1. Read `hyperdht/index.js` top-to-bottom, list every `this.xxx` property
+   and every `xxx()` method on the prototype.
+2. Do the same for `hyperdht/lib/server.js`, `hyperdht/lib/connect.js`,
+   `dht-rpc/index.js`, `@hyperswarm/secret-stream/index.js`.
+3. For each: mark PRESENT / MISSING / DEFERRED in a table, with the C++
+   file:line and a short rationale if deferred.
+4. Produce a single-page "API parity matrix" that replaces or supplements
+   this doc.
+
+This audit should happen AFTER the manual remote-machine tests confirm
+everything works end-to-end, so it's informed by real-world usage rather
+than purely spec-driven.
 
 ---
 

@@ -380,4 +380,11 @@ if(HYPERDHT_BUILD_TESTS)
     target_link_libraries(test_live_bootstrap_smoke PRIVATE hyperdht GTest::gtest_main)
     add_test(NAME test_live_bootstrap_smoke COMMAND test_live_bootstrap_smoke)
     gtest_discover_tests(test_live_bootstrap_smoke)
+
+    # Echo test against the permanent JS test fixture.
+    # Skips when SERVER_KEY is not set. Uses the C FFI end-to-end.
+    add_executable(test_echo_fixture test/test_echo_fixture.cpp)
+    target_link_libraries(test_echo_fixture PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_echo_fixture COMMAND test_echo_fixture)
+    gtest_discover_tests(test_echo_fixture)
 endif()

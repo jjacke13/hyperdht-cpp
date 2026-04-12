@@ -442,7 +442,12 @@ hyperdht_stream_t* hyperdht_stream_open(
         if (conn->peer_port != 0) {
             struct sockaddr_in dest{};
             uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
-            udx_stream_connect(raw, dht->dht->socket().socket_handle(),
+            // Use the holepunch-discovered socket when available — it has
+            // the correct NAT mapping. Fall back to the main RPC socket.
+            udx_socket_t* sock = conn->udx_socket
+                ? static_cast<udx_socket_t*>(conn->udx_socket)
+                : dht->dht->socket().socket_handle();
+            udx_stream_connect(raw, sock,
                                conn->remote_udx_id,
                                reinterpret_cast<const struct sockaddr*>(&dest));
         }

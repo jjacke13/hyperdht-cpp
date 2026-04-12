@@ -257,6 +257,7 @@ TEST(LiveConnect, FullPipeline) {
 
             peer_connect::peer_handshake(rpc_socket, state.relay_addr,
                 kp, server_pk, state.our_udx_id,
+                peer_connect::FIREWALL_UNKNOWN, {},
                 [&](const peer_connect::HandshakeResult& hs) {
                     state.handshake_done = true;
                     state.hs_result = hs;

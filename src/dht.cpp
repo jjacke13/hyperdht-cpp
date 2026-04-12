@@ -841,8 +841,39 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                 state->relay_addr = state->relays[state->relay_idx];
                 state->relay_idx--;
 
+                // Compute firewall + addresses4 for the handshake payload.
+                // JS: connect.js:386-394 (connectThroughNode)
+                //   const addr = c.dht.remoteAddress()
+                //   const localAddrs = c.lan ? localAddresses(serverSocket) : null
+                //   firewall = addr ? FIREWALL.OPEN : FIREWALL.UNKNOWN
+                //
+                // remoteAddress() returns non-null only when: host known,
+                // port known, not firewalled, NAT port == bound port.
+                uint32_t our_fw = peer_connect::FIREWALL_UNKNOWN;
+                std::vector<compact::Ipv4Address> our_addrs;
+
+                const auto& sampler = state->socket->nat_sampler();
+                if (!sampler.host().empty() &&
+                    sampler.port() != 0 &&
+                    !state->socket->is_firewalled() &&
+                    sampler.port() == state->socket->port()) {
+                    // Public / 1:1 NAT — advertise our public address
+                    our_fw = peer_connect::FIREWALL_OPEN;
+                    our_addrs.push_back(compact::Ipv4Address::from_string(
+                        sampler.host(), sampler.port()));
+                }
+
+                // Append validated LAN addresses (§6 local_connection support).
+                // JS: Holepuncher.localAddresses(dht.io.serverSocket) when c.lan
+                if (state->local_connection) {
+                    for (const auto& la : state->dht->validated_local_addresses()) {
+                        our_addrs.push_back(la);
+                    }
+                }
+
                 peer_connect::peer_handshake(*state->socket, state->relay_addr,
                     state->keypair, state->remote_pk, state->our_udx_id,
+                    our_fw, our_addrs,
                     [state](const peer_connect::HandshakeResult& hs) {
                         if (state->completed) return;
                         if (state->alive.expired() || !hs.success) {

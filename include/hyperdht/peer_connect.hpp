@@ -132,11 +132,16 @@ using OnHandshakeCallback = std::function<void(const HandshakeResult& result)>;
 // our_keypair: our Ed25519 keypair
 // remote_pubkey: the target's public key (known from findPeer)
 // our_udx_id: our UDX stream ID for the connection
+// firewall: our firewall status (OPEN if public, UNKNOWN if behind NAT)
+// addresses4: our addresses to advertise (public addr if OPEN + validated LAN)
+//   JS: connect.js:386-394 — remoteAddress() + localAddresses(serverSocket)
 void peer_handshake(rpc::RpcSocket& socket,
                     const compact::Ipv4Address& relay_addr,
                     const noise::Keypair& our_keypair,
                     const noise::PubKey& remote_pubkey,
                     uint32_t our_udx_id,
+                    uint32_t firewall,
+                    const std::vector<compact::Ipv4Address>& addresses4,
                     OnHandshakeCallback on_done);
 
 }  // namespace peer_connect

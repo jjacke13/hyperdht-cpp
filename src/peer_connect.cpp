@@ -311,6 +311,8 @@ void peer_handshake(rpc::RpcSocket& socket,
                     const noise::Keypair& our_keypair,
                     const noise::PubKey& remote_pubkey,
                     uint32_t our_udx_id,
+                    uint32_t firewall,
+                    const std::vector<compact::Ipv4Address>& addresses4,
                     OnHandshakeCallback on_done) {
 
     // Create Noise IK initiator with real prologue
@@ -319,10 +321,12 @@ void peer_handshake(rpc::RpcSocket& socket,
                                                       &remote_pubkey);
 
     // Build noisePayload for msg1
+    // JS: connect.js:396-411 — firewall + addresses4 from caller
     NoisePayload payload;
     payload.version = 1;
     payload.error = ERROR_NONE;
-    payload.firewall = FIREWALL_UNKNOWN;
+    payload.firewall = firewall;
+    payload.addresses4 = addresses4;
     payload.udx = UdxInfo{1, false, our_udx_id, 0};
     payload.has_secret_stream = true;
 

@@ -20,23 +20,17 @@
 // Matches JS: rawStream created at connect() time with firewall callback.
 struct ClientRawStreamCtx {
     std::weak_ptr<bool> alive;
-    std::function<void(udx_stream_t*, const struct sockaddr*)> on_firewall;
+    std::function<void(udx_stream_t*, udx_socket_t*, const struct sockaddr*)> on_firewall;
 };
 
 // Firewall callback for client-side rawStream. Fires when the server's
 // first UDX packet arrives with the REAL peer address.
 // Matches JS: rawStream firewall → c.onsocket(socket, port, host)
-static int client_raw_stream_firewall(udx_stream_t* stream, udx_socket_t*,
+static int client_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket,
                                        const struct sockaddr* from) {
-    auto* addr_in = reinterpret_cast<const struct sockaddr_in*>(from);
-    char host[INET_ADDRSTRLEN];
-    uv_ip4_name(addr_in, host, sizeof(host));
-    printf("  [rawStream] FIREWALL FIRED from %s:%u (stream=%u)\n",
-           host, ntohs(addr_in->sin_port), stream->local_id);
-    fflush(stdout);
     auto* ctx = static_cast<ClientRawStreamCtx*>(stream->data);
     if (ctx && !ctx->alive.expired() && ctx->on_firewall) {
-        ctx->on_firewall(stream, from);
+        ctx->on_firewall(stream, socket, from);
     }
     return 0;
 }
@@ -803,6 +797,65 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
     // Generate random UDX stream ID
     randombytes_buf(&state->our_udx_id, sizeof(state->our_udx_id));
 
+    // Create rawStream BEFORE the handshake — matching JS connect.js:73.
+    // JS creates the rawStream with a firewall callback at the start of
+    // the connect flow, not after the handshake reply. This is critical:
+    // when the server has a public IP, it sends UDX data to us immediately
+    // after processing the handshake. If the rawStream doesn't exist yet,
+    // we miss the server's first packet and fall through to holepunch.
+    {
+        auto* raw = new udx_stream_t;
+        auto* raw_ctx = new ClientRawStreamCtx{state->alive, nullptr};
+        std::weak_ptr<ConnState> weak_state = state;
+        raw_ctx->on_firewall = [weak_state](
+            udx_stream_t* stream, udx_socket_t* sock,
+            const struct sockaddr* from) {
+            auto st = weak_state.lock();
+            if (!st || st->completed) return;
+            // Can't fill keys yet — handshake hasn't completed.
+            // Store the firewall info and let the handshake callback
+            // check for it. This is a simplified path — the full
+            // result will be built when hs_result is available.
+            if (!st->hs_result.success) {
+                // Handshake not done yet — can't build ConnectResult.
+                // The server sent data before we even got the reply.
+                // Ignore for now; the handshake callback will handle it.
+                return;
+            }
+
+            auto* addr_in = reinterpret_cast<const struct sockaddr_in*>(from);
+            char host[INET_ADDRSTRLEN];
+            uv_ip4_name(addr_in, host, sizeof(host));
+            auto real_addr = compact::Ipv4Address::from_string(
+                host, ntohs(addr_in->sin_port));
+
+            DHT_LOG("  [connect] rawStream firewall: %s:%u\n",
+                    host, ntohs(addr_in->sin_port));
+
+            ConnectResult result;
+            result.success = true;
+            result.tx_key = st->hs_result.tx_key;
+            result.rx_key = st->hs_result.rx_key;
+            result.handshake_hash = st->hs_result.handshake_hash;
+            result.remote_public_key = st->hs_result.remote_public_key;
+            result.peer_address = real_addr;
+            result.udx_socket = sock;
+            result.local_udx_id = st->our_udx_id;
+            if (st->hs_result.remote_payload.udx.has_value()) {
+                result.remote_udx_id = st->hs_result.remote_payload.udx->id;
+            }
+            st->take_raw_stream(result);
+            st->complete(0, result);
+        };
+        udx_stream_init(state->socket->udx_handle(), raw,
+                        state->our_udx_id,
+                        [](udx_stream_t*, int) {},
+                        [](udx_stream_t* s) { delete s; });
+        raw->data = raw_ctx;
+        udx_stream_firewall(raw, client_raw_stream_firewall);
+        state->raw_stream = raw;
+    }
+
     // Step 1: findPeer — collect all relays that have the peer record.
     // JS: findAndConnect tries connectThroughNode for each result.
     // JS: connect.js:341-368 — for-await over findPeer query, semaphore(2)
@@ -880,49 +933,27 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                             if (state->try_relay_fn) (*state->try_relay_fn)();
                             return;
                         }
+                        // Guard: only the first successful handshake proceeds.
+                        // The parallel Semaphore(2) attempt fires a second
+                        // handshake that may also succeed. Without this guard,
+                        // it overwrites hs_result/raw_stream while holepunch #1
+                        // is in flight → mixed state (keys from hs2 + address
+                        // from hp1) → RTO because the server session at hp1's
+                        // address expects hs1's UDX IDs.
+                        if (state->hs_result.success) return;
                         state->try_relay_fn.reset();  // Break cycle
                     state->hs_result = hs;
 
-                    // Create rawStream NOW — like JS rawStream with firewall.
-                    // When the server sends UDX packets directly (public IP),
-                    // the firewall fires with the real address → connection.
-                    {
-                        auto* raw = new udx_stream_t;
-                        auto* raw_ctx = new ClientRawStreamCtx{state->alive, nullptr};
-                        std::weak_ptr<ConnState> weak_state = state;
-                        raw_ctx->on_firewall = [weak_state](
-                            udx_stream_t* stream, const struct sockaddr* from) {
-                            auto st = weak_state.lock();
-                            if (!st || st->completed) return;
+                    // rawStream was already created before findPeer
+                    // (matching JS connect.js:73). No need to create it here.
 
-                            auto* addr_in = reinterpret_cast<const struct sockaddr_in*>(from);
-                            char host[INET_ADDRSTRLEN];
-                            uv_ip4_name(addr_in, host, sizeof(host));
-                            auto real_addr = compact::Ipv4Address::from_string(
-                                host, ntohs(addr_in->sin_port));
-
-                            ConnectResult result;
-                            result.success = true;
-                            result.tx_key = st->hs_result.tx_key;
-                            result.rx_key = st->hs_result.rx_key;
-                            result.handshake_hash = st->hs_result.handshake_hash;
-                            result.remote_public_key = st->hs_result.remote_public_key;
-                            result.peer_address = real_addr;
-                            result.local_udx_id = st->our_udx_id;
-                            if (st->hs_result.remote_payload.udx.has_value()) {
-                                result.remote_udx_id = st->hs_result.remote_payload.udx->id;
-                            }
-                            st->take_raw_stream(result);
-                            st->complete(0, result);
-                        };
-                        udx_stream_init(state->socket->udx_handle(), raw,
-                                        state->our_udx_id,
-                                        [](udx_stream_t*, int) {},
-                                        [](udx_stream_t* s) { delete s; });
-                        raw->data = raw_ctx;
-                        udx_stream_firewall(raw, client_raw_stream_firewall);
-                        state->raw_stream = raw;
-                    }
+                    // Log the server's handshake reply
+                    DHT_LOG("  [connect] Server reply: fw=%u, addrs4=%zu, hp=%s, relays=%zu\n",
+                            hs.remote_payload.firewall,
+                            hs.remote_payload.addresses4.size(),
+                            hs.remote_payload.holepunch.has_value() ? "yes" : "no",
+                            hs.remote_payload.holepunch.has_value()
+                                ? hs.remote_payload.holepunch->relays.size() : 0);
 
                     // Check for direct connect (OPEN firewall)
                     holepunch::HolepunchResult hp_result;
@@ -1111,6 +1142,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                             result.remote_public_key = state->hs_result.remote_public_key;
                             result.peer_address = hp.address;
                             result.udx_socket = hp.socket;  // JS: ref.socket from probe
+                            result.socket_keepalive = hp.socket_keepalive;
                             result.local_udx_id = state->our_udx_id;
                             if (state->hs_result.remote_payload.udx.has_value()) {
                                 result.remote_udx_id = state->hs_result.remote_payload.udx->id;

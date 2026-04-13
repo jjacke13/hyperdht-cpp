@@ -110,6 +110,7 @@ typedef struct {
     int is_initiator;       /**< 1 if we initiated, 0 if we accepted */
     void* raw_stream;       /**< Pre-created UDX stream (server side), or NULL */
     void* udx_socket;       /**< Socket for UDX connect (from holepunch probe), or NULL */
+    void* _internal;        /**< Opaque — do not touch. Pool socket keepalive. */
 } hyperdht_connection_t;
 
 /* =========================================================================

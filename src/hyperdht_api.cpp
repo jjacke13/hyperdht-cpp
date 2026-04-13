@@ -180,7 +180,16 @@ int hyperdht_connect(hyperdht_t* dht,
                         result.local_udx_id, true);
         conn.raw_stream = result.raw_stream;
         conn.udx_socket = result.udx_socket;  // Socket from holepunch probe
+        // Stash the pool socket keepalive so hyperdht_stream_open can pick it up.
+        // Heap-allocated shared_ptr — stream_open takes ownership.
+        conn._internal = result.socket_keepalive
+            ? new std::shared_ptr<void>(result.socket_keepalive)
+            : nullptr;
         cb(0, &conn, userdata);
+        // Clean up if user didn't call stream_open (didn't consume _internal)
+        if (conn._internal) {
+            delete static_cast<std::shared_ptr<void>*>(conn._internal);
+        }
     });
 
     return 0;
@@ -390,6 +399,12 @@ struct hyperdht_stream_s {
     void* userdata = nullptr;
 
     bool closed = false;
+
+    // Keeps the holepunch pool socket alive for the UDX stream's lifetime.
+    // The raw UDX stream holds a raw pointer to the pool socket (via
+    // udx_stream_connect). This shared_ptr prevents the pool from being
+    // closed while the stream is active.
+    std::shared_ptr<void> socket_keepalive;
 };
 
 // `on_close` wrapper: fires the user callback exactly once, then frees
@@ -508,6 +523,17 @@ hyperdht_stream_t* hyperdht_stream_open(
     s->on_data = on_data;
     s->on_close = on_close;
     s->userdata = userdata;
+
+    // Take ownership of the pool socket keepalive from the connection.
+    // This keeps the holepunch pool socket alive for the stream's lifetime.
+    if (conn->_internal) {
+        s->socket_keepalive = std::move(
+            *static_cast<std::shared_ptr<void>*>(conn->_internal));
+        delete static_cast<std::shared_ptr<void>*>(conn->_internal);
+        // Cast away const to null the consumed pointer — prevents the
+        // connect callback's cleanup from double-freeing.
+        const_cast<hyperdht_connection_t*>(conn)->_internal = nullptr;
+    }
 
     // `make_duplex_options()` populates `keep_alive_ms` from
     // `DhtOptions::connection_keep_alive` (default 5000 ms) — this is

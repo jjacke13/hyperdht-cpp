@@ -530,6 +530,13 @@ void Holepuncher::destroy() {
         auto cb = std::move(on_abort_);
         if (cb) cb();
     }
+
+    // Break circular refs AFTER abort fires: these closures capture
+    // PunchState shared_ptr, and PunchState owns us → cycle.
+    send_fn_ = nullptr;
+    send_ttl_fn_ = nullptr;
+    on_connect_ = nullptr;
+    on_abort_ = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -697,13 +704,17 @@ void PoolSocket::handle_message(const uint8_t* data, size_t len,
     DHT_LOG("  [pool] Recv %zu bytes from %s:%u (type=0x%02x)\n",
             len, host, ntohs(addr->sin_port), len > 0 ? data[0] : 0);
 
-    // 1-byte probe → holepunch callback
+    // 1-byte probe → holepunch callback.
+    // Copy before invoking — the handler may clear on_probe_ during execution
+    // (PunchState::complete resets it to break circular refs → UB if we call
+    // on_probe_ directly and it's destroyed mid-call).
     if (len == 1 && data[0] == 0x00) {
-        if (on_probe_) {
+        auto cb = on_probe_;
+        if (cb) {
             char host[INET_ADDRSTRLEN];
             uv_ip4_name(addr, host, sizeof(host));
             auto from = Ipv4Address::from_string(host, ntohs(addr->sin_port));
-            on_probe_(from);
+            cb(from);
         }
         return;
     }
@@ -839,7 +850,7 @@ void PoolSocket::close() {
     socket_.data = nullptr;
     // Clean up inflight
     for (auto* inf : inflight_) {
-        if (inf->timer) {
+        if (inf->timer && !uv_is_closing(reinterpret_cast<uv_handle_t*>(inf->timer))) {
             uv_timer_stop(inf->timer);
             uv_close(reinterpret_cast<uv_handle_t*>(inf->timer),
                      [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
@@ -865,6 +876,7 @@ void discover_pool_addresses(
     PoolSocket& pool,
     const routing::RoutingTable& table,
     const compact::Ipv4Address& relay_addr,
+    const compact::Ipv4Address& peer_addr,
     std::function<void(bool)> on_done) {
 
     struct DiscoverCtx {
@@ -886,9 +898,17 @@ void discover_pool_addresses(
         }
     };
 
-    // Pick up to 5 DHT nodes for PING (JS: nat.autoSample with 4+ nodes)
+    // Pick up to 6 DHT nodes for PING (JS: nat.autoSample with 4+ nodes).
+    // Include the server's announce address so our pool socket establishes
+    // a direct NAT mapping with the server's IP. This is critical for
+    // NAT-to-NAT: when the server's puncher probes us later, our NAT
+    // already has a pinhole for the server's IP (from the PING response).
+    // JS gets this implicitly because its autoSample runs later (during
+    // analyze() after findPeer), when the routing table already contains
+    // the server. Our discover runs earlier, so we add it explicitly.
     std::vector<compact::Ipv4Address> targets;
     targets.push_back(relay_addr);
+    targets.push_back(peer_addr);  // Server's announce address
 
     // Use routing table nodes if available
     auto closest = table.closest(routing::NodeId{}, 20);
@@ -1006,17 +1026,26 @@ struct PunchState {
         if (completed) return;
         completed = true;
 
-        // Destroy puncher (stops timer, releases holders, clears callbacks)
+        // Destroy puncher (stops timer, releases holders, clears callbacks).
+        // Don't call close() — destroy() handles cleanup, and close()
+        // can race with other handle closures during teardown.
         if (puncher) {
             puncher->destroy();
-            puncher->close();
         }
 
         // Cancel sleeper timer
         if (sleeper) sleeper->cancel();
 
-        // Close pool socket
-        if (pool) pool->close();
+        // Close pool socket on FAILURE only. On success, the caller needs the
+        // pool socket alive for udx_stream_connect — the HolepunchResult.socket
+        // raw pointer must remain valid. Clear the probe callback to break the
+        // circular reference (pool callback → state → pool) so the PunchState
+        // can be destroyed when all other refs drop.
+        if (pool && !result.success) {
+            pool->close();
+        } else if (pool) {
+            pool->on_holepunch_probe(nullptr);  // Break circular ref
+        }
 
         // Clear probe listener on main socket
         if (socket) socket->on_holepunch_probe(nullptr);
@@ -1100,14 +1129,38 @@ void holepunch_connect(rpc::RpcSocket& socket,
     state->pool = std::make_shared<PoolSocket>(socket.loop(), socket.udx_handle());
     state->pool->bind();
 
-    // JS: connect.js:269 — probeRound(c, opts.fastOpen === false ? null : serverAddress, ...)
-    //     probeRound calls `c.puncher.openSession(serverAddress)` before
-    //     sending round 1. The puncher's socket in JS == the pool socket.
-    //     We send the TTL=5 probe from the POOL socket (not main) so it
-    //     primes the same NAT pinhole that subsequent probes will use.
-    //     The server expects probes to arrive on the pool socket's port
-    //     (advertised in Round 1 addresses), so priming the main socket
-    //     would open the wrong pinhole and have zero practical effect.
+    // Create puncher EARLY — matching JS connect.js:258.
+    // JS creates the Holepuncher (which acquires a pool socket) BEFORE
+    // sending the handshake. The puncher's probe listener must exist
+    // before the fast-open probe so it can catch the echo. When the
+    // server has a public IP, the TTL=5 probe arrives, the server echoes
+    // it, and the puncher detects it → connected without holepunch rounds.
+    auto puncher = std::make_shared<Holepuncher>(socket.loop(), true);
+    puncher->set_local_firewall(local_firewall);
+    puncher->set_send_fn([state](const Ipv4Address& addr) {
+        if (state->pool) state->pool->send_probe(addr);
+    });
+    puncher->set_send_ttl_fn([state](const Ipv4Address& addr, int ttl) {
+        if (state->pool) state->pool->send_probe_ttl(addr, ttl);
+    });
+    puncher->on_connect([state](const HolepunchResult& result) {
+        auto augmented = result;
+        augmented.socket_keepalive = state->pool;
+        state->complete(augmented);
+    });
+    state->puncher = puncher;
+
+    // Listen for probes on pool socket (matching JS holepuncher.js:225).
+    state->pool->on_holepunch_probe([state](const Ipv4Address& from) {
+        if (state->puncher) state->puncher->on_message(from,
+            state->pool ? state->pool->socket_handle() : nullptr);
+    });
+
+    // Fast-open: TTL=5 probe to server's announced address.
+    // JS: probeRound calls `c.puncher.openSession(serverAddress)` before
+    // Round 1 (connect.js:557). If the server is reachable (public IP),
+    // the probe arrives, the server echoes it, and the puncher detects
+    // the echo → connected without holepunch rounds.
     if (fast_open && peer_addr.port != 0) {
         DHT_LOG("  [hp] fast-open: low-TTL probe to %s:%u (from pool)\n",
                 peer_addr.host_string().c_str(), peer_addr.port);
@@ -1121,7 +1174,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        nullptr, 0);
 
     // Discover pool socket's external address via PINGs (JS: nat.autoSample())
-    discover_pool_addresses(*state->pool, socket.table(), relay_addr,
+    discover_pool_addresses(*state->pool, socket.table(), relay_addr, peer_addr,
         [state, target, relay_addr, peer_addr, holepunch_id,
          local_firewall, local_addresses](bool addr_ok) {
 
@@ -1165,10 +1218,12 @@ void holepunch_connect(rpc::RpcSocket& socket,
             holepunch_id,
             peer_addr.host_string().c_str(), peer_addr.port);
 
-    // Send Round 1 from MAIN socket — the relay must see the same address
-    // as the handshake so the server's rawStream can reach us. Pool socket
-    // is used for probes only.
-    state->socket->request(req,
+    // Send Round 1 from POOL socket — JS sends holepunch rounds via
+    // c.puncher.socket (connect.js:505-516, updateHolepunch). The relay
+    // sets peerAddress = req.from, so using the pool socket ensures the
+    // server sees the same address as our probes. Using the main socket
+    // would cause a port mismatch on NAT.
+    state->pool->request(req,
         [state, relay_addr, peer_addr, holepunch_id, target, local_firewall]
         (const messages::Response& resp) {
             if (state->completed) return;
@@ -1270,43 +1325,30 @@ void holepunch_connect(rpc::RpcSocket& socket,
                 return;
             }
 
-            // -------------------------------------------------------------------
-            // Set up the Holepuncher
-            // -------------------------------------------------------------------
-            auto puncher = std::make_shared<Holepuncher>(state->socket->loop(), true);
-            puncher->set_local_firewall(local_firewall);
-            puncher->set_remote_firewall(effective_remote_fw);
-            // Use update_remote with first address verified (from relay)
+            // Puncher was created early (before fast-open probe). Now update
+            // it with server addresses from Round 1 response.
+            state->puncher->set_remote_firewall(effective_remote_fw);
             std::string verified_host;
             if (!server_addrs.empty()) verified_host = server_addrs[0].host_string();
-            puncher->update_remote(server_addrs, verified_host);
+            state->puncher->update_remote(server_addrs, verified_host);
 
-            // Send probes from BOTH main and pool socket. We report the pool
-            // socket's address but also probe from main to maximize chances.
-            puncher->set_send_fn([state](const Ipv4Address& addr) {
-                if (state->socket) state->socket->send_probe(addr);
-                if (state->pool) state->pool->send_probe(addr);
-            });
-            puncher->set_send_ttl_fn([state](const Ipv4Address& addr, int ttl) {
-                if (state->socket) state->socket->send_probe_ttl(addr, ttl);
-                if (state->pool) state->pool->send_probe_ttl(addr, ttl);
-            });
-
-            puncher->on_connect([state](const HolepunchResult& result) {
-                state->complete(result);
-            });
-
-            state->puncher = puncher;
-
-            // Listen for probes on BOTH pool socket and main socket.
-            state->pool->on_holepunch_probe([state](const Ipv4Address& from) {
-                if (state->puncher) state->puncher->on_message(from,
-                    state->pool ? state->pool->socket_handle() : nullptr);
-            });
-            state->socket->on_holepunch_probe([state](const Ipv4Address& from) {
-                if (state->puncher) state->puncher->on_message(from,
-                    state->socket->socket_handle());
-            });
+            // JS: probeRound:582-591 — if the server's address from the
+            // Round 1 payload differs from the announce address and the
+            // firewall isn't RANDOM, send an openSession (TTL=5) probe.
+            // The server's puncher (created during _addHandshake) echoes
+            // ALL probes on its pool socket. If the echo arrives back
+            // before Round 2, we connect without holepunch rounds.
+            // Post-Round1 probe: send to server's pool address so the
+            // server's puncher echoes it. If NAT conditions allow, the
+            // echo arrives before Round 2 → connected without holepunch
+            // rounds (matching JS probeRound:582-591).
+            if (effective_remote_fw < peer_connect::FIREWALL_RANDOM &&
+                !server_addrs.empty()) {
+                DHT_LOG("  [hp] Post-Round1 probe to %s:%u\n",
+                        server_addrs[0].host_string().c_str(),
+                        server_addrs[0].port);
+                state->puncher->send_probe(server_addrs[0]);
+            }
 
             // Start overall timeout
             auto* timer = new uv_timer_t;
@@ -1337,7 +1379,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
 
             auto send_round2 = [state, relay_addr, peer_addr,
                                 holepunch_id, target, local_firewall,
-                                server_addrs, server_r1, puncher, our_addr]() {
+                                server_addrs, server_r1, our_addr]() {
             if (state->completed) return;
 
             // JS: c.puncher.nat.freeze() — prevent NAT updates during punch
@@ -1381,15 +1423,14 @@ void holepunch_connect(rpc::RpcSocket& socket,
             // JS: openSession BEFORE sending round 2 (connect.js:557)
             // Prime our NAT mapping with low-TTL probe
             if (!server_addrs.empty()) {
-                puncher->open_session(server_addrs[0]);
+                state->puncher->open_session(server_addrs[0]);
             }
 
-            // Round 2 sent from main RPC socket — needs routing context (node ID,
-            // token) that PoolSocket doesn't have. JS sends via peerHolepunch
-            // which uses the puncher's socket, but the relay routing works
-            // differently in JS. Probes go from pool socket only (fixed above).
-            state->socket->request(req2,
-                [state, puncher, server_addrs](const messages::Response& r2resp) {
+            // Round 2 also sent from pool socket — same rationale as Round 1.
+            // JS: connect.js:505-516 (updateHolepunch) uses c.puncher.socket.
+            // PoolSocket::request() handles encoding, TID, and timeout.
+            state->pool->request(req2,
+                [state, server_addrs](const messages::Response& r2resp) {
                     if (state->completed) return;
 
                     // Decode round 2 response to check for errors
@@ -1439,15 +1480,35 @@ void holepunch_connect(rpc::RpcSocket& socket,
             // Start probing IMMEDIATELY after sending Round 2 — don't wait
             // for relay response. JS: roundPunch calls punch() right after
             // sending the update, not in the response callback.
-            puncher->punch();
+            state->puncher->punch();
             };  // end send_round2 lambda
 
-            // Dispatch Round 2: immediately or after 1s delay
+            // Dispatch Round 2 with appropriate delay.
+            // JS: between Round 1 response and Round 2, connect.js calls
+            // `await c.puncher.analyze(false)` which waits for the client's
+            // NAT sampling (~200-400ms). This delay also gives the SERVER's
+            // puncher time to complete its own autoSample. Without it, the
+            // server's punch() → analyze() returns UNKNOWN → abort → no probes.
+            // JS: between Round 1 and Round 2, connect.js calls
+            // `await c.puncher.analyze(false)` which yields to the event loop.
+            // During this yield, the post-Round1 probe echo may arrive and
+            // complete the connection (via puncher on_connect) — skipping
+            // Round 2 entirely. We replicate this with a polling check:
+            // yield 50ms at a time (up to 500ms), checking if the probe
+            // connected us. libuv processes I/O between timer callbacks.
             if (delay_round2) {
                 DHT_LOG("  [hp] Delaying Round 2 by 1s (server fw was UNKNOWN)\n");
                 state->sleeper->pause(1000, send_round2);
             } else {
-                send_round2();
+                // Delay 500ms before Round 2, matching JS analyze() wait.
+                // During this time, the post-Round1 probe echo may arrive
+                // and complete the connection, skipping Round 2.
+                auto sr2 = std::make_shared<std::function<void()>>(
+                    std::move(send_round2));
+                state->sleeper->pause(500, [state, sr2]() {
+                    if (state->completed) return;  // Probe connected us!
+                    (*sr2)();
+                });
             }
         },
         [state](uint16_t) {

@@ -166,8 +166,22 @@ public:
     // Set handler for incoming requests
     void on_request(OnRequestCallback cb) { on_request_ = std::move(cb); }
 
-    // Set handler for incoming holepunch probes (1-byte [0x00] UDP packets)
-    void on_holepunch_probe(OnProbeCallback cb) { on_probe_ = std::move(cb); }
+    // Add a handler for incoming holepunch probes (1-byte [0x00] UDP packets).
+    // Returns an ID for later removal. Supports multiple concurrent listeners
+    // so concurrent holepunch sessions don't clobber each other.
+    uint32_t add_probe_listener(OnProbeCallback cb);
+    void remove_probe_listener(uint32_t id);
+
+    // Legacy single-slot API (sets/clears a catch-all listener).
+    // Prefer add_probe_listener/remove_probe_listener for per-session use.
+    void on_holepunch_probe(OnProbeCallback cb) {
+        if (cb) {
+            legacy_probe_id_ = add_probe_listener(std::move(cb));
+        } else if (legacy_probe_id_ != 0) {
+            remove_probe_listener(legacy_probe_id_);
+            legacy_probe_id_ = 0;
+        }
+    }
 
     // Send a 1-byte [0x00] UDP probe to the given address
     void send_probe(const compact::Ipv4Address& to);
@@ -340,7 +354,9 @@ private:
                          const routing::Node& oldest);
 
     OnRequestCallback on_request_;
-    OnProbeCallback on_probe_;
+    std::unordered_map<uint32_t, OnProbeCallback> probe_listeners_;
+    uint32_t next_probe_id_ = 1;
+    uint32_t legacy_probe_id_ = 0;
     OnRefreshCallback on_refresh_;
     OnStateCallback on_persistent_;
     OnStateCallback on_health_change_;

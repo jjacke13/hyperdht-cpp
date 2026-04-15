@@ -178,17 +178,15 @@ void Server::close(std::function<void()> on_done) {
         announcer_.reset();
     }
 
-    // Cancel all session timers
-    for (auto& [id, timer] : session_timers_) {
-        uv_timer_stop(timer);
-        auto* ctx = static_cast<std::pair<Server*, uint32_t>*>(timer->data);
-        delete ctx;
-        timer->data = nullptr;
-        uv_close(reinterpret_cast<uv_handle_t*>(timer),
-                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-    }
+    // Cancel all session timers (UvTimer RAII handles stop + close)
     session_timers_.clear();
     pending_punch_streams_.clear();
+
+    // Remove probe echo listener
+    if (probe_listener_id_ != 0) {
+        socket_.remove_probe_listener(probe_listener_id_);
+        probe_listener_id_ = 0;
+    }
 
     // Remove from router
     router_.remove(target_);
@@ -233,15 +231,7 @@ void Server::suspend() {
     // Stop announcer
     if (announcer_) announcer_->stop();
 
-    // Clear pending holepunches (JS: server.suspend clears holepunches)
-    for (auto& [id, timer] : session_timers_) {
-        uv_timer_stop(timer);
-        auto* ctx = static_cast<std::pair<Server*, uint32_t>*>(timer->data);
-        delete ctx;
-        timer->data = nullptr;
-        uv_close(reinterpret_cast<uv_handle_t*>(timer),
-                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-    }
+    // Clear pending holepunches (UvTimer RAII handles stop + close)
     session_timers_.clear();
     connections_.clear();
     handshake_dedup_.clear();
@@ -618,23 +608,12 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     connections_[hp_id] = std::move(conn_ptr);
     handshake_dedup_[noise_key] = hp_id;
 
-    // Per-session timeout — JS: server.js:445-462 (_clearLater + _clear)
-    //   JS uses `hs.clearing = setTimeout(() => _clear(...), handshakeClearWait)`
-    //   We store the uv_timer_t* in session_timers_ keyed by hp_id.
-    auto* timer = new uv_timer_t;
-    uv_timer_init(socket_.loop(), timer);
-    auto* ctx = new std::pair<Server*, uint32_t>(this, hp_id);
-    timer->data = ctx;
-    uv_timer_start(timer, [](uv_timer_t* t) {
-        auto* c = static_cast<std::pair<Server*, uint32_t>*>(t->data);
-        if (c->first && !c->first->closed_) {
-            c->first->clear_session(c->second);
-        }
-        delete c;
-        uv_close(reinterpret_cast<uv_handle_t*>(t),
-                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-    }, handshake_clear_wait, 0);
-    session_timers_[hp_id] = timer;
+    // Per-session timeout (RAII) — JS: server.js:445-462 (_clearLater + _clear)
+    auto session_timer = std::make_unique<async_utils::UvTimer>(socket_.loop());
+    session_timer->start([this, hp_id]() {
+        if (!closed_) clear_session(hp_id);
+    }, handshake_clear_wait);
+    session_timers_[hp_id] = std::move(session_timer);
 
     DHT_LOG( "  [server] Handshake complete (id=%d), waiting for holepunch\n", hp_id);
 }
@@ -787,12 +766,16 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
             pending_punch_streams_[conn.local_udx_id] = hp_msg.id;
         }
 
-        // Install probe listener — routes to puncher's on_message (echoes back)
-        // and also serves as a global echo for any probe from any client
-        socket_.on_holepunch_probe([this](const compact::Ipv4Address& from) {
-            if (closed_) return;
-            socket_.send_probe(from);
-        });
+        // Install probe echo listener ONCE — echoes probes from ALL clients.
+        // Uses add_probe_listener so it doesn't clobber other listeners.
+        // The listener stays active for the server's lifetime (removed in close).
+        if (probe_listener_id_ == 0) {
+            probe_listener_id_ = socket_.add_probe_listener(
+                [this](const compact::Ipv4Address& from) {
+                    if (closed_) return;
+                    socket_.send_probe(from);
+                });
+        }
     }
 }
 
@@ -900,16 +883,8 @@ void Server::on_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket,
     for (auto dit = handshake_dedup_.begin(); dit != handshake_dedup_.end(); ++dit) {
         if (dit->second == hp_id) { handshake_dedup_.erase(dit); break; }
     }
-    auto tit = session_timers_.find(hp_id);
-    if (tit != session_timers_.end()) {
-        uv_timer_stop(tit->second);
-        auto* ctx = static_cast<std::pair<Server*, uint32_t>*>(tit->second->data);
-        delete ctx;
-        tit->second->data = nullptr;
-        uv_close(reinterpret_cast<uv_handle_t*>(tit->second),
-                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-        session_timers_.erase(tit);
-    }
+    // Cancel session timer (UvTimer RAII handles stop + close)
+    session_timers_.erase(hp_id);
     connections_.erase(it);
 
     // Connect with the REAL address and the socket that received the probe

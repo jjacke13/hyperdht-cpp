@@ -806,6 +806,8 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
         // cache the firewall info here and replay it after hs_result is set.
         udx_socket_t* cached_fw_socket = nullptr;
         compact::Ipv4Address cached_fw_address;
+        // Passive wait timer (OPEN firewall path) — RAII
+        std::unique_ptr<async_utils::UvTimer> passive_timer;
         // §6 ConnectOptions snapshot (copied, not referenced — opts may
         // outlive the original scope once we enter async territory).
         bool fast_open = true;
@@ -820,7 +822,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
         // correct teardown order regardless of destruction path.
         struct RelayState {
             bool paired = false;
-            uv_timer_t* timeout = nullptr;
+            std::unique_ptr<async_utils::UvTimer> timeout;
             // Connection resources in dependency order (destroyed bottom-up):
             std::unique_ptr<blind_relay::BlindRelayClient> client;
             std::unique_ptr<protomux::Mux> mux;
@@ -832,17 +834,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                 mux.reset();
                 duplex.reset();
                 raw_stream = nullptr;
-                if (timeout) {
-                    if (timeout->data) {
-                        // The timer lambda stores a shared_ptr<ConnState>*
-                        delete static_cast<std::shared_ptr<void>*>(timeout->data);
-                        timeout->data = nullptr;
-                    }
-                    uv_timer_stop(timeout);
-                    uv_close(reinterpret_cast<uv_handle_t*>(timeout),
-                             [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-                    timeout = nullptr;
-                }
+                timeout.reset();  // UvTimer RAII handles stop + close
             }
         };
         std::unique_ptr<RelayState> relay;
@@ -1160,28 +1152,18 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                             state->dht->relay_stats().attempts++;
                         }
 
-                        // 15-second timeout for relay pairing
+                        // 15-second timeout for relay pairing (RAII — auto-cleaned)
                         // JS: connect.js:765 — c.relayTimeout = setTimeout(onabort, 15000)
-                        auto* timer = new uv_timer_t;
-                        uv_timer_init(state->dht->loop(), timer);
-                        timer->data = new std::shared_ptr<ConnState>(state);
-                        uv_timer_start(timer, [](uv_timer_t* t) {
-                            auto* sp = static_cast<std::shared_ptr<ConnState>*>(t->data);
-                            if (sp && *sp) {
-                                if ((*sp)->relay) (*sp)->relay->timeout = nullptr;
-                                if (!(*sp)->completed) {
-                                    DHT_LOG("  [connect] Relay pairing timed out (15s)\n");
-                                    if ((*sp)->dht) {
-                                        (*sp)->dht->relay_stats().aborts++;
-                                    }
+                        state->relay->timeout = std::make_unique<async_utils::UvTimer>(
+                            state->dht->loop());
+                        state->relay->timeout->start([state]() {
+                            if (!state->completed) {
+                                DHT_LOG("  [connect] Relay pairing timed out (15s)\n");
+                                if (state->dht) {
+                                    state->dht->relay_stats().aborts++;
                                 }
                             }
-                            delete sp;
-                            t->data = nullptr;
-                            uv_close(reinterpret_cast<uv_handle_t*>(t),
-                                     [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-                        }, blind_relay::RELAY_TIMEOUT_MS, 0);
-                        state->relay->timeout = timer;
+                        }, blind_relay::RELAY_TIMEOUT_MS);
 
                         // Step 1: Connect to the relay node via normal DHT connect.
                         // JS: connect.js:762 — c.relaySocket = c.dht.connect(publicKey)
@@ -1285,17 +1267,8 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                                     DHT_LOG("  [connect] Relay pairing succeeded! remote_id=%u\n",
                                             remote_id);
 
-                                    // Cancel timeout
-                                    if (state->relay->timeout) {
-                                        auto* sp = static_cast<std::shared_ptr<ConnState>*>(
-                                            state->relay->timeout->data);
-                                        delete sp;
-                                        state->relay->timeout->data = nullptr;
-                                        uv_timer_stop(state->relay->timeout);
-                                        uv_close(reinterpret_cast<uv_handle_t*>(state->relay->timeout),
-                                                 [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-                                        state->relay->timeout = nullptr;
-                                    }
+                                    // Cancel timeout (RAII handles cleanup)
+                                    state->relay->timeout.reset();
 
                                     state->relay->paired = true;
                                     if (state->dht) state->dht->relay_stats().successes++;
@@ -1420,19 +1393,13 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                         // C++ uses `completed` guard instead — the timer fires
                         // as a harmless no-op if rawStream firewall already completed.
                         // Functionally equivalent, minor resource difference.
-                        auto* passive_timer = new uv_timer_t;
-                        uv_timer_init(state->socket->loop(), passive_timer);
-                        passive_timer->data = new std::shared_ptr<ConnState>(state);
-                        uv_timer_start(passive_timer, [](uv_timer_t* t) {
-                            auto* sp = static_cast<std::shared_ptr<ConnState>*>(t->data);
-                            if (sp && *sp && !(*sp)->completed) {
-                                (*sp)->complete(ConnectError::HOLEPUNCH_TIMEOUT);
+                        state->passive_timer = std::make_unique<async_utils::UvTimer>(
+                            state->socket->loop());
+                        state->passive_timer->start([state]() {
+                            if (!state->completed) {
+                                state->complete(ConnectError::HOLEPUNCH_TIMEOUT);
                             }
-                            delete sp;
-                            t->data = nullptr;
-                            uv_close(reinterpret_cast<uv_handle_t*>(t),
-                                     [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-                        }, 10000, 0);
+                        }, 10000);
                         return;
                     }
 

@@ -1077,7 +1077,7 @@ struct PunchState {
     std::shared_ptr<async_utils::Sleeper> sleeper;  // For probe retry delay
     OnHolepunchCallback on_done;
     rpc::RpcSocket* socket = nullptr;
-    uv_timer_t* timeout = nullptr;
+    std::unique_ptr<async_utils::UvTimer> timeout;  // RAII holepunch timeout
     bool completed = false;
     int round = 0;
     bool retried_unknown = false;  // JS: retry flag in probeRound
@@ -1110,19 +1110,8 @@ struct PunchState {
         // Clear probe listener on main socket
         if (socket) socket->on_holepunch_probe(nullptr);
 
-        // Stop and close timeout timer. The timer callback lambda owns its
-        // heap-allocated shared_ptr<PunchState>*. We must delete it here since
-        // uv_timer_stop prevents the lambda from firing (and doing its own delete).
-        if (timeout && !uv_is_closing(reinterpret_cast<uv_handle_t*>(timeout))) {
-            uv_timer_stop(timeout);
-            // Delete the heap-alloc'd shared_ptr that the timer lambda would have deleted
-            auto* sp = static_cast<std::shared_ptr<PunchState>*>(timeout->data);
-            timeout->data = nullptr;  // Null BEFORE delete — prevents double-free if timer fires
-            delete sp;
-            uv_close(reinterpret_cast<uv_handle_t*>(timeout),
-                     [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-            timeout = nullptr;
-        }
+        // Stop and close timeout timer (RAII handles cleanup)
+        timeout.reset();
 
         auto cb = std::move(on_done);
         if (cb) cb(result);
@@ -1418,22 +1407,12 @@ void holepunch_connect(rpc::RpcSocket& socket,
                 state->puncher->send_probe(server_addrs[0]);
             }
 
-            // Start overall timeout
-            auto* timer = new uv_timer_t;
-            uv_timer_init(state->socket->loop(), timer);
-            auto timeout_state = state;  // prevent shared_ptr from dying
-            timer->data = new std::shared_ptr<PunchState>(timeout_state);
-            state->timeout = timer;
-
-            uv_timer_start(timer, [](uv_timer_t* t) {
-                auto* sp = static_cast<std::shared_ptr<PunchState>*>(t->data);
-                if (!sp) return;  // Already cleaned up by complete()
-                t->data = nullptr;
-                if (*sp) {
-                    (*sp)->complete({});  // Timeout — fail
-                }
-                delete sp;
-            }, HOLEPUNCH_TIMEOUT_MS, 0);
+            // Start overall timeout (RAII — auto-cleaned by PunchState destructor)
+            state->timeout = std::make_unique<async_utils::UvTimer>(
+                state->socket->loop());
+            state->timeout->start([state]() {
+                state->complete({});  // Timeout — fail
+            }, HOLEPUNCH_TIMEOUT_MS);
 
             // -------------------------------------------------------------------
             // Round 2: punch exchange — tell server to start probing

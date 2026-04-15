@@ -25,6 +25,7 @@
 
 #include "hyperdht/announcer.hpp"
 #include "hyperdht/compact.hpp"
+#include "hyperdht/async_utils.hpp"
 #include "hyperdht/noise_wrap.hpp"
 #include "hyperdht/peer_connect.hpp"
 #include "hyperdht/router.hpp"
@@ -185,6 +186,10 @@ private:
     bool closed_ = false;
     bool suspended_ = false;
 
+    // Probe echo listener ID (0 = not installed).
+    // Installed once on first holepunch, removed on close.
+    uint32_t probe_listener_id_ = 0;
+
     // Active holepunch sessions indexed by ID
     uint32_t next_hp_id_ = 0;
     std::unordered_map<uint32_t, std::unique_ptr<server_connection::ServerConnection>> connections_;
@@ -205,7 +210,7 @@ public:
 private:
 
     // Per-session cleanup — uses configurable handshake_clear_wait
-    std::unordered_map<uint32_t, uv_timer_t*> session_timers_;
+    std::unordered_map<uint32_t, std::unique_ptr<async_utils::UvTimer>> session_timers_;
     void clear_session(uint32_t hp_id);
 
     // Router callbacks

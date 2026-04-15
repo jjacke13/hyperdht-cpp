@@ -486,6 +486,16 @@ void RpcSocket::on_recv(udx_socket_t* socket, ssize_t nread, const uv_buf_t* buf
                          static_cast<size_t>(nread), addr_in);
 }
 
+uint32_t RpcSocket::add_probe_listener(OnProbeCallback cb) {
+    uint32_t id = next_probe_id_++;
+    probe_listeners_[id] = std::move(cb);
+    return id;
+}
+
+void RpcSocket::remove_probe_listener(uint32_t id) {
+    probe_listeners_.erase(id);
+}
+
 void RpcSocket::send_probe(const compact::Ipv4Address& to) {
     static const std::vector<uint8_t> probe_byte = {0x00};
     udp_send(probe_byte, to);
@@ -520,11 +530,15 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
 
     // Holepunch probe: single byte 0x00
     if (len == 1 && data[0] == 0x00) {
-        if (on_probe_) {
+        if (!probe_listeners_.empty()) {
             char host[INET_ADDRSTRLEN];
             uv_ip4_name(addr, host, sizeof(host));
             auto from = compact::Ipv4Address::from_string(host, ntohs(addr->sin_port));
-            on_probe_(from);
+            // Copy — a listener callback might remove itself during dispatch
+            auto listeners = probe_listeners_;
+            for (auto& [id, cb] : listeners) {
+                if (cb) cb(from);
+            }
         }
         return;
     }

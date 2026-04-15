@@ -144,6 +144,9 @@ TEST(Fixture, EchoRoundTrip) {
     EXPECT_EQ(state.echo_data, test_msg)
         << "echo should match exactly what we sent";
 
+    // Drain any pending close callbacks (interface watcher, etc.)
+    uv_run(&loop, UV_RUN_DEFAULT);
+
     hyperdht_free(dht);
     uv_loop_close(&loop);
 }

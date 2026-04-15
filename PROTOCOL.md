@@ -1063,51 +1063,335 @@ Both sides now have:
 
 Only needed when neither side is FIREWALL.OPEN and connection was relayed.
 
-#### 8.3.1 Probe Round (round 0)
+**Source**: `hyperdht/lib/connect.js`, `hyperdht/lib/holepuncher.js`, `hyperdht/lib/nat.js`
 
-Purpose: classify both NATs before attempting to punch.
+#### 8.3.1 Architecture: Pool Socket and NAT Sampler
+
+Each holepunch session uses a **dedicated UDP socket** ("pool socket") acquired from
+`dht._socketPool`. This socket has its own NAT mapping, separate from the main DHT
+socket. All probe traffic and holepunch relay messages flow through the pool socket
+so that NAT classification and probe addresses are consistent.
+
+```
+Main DHT socket (port A)         Pool socket (port B)
+├─ RPC traffic (PING, FIND_NODE) ├─ Holepunch relay messages (PEER_HOLEPUNCH)
+├─ Handshake (PEER_HANDSHAKE)    ├─ NAT sampling PINGs
+└─ rawStream firewall detection  ├─ openSession (TTL=5 probes)
+                                 └─ Probe send/recv (1-byte [0x00])
+```
+
+**NAT Sampler** (`Nat` class): Determines the pool socket's firewall type by sending
+PINGs to 4+ known DHT nodes. Each PING response includes a `to` field showing our
+external address as seen by the remote node. The sampler classifies based on hit
+counts:
+
+| Hits on top address | Classification |
+|---------------------|----------------|
+| ≥ 3 same host:port  | CONSISTENT     |
+| All different        | RANDOM         |
+| < 3 samples          | UNKNOWN        |
+| Not firewalled       | OPEN           |
+
+Node selection: skip the first 5 nodes in the routing table (load balancing), then
+ping up to `_minSamples` (4) unique nodes. Retry once if fewer than 4 responses.
+
+The `analyzing` promise resolves when classification reaches CONSISTENT/OPEN, or
+when `_minSamples` responses arrive.
+
+#### 8.3.2 Connection Paths (Pre-Holepunch)
+
+Before holepunch probing starts, several fast paths are checked:
+
+```
+Server firewall OPEN?          → client connects directly (onsocket)
+  OR relayed && !holepunchable?
+
+Client firewall OPEN?          → passive wait (10s timeout for server to reach us)
+
+Same-NAT LAN shortcut?        → ping server's LAN address, connect if reachable
+  (client.host == server.host
+   AND server has private addresses
+   AND matchAddress succeeds)
+
+Server not holepunchable?      → abort (CANNOT_HOLEPUNCH)
+  (!payload.holepunch.relays)
+```
+
+`coerceFirewall(fw)`: OPEN is treated as CONSISTENT for strategy selection.
+
+#### 8.3.3 rawStream Firewall Detection (Zero-Punch Path)
+
+Both client and server create a **rawStream** (UDX stream with firewall callback)
+during the handshake phase, before holepunch starts.
+
+```
+Client: rawStream created at connect() init (before findPeer)
+Server: rawStream created during _addHandshake (after Noise exchange)
+```
+
+The rawStream is registered on the UDX instance with a unique `local_id` (the UDX
+stream ID exchanged in the Noise payload). When a UDX packet arrives matching this
+`local_id` from an unknown address, the firewall callback fires.
+
+**Client firewall callback**:
+```
+if (traffic from relay socket)  → ignore (relay traffic, not direct)
+else if (onsocket is set)       → call onsocket(socket, port, host)
+else                            → cache in serverSocket/serverAddress for later
+```
+
+**Server firewall callback**:
+```
+if (traffic from relay socket)  → ignore
+else                            → call onsocket(socket, port, host)
+```
+
+When `onsocket` fires:
+1. `rawStream.connect(socket, remoteUdxId, port, host)` — bind to the real address
+2. Start SecretStream encryption
+3. Destroy holepuncher (if running)
+4. Set `rawStream = null` (signal: connection complete)
+
+This path allows connections without any holepunch probes when one side can reach
+the other directly (e.g., server with public IP, or NAT mapping already open from
+relay traffic).
+
+#### 8.3.4 Probe Round (Round 0)
+
+Purpose: exchange NAT info, classify both sides, establish tokens.
 
 ```
 1. Client opens low-TTL (5) session to guessed server address
-2. Client sends PEER_HOLEPUNCH round=0 (punching=false) via relay
-3. Server responds with its NAT info
-4. Both classify: OPEN / CONSISTENT / RANDOM / UNKNOWN
-5. If UNKNOWN after retry → abort
-6. If both RANDOM → abort (DOUBLE_RANDOMIZED_NATS)
+   └─ openSession(serverAddress) → sends [0x00] with TTL=5 from pool socket
+   └─ Primes client's NAT mapping for server's address without reaching server
+
+2. Client sends PEER_HOLEPUNCH round=0 via relay (from pool socket):
+   - firewall: puncher.nat.firewall (pool socket classification)
+   - addresses: puncher.nat.addresses
+   - remoteAddress: serverAddress (where we think server is)
+   - punching: false
+   - token: null (no token yet)
+
+3. Server decrypts, creates its own Holepuncher (non-initiator)
+   - Feeds NAT sample: nat.add(req.to, req.from) (if req.socket === puncher.socket)
+   - Updates remote state: updateRemote({ punching, firewall, addresses, verified })
+   - Token echo: if request came from server's relay AND client echoed token → verified
+
+4. Server responds with its NAT info:
+   - firewall, addresses, token
+   - If server NAT is CONSISTENT and client opened session to matching address:
+     → server sends fast-mode ping back (shortcut probe)
+
+5. Client receives response:
+   - nat.add(reply.to, reply.from) — feeds pool socket's NAT sampler
+   - If server reported different address → openSession(newAddress)
+   - If server firewall is UNKNOWN → wait 1000ms (give server time to classify)
+
+6. Client analyzes NAT stability:
+   - analyze(false) — passive check
+   - If unstable: analyze(true) — reopen socket (up to MAX_REOPENS=3)
+   - If stable after reopen: re-run probeRound
+   - If server UNKNOWN and retry flag: re-run probeRound(retry=false)
+
+7. Abort conditions:
+   - Either side still UNKNOWN after retry → HOLEPUNCH_PROBE_TIMEOUT
+   - Both sides RANDOM → HOLEPUNCH_DOUBLE_RANDOMIZED_NATS
 ```
 
-#### 8.3.2 Token Verification
+#### 8.3.5 Token Verification
 
-Proves NAT address ownership:
-```
-Client: token = BLAKE2b(serverAddress.host, localSecret)
-Client sends token in holepunch payload
-Server echoes token back in response
-Client verifies: echoed token matches → address is verified
-Only verified addresses used for aggressive punching
-```
-
-#### 8.3.3 Punch Strategies (rounds 1+)
-
-Based on firewall combination:
-
-| Client | Server | Strategy |
-|--------|--------|----------|
-| CONSISTENT | CONSISTENT | 10 probe rounds, 1s apart |
-| CONSISTENT | RANDOM | 1750 probes to random ports, 20ms apart (~35s) |
-| RANDOM | CONSISTENT | 256 birthday-paradox sockets + cycling probes |
-| RANDOM | RANDOM | **Fail** — cannot punch |
-
-**Birthday paradox**: Open 256 UDP sockets. Probability that one gets a matching
-NAT mapping: 1 - (1 - 1/65536)^256 ≈ ~0.4% per socket, but combined with
-probe cycling the success rate is much higher.
-
-#### 8.3.4 Random NAT Throttling
+Proves NAT address ownership, controls which addresses are used for aggressive
+punching strategies.
 
 ```
-Max concurrent random punches: 1
-Min interval between random punches: 20 seconds
-If throttled: send TRY_LATER error, wait 10-20s (with jitter)
+Generation: token = BLAKE2b-256(peerAddress.host, localSecret)
+  where localSecret is a random 32-byte secret per SecurePayload
+
+Echo flow:
+  Round 0: Client sends token=null, server generates token from client's peerAddress
+  Round 1: Server echoes its token in response
+  Round 1: Client generates token from server's address, sends it
+  Round 2: Client echoes server's token as remoteToken
+
+Verification:
+  Server checks: isServerRelay && remoteToken === BLAKE2b(peerAddress.host, localSecret)
+  If match: echoed=true → verified=peerAddress.host in updateRemote
+
+Effect: addresses from verified hosts are probed every round.
+         Unverified addresses only probed every 4th round (tries & 3 === 0).
+```
+
+#### 8.3.6 Punch Round (Round 1+)
+
+```
+1. Freeze NAT classification: nat.freeze()
+   └─ Prevents further updates during the gossip exchange
+
+2. Random NAT throttle check (if either side RANDOM):
+   - If dht._randomPunches >= limit OR interval not elapsed:
+     → send non-punching round with token (to maintain relay session)
+     → wait 10-20s (tryLater)
+     → retry roundPunch(delayed=true)
+   - If throttled and delayed: use server's chosen relay instead of client's
+
+3. Send PEER_HOLEPUNCH round=1 via relay:
+   - punching: true  ← tells server to start probing
+   - addresses: puncher.nat.addresses (pool socket's external addresses)
+   - token: BLAKE2b(serverAddress.host, localSecret)
+   - remoteToken: server's token from round 0 (echo)
+
+4. Server receives, checks remoteHolepunching:
+   - Calls holepunch hook (user callback to allow/reject)
+   - Checks random throttle (TRY_LATER if exceeded)
+   - Calls puncher.punch() → starts probing client's addresses
+
+5. Client receives response:
+   - If tryLater → wait and retry
+   - Check remoteHolepunching flag (server is actively punching)
+   - If not punching: throw REMOTE_NOT_HOLEPUNCHING
+
+6. Client calls puncher.punch() → start probing
+```
+
+#### 8.3.7 Punch Strategies
+
+Based on `coerceFirewall()` of both sides (OPEN treated as CONSISTENT):
+
+| Client | Server | Strategy | Details |
+|--------|--------|----------|---------|
+| CONSISTENT | CONSISTENT | `_consistentProbe` | 10 rounds, 1s apart |
+| CONSISTENT | RANDOM | `_randomProbes` | 1750 probes, random ports, 20ms apart |
+| RANDOM | CONSISTENT | Birthday sockets | 256 sockets + `_keepAliveRandomNat` |
+| RANDOM | RANDOM | Fail | Cannot punch |
+
+**CONSISTENT + CONSISTENT** (`_consistentProbe`):
+```
+Non-initiator (server): wait 1000ms before first round
+  └─ Gives initiator's openSession time to prime NAT
+
+Initiator (client): start immediately
+
+Loop (max 10 rounds):
+  For each remote address:
+    if (!addr.verified && (tries & 3) !== 0) → skip (filter unverified)
+    send [0x00] probe via pool socket (TTL=64)
+  Wait 1000ms
+
+Probe message: single byte [0x00]
+Probe detection (non-initiator): echo probe back, do NOT set connected
+Probe detection (initiator): set connected=true, fire onconnect(socket, port, host)
+```
+
+**CONSISTENT + RANDOM** (`_randomProbes`):
+```
+Requires verified remote address
+1750 iterations (~35 seconds):
+  Generate random port (1000-65535)
+  Send [0x00] to remoteAddr.host:randomPort via pool socket
+  Wait 20ms
+```
+
+**RANDOM + CONSISTENT** (Birthday sockets):
+```
+Requires verified remote address
+
+Phase 1: _openBirthdaySockets
+  Open 256 UDP sockets from pool (BIRTHDAY_SOCKETS)
+  Each socket sends [0x00] to remoteAddr with TTL=5
+
+Phase 2: _keepAliveRandomNat
+  Initial pause: 100ms
+  1750 iterations (~35 seconds):
+    Cycle through all 256 sockets (i++ mod 256)
+    First pass (round 0): send with TTL=5
+    Subsequent passes: send with TTL=64
+    Wait 20ms
+```
+
+#### 8.3.8 NAT Stability Analysis
+
+The `analyze(allowReopen)` flow checks if the NAT classification is usable:
+
+```
+1. await nat.analyzing (wait for classification to complete)
+
+2. _unstable() check:
+   - Both local AND remote >= RANDOM → unstable
+   - Local is UNKNOWN → unstable
+
+3. If stable → return true
+
+4. If unstable AND !allowReopen → return false (caller handles)
+
+5. If unstable AND allowReopen → _reopen():
+   Loop up to MAX_REOPENS (3) times:
+     _reset() → acquire new pool socket, destroy old NAT, create new NAT
+     await nat.analyzing → re-classify with new socket
+   Return: coerceFirewall(nat.firewall) === CONSISTENT
+
+6. If reopen succeeded → caller re-runs probeRound
+```
+
+#### 8.3.9 NAT Freeze
+
+Before Round 1+ (punch round), both sides freeze their NAT classification:
+```
+nat.freeze()
+  → Prevents add() from triggering _updateFirewall/_updateAddresses
+  → Ensures consistent addresses during the gossip exchange
+  → Unfrozen by nat.unfreeze() (re-runs classification)
+```
+
+#### 8.3.10 Random NAT Throttling
+
+Global rate limiting for random-NAT strategies to prevent port exhaustion:
+```
+dht._randomPunches: current concurrent random punches
+dht._randomPunchLimit: max concurrent (default 1)
+dht._lastRandomPunch: timestamp of last completed random punch
+dht._randomPunchInterval: min interval between punches (default 20s)
+
+_incrementRandomized(): dht._randomPunches++, set randomized=true
+_decrementRandomized(): dht._randomPunches--, set _lastRandomPunch=now
+
+If throttled:
+  Server: send TRY_LATER error in holepunch response
+  Client: wait 10-20s, then retry with delayed=true
+  Delayed: use server's chosen relay instead of client's
+```
+
+#### 8.3.11 Holepuncher Lifecycle
+
+```
+Created:   punching=false, connected=false, destroyed=false
+           Pool socket acquired, NAT autoSample started
+
+Punching:  punch() called → punching=true
+           Strategy dispatched (_consistentProbe / _randomProbes / birthday)
+
+Connected: _onholepunchmessage fires (initiator only)
+           connected=true, punching=false
+           Release all pool sockets except winner
+           Fire onconnect(socket, port, host)
+
+Aborted:   Probe rounds exhausted → _autoDestroy() → destroy()
+           Or explicit destroy() from timeout/error
+
+Destroyed: destroyed=true, punching=false
+           Release all pool sockets
+           Destroy NAT object
+           If !connected: _decrementRandomized(), fire onabort()
+```
+
+#### 8.3.12 Constants
+
+```
+BIRTHDAY_SOCKETS     = 256    Max sockets for RANDOM+CONSISTENT
+HOLEPUNCH            = [0x00] Probe payload (1 byte)
+HOLEPUNCH_TTL        = 5      Low TTL for NAT priming / birthday
+DEFAULT_TTL          = 64     Normal probe TTL
+MAX_REOPENS          = 3      Socket reopen attempts for unstable NAT
+HANDSHAKE_INITIAL_TIMEOUT = 10000  Prepunching abort timeout (ms)
 ```
 
 ### 8.4 Phase 4: Direct Connection
@@ -1118,10 +1402,20 @@ Client ←→ Server (UDX stream over UDP)
   Protomux channels available for application protocols
 ```
 
-If holepunch succeeds, both sides call `onsocket()`:
-- Connect rawStream to peer's address with exchanged UDX stream IDs
-- Start SecretStream encryption with Noise-derived keys
-- Cache relay addresses for future connections
+When holepunch succeeds (or rawStream firewall fires), both sides call `onsocket()`:
+
+```
+onsocket(socket, port, host):
+  1. rawStream.connect(socket, remoteUdxId, port, host)
+  2. Start SecretStream encryption with Noise-derived keys (tx, rx, handshakeHash)
+  3. Cache relay addresses for future reconnections:
+     - Prefer remote's relayAddresses (from Noise payload)
+     - Fallback to locally discovered relay addresses
+  4. Add to socket pool routes (if reusableSocket enabled)
+  5. Destroy holepuncher (if running)
+  6. Clear passive connect timeout (if set)
+  7. Set rawStream = null (signal: connection complete)
+```
 
 ### 8.5 Phase 5: Relay Fallback (Blind Relay)
 
@@ -1205,38 +1499,79 @@ server.listen(keyPair)
   → start announcer (periodic ANNOUNCE to DHT)
 ```
 
-### 10.2 Incoming Handshake (_onpeerhandshake)
+### 10.2 Incoming Handshake (_addHandshake)
 
 ```
-1. Receive PEER_HANDSHAKE with noise bytes
-2. Deduplicate by hash(noise)
-3. Decrypt Noise IK message → get client's payload
-4. Call firewall hook: firewall(remotePublicKey, payload, clientAddress)
-   → if true: reject
-5. Check version (must be 1), check udx field exists
-6. Build server's NoisePayload response:
-   - firewall type, addresses, udx info
-   - holepunch: { id, relays } if not OPEN
-   - relayThrough if configured
-7. Send Noise IK message 2 back through relay
-8. If client is OPEN → connect directly (onsocket)
-9. If relay-through → setup relay connection
-10. Else → create Holepuncher, wait for holepunch rounds
+ 1. Receive PEER_HANDSHAKE with noise bytes
+ 2. Deduplicate by hash(noise) — same client via multiple relays = one session
+ 3. Decrypt Noise IK message → get client's payload
+ 4. Call firewall hook: firewall(remotePublicKey, payload, clientAddress)
+    → if true: reject (set firewalled=true, respond with ERROR_ABORTED)
+ 5. Check version (must be 1), check udx field exists
+ 6. Create rawStream with firewall callback (see §8.3.3)
+ 7. Define onsocket callback (connects rawStream, starts SecretStream)
+ 8. Build server's NoisePayload response:
+    - firewall type, addresses (including LAN addresses if shareLocalAddress)
+    - holepunch: { id, relays } — ONLY if server creates a Holepuncher
+    - relayThrough if configured
+    - udx: { id, seq }
+ 9. Send Noise IK message 2 back through relay
+10. Connection path decision:
+    a. Client FIREWALL.OPEN or direct (non-relayed):
+       → call onsocket() immediately (server sends first UDX)
+    b. Same-NAT LAN shortcut:
+       → if client and server on same host AND private addresses match
+       → set prepunching timeout (10s), wait for LAN ping from client
+    c. Server has ourRemoteAddr (knows its public address) OR _neverPunch:
+       → set prepunching timeout (10s), do NOT create Holepuncher
+       → wait for client's rawStream UDX (firewall detection path)
+       → holepunch field in response is NULL (no relays reported)
+    d. Else (server behind NAT, no public address):
+       → create Holepuncher(dht, session, false, remoteFirewall)
+       → puncher.onconnect = onsocket
+       → set prepunching timeout (10s → destroy puncher)
+       → holepunch field includes { id, relays } from announcer
 ```
 
 ### 10.3 Incoming Holepunch (_onpeerholepunch)
 
 ```
-1. Look up session by holepunch ID
-2. Decrypt payload with holepunchSecret
-3. Update NAT samples, verify token echo
-4. Analyze NAT stability
-5. If remote is punching:
-   - Call holepunch hook
-   - Check random punch throttle
-   - Execute punch strategy
-6. Send encrypted response with our NAT info
-7. On success → onsocket() → emit 'connection'
+ 1. Look up session by holepunch ID
+    → if no puncher exists (server skipped creation) → abort
+ 2. Decrypt payload with holepunchSecret (XSalsa20-Poly1305)
+ 3. Token echo verification:
+    - Server generates: token = BLAKE2b(peerAddress.host, localSecret)
+    - If request from server's relay AND client echoed token → verified=true
+ 4. NAT sampling: nat.add(req.to, req.from)
+    → only if req.socket === puncher.socket (same pool socket)
+ 5. Update remote state: updateRemote({ punching, firewall, addresses, verified })
+    → verified host: peerAddress.host if token echoed, else null
+ 6. Analyze NAT stability:
+    a. analyze(false) — passive check of current samples
+    b. If !remoteHolepunching && !stable → analyze(true) — allow reopen
+    c. If still not stable → abort
+ 7. Fast-mode ping:
+    → if server is CONSISTENT AND client opened session to matching address
+    → send ping back immediately (shortcut before full probe rounds)
+ 8. NAT freeze:
+    → if nat.firewall !== UNKNOWN → nat.freeze()
+    → locks classification during the gossip exchange
+ 9. If remote is punching (punching=true in payload):
+    a. Call holepunch hook: this.holepunch(remoteFw, localFw, remoteAddrs, localAddrs)
+       → if returns false: abort
+    b. Random punch throttle:
+       → if either side RANDOM: check _randomPunches >= limit or interval
+       → if throttled: respond with ERROR.TRY_LATER (client retries after 10-20s)
+    c. Execute punch: puncher.punch()
+       → non-initiator → _consistentProbe with 1s initial delay
+       → sends 10 rounds of probes, echoes received probes back
+10. Send encrypted response:
+    - firewall, addresses, token (if from relay), remoteToken echo
+    - punching flag reflects server's punch state
+11. On connection:
+    → puncher.onconnect fires (from probe echo or rawStream detection)
+    → onsocket(socket, port, host)
+    → rawStream.connect → SecretStream → emit 'connection'
 ```
 
 ---

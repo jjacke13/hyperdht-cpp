@@ -1,6 +1,28 @@
 // Server-side connection state machine — handles an incoming
 // PEER_HANDSHAKE as Noise IK responder, runs PEER_HOLEPUNCH, then
 // establishes the UDX stream and SecretStream for the application.
+//
+// =========================================================================
+// JS FLOW MAP — how this file maps to the JavaScript reference
+// =========================================================================
+//
+// C++ function                       Line  JS file (server.js)       JS lines
+// ─────────────────────────────────── ────  ────────────────────────  ────────
+// handle_handshake                    112  server.js                237-388
+//   ├─ Noise IK responder             121  noise-wrap.js             29-67
+//   ├─ Client payload decrypt         131  server.js                246-261
+//   ├─ Firewall hook                  144  server.js                350-358
+//   ├─ Version + udx checks           157  server.js                359-363
+//   ├─ Build server NoisePayload      179  server.js                369-388
+//   └─ Derive holepunchSecret         219  server.js                437
+//
+// handle_holepunch                    255  server.js                483-600
+//   ├─ Outer message decode           265  server.js                484-490
+//   ├─ Payload decrypt                276  server.js                492-493
+//   ├─ Token echo verification        317  server.js                505-506
+//   ├─ Remote state update            314  server.js                513-516
+//   └─ Build encrypted response       333  server.js                586-600
+// =========================================================================
 
 #include "hyperdht/server_connection.hpp"
 
@@ -78,8 +100,8 @@ ServerConnection& ServerConnection::operator=(ServerConnection&& other) noexcept
 //
 // C++ diffs from JS:
 //   - Synchronous (no Promise) — firewall callback is sync; JS awaits.
-//   - We always report FIREWALL_CONSISTENT (never OPEN) to force the
-//     holepunch path; JS checks `dht.remoteAddress()` and may report OPEN.
+//   - `has_remote_address` flag mirrors JS `dht.remoteAddress()` check:
+//     when true, reports FIREWALL_OPEN and omits holepunch relays.
 //   - Holepunch secret derivation lives at the bottom of this fn rather
 //     than in the caller (JS: `new SecurePayload(h.holepunchSecret)`
 //     server.js:435).
@@ -94,7 +116,9 @@ std::optional<ServerConnection> handle_handshake(
     int holepunch_id,
     const std::vector<compact::Ipv4Address>& our_addresses,
     const std::vector<peer_connect::RelayInfo>& relay_infos,
-    FirewallFn firewall) {
+    FirewallFn firewall,
+    bool has_remote_address,
+    const std::optional<peer_connect::RelayThroughInfo>& relay_through) {
 
     ServerConnection conn;
     conn.id = holepunch_id;
@@ -147,12 +171,17 @@ std::optional<ServerConnection> handle_handshake(
     conn.local_udx_id = udx_id;
 
     // Step 6: Determine our firewall status
-    // Report CONSISTENT (not OPEN) to force the holepunch path.
-    // OPEN tells the JS client to connect directly via UDX, but we don't
-    // have a UDX rawStream firewall callback to detect that (TODO).
-    conn.our_firewall = our_addresses.empty()
-        ? peer_connect::FIREWALL_UNKNOWN
-        : peer_connect::FIREWALL_CONSISTENT;
+    // JS: server.js:271 — `const ourRemoteAddr = this.dht.remoteAddress()`
+    // JS: server.js:358 — firewall reported based on remoteAddress presence
+    // If we have a public address (has_remote_address), report OPEN.
+    // Otherwise report CONSISTENT (we're behind NAT but port-stable).
+    if (has_remote_address) {
+        conn.our_firewall = peer_connect::FIREWALL_OPEN;
+    } else {
+        conn.our_firewall = our_addresses.empty()
+            ? peer_connect::FIREWALL_UNKNOWN
+            : peer_connect::FIREWALL_CONSISTENT;
+    }
 
     // Step 7: Build our response NoisePayload
     peer_connect::NoisePayload response;
@@ -170,8 +199,10 @@ std::optional<ServerConnection> handle_handshake(
             0      // seq
         };
 
-        // Include holepunch info if we're not OPEN
-        if (conn.our_firewall != peer_connect::FIREWALL_OPEN) {
+        // JS: server.js:358 — `holepunch: ourRemoteAddr ? null : { id, relays }`
+        // If we have a public address, omit holepunch info → client connects
+        // directly using our addresses4 (no holepunch rounds needed).
+        if (!has_remote_address) {
             peer_connect::HolepunchInfo hp_info;
             hp_info.id = static_cast<uint32_t>(holepunch_id);
             for (const auto& ri : relay_infos) {
@@ -184,6 +215,10 @@ std::optional<ServerConnection> handle_handshake(
         for (const auto& ri : relay_infos) {
             response.relay_addresses.push_back(ri.relay_address);
         }
+
+        // Phase E: include relayThrough if server is configured for blind relay
+        // JS: server.js:367 — relayThrough: relayThrough ? { publicKey, token } : null
+        response.relay_through = relay_through;
     }
 
     // Step 8: Encode and encrypt our response via Noise msg2

@@ -215,6 +215,7 @@ TEST(HyperDHT, LiveConnect) {
     bool header_received = false;
     udx_stream_t* stream = nullptr;
     secret_stream::SecretStream* ss = nullptr;
+    std::shared_ptr<void> socket_keepalive;  // Hold pool socket alive for UDX stream
 
     dht.connect(server_pk, conn_opts, [&](int err, const ConnectResult& r) {
         printf("  connect: err=%d success=%d\n", err, r.success);
@@ -227,6 +228,7 @@ TEST(HyperDHT, LiveConnect) {
                r.raw_stream ? "yes" : "no");
 
         // Step 2: UDX stream connect — reuse rawStream, clear stale firewall first
+        socket_keepalive = r.socket_keepalive;  // Keep pool socket alive
         stream = r.raw_stream;
         udx_stream_firewall(stream, nullptr);  // Clear holepunch firewall
         struct sockaddr_in dest{};
@@ -235,7 +237,12 @@ TEST(HyperDHT, LiveConnect) {
                r.peer_address.host_string().c_str(), r.peer_address.port,
                r.local_udx_id, r.remote_udx_id);
         fflush(stdout);
-        udx_stream_connect(stream, dht.socket().socket_handle(), r.remote_udx_id,
+        // Use the socket from holepunch result (pool socket), NOT the main
+        // RPC socket — the NAT pinhole is on the pool socket's port.
+        udx_socket_t* connect_socket = r.udx_socket
+            ? r.udx_socket
+            : dht.socket().socket_handle();
+        udx_stream_connect(stream, connect_socket, r.remote_udx_id,
                            reinterpret_cast<const struct sockaddr*>(&dest));
 
         // Step 3: SecretStream header exchange

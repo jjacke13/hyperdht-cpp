@@ -155,6 +155,22 @@ struct ConnectResult {
     std::shared_ptr<void> socket_keepalive;
 };
 
+// ---------------------------------------------------------------------------
+// Connect error codes — matches JS hyperdht/lib/errors.js
+// ---------------------------------------------------------------------------
+// Passed as the `error` parameter to ConnectCallback. 0 = success.
+
+namespace ConnectError {
+    constexpr int NONE                  =  0;  // Success
+    constexpr int DESTROYED             = -1;  // DHT was destroyed during connect
+    constexpr int PEER_NOT_FOUND        = -2;  // JS: PEER_NOT_FOUND — findPeer returned no results
+    constexpr int PEER_CONNECTION_FAILED = -3;  // JS: PEER_CONNECTION_FAILED — all relay handshakes failed
+    constexpr int NO_ADDRESSES          = -4;  // Server replied but provided no connectable addresses
+    constexpr int HOLEPUNCH_FAILED      = -5;  // JS: CANNOT_HOLEPUNCH — holepunch probing failed
+    constexpr int HOLEPUNCH_TIMEOUT     = -6;  // JS: HOLEPUNCH_ABORTED — passive wait timed out (OPEN fw)
+    constexpr int RELAY_FAILED          = -7;  // JS: RELAY_ABORTED — blind relay pairing failed
+}
+
 using ConnectCallback = std::function<void(int error, const ConnectResult& result)>;
 
 // ---------------------------------------------------------------------------
@@ -197,26 +213,35 @@ struct ConnectOptions {
     // the LAN path and go straight to the public-internet flow.
     bool local_connection = true;
 
-    // --- Deferred JS options NOT exposed here ---
+    // --- Blind-relay options (Phase E) ---
     //
-    // The following JS `connect.js` options are intentionally absent from
-    // this struct. Do NOT add them without first reading the deferred
-    // section in docs/JS-PARITY-GAPS.md §6:
+    // JS: opts.relayThrough — public key of a node to relay through when
+    // holepunch fails (or is skipped). Can be a single key or empty (no
+    // relay). When set, the client includes `relayThrough: { publicKey,
+    // token }` in the Noise payload so the server can also connect to the
+    // relay. JS supports arrays and functions; C++ uses a single key.
     //
-    //  - `relayThrough` / `relayToken`: blind-relay fallback. Tied to §4
-    //    (`FROM_SECOND_RELAY`) which is deliberately DEFERRED.
-    //  - `relayKeepAlive`: keepalive on the blind-relay socket. Only used
-    //    when `relayThrough` is active, so also deferred with §4.
+    // JS: connect.js:40,87-92
+    std::optional<noise::PubKey> relay_through;
+
+    // Auto-generated relay token. If relay_through is set and relay_token
+    // is all-zeros, a random token is generated at connect() time.
+    // JS: connect.js:88 — relay.token()
+    std::array<uint8_t, 32> relay_token{};
+
+    // JS: opts.relayKeepAlive || 5000 — keep-alive for the relay socket
+    uint64_t relay_keep_alive = 5000;
+
+    // --- Remaining deferred JS options ---
+    //
     //  - `createSecretStream`: factory hook for a custom secret-stream
-    //    wrapper. LOW priority — the C FFI doesn't expose this and C++
-    //    callers construct `SecretStreamDuplex` over the returned
-    //    `rawStream` directly.
+    //    wrapper. LOW priority — C++ callers construct `SecretStreamDuplex`
+    //    over the returned `rawStream` directly.
     //  - `createHandshake`: factory hook for a custom Noise handshake.
-    //    LOW priority — `peer_connect::peer_handshake` is called directly
-    //    instead of going through a factory.
+    //    LOW priority — `peer_connect::peer_handshake` is called directly.
     //
     // (Note: `relay_addresses` ABOVE is the cached "which relays found this
-    //  peer last time" hint, distinct from `relayThrough` blind-relay.)
+    //  peer last time" hint, distinct from `relay_through` blind-relay.)
 };
 
 // ---------------------------------------------------------------------------
@@ -373,6 +398,37 @@ public:
         return validated_local_addresses_;
     }
 
+    // --- Static helpers (B3-B6) ---
+    // JS: HyperDHT.keyPair(seed), HyperDHT.hash(data)
+    // JS: HyperDHT.BOOTSTRAP, HyperDHT.FIREWALL
+
+    // B5: Generate a keypair from an optional 32-byte seed.
+    // JS: HyperDHT.keyPair(seed) — hyperdht/index.js:444-446
+    static noise::Keypair key_pair(const noise::Seed& seed) {
+        return noise::generate_keypair(seed);
+    }
+    static noise::Keypair key_pair() {
+        return noise::generate_keypair();
+    }
+
+    // B6: BLAKE2b-256 hash of arbitrary data.
+    // JS: HyperDHT.hash(data) — hyperdht/index.js:448-450
+    static std::array<uint8_t, 32> hash(const uint8_t* data, size_t len);
+
+    // B3: Firewall constants (JS: HyperDHT.FIREWALL)
+    struct FIREWALL {
+        static constexpr uint32_t UNKNOWN    = 0;
+        static constexpr uint32_t OPEN       = 1;
+        static constexpr uint32_t CONSISTENT = 2;
+        static constexpr uint32_t RANDOM     = 3;
+    };
+
+    // B4: Public bootstrap nodes (JS: HyperDHT.BOOTSTRAP)
+    // Alias for default_bootstrap_nodes() — static const reference.
+    static const std::vector<compact::Ipv4Address>& BOOTSTRAP() {
+        return default_bootstrap_nodes();
+    }
+
     // --- Client API ---
 
     // Connect to a remote peer by public key.
@@ -427,6 +483,12 @@ public:
         const noise::Keypair& keypair,
         query::OnReplyCallback on_reply,
         query::OnDoneCallback on_done);
+
+    // B1: Standalone unannounce (JS: dht.unannounce — hyperdht/index.js:240-242)
+    // Convenience wrapper: runs lookup_and_unannounce, ignores per-reply.
+    void unannounce(const noise::PubKey& public_key,
+                    const noise::Keypair& keypair,
+                    std::function<void()> on_done = nullptr);
 
     // Ping a specific node (JS: dht.ping(addr))
     void ping(const compact::Ipv4Address& addr,
@@ -527,6 +589,29 @@ public:
         return mutable_get(public_key, 0, true, std::move(on_done));
     }
 
+    // --- Stats (B2) ---
+    // JS: dht.stats — hyperdht/index.js:44-48
+    struct RelayingStats {
+        int attempts = 0;
+        int successes = 0;
+        int aborts = 0;
+    };
+    struct Stats {
+        struct { int consistent = 0; int random = 0; int open = 0; } punches;
+        RelayingStats relaying;
+    };
+    Stats stats() const {
+        Stats s;
+        s.punches.consistent = punch_stats_.punches_consistent;
+        s.punches.random = punch_stats_.punches_random;
+        s.punches.open = punch_stats_.punches_open;
+        s.relaying = relay_stats_;
+        return s;
+    }
+
+    // Relay stat counters — connect/server flows increment these
+    RelayingStats& relay_stats() { return relay_stats_; }
+
     // --- Connection Pool ---
 
     // Create a new connection pool (JS: dht.pool())
@@ -589,6 +674,7 @@ private:
     bool suspended_ = false;
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);  // Sentinel for async safety
     holepunch::PunchStats punch_stats_;
+    RelayingStats relay_stats_;
     std::unique_ptr<socket_pool::SocketPool> socket_pool_;
 
     // §2 bootstrap walk state. `bootstrap_query_` holds a strong reference

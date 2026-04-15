@@ -70,6 +70,9 @@ struct ServerConnection {
 
     // Timestamp for stale cleanup (uv_now millis)
     uint64_t created_at = 0;
+
+    // Phase E: blind-relay token (set when relay is active)
+    std::array<uint8_t, 32> relay_token{};
 };
 
 // ---------------------------------------------------------------------------
@@ -97,6 +100,12 @@ using FirewallFn = std::function<bool(
 //
 // Returns: populated ServerConnection, or nullopt on failure.
 // On success, reply_noise contains the Noise msg2 to send back.
+// has_remote_address: true if server knows its public address (dht.remoteAddress() != null).
+//   When true: holepunch field is omitted from response (client connects directly).
+//   JS: server.js:358 — `holepunch: ourRemoteAddr ? null : { id, relays }`
+// relay_through: optional relayThrough info to include in the response payload.
+//   When set, the client can connect via blind relay. Phase E.
+//   JS: server.js:367 — `relayThrough: relayThrough ? { publicKey, token } : null`
 std::optional<ServerConnection> handle_handshake(
     const noise::Keypair& server_keypair,
     const std::vector<uint8_t>& noise_msg1,
@@ -104,7 +113,9 @@ std::optional<ServerConnection> handle_handshake(
     int holepunch_id,
     const std::vector<compact::Ipv4Address>& our_addresses,
     const std::vector<peer_connect::RelayInfo>& relay_infos,
-    FirewallFn firewall = nullptr);
+    FirewallFn firewall = nullptr,
+    bool has_remote_address = false,
+    const std::optional<peer_connect::RelayThroughInfo>& relay_through = std::nullopt);
 
 // ---------------------------------------------------------------------------
 // handle_holepunch — process incoming PEER_HOLEPUNCH on the server side

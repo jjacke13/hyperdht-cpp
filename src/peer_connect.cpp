@@ -395,5 +395,83 @@ void peer_handshake(rpc::RpcSocket& socket,
         });
 }
 
+// Overload with relayThrough in the Noise payload (Phase E)
+void peer_handshake(rpc::RpcSocket& socket,
+                    const compact::Ipv4Address& relay_addr,
+                    const noise::Keypair& our_keypair,
+                    const noise::PubKey& remote_pubkey,
+                    uint32_t our_udx_id,
+                    uint32_t firewall,
+                    const std::vector<compact::Ipv4Address>& addresses4,
+                    const std::optional<RelayThroughInfo>& relay_through,
+                    OnHandshakeCallback on_done) {
+    // Create Noise IK initiator with real prologue
+    auto noise_ik = std::make_shared<noise::NoiseIK>(true, our_keypair,
+                                                      PROLOGUE.data(), PROLOGUE.size(),
+                                                      &remote_pubkey);
+
+    // Build noisePayload for msg1
+    NoisePayload payload;
+    payload.version = 1;
+    payload.error = ERROR_NONE;
+    payload.firewall = firewall;
+    payload.addresses4 = addresses4;
+    payload.udx = UdxInfo{1, false, our_udx_id, 0};
+    payload.has_secret_stream = true;
+    payload.relay_through = relay_through;  // Phase E: include relayThrough
+
+    auto payload_bytes = encode_noise_payload(payload);
+    auto noise_msg1 = noise_ik->send(payload_bytes.data(), payload_bytes.size());
+
+    HandshakeMessage hs_msg;
+    hs_msg.mode = MODE_FROM_CLIENT;
+    hs_msg.noise = std::move(noise_msg1);
+    auto hs_value = encode_handshake_msg(hs_msg);
+
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32, remote_pubkey.data(), 32, nullptr, 0);
+
+    messages::Request req;
+    req.to.addr = relay_addr;
+    req.command = messages::CMD_PEER_HANDSHAKE;
+    req.target = target;
+    req.value = std::move(hs_value);
+
+    socket.request(req,
+        [noise_ik, on_done, remote_pubkey](const messages::Response& resp) {
+            HandshakeResult result;
+            if (!resp.value.has_value() || resp.value->empty()) {
+                result.success = false;
+                on_done(result);
+                return;
+            }
+            auto hs_resp = decode_handshake_msg(resp.value->data(), resp.value->size());
+            if (hs_resp.noise.empty()) {
+                result.success = false;
+                on_done(result);
+                return;
+            }
+            auto decrypted = noise_ik->recv(hs_resp.noise.data(), hs_resp.noise.size());
+            if (!decrypted.has_value() || !noise_ik->is_complete()) {
+                result.success = false;
+                on_done(result);
+                return;
+            }
+            result.remote_payload = decode_noise_payload(
+                decrypted->data(), decrypted->size());
+            result.success = (result.remote_payload.error == ERROR_NONE);
+            result.tx_key = noise_ik->tx_key();
+            result.rx_key = noise_ik->rx_key();
+            result.handshake_hash = noise_ik->handshake_hash();
+            result.remote_public_key = remote_pubkey;
+            on_done(result);
+        },
+        [noise_ik, on_done](uint16_t) {
+            HandshakeResult result;
+            result.success = false;
+            on_done(result);
+        });
+}
+
 }  // namespace peer_connect
 }  // namespace hyperdht

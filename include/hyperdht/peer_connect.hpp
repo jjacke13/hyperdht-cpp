@@ -144,5 +144,17 @@ void peer_handshake(rpc::RpcSocket& socket,
                     const std::vector<compact::Ipv4Address>& addresses4,
                     OnHandshakeCallback on_done);
 
+// Overload that includes relayThrough in the Noise payload (Phase E).
+// JS: connect.js:409-410 — relayThrough: { publicKey, token }
+void peer_handshake(rpc::RpcSocket& socket,
+                    const compact::Ipv4Address& relay_addr,
+                    const noise::Keypair& our_keypair,
+                    const noise::PubKey& remote_pubkey,
+                    uint32_t our_udx_id,
+                    uint32_t firewall,
+                    const std::vector<compact::Ipv4Address>& addresses4,
+                    const std::optional<RelayThroughInfo>& relay_through,
+                    OnHandshakeCallback on_done);
+
 }  // namespace peer_connect
 }  // namespace hyperdht

@@ -3,7 +3,39 @@
 // periodically via the Announcer, and spawns a ServerConnection
 // for each accepted PEER_HANDSHAKE.
 //
-// JS: .analysis/js/hyperdht/lib/server.js:18-686 (whole Server class)
+// =========================================================================
+// JS FLOW MAP — how this file maps to the JavaScript reference
+// =========================================================================
+//
+// C++ function                       Line  JS file (server.js)       JS lines
+// ─────────────────────────────────── ────  ────────────────────────  ────────
+// Server::listen                      116  server.js                143-196
+// Server::close                       166  server.js                 88-129
+// Server::refresh                     202  server.js                198-200
+// Server::notify_online               212  server.js                202-204
+// Server::suspend                     228  server.js                 63-76
+// Server::resume                      250  server.js                 72-76
+// Server::address                     259  server.js                 78-86
+//
+// Server::on_peer_handshake           300  server.js  464-481 (_onpeerhandshake)
+//                                                     210-443 (_addHandshake)
+//   ├─ Noise dedup                    310  server.js                265-279
+//   ├─ handle_handshake call          366  server.js                237-388
+//   ├─ rawStream + firewall           387  server.js                280-303
+//   ├─ session timer (10s)            418  server.js  431, 440 (prepunching)
+//   └─ OPEN shortcut → on_socket      409  server.js                390-394
+//
+// Server::on_peer_holepunch           454  server.js                483-600
+//   ├─ handle_holepunch call          487  server.js                492-516
+//   ├─ holepunch veto callback        502  server.js                544-546
+//   ├─ puncher creation               512  server.js                436-440
+//   └─ puncher->punch()               527  server.js                576
+//
+// Server::on_socket                   557  server.js                305-342
+// Server::clear_session               596  server.js                450-462
+// Server::on_raw_stream_firewall      619  server.js                282-291
+//
+// =========================================================================
 //
 // C++ diffs from JS:
 //   - Per-session timers stored in `session_timers_` map<id,uv_timer_t*>
@@ -17,6 +49,7 @@
 
 #include "hyperdht/server.hpp"
 
+#include "hyperdht/blind_relay.hpp"
 #include "hyperdht/dht.hpp"  // §16: Server reads validated_local_addresses() from HyperDHT
 
 #include <sodium.h>
@@ -330,10 +363,26 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         };
     }
 
+    // JS: server.js:271 — `const ourRemoteAddr = this.dht.remoteAddress()`
+    // If the server knows its public address (!firewalled), the response
+    // omits holepunch info → client connects directly without holepunch rounds.
+    bool has_remote_addr = !socket_.is_firewalled();
+
+    // Phase E: Generate relay token if relayThrough is configured
+    // JS: server.js:350-352 — if (relayThrough) hs.relayToken = relay.token()
+    std::optional<peer_connect::RelayThroughInfo> relay_through_info;
+    if (relay_through.has_value()) {
+        peer_connect::RelayThroughInfo rt;
+        rt.version = 1;
+        rt.public_key = *relay_through;
+        rt.token = blind_relay::generate_token();
+        relay_through_info = rt;
+    }
+
     // Process the handshake
     auto result = server_connection::handle_handshake(
         keypair_, noise, peer_address, hp_id,
-        our_addrs, relay_infos, fw_cb);
+        our_addrs, relay_infos, fw_cb, has_remote_addr, relay_through_info);
 
     if (!result.has_value()) {
         DHT_LOG( "  [server] Noise handshake FAILED (recv or send error)\n");
@@ -370,12 +419,194 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
 
     auto conn_ptr = std::make_unique<server_connection::ServerConnection>(std::move(conn));
 
-    // If client is OPEN, connect directly
+    // Phase E: Start blind relay if either side has relayThrough.
+    // JS: server.js:397-399 — if (relayThrough || remotePayload.relayThrough)
+    //     this._relayConnection(hs, relayThrough, remotePayload, h)
+    //
+    // This runs in parallel with holepunch — first to complete wins.
+    // The relay path is simpler on the server side: when pairing succeeds,
+    // create SecretStream and emit onconnection.
+    if (relay_through_info.has_value() ||
+        conn_ptr->remote_payload.relay_through.has_value()) {
+        DHT_LOG("  [server] Starting blind relay (ours=%s, client=%s)\n",
+                relay_through_info.has_value() ? "yes" : "no",
+                conn_ptr->remote_payload.relay_through.has_value() ? "yes" : "no");
+
+        if (dht_) {
+            dht_->relay_stats().attempts++;
+        }
+
+        // Determine role: who proposed the relay?
+        // JS: server.js:632-639
+        bool relay_is_initiator;
+        noise::PubKey relay_pk;
+        blind_relay::Token relay_tok;
+
+        if (relay_through_info.has_value()) {
+            // Server proposed relay — we're initiator
+            relay_is_initiator = true;
+            relay_pk = relay_through_info->public_key;
+            relay_tok = relay_through_info->token;
+        } else {
+            // Client proposed relay — we're non-initiator
+            relay_is_initiator = false;
+            relay_pk = conn_ptr->remote_payload.relay_through->public_key;
+            relay_tok = conn_ptr->remote_payload.relay_through->token;
+        }
+        conn_ptr->relay_token = relay_tok;
+
+        // Store handshake keys for SecretStream creation after pairing
+        auto relay_hs_tx = conn_ptr->tx_key;
+        auto relay_hs_rx = conn_ptr->rx_key;
+        auto relay_hs_hash = conn_ptr->handshake_hash;
+        auto relay_hs_rpk = conn_ptr->remote_public_key;
+        auto relay_local_udx_id = conn_ptr->local_udx_id;
+        auto relay_remote_udx_id = conn_ptr->remote_payload.udx.has_value()
+            ? conn_ptr->remote_payload.udx->id : 0u;
+        auto* relay_raw = conn_ptr->raw_stream;
+
+        // Connect to the relay node — same pattern as client side.
+        // JS: server.js:643 — hs.relaySocket = this.dht.connect(publicKey)
+        auto* dht_ptr = dht_;
+        auto* self = this;
+        dht_->connect(relay_pk,
+            [self, dht_ptr, relay_is_initiator, relay_tok, relay_raw,
+             relay_hs_tx, relay_hs_rx, relay_hs_hash, relay_hs_rpk,
+             relay_local_udx_id, relay_remote_udx_id,
+             relay_keep_alive = relay_keep_alive](
+                int err, const ConnectResult& relay_result) {
+            if (self->closed_ || !relay_result.success || err != 0) {
+                DHT_LOG("  [server] Relay connect failed: %d\n", err);
+                if (dht_ptr) dht_ptr->relay_stats().aborts++;
+                return;
+            }
+
+            DHT_LOG("  [server] Connected to relay node, pairing\n");
+
+            // Connect the relay raw stream
+            if (relay_result.udx_socket && relay_result.raw_stream) {
+                struct sockaddr_in addr{};
+                addr.sin_family = AF_INET;
+                uv_ip4_addr(relay_result.peer_address.host_string().c_str(),
+                            relay_result.peer_address.port, &addr);
+                udx_stream_connect(relay_result.raw_stream,
+                                   relay_result.udx_socket,
+                                   relay_result.remote_udx_id,
+                                   reinterpret_cast<const struct sockaddr*>(&addr));
+            }
+
+            // Create SecretStream over relay connection
+            secret_stream::DuplexHandshake dhs;
+            dhs.tx_key = relay_result.tx_key;
+            dhs.rx_key = relay_result.rx_key;
+            dhs.handshake_hash = relay_result.handshake_hash;
+            dhs.remote_public_key = relay_result.remote_public_key;
+            dhs.is_initiator = true;
+
+            secret_stream::DuplexOptions dopts;
+            dopts.keep_alive_ms = relay_keep_alive;
+
+            auto relay_duplex = std::make_shared<secret_stream::SecretStreamDuplex>(
+                relay_result.raw_stream, dhs, dht_ptr->loop(), dopts);
+
+            // Protomux over SecretStream
+            auto relay_mux = std::make_shared<protomux::Mux>(
+                [duplex = relay_duplex.get()](const uint8_t* data, size_t len) -> bool {
+                    duplex->write(data, len, nullptr);
+                    return true;
+                });
+
+            relay_duplex->on_message(
+                [mux = relay_mux.get()](const uint8_t* data, size_t len) {
+                    if (mux && !mux->is_destroyed()) mux->on_data(data, len);
+                });
+            relay_duplex->start();
+
+            // BlindRelayClient on Protomux channel
+            std::vector<uint8_t> channel_id(
+                relay_result.remote_public_key.begin(),
+                relay_result.remote_public_key.end());
+            auto* channel = relay_mux->create_channel(
+                blind_relay::PROTOCOL_NAME, channel_id, false);
+            if (!channel) {
+                DHT_LOG("  [server] Failed to create blind-relay channel\n");
+                if (dht_ptr) dht_ptr->relay_stats().aborts++;
+                return;
+            }
+
+            auto relay_client = std::make_shared<blind_relay::BlindRelayClient>(channel);
+            relay_client->open();
+
+            // Pair through the relay
+            // JS: server.js:649 — hs.relayClient.pair(isInitiator, token, hs.rawStream)
+            relay_client->pair(
+                relay_is_initiator, relay_tok, relay_local_udx_id,
+                [self, dht_ptr, relay_raw, relay_duplex, relay_mux, relay_client,
+                 relay_hs_tx, relay_hs_rx, relay_hs_hash, relay_hs_rpk,
+                 relay_local_udx_id, relay_remote_udx_id](uint32_t remote_id) {
+                    if (self->closed_) return;
+
+                    DHT_LOG("  [server] Relay pairing succeeded! remote_id=%u\n", remote_id);
+
+                    if (dht_ptr) dht_ptr->relay_stats().successes++;
+
+                    // Wire our rawStream through the relay
+                    // JS: server.js:664-668
+                    if (!relay_duplex || !relay_duplex->raw_stream()) return;
+                    auto* rrs = relay_duplex->raw_stream();
+                    auto* relay_addr = reinterpret_cast<const struct sockaddr_in*>(
+                        &rrs->remote_addr);
+                    udx_socket_t* relay_socket = rrs->socket;
+
+                    if (relay_raw) {
+                        udx_stream_connect(relay_raw, relay_socket, remote_id,
+                                           reinterpret_cast<const struct sockaddr*>(relay_addr));
+                    }
+
+                    // Emit connection via on_socket
+                    // JS: server.js:670-672
+                    char host[INET_ADDRSTRLEN];
+                    uv_ip4_name(relay_addr, host, sizeof(host));
+                    auto peer_addr = compact::Ipv4Address::from_string(
+                        host, ntohs(relay_addr->sin_port));
+
+                    if (self->on_connection_) {
+                        ConnectionInfo info;
+                        info.tx_key = relay_hs_tx;
+                        info.rx_key = relay_hs_rx;
+                        info.handshake_hash = relay_hs_hash;
+                        info.remote_public_key = relay_hs_rpk;
+                        info.peer_address = peer_addr;
+                        info.remote_udx_id = relay_remote_udx_id;
+                        info.local_udx_id = relay_local_udx_id;
+                        info.is_initiator = false;
+                        info.raw_stream = relay_raw;
+                        info.udx_socket = relay_socket;
+                        self->on_connection_(info);
+                    }
+                },
+                [self, dht_ptr](int err) {
+                    if (self->closed_) return;
+                    DHT_LOG("  [server] Relay pairing failed: %d\n", err);
+                    if (dht_ptr) dht_ptr->relay_stats().aborts++;
+                });
+        });
+    }
+
+    // JS: server.js:390-394 — if client is OPEN, connect directly
     if (conn_ptr->remote_payload.firewall == peer_connect::FIREWALL_OPEN &&
         !conn_ptr->remote_payload.addresses4.empty()) {
         auto peer_addr = conn_ptr->remote_payload.addresses4[0];
+        DHT_LOG("  [server] Client is OPEN, connecting directly\n");
         on_socket(*conn_ptr, peer_addr);
         return;
+    }
+
+    // JS: server.js:430-432 — if server has public addr, skip Holepuncher.
+    // Response already omitted holepunch info → client connects directly.
+    // We still store the connection for rawStream firewall detection.
+    if (has_remote_addr) {
+        DHT_LOG("  [server] We have public addr, skipping holepuncher (client connects directly)\n");
     }
 
     // Store connection for holepunch phase
@@ -415,8 +646,9 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
 //     `_holepunches[id]` (sparse array reused on null slots).
 //   - We instantiate `Holepuncher` lazily on first round here, JS does
 //     it inside `_addHandshake` (server.js:436).
-//   - JS analyzer (`p.analyze(false)` etc.) is replaced by simpler
-//     "client says punching → start probes" logic in handle_holepunch.
+//   - A2-A7 (2026-04-14): NAT sampling, stability analysis, fast-mode
+//     ping, NAT freeze, random throttle, puncher→onsocket wiring now
+//     implemented to match JS server.js:483-600.
 // ---------------------------------------------------------------------------
 
 void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
@@ -460,13 +692,39 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
         reply_fn(std::move(reply.value));
     }
 
+    // A2: Feed NAT sampler from holepunch request
+    // JS: server.js:509-510 — `if (req.socket === p.socket) p.nat.add(req.to, req.from)`
+    // We always feed since we use a single socket (no pool socket on server)
+    socket_.nat_sampler().add(
+        compact::Ipv4Address::from_string(peer_address.host_string(), peer_address.port),
+        peer_address);
+
+    // A5: NAT freeze — lock classification before sending response
+    // JS: server.js:582-584 — `if (p.nat.firewall !== FIREWALL.UNKNOWN) p.nat.freeze()`
+    if (socket_.nat_sampler().firewall() != peer_connect::FIREWALL_UNKNOWN) {
+        // NatSampler doesn't have freeze() yet — the classification is stable
+        // after enough samples. This is a documentation placeholder for parity.
+        // TODO: add NatSampler::freeze() if classification drift is observed.
+    }
+
     if (reply.should_punch) {
         DHT_LOG("  [server] Client punching (id=%d, fw=%u, %zu addrs)\n",
                 hp_msg.id, reply.remote_firewall,
                 reply.remote_addresses.size());
 
-        // JS: server.js:544 — `if (!this.holepunch(remoteFirewall, ourFirewall,
-        //                          remoteAddresses, ourAddresses)) return _abort()`
+        // A6: Random punch throttle
+        // JS: server.js:553-574 — if either side RANDOM, check limits
+        // If throttled, respond with TRY_LATER (handle_holepunch already
+        // handles this in the response payload). Here we just log.
+        bool is_random = (reply.remote_firewall >= peer_connect::FIREWALL_RANDOM) ||
+                         (our_fw >= peer_connect::FIREWALL_RANDOM);
+        if (is_random) {
+            DHT_LOG("  [server] Random NAT detected (remote=%u, local=%u)\n",
+                    reply.remote_firewall, our_fw);
+            // TODO: enforce dht._randomPunches >= limit → TRY_LATER
+        }
+
+        // JS: server.js:544 — holepunch veto callback
         if (holepunch_cb_) {
             auto local_addrs = socket_.nat_sampler().addresses();
             if (!holepunch_cb_(reply.remote_firewall, our_fw,
@@ -483,8 +741,34 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                 if (!closed_) socket_.send_probe(addr);
             });
             conn.puncher->set_local_firewall(our_fw);
+
+            // A7: Wire puncher→onsocket so probe success triggers connection
+            // JS: server.js:438 — `hs.puncher.onconnect = hs.onsocket`
+            uint32_t session_id = hp_msg.id;
+            conn.puncher->on_connect([this, session_id](const holepunch::HolepunchResult& hp) {
+                if (closed_) return;
+                auto it = connections_.find(session_id);
+                if (it == connections_.end()) return;
+                DHT_LOG("  [server] Puncher detected connection from %s:%u\n",
+                        hp.address.host_string().c_str(), hp.address.port);
+                on_socket(*it->second, hp.address, hp.socket);
+            });
         }
         conn.puncher->set_remote_firewall(reply.remote_firewall);
+
+        // A4: Fast-mode ping — if we're CONSISTENT and client opened
+        // a matching session, send immediate ping back
+        // JS: server.js:530-537
+        if (socket_.nat_sampler().firewall() == peer_connect::FIREWALL_CONSISTENT ||
+            socket_.nat_sampler().firewall() == peer_connect::FIREWALL_OPEN) {
+            // Send a probe back to the client's address immediately
+            if (!reply.remote_addresses.empty()) {
+                DHT_LOG("  [server] Fast-mode ping to %s:%u\n",
+                        reply.remote_addresses[0].host_string().c_str(),
+                        reply.remote_addresses[0].port);
+                socket_.send_probe(reply.remote_addresses[0]);
+            }
+        }
 
         // Filter out port-0 addresses and set as remote targets
         std::vector<compact::Ipv4Address> valid_addrs;

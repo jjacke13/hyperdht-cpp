@@ -69,6 +69,7 @@ add_library(hyperdht
     src/server_connection.cpp
     src/announcer.cpp
     src/server.cpp
+    src/blind_relay.cpp
     src/dht.cpp
     src/hyperdht_api.cpp
 )
@@ -155,15 +156,19 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/hyperdht.pc
 option(HYPERDHT_BUILD_TESTS "Build tests" ON)
 
 if(HYPERDHT_BUILD_TESTS)
-    include(FetchContent)
-    FetchContent_Declare(
-        googletest
-        GIT_REPOSITORY https://github.com/google/googletest.git
-        GIT_TAG v1.15.2
-    )
-    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(googletest)
+    # Try system GTest first (nix provides it), fall back to FetchContent
+    find_package(GTest QUIET)
+    if(NOT GTest_FOUND)
+        include(FetchContent)
+        FetchContent_Declare(
+            googletest
+            GIT_REPOSITORY https://github.com/google/googletest.git
+            GIT_TAG v1.15.2
+        )
+        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+        set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(googletest)
+    endif()
 
     enable_testing()
 
@@ -338,6 +343,11 @@ if(HYPERDHT_BUILD_TESTS)
     target_link_libraries(test_protomux_secretstream PRIVATE hyperdht GTest::gtest_main)
     add_test(NAME test_protomux_secretstream COMMAND test_protomux_secretstream)
     gtest_discover_tests(test_protomux_secretstream)
+
+    add_executable(test_blind_relay test/test_blind_relay.cpp)
+    target_link_libraries(test_blind_relay PRIVATE hyperdht GTest::gtest_main)
+    add_test(NAME test_blind_relay COMMAND test_blind_relay)
+    gtest_discover_tests(test_blind_relay)
 
     add_executable(test_health test/test_health.cpp)
     target_link_libraries(test_health PRIVATE hyperdht GTest::gtest_main)

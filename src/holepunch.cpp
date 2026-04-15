@@ -2,6 +2,58 @@
 // Runs the 4 strategies (consistent/random combinations), drives the
 // 2-round PEER_HOLEPUNCH exchange over a DHT relay, fires UDP probes,
 // and hands the resulting socket + remote address to the UDX stream.
+//
+// =========================================================================
+// JS FLOW MAP — how this file maps to the JavaScript reference
+// =========================================================================
+//
+// C++ function                        Line  JS file                   JS lines
+// ──────────────────────────────────── ────  ────────────────────────  ────────
+// SecurePayload::SecurePayload         95   secure-payload.js          6-11
+// SecurePayload::encrypt              101   secure-payload.js         31-45
+// SecurePayload::decrypt              116   secure-payload.js         13-29
+// SecurePayload::token                133   secure-payload.js         47-51
+// encode_holepunch_payload            148   messages.js              254-302
+// decode_holepunch_payload            187   messages.js              254-302
+// try_direct_connect                  231   connect.js               212-221
+//
+// Holepuncher class                   253   holepuncher.js            13-310
+// Holepuncher::punch                  309   holepuncher.js           161-212
+// Holepuncher::send_probe             374   holepuncher.js            77-79
+// Holepuncher::open_session           382   holepuncher.js            81-83
+// Holepuncher::on_message             391   holepuncher.js           124-146
+// Holepuncher::consistent_probe       442   holepuncher.js           215-231
+// Holepuncher::random_probes          475   holepuncher.js           234-244
+// Holepuncher::analyze                535   holepuncher.js            85-93
+// Holepuncher::destroy                559   holepuncher.js           297-310
+// Holepuncher::open_birthday_sockets  607   holepuncher.js           271-276
+// Holepuncher::keep_alive_random_nat  654   holepuncher.js           247-269
+//
+// PoolSocket class                    712   socket-pool.js           104-217
+// PoolSocket::request                 806   (lightweight RPC sender; no JS equivalent —
+//                                           JS uses dht.request({socket}) instead)
+// discover_pool_addresses             927   nat.js                    25-79
+//
+// encode_holepunch_msg               1006   messages.js               58-120
+// decode_holepunch_msg               1028   messages.js               58-120
+//
+// PunchState struct                  1065   connect.js                57-93
+// holepunch_connect                  1156   connect.js  205-316 (holepunch fn)
+//                                                       555-629 (probeRound)
+//                                                       631-711 (roundPunch)
+//   ├─ discover_pool_addresses       1228   nat.js                    25-79
+//   ├─ Round 1 (probe exchange)      1257   connect.js               557-629
+//   │  ├─ fast-open probe            1369   connect.js               557
+//   │  ├─ post-Round1 probe          1403   connect.js               582-591
+//   │  └─ analyze delay              1406   connect.js               607-614
+//   └─ Round 2 (punch exchange)      1432   connect.js               631-711
+//      ├─ NAT freeze                 1438   connect.js               634
+//      ├─ send punching=true         1472   connect.js               687-699
+//      └─ puncher->punch()           1542   connect.js               705
+//
+// local_addresses                    1579   holepuncher.js           337-354
+// match_address                      1613   holepuncher.js           356-386
+// =========================================================================
 
 #include "hyperdht/holepunch.hpp"
 
@@ -11,6 +63,7 @@
 
 #include <sodium.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -739,6 +792,7 @@ void PoolSocket::handle_message(const uint8_t* data, size_t len,
                 inflight_.erase(it);
                 if (inf->timer) {
                     uv_timer_stop(inf->timer);
+                    inf->timer->data = nullptr;  // Prevent timeout callback from using freed inf
                     uv_close(reinterpret_cast<uv_handle_t*>(inf->timer),
                              [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
                 }
@@ -791,12 +845,18 @@ void PoolSocket::request(const messages::Request& req,
         DHT_LOG("  [pool] udx_socket_send returned: %d\n", rc);
     }
 
-    // Timeout (2s, no retries — matches JS {retry: false})
+    // Timeout (2s, no retries — matches JS {retry: false}).
+    // The timer callback must remove the Inflight from the vector before
+    // freeing it — otherwise handle_message iterates a dangling pointer.
+    inf->pool = this;
     inf->timer = new uv_timer_t;
     uv_timer_init(loop_, inf->timer);
     inf->timer->data = inf;
     uv_timer_start(inf->timer, [](uv_timer_t* t) {
         auto* inf = static_cast<Inflight*>(t->data);
+        // Remove from vector BEFORE freeing
+        auto& vec = inf->pool->inflight_;
+        vec.erase(std::remove(vec.begin(), vec.end(), inf), vec.end());
         auto timeout_cb = std::move(inf->on_timeout);
         uv_close(reinterpret_cast<uv_handle_t*>(t),
                  [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
@@ -1176,7 +1236,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
     // Discover pool socket's external address via PINGs (JS: nat.autoSample())
     discover_pool_addresses(*state->pool, socket.table(), relay_addr, peer_addr,
         [state, target, relay_addr, peer_addr, holepunch_id,
-         local_firewall, local_addresses](bool addr_ok) {
+         local_addresses](bool addr_ok) {
 
         if (state->completed) return;
 
@@ -1184,8 +1244,16 @@ void holepunch_connect(rpc::RpcSocket& socket,
         auto pool_addrs = state->pool->addresses();
         auto& addrs = pool_addrs.empty() ? local_addresses : pool_addrs;
 
+        // Use pool socket's firewall classification (not the main socket's).
+        // JS: holepuncher.js uses its own nat.firewall for holepunch rounds,
+        // which is sampled from the pool socket's PING responses.
+        auto pool_fw = state->pool->nat_sampler().firewall();
+
+        // Update puncher with pool socket's classification now that we know it
+        state->puncher->set_local_firewall(pool_fw);
+
         DHT_LOG("  [hp] Pool NAT: fw=%u, %zu addrs (discovered=%s)\n",
-                state->pool->nat_sampler().firewall(), pool_addrs.size(),
+                pool_fw, pool_addrs.size(),
                 addr_ok ? "yes" : "no");
 
     // -----------------------------------------------------------------------
@@ -1193,7 +1261,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
     // -----------------------------------------------------------------------
     HolepunchPayload probe;
     probe.error = peer_connect::ERROR_NONE;
-    probe.firewall = local_firewall;
+    probe.firewall = pool_fw;
     probe.round = 0;
     probe.addresses = addrs;
     probe.remote_address = peer_addr;
@@ -1224,7 +1292,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
     // server sees the same address as our probes. Using the main socket
     // would cause a port mismatch on NAT.
     state->pool->request(req,
-        [state, relay_addr, peer_addr, holepunch_id, target, local_firewall]
+        [state, relay_addr, peer_addr, holepunch_id, target, pool_fw]
         (const messages::Response& resp) {
             if (state->completed) return;
 
@@ -1295,7 +1363,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
 
             // JS: abort if both sides are RANDOM (impossible to punch)
             if (effective_remote_fw >= peer_connect::FIREWALL_RANDOM &&
-                local_firewall >= peer_connect::FIREWALL_RANDOM) {
+                pool_fw >= peer_connect::FIREWALL_RANDOM) {
                 DHT_LOG("  [hp] Both sides RANDOM — cannot holepunch\n");
                 state->complete({});
                 return;
@@ -1378,7 +1446,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
             Ipv4Address our_addr = resp.from.addr;
 
             auto send_round2 = [state, relay_addr, peer_addr,
-                                holepunch_id, target, local_firewall,
+                                holepunch_id, target, pool_fw,
                                 server_addrs, server_r1, our_addr]() {
             if (state->completed) return;
 
@@ -1389,7 +1457,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
 
             HolepunchPayload punch;
             punch.error = peer_connect::ERROR_NONE;
-            punch.firewall = local_firewall;
+            punch.firewall = pool_fw;
             punch.round = 1;
             punch.punching = true;
             punch.addresses.push_back(our_addr);

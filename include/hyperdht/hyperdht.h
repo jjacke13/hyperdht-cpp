@@ -357,6 +357,139 @@ HYPERDHT_API void hyperdht_stream_close(hyperdht_stream_t* stream);
  */
 HYPERDHT_API int hyperdht_stream_is_open(const hyperdht_stream_t* stream);
 
+/* =========================================================================
+ * Phase C: Extended API (2026-04-14)
+ * ========================================================================= */
+
+/* --- C9: Constants --- */
+#define HYPERDHT_FIREWALL_UNKNOWN    0
+#define HYPERDHT_FIREWALL_OPEN       1
+#define HYPERDHT_FIREWALL_CONSISTENT 2
+#define HYPERDHT_FIREWALL_RANDOM     3
+
+/* Connect error codes (JS: hyperdht/lib/errors.js) */
+#define HYPERDHT_OK                      0
+#define HYPERDHT_ERR_DESTROYED          (-1)
+#define HYPERDHT_ERR_PEER_NOT_FOUND     (-2)
+#define HYPERDHT_ERR_CONNECTION_FAILED  (-3)
+#define HYPERDHT_ERR_NO_ADDRESSES       (-4)
+#define HYPERDHT_ERR_HOLEPUNCH_FAILED   (-5)
+#define HYPERDHT_ERR_HOLEPUNCH_TIMEOUT  (-6)
+#define HYPERDHT_ERR_RELAY_FAILED       (-7)
+
+/* --- C2: DHT state --- */
+
+HYPERDHT_API int hyperdht_is_online(const hyperdht_t* dht);
+HYPERDHT_API int hyperdht_is_degraded(const hyperdht_t* dht);
+HYPERDHT_API int hyperdht_is_persistent(const hyperdht_t* dht);
+HYPERDHT_API int hyperdht_is_bootstrapped(const hyperdht_t* dht);
+HYPERDHT_API int hyperdht_is_suspended(const hyperdht_t* dht);
+
+/* --- C3: DHT event hooks --- */
+
+typedef void (*hyperdht_event_cb)(void* userdata);
+
+HYPERDHT_API void hyperdht_on_bootstrapped(hyperdht_t* dht,
+                                            hyperdht_event_cb cb, void* userdata);
+HYPERDHT_API void hyperdht_on_network_change(hyperdht_t* dht,
+                                              hyperdht_event_cb cb, void* userdata);
+HYPERDHT_API void hyperdht_on_network_update(hyperdht_t* dht,
+                                              hyperdht_event_cb cb, void* userdata);
+HYPERDHT_API void hyperdht_on_persistent(hyperdht_t* dht,
+                                          hyperdht_event_cb cb, void* userdata);
+
+/* --- C4: DHT query operations --- */
+
+/** Callback for find_peer/lookup per-reply results */
+typedef void (*hyperdht_peer_cb)(const uint8_t* value, size_t len,
+                                  const char* from_host, uint16_t from_port,
+                                  void* userdata);
+
+HYPERDHT_API int hyperdht_find_peer(hyperdht_t* dht,
+                                     const uint8_t public_key[32],
+                                     hyperdht_peer_cb on_reply,
+                                     hyperdht_done_cb on_done,
+                                     void* userdata);
+
+HYPERDHT_API int hyperdht_lookup(hyperdht_t* dht,
+                                  const uint8_t target[32],
+                                  hyperdht_peer_cb on_reply,
+                                  hyperdht_done_cb on_done,
+                                  void* userdata);
+
+HYPERDHT_API int hyperdht_announce(hyperdht_t* dht,
+                                    const uint8_t target[32],
+                                    const uint8_t* value, size_t value_len,
+                                    hyperdht_done_cb on_done,
+                                    void* userdata);
+
+HYPERDHT_API int hyperdht_unannounce(hyperdht_t* dht,
+                                      const uint8_t public_key[32],
+                                      const hyperdht_keypair_t* kp,
+                                      hyperdht_done_cb on_done,
+                                      void* userdata);
+
+/* --- C5: DHT lifecycle --- */
+
+HYPERDHT_API void hyperdht_suspend(hyperdht_t* dht);
+HYPERDHT_API void hyperdht_resume(hyperdht_t* dht);
+
+/* --- C6: DHT misc --- */
+
+/** BLAKE2b-256 hash of arbitrary data */
+HYPERDHT_API void hyperdht_hash(const uint8_t* data, size_t len,
+                                 uint8_t out[32]);
+
+/** Get connection keep-alive setting (ms) */
+HYPERDHT_API uint64_t hyperdht_connection_keep_alive(const hyperdht_t* dht);
+
+/* --- C7: Server state --- */
+
+HYPERDHT_API void hyperdht_server_suspend(hyperdht_server_t* srv);
+HYPERDHT_API void hyperdht_server_resume(hyperdht_server_t* srv);
+HYPERDHT_API void hyperdht_server_notify_online(hyperdht_server_t* srv);
+HYPERDHT_API int  hyperdht_server_is_listening(const hyperdht_server_t* srv);
+
+/** Get server's public key. Returns 0 on success, -1 if not listening. */
+HYPERDHT_API int  hyperdht_server_public_key(const hyperdht_server_t* srv,
+                                              uint8_t out[32]);
+
+/* --- C8: Server config --- */
+
+/** Holepunch veto callback. Return 0 to allow, non-zero to reject.
+ *  Args: remote_fw, local_fw, remote_addr_count, local_addr_count */
+typedef int (*hyperdht_holepunch_cb)(uint32_t remote_fw, uint32_t local_fw,
+                                      int remote_addr_count, int local_addr_count,
+                                      void* userdata);
+
+HYPERDHT_API void hyperdht_server_set_holepunch(hyperdht_server_t* srv,
+                                                 hyperdht_holepunch_cb cb,
+                                                 void* userdata);
+
+/* ── Phase E: Blind Relay ─────────────────────────────────────────────── */
+
+/** Set relay-through public key on a server (enables blind relay fallback).
+ *  relay_pk: 32-byte public key of the relay node, or NULL to disable.
+ *  keep_alive_ms: keep-alive for relay connection (default 5000). */
+HYPERDHT_API void hyperdht_server_set_relay_through(hyperdht_server_t* srv,
+                                                     const uint8_t* relay_pk,
+                                                     uint64_t keep_alive_ms);
+
+/** Connect with relay-through option.
+ *  relay_pk: 32-byte public key of relay node, or NULL (no relay).
+ *  relay_keep_alive_ms: keep-alive for relay socket (default 5000). */
+HYPERDHT_API void hyperdht_connect_relay(hyperdht_t* dht,
+                                          const uint8_t* remote_pk,
+                                          const uint8_t* relay_pk,
+                                          uint64_t relay_keep_alive_ms,
+                                          hyperdht_connect_cb cb,
+                                          void* userdata);
+
+/** Get relay stats. */
+HYPERDHT_API int hyperdht_relay_stats_attempts(hyperdht_t* dht);
+HYPERDHT_API int hyperdht_relay_stats_successes(hyperdht_t* dht);
+HYPERDHT_API int hyperdht_relay_stats_aborts(hyperdht_t* dht);
+
 #ifdef __cplusplus
 }
 #endif

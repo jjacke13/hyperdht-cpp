@@ -55,6 +55,41 @@
           default = mkHyperdht pkgs {};
           static = mkHyperdht pkgs {};
           shared = mkHyperdht pkgs { shared = true; };
+
+          # Minimal server test binary — for live cross-testing on remote machines.
+          # Usage: nix build .#server-test && ./result/bin/test_server_live
+          server-test = pkgs.stdenv.mkDerivation {
+            pname = "hyperdht-server-test";
+            version = "0.1.0";
+            src = pkgs.lib.cleanSourceWith {
+              src = self;
+              filter = path: type:
+                let baseName = builtins.baseNameOf path; in
+                baseName != "build" && baseName != "build-asan"
+                && baseName != "build-debug" && baseName != "build-fuzz"
+                && baseName != "build-shared" && baseName != ".analysis";
+            };
+            postUnpack = ''
+              rm -rf $sourceRoot/deps/libudx
+              mkdir -p $sourceRoot/deps
+              cp -r ${libudx} $sourceRoot/deps/libudx
+            '';
+            nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.pkg-config ];
+            buildInputs = [ pkgs.libsodium pkgs.libuv pkgs.gtest ];
+            cmakeFlags = [
+              "-DHYPERDHT_BUILD_TESTS=ON"
+              "-DHYPERDHT_DEBUG=ON"
+              "-DCMAKE_BUILD_TYPE=Debug"
+              "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"
+              "-DGTEST_ROOT=${pkgs.gtest}"
+            ];
+            # Let the default cmake build phase run, then just pick the binary
+            buildTargets = [ "test_server_live" ];
+            installPhase = ''
+              mkdir -p $out/bin
+              cp test_server_live $out/bin/
+            '';
+          };
         }
       );
 

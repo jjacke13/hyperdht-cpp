@@ -148,6 +148,16 @@ public:
     bool share_local_address = true;   // JS: opts.shareLocalAddress (default true)
     uint64_t handshake_clear_wait = 10000;  // JS: opts.handshakeClearWait (default 10s)
 
+    // Blind-relay options (Phase E)
+    // JS: server.js:28-29 — this.relayThrough, this.relayKeepAlive
+    //
+    // `relay_through`: public key of a node to relay through. When set,
+    // the server includes `relayThrough: { publicKey, token }` in the
+    // Noise payload, enabling the client to connect via relay.
+    // Can be empty (default, no relay).
+    std::optional<noise::PubKey> relay_through;
+    uint64_t relay_keep_alive = 5000;  // JS default: 5000ms
+
 private:
     rpc::RpcSocket& socket_;
     router::Router& router_;

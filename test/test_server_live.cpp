@@ -23,7 +23,9 @@ TEST(LiveServer, WaitForConnection) {
     uv_loop_t loop;
     uv_loop_init(&loop);
 
-    HyperDHT dht(&loop);
+    DhtOptions opts;
+    opts.bootstrap = HyperDHT::default_bootstrap_nodes();
+    HyperDHT dht(&loop, opts);
     dht.bind();
     printf("  Bound to port %u\n", dht.port());
 
@@ -62,7 +64,7 @@ TEST(LiveServer, WaitForConnection) {
         auto* d = static_cast<HyperDHT*>(t->data);
         d->destroy();
         uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
-    }, 120000, 0);
+    }, 300000, 0);  // 5 minutes
 
     uv_run(&loop, UV_RUN_DEFAULT);
 

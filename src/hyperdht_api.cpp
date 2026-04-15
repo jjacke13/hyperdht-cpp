@@ -583,3 +583,318 @@ int hyperdht_stream_is_open(const hyperdht_stream_t* stream) {
     if (!stream || !stream->duplex) return 0;
     return stream->duplex->is_connected() ? 1 : 0;
 }
+
+// =========================================================================
+// Phase C: Extended C API (2026-04-14)
+// =========================================================================
+
+// --- C2: DHT state ---
+
+int hyperdht_is_online(const hyperdht_t* dht) {
+    if (!dht || !dht->dht) return 0;
+    return dht->dht->is_online() ? 1 : 0;
+}
+
+int hyperdht_is_degraded(const hyperdht_t* dht) {
+    if (!dht || !dht->dht) return 0;
+    return dht->dht->is_degraded() ? 1 : 0;
+}
+
+int hyperdht_is_persistent(const hyperdht_t* dht) {
+    if (!dht || !dht->dht) return 0;
+    return dht->dht->is_persistent() ? 1 : 0;
+}
+
+int hyperdht_is_bootstrapped(const hyperdht_t* dht) {
+    if (!dht || !dht->dht) return 0;
+    return dht->dht->is_bootstrapped() ? 1 : 0;
+}
+
+int hyperdht_is_suspended(const hyperdht_t* dht) {
+    if (!dht || !dht->dht) return 0;
+    return dht->dht->is_suspended() ? 1 : 0;
+}
+
+// --- C3: DHT event hooks ---
+
+void hyperdht_on_bootstrapped(hyperdht_t* dht,
+                               hyperdht_event_cb cb, void* userdata) {
+    if (!dht || !dht->dht) return;
+    if (!cb) {
+        dht->dht->on_bootstrapped(nullptr);
+        return;
+    }
+    dht->dht->on_bootstrapped([cb, userdata]() { cb(userdata); });
+}
+
+void hyperdht_on_network_change(hyperdht_t* dht,
+                                 hyperdht_event_cb cb, void* userdata) {
+    if (!dht || !dht->dht) return;
+    if (!cb) {
+        dht->dht->on_network_change(nullptr);
+        return;
+    }
+    dht->dht->on_network_change([cb, userdata]() { cb(userdata); });
+}
+
+void hyperdht_on_network_update(hyperdht_t* dht,
+                                 hyperdht_event_cb cb, void* userdata) {
+    if (!dht || !dht->dht) return;
+    if (!cb) {
+        dht->dht->on_network_update(nullptr);
+        return;
+    }
+    dht->dht->on_network_update([cb, userdata]() { cb(userdata); });
+}
+
+void hyperdht_on_persistent(hyperdht_t* dht,
+                             hyperdht_event_cb cb, void* userdata) {
+    if (!dht || !dht->dht) return;
+    if (!cb) {
+        dht->dht->on_persistent(nullptr);
+        return;
+    }
+    dht->dht->on_persistent([cb, userdata]() { cb(userdata); });
+}
+
+// --- C4: DHT query operations ---
+
+int hyperdht_find_peer(hyperdht_t* dht,
+                        const uint8_t public_key[32],
+                        hyperdht_peer_cb on_reply,
+                        hyperdht_done_cb on_done,
+                        void* userdata) {
+    if (!dht || !dht->dht || !public_key) return -1;
+
+    hyperdht::noise::PubKey pk{};
+    memcpy(pk.data(), public_key, 32);
+
+    dht->dht->find_peer(pk,
+        [on_reply, userdata](const hyperdht::query::QueryReply& reply) {
+            if (on_reply && reply.value.has_value() && !reply.value->empty()) {
+                auto host = reply.from_addr.host_string();
+                on_reply(reply.value->data(), reply.value->size(),
+                         host.c_str(), reply.from_addr.port, userdata);
+            }
+        },
+        [on_done, userdata](const std::vector<hyperdht::query::QueryReply>&) {
+            if (on_done) on_done(0, userdata);
+        });
+    return 0;
+}
+
+int hyperdht_lookup(hyperdht_t* dht,
+                     const uint8_t target[32],
+                     hyperdht_peer_cb on_reply,
+                     hyperdht_done_cb on_done,
+                     void* userdata) {
+    if (!dht || !dht->dht || !target) return -1;
+
+    hyperdht::routing::NodeId t{};
+    memcpy(t.data(), target, 32);
+
+    dht->dht->lookup(t,
+        [on_reply, userdata](const hyperdht::query::QueryReply& reply) {
+            if (on_reply && reply.value.has_value() && !reply.value->empty()) {
+                auto host = reply.from_addr.host_string();
+                on_reply(reply.value->data(), reply.value->size(),
+                         host.c_str(), reply.from_addr.port, userdata);
+            }
+        },
+        [on_done, userdata](const std::vector<hyperdht::query::QueryReply>&) {
+            if (on_done) on_done(0, userdata);
+        });
+    return 0;
+}
+
+int hyperdht_announce(hyperdht_t* dht,
+                       const uint8_t target[32],
+                       const uint8_t* value, size_t value_len,
+                       hyperdht_done_cb on_done,
+                       void* userdata) {
+    if (!dht || !dht->dht || !target || !value || value_len == 0) return -1;
+
+    hyperdht::routing::NodeId t{};
+    memcpy(t.data(), target, 32);
+    std::vector<uint8_t> val(value, value + value_len);
+
+    dht->dht->announce(t, val,
+        [on_done, userdata](const std::vector<hyperdht::query::QueryReply>&) {
+            if (on_done) on_done(0, userdata);
+        });
+    return 0;
+}
+
+int hyperdht_unannounce(hyperdht_t* dht,
+                         const uint8_t public_key[32],
+                         const hyperdht_keypair_t* kp,
+                         hyperdht_done_cb on_done,
+                         void* userdata) {
+    if (!dht || !dht->dht || !public_key || !kp) return -1;
+
+    hyperdht::noise::PubKey pk{};
+    memcpy(pk.data(), public_key, 32);
+
+    hyperdht::noise::Keypair cpp_kp;
+    memcpy(cpp_kp.public_key.data(), kp->public_key, 32);
+    memcpy(cpp_kp.secret_key.data(), kp->secret_key, 64);
+
+    dht->dht->unannounce(pk, cpp_kp,
+        [on_done, userdata]() {
+            if (on_done) on_done(0, userdata);
+        });
+    return 0;
+}
+
+// --- C5: DHT lifecycle ---
+
+void hyperdht_suspend(hyperdht_t* dht) {
+    if (dht && dht->dht) dht->dht->suspend();
+}
+
+void hyperdht_resume(hyperdht_t* dht) {
+    if (dht && dht->dht) dht->dht->resume();
+}
+
+// --- C6: DHT misc ---
+
+void hyperdht_hash(const uint8_t* data, size_t len, uint8_t out[32]) {
+    if (!data || !out) return;
+    auto h = hyperdht::HyperDHT::hash(data, len);
+    memcpy(out, h.data(), 32);
+}
+
+uint64_t hyperdht_connection_keep_alive(const hyperdht_t* dht) {
+    if (!dht || !dht->dht) return 0;
+    return dht->dht->connection_keep_alive();
+}
+
+// --- C7: Server state ---
+
+void hyperdht_server_suspend(hyperdht_server_t* srv) {
+    if (srv && srv->server) srv->server->suspend();
+}
+
+void hyperdht_server_resume(hyperdht_server_t* srv) {
+    if (srv && srv->server) srv->server->resume();
+}
+
+void hyperdht_server_notify_online(hyperdht_server_t* srv) {
+    if (srv && srv->server) srv->server->notify_online();
+}
+
+int hyperdht_server_is_listening(const hyperdht_server_t* srv) {
+    if (!srv || !srv->server) return 0;
+    return srv->server->is_listening() ? 1 : 0;
+}
+
+int hyperdht_server_public_key(const hyperdht_server_t* srv,
+                                uint8_t out[32]) {
+    if (!srv || !srv->server || !out) return -1;
+    if (!srv->server->is_listening()) return -1;
+    auto& pk = srv->server->public_key();
+    memcpy(out, pk.data(), 32);
+    return 0;
+}
+
+// --- C8: Server config ---
+
+void hyperdht_server_set_holepunch(hyperdht_server_t* srv,
+                                    hyperdht_holepunch_cb cb,
+                                    void* userdata) {
+    if (!srv || !srv->server) return;
+
+    if (!cb) {
+        srv->server->set_holepunch(nullptr);
+        return;
+    }
+
+    srv->server->set_holepunch(
+        [cb, userdata](uint32_t remote_fw, uint32_t local_fw,
+                       const std::vector<hyperdht::compact::Ipv4Address>& remote_addrs,
+                       const std::vector<hyperdht::compact::Ipv4Address>& local_addrs) -> bool {
+            return cb(remote_fw, local_fw,
+                      static_cast<int>(remote_addrs.size()),
+                      static_cast<int>(local_addrs.size()),
+                      userdata) == 0;
+        });
+}
+
+// ---------------------------------------------------------------------------
+// Phase E: Blind Relay
+// ---------------------------------------------------------------------------
+
+void hyperdht_server_set_relay_through(hyperdht_server_t* srv,
+                                        const uint8_t* relay_pk,
+                                        uint64_t keep_alive_ms) {
+    if (!srv || !srv->server) return;
+
+    if (relay_pk) {
+        hyperdht::noise::PubKey pk{};
+        memcpy(pk.data(), relay_pk, 32);
+        srv->server->relay_through = pk;
+    } else {
+        srv->server->relay_through = std::nullopt;
+    }
+    srv->server->relay_keep_alive = keep_alive_ms;
+}
+
+void hyperdht_connect_relay(hyperdht_t* dht,
+                             const uint8_t* remote_pk,
+                             const uint8_t* relay_pk,
+                             uint64_t relay_keep_alive_ms,
+                             hyperdht_connect_cb cb,
+                             void* userdata) {
+    if (!dht || !dht->dht || !remote_pk || !cb) {
+        if (cb) cb(-1, nullptr, userdata);
+        return;
+    }
+
+    hyperdht::noise::PubKey pk{};
+    memcpy(pk.data(), remote_pk, 32);
+
+    hyperdht::ConnectOptions opts;
+    if (relay_pk) {
+        hyperdht::noise::PubKey rpk{};
+        memcpy(rpk.data(), relay_pk, 32);
+        opts.relay_through = rpk;
+    }
+    opts.relay_keep_alive = relay_keep_alive_ms;
+
+    dht->dht->connect(pk, opts,
+        [cb, userdata](int error, const hyperdht::ConnectResult& result) {
+            if (error != 0) {
+                cb(error, nullptr, userdata);
+                return;
+            }
+            hyperdht_connection_t conn{};
+            fill_connection(&conn, result.tx_key, result.rx_key,
+                            result.handshake_hash, result.remote_public_key,
+                            result.peer_address, result.remote_udx_id,
+                            result.local_udx_id, true);
+            conn.raw_stream = result.raw_stream;
+            conn.udx_socket = result.udx_socket;
+            conn._internal = result.socket_keepalive
+                ? new std::shared_ptr<void>(result.socket_keepalive)
+                : nullptr;
+            cb(0, &conn, userdata);
+            if (conn._internal) {
+                delete static_cast<std::shared_ptr<void>*>(conn._internal);
+            }
+        });
+}
+
+int hyperdht_relay_stats_attempts(hyperdht_t* dht) {
+    if (!dht || !dht->dht) return 0;
+    return dht->dht->stats().relaying.attempts;
+}
+
+int hyperdht_relay_stats_successes(hyperdht_t* dht) {
+    if (!dht || !dht->dht) return 0;
+    return dht->dht->stats().relaying.successes;
+}
+
+int hyperdht_relay_stats_aborts(hyperdht_t* dht) {
+    if (!dht || !dht->dht) return 0;
+    return dht->dht->stats().relaying.aborts;
+}

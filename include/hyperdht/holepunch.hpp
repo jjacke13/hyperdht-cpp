@@ -164,6 +164,7 @@ private:
         rpc::OnResponseCallback on_response;
         rpc::OnTimeoutCallback on_timeout;
         uv_timer_t* timer = nullptr;
+        PoolSocket* pool = nullptr;  // Back-pointer for timer callback cleanup
     };
 
     uv_loop_t* loop_;
@@ -203,6 +204,7 @@ struct PunchStats {
     uint64_t last_random_punch = 0;  // Timestamp of last random punch completion
     int punches_consistent = 0;      // Total consistent punches attempted
     int punches_random = 0;          // Total random punches attempted
+    int punches_open = 0;            // Total OPEN-firewall direct connects (B2)
     int random_punch_limit = 1;      // Max concurrent random punches (JS default: 1)
     uint64_t random_punch_interval = 20000;  // Min ms between random punches (JS: 20s)
 

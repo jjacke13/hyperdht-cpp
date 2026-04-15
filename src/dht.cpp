@@ -800,53 +800,61 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
         uint32_t our_udx_id = 0;
         udx_stream_t* raw_stream = nullptr;  // Client rawStream (like JS)
         bool completed = false;
+
+        // Cached early firewall event — JS: c.serverSocket / c.serverAddress.
+        // If the server's first UDX packet arrives BEFORE the handshake reply,
+        // cache the firewall info here and replay it after hs_result is set.
+        udx_socket_t* cached_fw_socket = nullptr;
+        compact::Ipv4Address cached_fw_address;
         // §6 ConnectOptions snapshot (copied, not referenced — opts may
         // outlive the original scope once we enter async territory).
         bool fast_open = true;
         bool local_connection = true;
 
-        // Phase E: blind-relay state
-        // JS: connect.js:86-92 — relayTimeout, relayThrough, relayToken,
-        //     relaySocket, relayClient, relayPaired, relayKeepAlive
+        // Phase E: blind-relay config (from ConnectOptions)
         std::optional<noise::PubKey> relay_through;
         std::array<uint8_t, 32> relay_token{};
         uint64_t relay_keep_alive = 5000;
-        bool relay_paired = false;
-        uv_timer_t* relay_timeout = nullptr;
 
-        // Relay connection resources — owned by ConnState, cleaned up on destroy.
-        // JS: c.relaySocket (NoiseSecretStream), c.relayClient (BlindRelayClient)
-        // C++: relay_raw_stream → relay_duplex (SecretStream) → relay_mux (Protomux)
-        //      → relay_client (BlindRelayClient)
-        udx_stream_t* relay_raw_stream = nullptr;
-        std::unique_ptr<secret_stream::SecretStreamDuplex> relay_duplex;
-        std::unique_ptr<protomux::Mux> relay_mux;
-        std::unique_ptr<blind_relay::BlindRelayClient> relay_client;
+        // Phase E: relay connection state — RAII struct that guarantees
+        // correct teardown order regardless of destruction path.
+        struct RelayState {
+            bool paired = false;
+            uv_timer_t* timeout = nullptr;
+            // Connection resources in dependency order (destroyed bottom-up):
+            std::unique_ptr<blind_relay::BlindRelayClient> client;
+            std::unique_ptr<protomux::Mux> mux;
+            std::unique_ptr<secret_stream::SecretStreamDuplex> duplex;
+            udx_stream_t* raw_stream = nullptr;  // owned by duplex
+
+            ~RelayState() {
+                client.reset();
+                mux.reset();
+                duplex.reset();
+                raw_stream = nullptr;
+                if (timeout) {
+                    if (timeout->data) {
+                        // The timer lambda stores a shared_ptr<ConnState>*
+                        delete static_cast<std::shared_ptr<void>*>(timeout->data);
+                        timeout->data = nullptr;
+                    }
+                    uv_timer_stop(timeout);
+                    uv_close(reinterpret_cast<uv_handle_t*>(timeout),
+                             [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
+                    timeout = nullptr;
+                }
+            }
+        };
+        std::unique_ptr<RelayState> relay;
 
         ~ConnState() {
-            // Clean up rawStream if not transferred to ConnectResult
+            // Clean up rawStream if not transferred to ConnectResult.
+            // Context is freed by the stream's on_close callback (RAII).
             if (raw_stream) {
-                if (raw_stream->data) {
-                    delete static_cast<ClientRawStreamCtx*>(raw_stream->data);
-                    raw_stream->data = nullptr;
-                }
                 udx_stream_destroy(raw_stream);
             }
-            // Clean up relay resources in reverse order
-            relay_client.reset();
-            relay_mux.reset();
-            relay_duplex.reset();
-            // relay_raw_stream is owned by relay_duplex (destroyed above)
-            relay_raw_stream = nullptr;
-            // Clean up relay timeout if still pending
-            if (relay_timeout) {
-                auto* sp = static_cast<std::shared_ptr<ConnState>*>(relay_timeout->data);
-                delete sp;
-                relay_timeout->data = nullptr;
-                uv_close(reinterpret_cast<uv_handle_t*>(relay_timeout),
-                         [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-                relay_timeout = nullptr;
-            }
+            // Relay cleanup is handled by RelayState's destructor
+            relay.reset();
         }
 
         void complete(int err, const ConnectResult& result = {}) {
@@ -860,10 +868,8 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
         // Transfer rawStream ownership to result, cleaning up firewall ctx
         void take_raw_stream(ConnectResult& result) {
             if (raw_stream) {
-                if (raw_stream->data) {
-                    delete static_cast<ClientRawStreamCtx*>(raw_stream->data);
-                    raw_stream->data = nullptr;
-                }
+                // Detach context — stream's on_close will handle cleanup
+                raw_stream->data = nullptr;
                 result.raw_stream = raw_stream;
                 raw_stream = nullptr;
             }
@@ -916,9 +922,10 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
             // a direct connection. JS: connect.js:124-126
             //   if (c.relaySocket && isRelay(c.relaySocket, socket, port, host))
             //     return false
-            if (st->relay_raw_stream && st->relay_raw_stream->socket == sock) {
+            if (st->relay && st->relay->raw_stream &&
+                st->relay->raw_stream->socket == sock) {
                 auto* relay_addr = reinterpret_cast<const struct sockaddr_in*>(
-                    &st->relay_raw_stream->remote_addr);
+                    &st->relay->raw_stream->remote_addr);
                 auto* from_addr = reinterpret_cast<const struct sockaddr_in*>(from);
                 if (relay_addr->sin_port == from_addr->sin_port &&
                     relay_addr->sin_addr.s_addr == from_addr->sin_addr.s_addr) {
@@ -933,8 +940,16 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
             // result will be built when hs_result is available.
             if (!st->hs_result.success) {
                 // Handshake not done yet — can't build ConnectResult.
-                // The server sent data before we even got the reply.
-                // Ignore for now; the handshake callback will handle it.
+                // Cache the firewall event; the handshake callback will
+                // replay it. JS: c.serverSocket = socket; c.serverAddress = {port, host}
+                auto* addr_in = reinterpret_cast<const struct sockaddr_in*>(from);
+                char host_buf[INET_ADDRSTRLEN];
+                uv_ip4_name(addr_in, host_buf, sizeof(host_buf));
+                st->cached_fw_socket = sock;
+                st->cached_fw_address = compact::Ipv4Address::from_string(
+                    host_buf, ntohs(addr_in->sin_port));
+                DHT_LOG("  [connect] rawStream firewall cached (handshake pending): %s:%u\n",
+                        host_buf, ntohs(addr_in->sin_port));
                 return;
             }
 
@@ -965,7 +980,15 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
         udx_stream_init(state->socket->udx_handle(), raw,
                         state->our_udx_id,
                         [](udx_stream_t*, int) {},
-                        [](udx_stream_t* s) { delete s; });
+                        [](udx_stream_t* s) {
+                            // RAII: delete context when stream closes, regardless
+                            // of which callback path fires (firewall, recv, or error).
+                            if (s->data) {
+                                delete static_cast<ClientRawStreamCtx*>(s->data);
+                                s->data = nullptr;
+                            }
+                            delete s;
+                        });
         raw->data = raw_ctx;
         udx_stream_firewall(raw, client_raw_stream_firewall);
         state->raw_stream = raw;
@@ -1069,8 +1092,27 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                         state->try_relay_fn.reset();  // Break cycle
                     state->hs_result = hs;
 
-                    // rawStream was already created before findPeer
-                    // (matching JS connect.js:73). No need to create it here.
+                    // Replay cached firewall event if server's first packet
+                    // arrived before the handshake reply. JS: connect.js:493-496
+                    //   if (c.serverSocket) { c.onsocket(c.serverSocket, ...); return }
+                    if (state->cached_fw_socket && !state->completed) {
+                        DHT_LOG("  [connect] Replaying cached firewall event\n");
+                        ConnectResult result;
+                        result.success = true;
+                        result.tx_key = hs.tx_key;
+                        result.rx_key = hs.rx_key;
+                        result.handshake_hash = hs.handshake_hash;
+                        result.remote_public_key = hs.remote_public_key;
+                        result.peer_address = state->cached_fw_address;
+                        result.udx_socket = state->cached_fw_socket;
+                        result.local_udx_id = state->our_udx_id;
+                        if (hs.remote_payload.udx.has_value()) {
+                            result.remote_udx_id = hs.remote_payload.udx->id;
+                        }
+                        state->take_raw_stream(result);
+                        state->complete(0, result);
+                        return;
+                    }
 
                     // Log the server's handshake reply
                     DHT_LOG("  [connect] Server reply: fw=%u, addrs4=%zu, hp=%s, relays=%zu, "
@@ -1111,6 +1153,9 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                                 "relay_pk=%02x%02x...\n",
                                 is_initiator, relay_pk[0], relay_pk[1]);
 
+                        // Create relay state (RAII — destructor handles teardown)
+                        state->relay = std::make_unique<ConnState::RelayState>();
+
                         if (state->dht) {
                             state->dht->relay_stats().attempts++;
                         }
@@ -1123,7 +1168,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                         uv_timer_start(timer, [](uv_timer_t* t) {
                             auto* sp = static_cast<std::shared_ptr<ConnState>*>(t->data);
                             if (sp && *sp) {
-                                (*sp)->relay_timeout = nullptr;
+                                if ((*sp)->relay) (*sp)->relay->timeout = nullptr;
                                 if (!(*sp)->completed) {
                                     DHT_LOG("  [connect] Relay pairing timed out (15s)\n");
                                     if ((*sp)->dht) {
@@ -1136,7 +1181,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                             uv_close(reinterpret_cast<uv_handle_t*>(t),
                                      [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
                         }, blind_relay::RELAY_TIMEOUT_MS, 0);
-                        state->relay_timeout = timer;
+                        state->relay->timeout = timer;
 
                         // Step 1: Connect to the relay node via normal DHT connect.
                         // JS: connect.js:762 — c.relaySocket = c.dht.connect(publicKey)
@@ -1161,7 +1206,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                             // JS: dht.connect() returns a NoiseSecretStream which wraps
                             // the rawStream. We do the same: wrap relay_result.raw_stream
                             // in a SecretStreamDuplex.
-                            state->relay_raw_stream = relay_result.raw_stream;
+                            state->relay->raw_stream = relay_result.raw_stream;
 
                             secret_stream::DuplexHandshake relay_hs;
                             relay_hs.tx_key = relay_result.tx_key;
@@ -1187,14 +1232,14 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                                                    reinterpret_cast<const struct sockaddr*>(&relay_addr));
                             }
 
-                            state->relay_duplex = std::make_unique<secret_stream::SecretStreamDuplex>(
+                            state->relay->duplex = std::make_unique<secret_stream::SecretStreamDuplex>(
                                 relay_result.raw_stream, relay_hs,
                                 state->dht->loop(), duplex_opts);
 
                             // Step 3: Create Protomux over the SecretStream.
                             // JS: Protomux.from(stream) — creates mux from stream
-                            state->relay_mux = std::make_unique<protomux::Mux>(
-                                [duplex = state->relay_duplex.get()](
+                            state->relay->mux = std::make_unique<protomux::Mux>(
+                                [duplex = state->relay->duplex.get()](
                                     const uint8_t* data, size_t len) -> bool {
                                     if (!duplex) return false;
                                     duplex->write(data, len, nullptr);
@@ -1202,22 +1247,22 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                                 });
 
                             // Wire SecretStream on_message → Protomux on_data
-                            state->relay_duplex->on_message(
-                                [mux = state->relay_mux.get()](
+                            state->relay->duplex->on_message(
+                                [mux = state->relay->mux.get()](
                                     const uint8_t* data, size_t len) {
                                     if (mux && !mux->is_destroyed()) {
                                         mux->on_data(data, len);
                                     }
                                 });
 
-                            state->relay_duplex->start();
+                            state->relay->duplex->start();
 
                             // Step 4: Create BlindRelayClient over the Protomux channel.
                             // JS: relay.Client.from(relaySocket, { id: relaySocket.publicKey })
                             std::vector<uint8_t> channel_id(
                                 relay_result.remote_public_key.begin(),
                                 relay_result.remote_public_key.end());
-                            auto* channel = state->relay_mux->create_channel(
+                            auto* channel = state->relay->mux->create_channel(
                                 blind_relay::PROTOCOL_NAME, channel_id, false);
                             if (!channel) {
                                 DHT_LOG("  [connect] Failed to create blind-relay channel\n");
@@ -1225,13 +1270,13 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                                 return;
                             }
 
-                            state->relay_client = std::make_unique<blind_relay::BlindRelayClient>(channel);
-                            state->relay_client->open();
+                            state->relay->client = std::make_unique<blind_relay::BlindRelayClient>(channel);
+                            state->relay->client->open();
 
                             // Step 5: Pair our rawStream through the relay.
                             // JS: c.relayClient.pair(isInitiator, token, c.rawStream)
                             //     .on('data', (remoteId) => { ... })
-                            state->relay_client->pair(
+                            state->relay->client->pair(
                                 relay_is_initiator, relay_tok, state->our_udx_id,
                                 [state](uint32_t remote_id) {
                                     // Pair success!
@@ -1241,24 +1286,24 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                                             remote_id);
 
                                     // Cancel timeout
-                                    if (state->relay_timeout) {
+                                    if (state->relay->timeout) {
                                         auto* sp = static_cast<std::shared_ptr<ConnState>*>(
-                                            state->relay_timeout->data);
+                                            state->relay->timeout->data);
                                         delete sp;
-                                        state->relay_timeout->data = nullptr;
-                                        uv_timer_stop(state->relay_timeout);
-                                        uv_close(reinterpret_cast<uv_handle_t*>(state->relay_timeout),
+                                        state->relay->timeout->data = nullptr;
+                                        uv_timer_stop(state->relay->timeout);
+                                        uv_close(reinterpret_cast<uv_handle_t*>(state->relay->timeout),
                                                  [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
-                                        state->relay_timeout = nullptr;
+                                        state->relay->timeout = nullptr;
                                     }
 
-                                    state->relay_paired = true;
+                                    state->relay->paired = true;
                                     if (state->dht) state->dht->relay_stats().successes++;
 
                                     // Step 6: Wire our rawStream through the relay.
                                     // JS: const { remotePort, remoteHost, socket } = c.relaySocket.rawStream
                                     //     c.rawStream.connect(socket, remoteId, remotePort, remoteHost)
-                                    auto* relay_raw = state->relay_raw_stream;
+                                    auto* relay_raw = state->relay->raw_stream;
                                     if (!relay_raw || !state->raw_stream) {
                                         DHT_LOG("  [connect] Relay paired but streams gone\n");
                                         return;

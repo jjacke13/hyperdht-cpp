@@ -183,7 +183,7 @@ BlindRelayClient::BlindRelayClient(protomux::Channel* channel)
         closed_ = true;
         // Fail all pending requests
         for (auto& [key, req] : requests_) {
-            if (req.on_error) req.on_error(-1);
+            if (req.on_error) req.on_error(RelayError::CHANNEL_CLOSED);
         }
         requests_.clear();
     };
@@ -211,14 +211,14 @@ void BlindRelayClient::pair(bool is_initiator, const Token& token,
                              uint32_t local_stream_id,
                              OnPairedCb on_paired, OnErrorCb on_error) {
     if (destroyed_) {
-        if (on_error) on_error(-2);
+        if (on_error) on_error(RelayError::CHANNEL_DESTROYED);
         return;
     }
 
     auto key = token_hex(token);
     if (requests_.count(key)) {
         // JS: throw ALREADY_PAIRING
-        if (on_error) on_error(-3);
+        if (on_error) on_error(RelayError::ALREADY_PAIRING);
         return;
     }
 
@@ -246,7 +246,7 @@ void BlindRelayClient::unpair(const Token& token) {
     if (it != requests_.end()) {
         auto req = std::move(it->second);
         requests_.erase(it);
-        if (req.on_error) req.on_error(-4);  // PAIRING_CANCELLED
+        if (req.on_error) req.on_error(RelayError::PAIRING_CANCELLED);  // PAIRING_CANCELLED
     }
 
     if (!destroyed_) {
@@ -268,7 +268,7 @@ void BlindRelayClient::destroy() {
     destroyed_ = true;
     // Fail all pending requests
     for (auto& [key, req] : requests_) {
-        if (req.on_error) req.on_error(-5);
+        if (req.on_error) req.on_error(RelayError::DESTROYED);
     }
     requests_.clear();
     channel_->close();
@@ -309,7 +309,7 @@ void BlindRelayClient::on_unpair_response(const uint8_t* data, size_t len) {
     auto req = std::move(it->second);
     requests_.erase(it);
 
-    if (req.on_error) req.on_error(-4);  // PAIRING_CANCELLED
+    if (req.on_error) req.on_error(RelayError::PAIRING_CANCELLED);  // PAIRING_CANCELLED
 }
 
 // ---------------------------------------------------------------------------

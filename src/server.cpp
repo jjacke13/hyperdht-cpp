@@ -408,11 +408,15 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     auto* raw = new udx_stream_t;
     auto* raw_ctx = new RawStreamCtx{this};
     udx_stream_init(socket_.udx_handle(), raw, conn.local_udx_id,
-                    [](udx_stream_t* s, int) {
-                        delete static_cast<RawStreamCtx*>(s->data);
-                        s->data = nullptr;
-                    },
-                    [](udx_stream_t* s) { delete s; });
+                    [](udx_stream_t*, int) {},
+                    [](udx_stream_t* s) {
+                        // RAII: context freed in on_close regardless of callback path
+                        if (s->data) {
+                            delete static_cast<RawStreamCtx*>(s->data);
+                            s->data = nullptr;
+                        }
+                        delete s;
+                    });
     raw->data = raw_ctx;
     udx_stream_firewall(raw, server_raw_stream_firewall);
     conn.raw_stream = raw;

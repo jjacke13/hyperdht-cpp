@@ -71,6 +71,15 @@ inline constexpr const char* PROTOCOL_NAME = "blind-relay";
 inline constexpr uint64_t RELAY_TIMEOUT_MS = 15000;  // 15s pairing timeout
 inline constexpr uint64_t RELAY_KEEP_ALIVE_MS = 5000; // default keep-alive
 
+// Error codes for BlindRelayClient callbacks (JS: blind-relay/lib/errors.js)
+namespace RelayError {
+    constexpr int CHANNEL_CLOSED    = -1;  // JS: CHANNEL_CLOSED
+    constexpr int CHANNEL_DESTROYED = -2;  // JS: CHANNEL_DESTROYED
+    constexpr int ALREADY_PAIRING   = -3;  // JS: ALREADY_PAIRING
+    constexpr int PAIRING_CANCELLED = -4;  // JS: PAIRING_CANCELLED
+    constexpr int DESTROYED         = -5;  // Client destroyed with pending requests
+}
+
 // ---------------------------------------------------------------------------
 // Messages — Pair and Unpair
 // ---------------------------------------------------------------------------

@@ -222,7 +222,7 @@ TEST(BlindRelayClient, DuplicatePairFails) {
     client.pair(true, token, 200, [](uint32_t) {},
                 [&error_code](int err) { error_code = err; });
 
-    EXPECT_EQ(error_code, -3);  // ALREADY_PAIRING
+    EXPECT_EQ(error_code, RelayError::ALREADY_PAIRING);
 }
 
 TEST(BlindRelayClient, UnpairCancelsPending) {
@@ -238,7 +238,7 @@ TEST(BlindRelayClient, UnpairCancelsPending) {
                 [&error_code](int err) { error_code = err; });
 
     client.unpair(token);
-    EXPECT_EQ(error_code, -4);  // PAIRING_CANCELLED
+    EXPECT_EQ(error_code, RelayError::PAIRING_CANCELLED);
 }
 
 TEST(BlindRelayClient, DestroyFailsAllPending) {
@@ -276,7 +276,7 @@ TEST(BlindRelayClient, PairAfterDestroyFails) {
     client.pair(true, token, 100, [](uint32_t) {},
                 [&error_code](int err) { error_code = err; });
 
-    EXPECT_EQ(error_code, -2);  // CHANNEL_DESTROYED
+    EXPECT_EQ(error_code, RelayError::CHANNEL_DESTROYED);
 }
 
 // ===========================================================================

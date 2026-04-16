@@ -1663,3 +1663,111 @@ TEST(DelayedPing, HandlersDestructorCancelsPending) {
     // If we got here without ASan/UBSan complaints, cleanup worked.
     SUCCEED();
 }
+
+// ---------------------------------------------------------------------------
+// rpc::Session — JS dht-rpc/lib/session.js. A Session tracks the requests
+// issued through it so `destroy()` can cancel them as a batch. Cancellation
+// is silent (neither on_response nor on_timeout fires).
+// ---------------------------------------------------------------------------
+
+TEST(Session, DestroyCancelsInflightRequests) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    // Server that never replies — we want the timeout-budget-releasing
+    // cancel to fire before any response could race it.
+    NodeId server_id{};
+    server_id.fill(0x10);
+    RpcSocket server(&loop, server_id);
+    server.bind(0);
+
+    NodeId client_id{};
+    client_id.fill(0x11);
+    RpcSocket client(&loop, client_id);
+    client.bind(0);
+
+    Session session(client);
+
+    // Two PING requests tracked through the session.
+    int responses = 0;
+    int timeouts = 0;
+    Request ping1;
+    ping1.to.addr = Ipv4Address::from_string("127.0.0.1", server.port());
+    ping1.command = CMD_PING;
+
+    Request ping2;
+    ping2.to.addr = Ipv4Address::from_string("127.0.0.1", server.port());
+    ping2.command = CMD_PING;
+
+    session.request(ping1,
+        [&](const Response&) { responses++; },
+        [&](uint16_t) { timeouts++; });
+    session.request(ping2,
+        [&](const Response&) { responses++; },
+        [&](uint16_t) { timeouts++; });
+
+    EXPECT_EQ(session.inflight_count(), 2u);
+    EXPECT_EQ(client.inflight_count(), 2u);
+
+    // destroy() must cancel both; no callback fires.
+    session.destroy();
+
+    EXPECT_EQ(session.inflight_count(), 0u);
+    EXPECT_EQ(client.inflight_count(), 0u)
+        << "RpcSocket inflight budget must be returned on cancel";
+    EXPECT_EQ(responses, 0);
+    EXPECT_EQ(timeouts, 0);
+
+    // Pump the loop a little to make sure no callback arrives after the fact.
+    uv_timer_t timer;
+    uv_timer_init(&loop, &timer);
+    struct Ctx { RpcSocket& c; RpcSocket& s; uv_timer_t& t; };
+    Ctx ctx{client, server, timer};
+    timer.data = &ctx;
+    uv_timer_start(&timer, [](uv_timer_t* t) {
+        auto* c = static_cast<Ctx*>(t->data);
+        c->c.close();
+        c->s.close();
+        uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
+    }, 200, 0);
+    uv_run(&loop, UV_RUN_DEFAULT);
+
+    EXPECT_EQ(responses, 0);
+    EXPECT_EQ(timeouts, 0);
+
+    uv_loop_close(&loop);
+}
+
+TEST(Session, DestructorCancelsPending) {
+    // Scope guarantee: a Session going out of scope with tracked
+    // requests must cancel them — otherwise those requests would
+    // leak their congestion budget.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    NodeId server_id{};
+    server_id.fill(0x20);
+    RpcSocket server(&loop, server_id);
+    server.bind(0);
+
+    NodeId client_id{};
+    client_id.fill(0x21);
+    RpcSocket client(&loop, client_id);
+    client.bind(0);
+
+    {
+        Session session(client);
+        Request ping;
+        ping.to.addr = Ipv4Address::from_string("127.0.0.1", server.port());
+        ping.command = CMD_PING;
+        session.request(ping, [](const Response&) {}, [](uint16_t) {});
+        EXPECT_EQ(client.inflight_count(), 1u);
+    } // ~Session here
+
+    EXPECT_EQ(client.inflight_count(), 0u);
+
+    client.close();
+    server.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}

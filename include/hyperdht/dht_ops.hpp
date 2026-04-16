@@ -105,11 +105,17 @@ struct MutableResult {
 // on_result is called for each verified result (valid signature, seq >= min_seq).
 using OnMutableCallback = std::function<void(const MutableResult& result)>;
 
+// When `latest == false`, the query destroys itself after the FIRST
+// verified result, matching JS `mutableGet(pk, { latest: false })`
+// (index.js:319-328). When `true` (default), the walk completes so
+// the caller can pick the max-seq reply. Single-shot destroy() on
+// first match avoids wasted traffic when callers only need "any valid".
 std::shared_ptr<query::Query> mutable_get(rpc::RpcSocket& socket,
                                            const std::array<uint8_t, 32>& public_key,
                                            uint64_t min_seq,
                                            OnMutableCallback on_result,
-                                           query::OnDoneCallback on_done);
+                                           query::OnDoneCallback on_done,
+                                           bool latest = true);
 
 }  // namespace dht_ops
 }  // namespace hyperdht

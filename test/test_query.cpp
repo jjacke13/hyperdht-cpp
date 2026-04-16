@@ -111,6 +111,122 @@ TEST(Query, LoopbackFindNode) {
 }
 
 // ---------------------------------------------------------------------------
+// Query early termination — JS `query.destroy()` equivalent. Calling
+// destroy() from an on_reply handler must:
+//   - immediately mark the query done
+//   - invoke on_done exactly once
+//   - drop any late responses (no further on_reply dispatches)
+// JS: dht-rpc/lib/query.js:385-390 (_destroy)
+// ---------------------------------------------------------------------------
+
+TEST(Query, DestroyFromOnReplyEndsWalk) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    // Server with a fat routing table so the walk *would* take many steps
+    // if we didn't short-circuit.
+    NodeId server_id{};
+    server_id.fill(0x11);
+    RpcSocket server(&loop, server_id);
+    server.bind(0);
+    RpcHandlers handlers(server);
+    handlers.install();
+
+    for (int i = 1; i <= 30; i++) {
+        Node node;
+        node.id.fill(0x00);
+        node.id[0] = static_cast<uint8_t>(i);
+        node.host = "10.0.0." + std::to_string(i);
+        node.port = static_cast<uint16_t>(9000 + i);
+        server.table().add(node);
+    }
+
+    NodeId client_id{};
+    client_id.fill(0x22);
+    RpcSocket client(&loop, client_id);
+    client.bind(0);
+
+    NodeId target{};
+    target.fill(0x05);
+
+    bool query_done = false;
+    int on_done_count = 0;
+    int on_reply_count = 0;
+
+    auto q = Query::create(client, target, CMD_FIND_NODE);
+    q->set_internal(true);
+    q->add_bootstrap(Ipv4Address::from_string("127.0.0.1", server.port()));
+
+    // Destroy on the first reply.
+    auto q_weak = std::weak_ptr<Query>(q);
+    q->on_reply([&, q_weak](const QueryReply&) {
+        on_reply_count++;
+        if (auto qp = q_weak.lock()) qp->destroy();
+    });
+
+    q->on_done([&](const std::vector<QueryReply>&) {
+        query_done = true;
+        on_done_count++;
+        server.close();
+        client.close();
+    });
+
+    q->start();
+
+    uv_timer_t timer;
+    uv_timer_init(&loop, &timer);
+    struct TimerCtx { RpcSocket* s; RpcSocket* c; uv_timer_t* t; };
+    TimerCtx tctx{&server, &client, &timer};
+    timer.data = &tctx;
+    uv_timer_start(&timer, [](uv_timer_t* t) {
+        auto* ctx = static_cast<TimerCtx*>(t->data);
+        ctx->s->close();
+        ctx->c->close();
+        uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
+    }, 3000, 0);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+
+    EXPECT_TRUE(query_done) << "destroy() must fire on_done";
+    EXPECT_EQ(on_done_count, 1) << "on_done must be invoked exactly once";
+    EXPECT_EQ(on_reply_count, 1) << "no on_reply dispatches allowed after destroy()";
+    EXPECT_TRUE(q->is_done());
+
+    uv_loop_close(&loop);
+}
+
+TEST(Query, DestroyIsIdempotent) {
+    // destroy() called twice (e.g. from two concurrent on_reply handlers
+    // in the final tick) must not fire on_done twice.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    NodeId client_id{};
+    client_id.fill(0x22);
+    RpcSocket client(&loop, client_id);
+    client.bind(0);
+
+    NodeId target{};
+    target.fill(0xAA);
+
+    int on_done_count = 0;
+    auto q = Query::create(client, target, CMD_FIND_NODE);
+    q->set_internal(true);
+    q->on_done([&](const std::vector<QueryReply>&) { on_done_count++; });
+
+    q->destroy();
+    q->destroy();
+    q->destroy();
+
+    EXPECT_TRUE(q->is_done());
+    EXPECT_EQ(on_done_count, 1);
+
+    client.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
 // Test: iterative FIND_NODE against live bootstrap
 // ---------------------------------------------------------------------------
 

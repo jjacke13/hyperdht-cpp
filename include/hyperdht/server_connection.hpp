@@ -134,15 +134,21 @@ struct HolepunchReply {
     bool address_verified = false;    // True if client echoed our token (relay verification)
     uint32_t remote_firewall = 0;     // Client's reported firewall
     std::vector<compact::Ipv4Address> remote_addresses;  // Client's addresses to probe
+    bool try_later = false;           // JS: server.js:558-573 — TRY_LATER sent; caller must NOT start probing
 };
 
+// random_throttled: caller-provided gate. When true AND this is a random
+// punch (either side RANDOM), the response is built with
+// `error = ERROR_TRY_LATER` and `should_punch` stays false. Mirrors JS
+// server.js:553-574 which guards `dht._randomPunches / _lastRandomPunch`.
 HolepunchReply handle_holepunch(
     ServerConnection& conn,
     const std::vector<uint8_t>& value,
     const compact::Ipv4Address& client_address,
     uint32_t our_firewall,
     const std::vector<compact::Ipv4Address>& our_addresses,
-    bool is_server_relay = false);
+    bool is_server_relay = false,
+    bool random_throttled = false);
 
 }  // namespace server_connection
 }  // namespace hyperdht

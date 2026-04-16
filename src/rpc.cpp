@@ -22,6 +22,7 @@
 
 #include "hyperdht/rpc.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <memory>
@@ -193,6 +194,16 @@ uint16_t RpcSocket::alloc_tid() {
     uint16_t tid = next_tid_++;
     if (next_tid_ == 0) next_tid_ = 1;
     return tid;
+}
+
+bool RpcSocket::cancel_request(uint16_t tid) {
+    auto* req = find_inflight(tid);
+    if (!req) return false;
+    // destroy_request handles timer close + congestion bookkeeping and
+    // marks the request `destroyed`, so any later arrivals hitting
+    // find_inflight return nullptr and fall through.
+    destroy_request(req);
+    return true;
 }
 
 InflightRequest* RpcSocket::find_inflight(uint16_t tid) {
@@ -872,6 +883,51 @@ uint64_t RpcSocket::timeout_for(const compact::Ipv4Address& peer) const {
     if (timeout < 200) timeout = 200;
     if (timeout > 5000) timeout = 5000;
     return timeout;
+}
+
+// ---------------------------------------------------------------------------
+// Session (JS: dht-rpc/lib/session.js)
+// ---------------------------------------------------------------------------
+
+uint16_t Session::request(const messages::Request& req,
+                          OnResponseCallback on_response,
+                          OnTimeoutCallback on_timeout) {
+    // Wrap the caller's callbacks so we automatically detach from the
+    // session's tid list on completion. Capturing `this` is safe: if
+    // the Session is destroyed first it cancels every tid before
+    // returning, so the inner callback can never fire against a dead
+    // Session.
+    auto* self = this;
+    auto tid = socket_.request(req,
+        [self, on_response = std::move(on_response)](const messages::Response& resp) {
+            // Response arrived — detach from session tracker. Use the
+            // response's tid for the detach, not a captured value, so
+            // we survive congestion-queued sends that allocated a tid
+            // later than initial request().
+            self->tids_.erase(
+                std::remove(self->tids_.begin(), self->tids_.end(), resp.tid),
+                self->tids_.end());
+            if (on_response) on_response(resp);
+        },
+        [self, on_timeout = std::move(on_timeout)](uint16_t tid) {
+            self->tids_.erase(
+                std::remove(self->tids_.begin(), self->tids_.end(), tid),
+                self->tids_.end());
+            if (on_timeout) on_timeout(tid);
+        });
+    if (tid != 0) tids_.push_back(tid);
+    return tid;
+}
+
+void Session::destroy() {
+    // Swap first so callbacks that fire during cancel (shouldn't —
+    // cancel_request is silent — but defensive) don't re-enter and
+    // mutate the vector we're iterating.
+    auto local = std::move(tids_);
+    tids_.clear();
+    for (auto tid : local) {
+        socket_.cancel_request(tid);
+    }
 }
 
 }  // namespace rpc

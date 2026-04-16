@@ -83,6 +83,31 @@ static int client_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket
 namespace hyperdht {
 
 // ---------------------------------------------------------------------------
+// ConnectOptions helpers
+// ---------------------------------------------------------------------------
+
+// JS connect.js:842-848 — `selectRelay(relayThrough)`.
+// Order of precedence matches JS (function first, then array, then literal).
+std::optional<noise::PubKey> ConnectOptions::select_relay_through(
+    uint64_t (*rand_u64)()) const {
+
+    if (relay_through_fn) return relay_through_fn();
+
+    if (!relay_through_array.empty()) {
+        uint64_t r;
+        if (rand_u64) {
+            r = rand_u64();
+        } else {
+            randombytes_buf(&r, sizeof(r));
+        }
+        size_t idx = static_cast<size_t>(r % relay_through_array.size());
+        return relay_through_array[idx];
+    }
+
+    return relay_through;
+}
+
+// ---------------------------------------------------------------------------
 // Constructor / Destructor
 // ---------------------------------------------------------------------------
 
@@ -119,6 +144,29 @@ HyperDHT::HyperDHT(uv_loop_t* loop, DhtOptions opts)
               our_id.begin());
 
     socket_ = std::make_unique<rpc::RpcSocket>(loop_, our_id);
+
+    // filterNode: install the JS hardcoded testnet blocklist
+    // (hyperdht/index.js:585-592) plus any caller-provided filter. Both
+    // must pass (AND semantics) — matches JS where the built-in filter
+    // replaces opts.filterNode unless the caller opted in explicitly via
+    // dht-rpc's lower-level surface. Bundling them here ensures every
+    // HyperDHT instance ignores the known-bad testnet nodes without a
+    // caller having to know they exist.
+    auto user_filter = opts_.filter_node;
+    socket_->set_filter_node(
+        [user_filter](const routing::NodeId& id,
+                      const compact::Ipv4Address& addr) {
+            // Built-in JS testnet blocklist (index.js:585-592).
+            const std::string host = addr.host_string();
+            const uint16_t port = addr.port;
+            if (port == 49738 &&
+                (host == "134.209.28.98" || host == "167.99.142.185")) return false;
+            if (port == 9400 && host == "35.233.47.252") return false;
+            if (host == "150.136.142.116") return false;
+            // Then the caller-supplied filter, if any.
+            if (user_filter) return user_filter(id, addr);
+            return true;
+        });
 
     // §7: thread storage cache tuning into the handlers.
     // max_size governs entry count (JS: opts.maxSize); ttl_ms is the
@@ -277,6 +325,25 @@ std::array<uint8_t, 32> HyperDHT::hash(const uint8_t* data, size_t len) {
     std::array<uint8_t, 32> out{};
     crypto_generichash(out.data(), 32, data, len, nullptr, 0);
     return out;
+}
+
+// JS: HyperDHT.connectRawStream — hyperdht/index.js:452-458.
+int HyperDHT::connect_raw_stream(const ConnectResult& base,
+                                 udx_stream_t* raw,
+                                 uint32_t remote_udx_id) {
+    if (!base.success || !raw || !base.udx_socket) return -1;
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    if (uv_ip4_addr(base.peer_address.host_string().c_str(),
+                    base.peer_address.port, &addr) != 0) {
+        return -2;
+    }
+    return udx_stream_connect(
+        raw,
+        static_cast<udx_socket_t*>(base.udx_socket),
+        remote_udx_id,
+        reinterpret_cast<const struct sockaddr*>(&addr));
 }
 
 // ---------------------------------------------------------------------------
@@ -917,12 +984,16 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
     state->dht = this;
     state->fast_open = opts.fast_open;
     state->local_connection = opts.local_connection;
-    state->relay_through = opts.relay_through;
     state->relay_keep_alive = opts.relay_keep_alive;
+
+    // JS parity (connect.js:842-848): delegate to the ConnectOptions
+    // helper which mirrors `selectRelay()` — function form wins, then
+    // array (random pick), then literal.
+    state->relay_through = opts.select_relay_through();
 
     // Generate relay token if relay_through is set
     // JS: connect.js:88 — relayToken: relayThrough ? relay.token() : null
-    if (opts.relay_through.has_value()) {
+    if (state->relay_through.has_value()) {
         auto zero_check = std::array<uint8_t, 32>{};
         if (opts.relay_token == zero_check) {
             state->relay_token = blind_relay::generate_token();
@@ -1138,6 +1209,15 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
 // ---------------------------------------------------------------------------
 // create_server
 // ---------------------------------------------------------------------------
+
+std::vector<server::Server*> HyperDHT::listening() const {
+    std::vector<server::Server*> out;
+    out.reserve(servers_.size());
+    for (const auto& srv : servers_) {
+        if (srv && srv->is_listening()) out.push_back(srv.get());
+    }
+    return out;
+}
 
 server::Server* HyperDHT::create_server() {
     ensure_bound();
@@ -1524,6 +1604,10 @@ void HyperDHT::resume() {
 // ---------------------------------------------------------------------------
 
 void HyperDHT::destroy(std::function<void()> on_done) {
+    destroy(DestroyOptions{}, std::move(on_done));
+}
+
+void HyperDHT::destroy(DestroyOptions opts, std::function<void()> on_done) {
     if (destroyed_) {
         if (on_done) on_done();
         return;
@@ -1558,10 +1642,20 @@ void HyperDHT::destroy(std::function<void()> on_done) {
     // to a valid struct.
     stop_interface_watcher();
 
-    // Close all servers (don't clear vector yet — let ~HyperDHT handle deallocation
-    // after the event loop processes the close callbacks)
+    // JS parity (index.js:123-127): graceful close vs force.
+    //
+    // In JS, `force=true` skips `await server.close()` entirely, which
+    // means the announcer never emits UNANNOUNCE and peers continue to
+    // consider us active until their records expire.
+    //
+    // In C++ our close() is synchronous, so we cannot "not-await" it —
+    // but we can still honour the intent by telling the announcer to
+    // stop silently (skip the unannounce emission). Closing the server
+    // is still required even under force=true, otherwise libuv timers
+    // and rawStream handles keep the event loop alive and the caller's
+    // final `uv_run(...)` never returns.
     for (auto& srv : servers_) {
-        srv->close();
+        srv->close(opts.force /* force = skip unannounce */);
     }
 
     // Clear router

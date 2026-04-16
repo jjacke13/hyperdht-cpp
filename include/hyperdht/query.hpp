@@ -103,6 +103,17 @@ public:
     // Is the query finished?
     bool is_done() const { return done_; }
 
+    // Early termination — equivalent to JS `query.destroy()` (or exiting
+    // the `for await (const node of query)` loop). Flags the query as
+    // done, suppresses further `on_reply_` dispatches, skips any pending
+    // commit phase, and fires `on_done_` once with whatever closest
+    // replies have accumulated so far. Idempotent: a second call is a
+    // no-op. Callers should use this from inside an `on_reply` handler
+    // once they have found the answer they were looking for (e.g.
+    // immutable_get's first verified value, mutable_get with
+    // `latest=false`). JS: dht-rpc/lib/query.js:385-390 (_destroy).
+    void destroy();
+
     // Access results
     const std::vector<QueryReply>& closest_replies() const { return closest_replies_; }
 

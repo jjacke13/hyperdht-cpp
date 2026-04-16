@@ -271,7 +271,8 @@ HolepunchReply handle_holepunch(
     const compact::Ipv4Address& client_address,
     uint32_t our_firewall,
     const std::vector<compact::Ipv4Address>& our_addresses,
-    bool is_server_relay) {
+    bool is_server_relay,
+    bool random_throttled) {
 
     HolepunchReply reply;
 
@@ -342,11 +343,39 @@ HolepunchReply handle_holepunch(
         reply.should_punch = true;
     }
 
+    // JS parity: server.js:553-574 — rate-limit random NAT punches.
+    //
+    //   if (remoteFirewall >= RANDOM || nat.firewall >= RANDOM) {
+    //     if (dht._randomPunches >= limit || too_recent) {
+    //       return encrypt({ error: ERROR.TRY_LATER, punching: p.punching, ... })
+    //     }
+    //   }
+    //
+    // The throttle condition is evaluated by the caller (which owns the
+    // DHT-level `PunchStats` counters). Here we simply honor the signal:
+    // when it fires AND the punch is classified as random, swap the
+    // response to TRY_LATER and clear `should_punch` so the caller does
+    // not start probing.
+    bool is_random_punch = reply.should_punch &&
+        (client_hp.firewall >= peer_connect::FIREWALL_RANDOM ||
+         our_firewall >= peer_connect::FIREWALL_RANDOM);
+    if (is_random_punch && random_throttled) {
+        reply.try_later = true;
+        reply.should_punch = false;
+    }
+
     // Build response payload
     holepunch::HolepunchPayload resp;
-    resp.error = peer_connect::ERROR_NONE;
+    resp.error = reply.try_later ? peer_connect::ERROR_TRY_LATER
+                                  : peer_connect::ERROR_NONE;
     resp.firewall = our_firewall;
     resp.round = static_cast<uint32_t>(conn.round);
+    // JS sets `punching: p.punching` even in the TRY_LATER path (server.js:566)
+    // — reflects server's existing state, NOT whether we're about to punch.
+    // Our Puncher is lazily created; if it hasn't been built yet we report
+    // false, otherwise we report whether it's currently punching. Since the
+    // Puncher is owned by the caller, use `reply.should_punch` post-throttle
+    // (false in the TRY_LATER path, should_punch's value otherwise).
     resp.punching = reply.should_punch;
     resp.connected = false;
     resp.addresses = our_addresses;

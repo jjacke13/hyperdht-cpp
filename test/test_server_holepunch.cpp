@@ -153,6 +153,66 @@ TEST(ServerHolepunch, PunchRound) {
     EXPECT_EQ(reply.remote_addresses.size(), 1u);
 }
 
+// JS parity: server.js:553-574 — when throttle flag fires on a random punch
+// the server responds with TRY_LATER and does NOT start probing.
+TEST(ServerHolepunch, RandomThrottledReturnsTryLater) {
+    auto setup = make_test_setup();
+
+    // Client reports RANDOM firewall and wants to punch.
+    holepunch::HolepunchPayload hp;
+    hp.firewall = peer_connect::FIREWALL_RANDOM;
+    hp.round = 1;
+    hp.punching = true;
+    hp.addresses.push_back(Ipv4Address::from_string("10.0.0.1", 5000));
+
+    auto value = make_client_holepunch(*setup.client_secure, hp);
+
+    auto reply = handle_holepunch(
+        setup.conn, value,
+        Ipv4Address::from_string("10.0.0.1", 5000),
+        peer_connect::FIREWALL_CONSISTENT,
+        {Ipv4Address::from_string("5.6.7.8", 49737)},
+        /*is_server_relay*/ false,
+        /*random_throttled*/ true);
+
+    EXPECT_TRUE(reply.try_later);
+    EXPECT_FALSE(reply.should_punch);  // MUST NOT start probing when throttled
+    ASSERT_FALSE(reply.value.empty());
+
+    auto resp_msg = holepunch::decode_holepunch_msg(reply.value.data(), reply.value.size());
+    auto decrypted = setup.client_secure->decrypt(
+        resp_msg.payload.data(), resp_msg.payload.size());
+    ASSERT_TRUE(decrypted.has_value());
+    auto resp = holepunch::decode_holepunch_payload(
+        decrypted->data(), decrypted->size());
+    EXPECT_EQ(resp.error, peer_connect::ERROR_TRY_LATER);
+}
+
+// Throttle flag is only honored when at least one side is RANDOM.
+// Two CONSISTENT peers are unaffected even with `random_throttled = true`.
+TEST(ServerHolepunch, ThrottleIgnoredOnConsistentConsistent) {
+    auto setup = make_test_setup();
+
+    holepunch::HolepunchPayload hp;
+    hp.firewall = peer_connect::FIREWALL_CONSISTENT;
+    hp.round = 1;
+    hp.punching = true;
+    hp.addresses.push_back(Ipv4Address::from_string("10.0.0.1", 5000));
+
+    auto value = make_client_holepunch(*setup.client_secure, hp);
+
+    auto reply = handle_holepunch(
+        setup.conn, value,
+        Ipv4Address::from_string("10.0.0.1", 5000),
+        peer_connect::FIREWALL_CONSISTENT,
+        {Ipv4Address::from_string("5.6.7.8", 49737)},
+        /*is_server_relay*/ false,
+        /*random_throttled*/ true);
+
+    EXPECT_FALSE(reply.try_later);
+    EXPECT_TRUE(reply.should_punch);  // Consistent-consistent: punch normally.
+}
+
 TEST(ServerHolepunch, ClientErrorAborts) {
     auto setup = make_test_setup();
 

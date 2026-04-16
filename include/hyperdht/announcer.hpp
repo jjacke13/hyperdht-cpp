@@ -46,6 +46,13 @@ public:
 
     void start();
     void stop(std::function<void()> on_done = nullptr);
+
+    // Force-stop: tear down timers and relays WITHOUT emitting
+    // UNANNOUNCE to the network. Mirrors the JS `destroy({ force: true })`
+    // path where `server.close()` is never awaited — active relays are
+    // left to expire on their own. Use for crash/exit paths.
+    void stop_without_unannounce();
+
     void refresh();
 
     // JS: `this.online.notify()` — wakes the _background loop from an
@@ -67,6 +74,9 @@ public:
     const std::vector<uint8_t>& record() const { return record_; }
 
 private:
+    // Common teardown invoked by stop() and stop_without_unannounce().
+    void stop_impl(bool send_unannounce);
+
     rpc::RpcSocket& socket_;
     noise::Keypair keypair_;
     std::array<uint8_t, 32> target_;

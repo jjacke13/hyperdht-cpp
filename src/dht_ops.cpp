@@ -180,9 +180,9 @@ std::shared_ptr<query::Query> immutable_put(rpc::RpcSocket& socket,
 //     with crypto_generichash check before returning the first match)
 //
 // C++ diffs from JS:
-//   - JS returns the first verified node and stops iterating; we keep
-//     the query running but only fire `on_result` on verified replies.
-//     Caller-side aggregation lives in HyperDHT::immutable_get.
+//   - Matches JS behaviour: the first verified reply short-circuits the
+//     walk via `query.destroy()`. on_result fires exactly once per query
+//     in the happy path.
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<query::Query> immutable_get(rpc::RpcSocket& socket,
@@ -195,8 +195,12 @@ std::shared_ptr<query::Query> immutable_get(rpc::RpcSocket& socket,
     auto q = query::Query::create(socket, target_id, messages::CMD_IMMUTABLE_GET);
     q->on_done(std::move(on_done));
 
-    // Verify each reply: BLAKE2b(value) must equal target
-    q->on_reply([target, on_result](const query::QueryReply& reply) {
+    // Verify each reply: BLAKE2b(value) must equal target.
+    // Capture a weak_ptr so the on_reply lambda can call destroy() on the
+    // query itself (JS: `return node` inside `for await` exits the
+    // iterator, which destroys the query — index.js:275).
+    auto q_weak = std::weak_ptr<query::Query>(q);
+    q->on_reply([target, on_result, q_weak](const query::QueryReply& reply) {
         if (!reply.value.has_value() || reply.value->empty()) return;
 
         std::array<uint8_t, 32> check{};
@@ -204,8 +208,9 @@ std::shared_ptr<query::Query> immutable_get(rpc::RpcSocket& socket,
                            reply.value->data(), reply.value->size(),
                            nullptr, 0);
 
-        if (check == target && on_result) {
-            on_result(*reply.value);
+        if (check == target) {
+            if (on_result) on_result(*reply.value);
+            if (auto q_ = q_weak.lock()) q_->destroy();
         }
     });
 
@@ -299,7 +304,8 @@ std::shared_ptr<query::Query> mutable_get(rpc::RpcSocket& socket,
                                            const std::array<uint8_t, 32>& public_key,
                                            uint64_t min_seq,
                                            OnMutableCallback on_result,
-                                           query::OnDoneCallback on_done) {
+                                           query::OnDoneCallback on_done,
+                                           bool latest) {
     auto target = hash_public_key(public_key.data(), 32);
     routing::NodeId target_id{};
     std::copy(target.begin(), target.end(), target_id.begin());
@@ -315,8 +321,12 @@ std::shared_ptr<query::Query> mutable_get(rpc::RpcSocket& socket,
     auto q = query::Query::create(socket, target_id, messages::CMD_MUTABLE_GET, &seq_buf);
     q->on_done(std::move(on_done));
 
-    // Verify each reply: signature must be valid and seq >= min_seq
-    q->on_reply([public_key, min_seq, on_result](const query::QueryReply& reply) {
+    // When `latest == false`, early-terminate on the first verified reply.
+    // JS: index.js:319-328 returns the first valid node and exits the
+    // `for await` loop, which tears down the query. Mirror with destroy().
+    auto q_weak = std::weak_ptr<query::Query>(q);
+    q->on_reply([public_key, min_seq, on_result, latest, q_weak](
+                    const query::QueryReply& reply) {
         if (!reply.value.has_value() || reply.value->empty()) return;
 
         auto resp = dht_messages::decode_mutable_get_resp(
@@ -339,6 +349,10 @@ std::shared_ptr<query::Query> mutable_get(rpc::RpcSocket& socket,
             result.value = resp.value;
             result.signature = resp.signature;
             on_result(result);
+        }
+
+        if (!latest) {
+            if (auto q_ = q_weak.lock()) q_->destroy();
         }
     });
 

@@ -82,10 +82,19 @@ void Announcer::start() {
 }
 
 void Announcer::stop(std::function<void()> on_done) {
-    if (!running_) {
-        if (on_done) on_done();
-        return;
-    }
+    stop_impl(/*send_unannounce=*/true);
+    if (on_done) on_done();
+}
+
+void Announcer::stop_without_unannounce() {
+    stop_impl(/*send_unannounce=*/false);
+}
+
+// Shared teardown for stop() and stop_without_unannounce(). Splitting
+// the policy flag keeps both entry points aligned on the timer/relay
+// cleanup order — only the UNANNOUNCE emission is conditional.
+void Announcer::stop_impl(bool send_unannounce) {
+    if (!running_) return;
     running_ = false;
 
     if (ping_timer_) {
@@ -103,13 +112,13 @@ void Announcer::stop(std::function<void()> on_done) {
         bg_timer_ = nullptr;
     }
 
-    for (const auto& relay : active_relays_) {
-        unannounce_node(relay);
+    if (send_unannounce) {
+        for (const auto& relay : active_relays_) {
+            unannounce_node(relay);
+        }
     }
     active_relays_.clear();
     relays_.clear();
-
-    if (on_done) on_done();
 }
 
 void Announcer::refresh() {

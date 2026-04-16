@@ -37,6 +37,71 @@ TEST(HyperDHT, CreateAndDestroy) {
     uv_loop_close(&loop);
 }
 
+// JS parity: hyperdht/index.js:585-592 ships a built-in filterNode that
+// drops a fixed set of mis-configured testnet nodes. HyperDHT composes
+// that blocklist with any caller-supplied filter (both must accept).
+TEST(HyperDHT, FilterNodeBuiltinBlocklist) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+
+    routing::NodeId any_id{};
+    any_id.fill(0x42);
+
+    // Blocklisted entries from hyperdht/index.js:585-592.
+    EXPECT_FALSE(dht.socket().filter_accept(
+        any_id, compact::Ipv4Address::from_string("134.209.28.98", 49738)));
+    EXPECT_FALSE(dht.socket().filter_accept(
+        any_id, compact::Ipv4Address::from_string("167.99.142.185", 49738)));
+    EXPECT_FALSE(dht.socket().filter_accept(
+        any_id, compact::Ipv4Address::from_string("35.233.47.252", 9400)));
+    EXPECT_FALSE(dht.socket().filter_accept(
+        any_id, compact::Ipv4Address::from_string("150.136.142.116", 12345)));
+
+    // Same hosts on DIFFERENT ports: pass through (JS is port-sensitive too).
+    EXPECT_TRUE(dht.socket().filter_accept(
+        any_id, compact::Ipv4Address::from_string("134.209.28.98", 49737)));
+
+    // Regular addresses pass through.
+    EXPECT_TRUE(dht.socket().filter_accept(
+        any_id, compact::Ipv4Address::from_string("8.8.8.8", 49737)));
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, FilterNodeUserFilterComposesWithBlocklist) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    DhtOptions opts;
+    // Caller rejects anything on a specific port.
+    opts.filter_node = [](const routing::NodeId&, const compact::Ipv4Address& addr) {
+        return addr.port != 7777;
+    };
+    HyperDHT dht(&loop, std::move(opts));
+
+    routing::NodeId any_id{};
+
+    // Caller's filter fires.
+    EXPECT_FALSE(dht.socket().filter_accept(
+        any_id, compact::Ipv4Address::from_string("1.2.3.4", 7777)));
+
+    // Blocklist still fires even though caller's filter would pass.
+    EXPECT_FALSE(dht.socket().filter_accept(
+        any_id, compact::Ipv4Address::from_string("134.209.28.98", 49738)));
+
+    // Neither filter rejects → accepted.
+    EXPECT_TRUE(dht.socket().filter_accept(
+        any_id, compact::Ipv4Address::from_string("1.2.3.4", 9999)));
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
 TEST(HyperDHT, DefaultKeypairGenerated) {
     uv_loop_t loop;
     uv_loop_init(&loop);
@@ -340,6 +405,146 @@ TEST(HyperDHT, SuspendResume) {
     dht.resume();
     EXPECT_FALSE(dht.is_suspended());
     EXPECT_TRUE(dht.is_connectable());
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// JS: hyperdht/index.js:37 — `this.listening` Set. Each Server adds
+// itself on listen() and removes on close().
+TEST(HyperDHT, ListeningTracksActiveServers) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    dht.bind();
+
+    EXPECT_TRUE(dht.listening().empty());
+
+    auto* s1 = dht.create_server();
+    auto* s2 = dht.create_server();
+
+    noise::Seed seed1{}; seed1.fill(0x31);
+    noise::Seed seed2{}; seed2.fill(0x32);
+    s1->listen(noise::generate_keypair(seed1),
+               [](const server::ConnectionInfo&) {});
+    // Only s1 is listening so far.
+    ASSERT_EQ(dht.listening().size(), 1u);
+    EXPECT_EQ(dht.listening()[0], s1);
+
+    s2->listen(noise::generate_keypair(seed2),
+               [](const server::ConnectionInfo&) {});
+    EXPECT_EQ(dht.listening().size(), 2u);
+
+    // Graceful close on s1 removes it from the listening view.
+    s1->close();
+    ASSERT_EQ(dht.listening().size(), 1u);
+    EXPECT_EQ(dht.listening()[0], s2);
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// JS: server.js:195 — `emit('listening')` after the announcer starts.
+TEST(HyperDHT, ServerListeningEventFires) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    dht.bind();
+
+    auto* srv = dht.create_server();
+    bool fired = false;
+    srv->on_listening([&fired]() { fired = true; });
+
+    noise::Seed seed{}; seed.fill(0x33);
+    srv->listen(noise::generate_keypair(seed),
+                [](const server::ConnectionInfo&) {});
+    EXPECT_TRUE(fired);
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// JS: HyperDHT.connectRawStream — hyperdht/index.js:452-458.
+// Negative-input gating: a not-yet-connected `base` + a null raw handle
+// must both return an error without crashing. The positive-path
+// exercise runs in `test_live_connect.cpp` against a real peer.
+TEST(HyperDHT, ConnectRawStreamRejectsUnconnectedBase) {
+    ConnectResult bad;
+    bad.success = false;
+    EXPECT_LT(HyperDHT::connect_raw_stream(bad, nullptr, 42), 0);
+
+    ConnectResult ok;
+    ok.success = true;
+    ok.udx_socket = nullptr;  // not populated
+    EXPECT_LT(HyperDHT::connect_raw_stream(ok, nullptr, 42), 0);
+}
+
+// JS parity: hyperdht/index.js:122-127 — destroy({ force: true })
+// skips the UNANNOUNCE emission but still must tear down libuv handles
+// so the event loop drains. Verifies both: (a) the force=true path
+// returns without hanging the loop, and (b) the destroyed flag is set.
+TEST(HyperDHT, DestroyForceShutsDownCleanly) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    dht.bind();
+
+    auto* srv = dht.create_server();
+    noise::Seed seed{};
+    seed.fill(0x55);
+    auto kp = noise::generate_keypair(seed);
+    srv->listen(kp, [](const server::ConnectionInfo&) {});
+    EXPECT_TRUE(srv->is_listening());
+
+    HyperDHT::DestroyOptions opts;
+    opts.force = true;
+    dht.destroy(opts);
+
+    EXPECT_TRUE(dht.is_destroyed());
+    // Force still performs the teardown — otherwise the loop below
+    // would block forever on the announcer's timers.
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// JS: server.suspend({ log }) — the log hook sees one message per
+// phase (pre-listening gate, post-listening gate, announcer stopped).
+TEST(HyperDHT, ServerSuspendLogHook) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    dht.bind();
+
+    auto* srv = dht.create_server();
+    noise::Seed seed{};
+    seed.fill(0x22);
+    auto kp = noise::generate_keypair(seed);
+    srv->listen(kp, [](const server::ConnectionInfo&) {});
+
+    std::vector<std::string> logs;
+    srv->suspend([&logs](const char* msg) { logs.emplace_back(msg); });
+
+    // Expect at least the entry + post-listening + post-announcer phases,
+    // matching the JS three-step pattern.
+    ASSERT_GE(logs.size(), 3u);
+    EXPECT_EQ(logs.front(), "Suspending hyperdht server");
+    EXPECT_NE(std::string(logs[1]).find("post listening"), std::string::npos);
+    EXPECT_NE(std::string(logs[2]).find("announcer"), std::string::npos);
+
+    EXPECT_TRUE(srv->is_suspended());
+
+    // Calling suspend again is a no-op except for a "already suspended" breadcrumb.
+    logs.clear();
+    srv->suspend([&logs](const char* msg) { logs.emplace_back(msg); });
+    ASSERT_GE(logs.size(), 2u);
+    EXPECT_NE(std::string(logs[1]).find("already suspended"), std::string::npos);
 
     dht.destroy();
     uv_run(&loop, UV_RUN_DEFAULT);

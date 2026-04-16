@@ -104,6 +104,25 @@ struct DhtOptions {
     // which populates `DuplexOptions::keep_alive_ms` from this field.
     uint64_t connection_keep_alive = DEFAULT_CONNECTION_KEEP_ALIVE_MS;
 
+    // Optional filter applied to every node observed from the network
+    // — both incoming RPCs that would be added to the routing table
+    // (dht-rpc/index.js:484) and closer-nodes suggestions returned by
+    // peers during a query walk (dht-rpc/lib/query.js:275).
+    //
+    //   Return `true`  → node is allowed.
+    //   Return `false` → node is silently dropped.
+    //
+    // JS parity (hyperdht/index.js:585-592): HyperDHT ships with its
+    // own hardcoded testnet blocklist that is ALWAYS applied on top of
+    // whatever the caller supplied. When this field is empty we still
+    // install the built-in JS blocklist; when set, the caller's filter
+    // runs AND the blocklist runs (both must pass, matching the JS
+    // single-filter semantics where the built-in filter composes).
+    //
+    // Signature matches `rpc::FilterNodeCallback`.
+    std::function<bool(const routing::NodeId&,
+                       const compact::Ipv4Address&)> filter_node;
+
     // Throttling for random-NAT holepunch attempts. JS defaults:
     //   randomPunchInterval: 20000ms (min gap between random punches)
     //   deferRandomPunch: false (if true, initial last_random_punch = now,
@@ -215,14 +234,33 @@ struct ConnectOptions {
 
     // --- Blind-relay options (Phase E) ---
     //
-    // JS: opts.relayThrough — public key of a node to relay through when
-    // holepunch fails (or is skipped). Can be a single key or empty (no
-    // relay). When set, the client includes `relayThrough: { publicKey,
-    // token }` in the Noise payload so the server can also connect to the
-    // relay. JS supports arrays and functions; C++ uses a single key.
+    // JS: opts.relayThrough — see `selectRelay()` in connect.js:842-848.
     //
-    // JS: connect.js:40,87-92
+    // Three forms, evaluated in this order at connect() time (first
+    // non-empty wins):
+    //   1. `relay_through_fn` — if set, it's called and its return value
+    //       is used. Analogous to JS `typeof relayThrough === 'function'`.
+    //   2. `relay_through_array` — if non-empty, one entry is picked at
+    //       random. Analogous to JS `Array.isArray(relayThrough)`.
+    //   3. `relay_through` — single fixed public key (the legacy single-
+    //       key form; JS: `relayThrough` is a buffer).
+    //
+    // A `std::nullopt` result from any of the forms means "no relay".
+    // When the chosen public key is non-null, the client includes
+    // `relayThrough: { publicKey, token }` in the Noise payload so the
+    // server can also dial the same relay.
+    //
+    // JS: connect.js:40,87-92,842-848
     std::optional<noise::PubKey> relay_through;
+    std::vector<noise::PubKey> relay_through_array;
+    std::function<std::optional<noise::PubKey>()> relay_through_fn;
+
+    // Resolve the three forms above into a single choice. Exposed for
+    // unit testing — `do_connect` calls this internally. `rand_u64` lets
+    // tests inject a deterministic PRNG; production calls pass nullptr
+    // to use libsodium's `randombytes_buf`.
+    std::optional<noise::PubKey> select_relay_through(
+        uint64_t (*rand_u64)() = nullptr) const;
 
     // Auto-generated relay token. If relay_through is set and relay_token
     // is all-zeros, a random token is generated at connect() time.
@@ -414,6 +452,25 @@ public:
     // B6: BLAKE2b-256 hash of arbitrary data.
     // JS: HyperDHT.hash(data) — hyperdht/index.js:448-450
     static std::array<uint8_t, 32> hash(const uint8_t* data, size_t len);
+
+    // JS: HyperDHT.connectRawStream(encryptedStream, rawStream, remoteId)
+    // — hyperdht/index.js:452-458.
+    //
+    // Advanced helper for piggy-backing a SECOND UDX stream onto the
+    // socket that an existing connection is already using. The new
+    // `raw` handle is UDX-connected to the same peer host/port as
+    // `base`, but gets a fresh stream id (`remote_udx_id`). Useful
+    // when a higher-level protocol wants multiple independent streams
+    // between the same two peers without opening another connection.
+    //
+    // Preconditions: `base.success == true` and `base.udx_socket` /
+    // `base.peer_address` populated (i.e. `base` came from a
+    // successfully-completed `connect()`).
+    //
+    // Returns 0 on success, negative on error.
+    static int connect_raw_stream(const ConnectResult& base,
+                                  udx_stream_t* raw,
+                                  uint32_t remote_udx_id);
 
     // B3: Firewall constants (JS: HyperDHT.FIREWALL)
     struct FIREWALL {
@@ -625,8 +682,32 @@ public:
     // Resume: resume all servers (JS: dht.resume())
     void resume();
 
+    // JS parity: hyperdht/index.js:122-133 `destroy({ force = false })`.
+    //
+    // `force = false` (default): gracefully close every active server —
+    // each announcer sends UNANNOUNCE records so peers learn we went
+    // away, then pending sessions are cleared.
+    //
+    // `force = true`: skip the announcer graceful shutdown and tear down
+    // the socket immediately. Faster but leaves stale announce records
+    // in the network for `maxAge`. Use when the process is about to exit
+    // anyway (SIGTERM, crash handler, etc.).
+    struct DestroyOptions {
+        bool force = false;
+    };
+    void destroy(DestroyOptions opts,
+                 std::function<void()> on_done = nullptr);
+    // Convenience: graceful destroy.
     void destroy(std::function<void()> on_done = nullptr);
     bool is_destroyed() const { return destroyed_; }
+
+    // JS: hyperdht/index.js:37 — `this.listening = new Set()`. Returns
+    // a snapshot view of every Server currently in the "listening"
+    // state. No separate Set is maintained; `servers_` owns every
+    // Server, and this helper filters on `is_listening()` at call time.
+    // Returned pointers are valid until the corresponding Server is
+    // destroyed (DHT destruction or its parent going out of scope).
+    std::vector<server::Server*> listening() const;
     bool is_suspended() const { return suspended_; }
     bool is_connectable() const { return !suspended_ && !destroyed_; }
 

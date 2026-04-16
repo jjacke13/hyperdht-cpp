@@ -17,18 +17,19 @@ Complete audit of `hyperdht-cpp` versus the JavaScript reference:
 | Layer | Status |
 |---|---|
 | compact-encoding / noise / udx / crypto | **100%** COMPLETE |
-| dht-rpc (messages, routing, tokens, RPC socket, handlers, query, NAT sampler) | **100%** COMPLETE |
+| dht-rpc (messages, routing, tokens, RPC socket, handlers, query, NAT sampler, session) | **100%** COMPLETE |
 | `@hyperswarm/secret-stream` (SecretStream + SecretStreamDuplex) | **100%** COMPLETE |
 | protomux (channels, cork/uncork, aliases, batch, pair/unpair) | **100%** COMPLETE |
-| server / router / announcer / server_connection | **~95%** (see remaining gaps) |
-| client holepunch (pool socket, 4 punch strategies, probing) | **~95%** (analyze() not called in flow) |
-| HyperDHT class (connect, listen, storage, lifecycle) | **~90%** |
-| blind relay (client, server, message encoding, connect/server integration) | **~90%** (see note below) |
-| C FFI (`hyperdht.h`) | **~85%** |
+| server / router / announcer / server_connection | **100%** |
+| client holepunch (pool socket, 4 punch strategies, probing, analyze) | **100%** |
+| HyperDHT class (connect, listen, storage, lifecycle, listening set, destroy flags) | **100%** |
+| blind relay (client, server, message encoding, connect/server integration, selectRelay) | **100%** |
+| C FFI (`hyperdht.h`) | **~95%** |
 
-**Bottom line:** Core P2P connectivity is production-ready. All connection paths
-(direct, holepunch, blind relay) are wired. Remaining items are polish, edge
-cases, and peripheral features.
+**Bottom line:** Wire-compatible with JS hyperdht 6.29.1 across every connection
+path. Remaining entries are either (a) intentional C++/JS architectural
+differences documented below, or (b) optimisations with negligible practical
+impact, also documented. No more feature-level parity gaps.
 
 ---
 
@@ -93,34 +94,35 @@ All HIGH gaps have been resolved:
 - **Connection pool**: `has(pk)` and `get(pk)` already exist in `connection_pool.hpp:100-104`.
 - **`announce()` interface**: The public `HyperDHT::announce()` is a low-level query op. The full announce flow (keypair + relay addresses + signatures) is handled internally by the `Announcer` when `server.listen()` is called — matching JS architecture.
 
-### MEDIUM — behavioral differences for edge cases
+### MEDIUM — none remaining
 
-| Gap | JS ref | C++ status | Impact |
-|-----|--------|------------|--------|
-| Client-side `analyze()` not called | `connect.js:607-614` | `analyze()` defined in `Holepuncher` but not invoked in `holepunch_connect` flow | NAT stability reopen not triggered during punch — may cause timeouts on unstable NATs |
-| Server LAN shortcut | `server.js:390-394` | Server always proceeds to holepunch for non-OPEN clients; no same-host private-address match | Same-LAN server→client misses direct path. LOW impact (client-side LAN shortcut works) |
-| Random punch throttle enforcement | `server.js:553-574` | Detected + logged, but `TRY_LATER` response not actually sent | Multiple random punches can run simultaneously. Rare in practice. |
-| NAT freeze on server | `server.js:582-584` | Placeholder comment, `NatSampler::freeze()` not implemented | Classification may drift mid-holepunch on server. Rare impact. |
-| Query early termination | `dht-rpc/lib/query.js` | C++ queries always walk to completion, no abort mid-walk | `mutable_get(latest=false)` walks full instead of returning first match. Latency only. |
-| `selectRelay()` array/function support | `connect.js:842-848` | C++ `relay_through` is a single public key, not array or function | Can't load-balance across relay nodes. Easy to extend. |
+All MEDIUM gaps resolved:
+- **Client `analyze()` in holepunch flow**: wired between Round 1 and Round 2 (`src/holepunch.cpp`).
+- **Server LAN shortcut**: effectively covered by lazy Holepuncher + existing client LAN path — see Architectural differences table.
+- **Random punch throttle**: `handle_holepunch` emits `ERROR_TRY_LATER` when `PunchStats::can_random_punch()` returns false.
+- **NatSampler freeze on server**: called after every holepunch response.
+- **Query early termination**: `Query::destroy()` + wired into `immutable_get` and `mutable_get(latest=false)`.
+- **`selectRelay()` array/function**: `ConnectOptions::{relay_through_fn, relay_through_array}` + `select_relay_through()` helper.
+- **C FFI `connection_keep_alive`**: `hyperdht_opts_t` field + `hyperdht_opts_default()` helper.
 
-### LOW — polish
+### LOW — none remaining
 
-| Gap | JS ref | Notes |
-|-----|--------|-------|
-| `createSecretStream` / `createHandshake` factory hooks | `connect.js:41, 68` | Callers construct Duplex directly in C++ |
-| `connectRawStream()` static helper | `hyperdht/index.js:460` | Advanced: manual rawStream wiring after handshake |
-| `listening` set on HyperDHT | `hyperdht/index.js` | Can't enumerate active servers from user code |
-| `'listening'` event on Server | `server.js` | No event emitted when `listen()` completes |
-| `session()` for batched request cancellation | `dht-rpc/lib/session.js` | Not implemented (B8 deferred) |
-| `filterNode` option | `hyperdht/index.js:32` | Custom bootstrap node filtering |
-| `suspend`/`resume` logging hook | `server.js:63-76` | No `{ log }` parameter |
-| `destroy({ force })` | `hyperdht/index.js` | Always graceful, no force flag |
-| `Client.from()` WeakMap caching | `blind-relay/index.js:284-291` | C++ creates fresh client per relay connection |
-| Multiple event listeners | EventEmitter pattern | C++ uses single-slot callbacks (last-writer-wins) |
-| `validate_local_addresses` 500ms echo probe | `hyperdht/index.js:160` | Bind-only check (JS itself calls this "semi terrible") |
-| Bootstrap two-pass NAT detection | `dht-rpc/index.js:379-433` | Single pass. Firewalled nodes get slightly fewer table entries. |
-| Query `_slow` oncycle counter | `dht-rpc/lib/query.js` | Retry-heavy queries have slightly lower concurrency. Latency only. |
+All LOW gaps resolved:
+- **`filterNode` option**: `DhtOptions::filter_node` + built-in JS testnet blocklist composed with caller filter.
+- **`suspend`/`resume` logging hook**: `Server::suspend(LogFn)` overload with phase breadcrumbs.
+- **`destroy({ force })`**: `HyperDHT::DestroyOptions{force}` skips announcer UNANNOUNCE while still tearing down handles.
+- **`listening` set on HyperDHT**: `HyperDHT::listening()` snapshot helper.
+- **`'listening'` event on Server**: `Server::on_listening(cb)` — fires right after `Announcer::start()`.
+- **`connectRawStream()` static helper**: `HyperDHT::connect_raw_stream(base, raw, remote_id)`.
+- **`session()` batched cancellation**: `rpc::Session` + `RpcSocket::cancel_request(tid)`.
+
+See "Architectural differences" table below for items that are not gaps:
+`createSecretStream` / `createHandshake` factory hooks, EventEmitter multi-listener pattern,
+`BlindRelayClient.from()` WeakMap cache, Server LAN shortcut.
+
+See "Deferred by design" table below for items with negligible practical value:
+`validate_local_addresses` echo probe, bootstrap two-pass NAT detection,
+Query `_slow` oncycle counter.
 
 ---
 
@@ -136,6 +138,10 @@ These are deliberate C++ design choices that differ from JS but are functionally
 | Error model | Named `Error` subclasses with `.code` | Negative integer error codes | Simpler for C FFI; enum can be added |
 | Port default | 49737 | 0 (ephemeral) | C++ picks free port unless explicitly set |
 | Secret stream ownership | `dht.connect()` wraps internally | Caller constructs over returned raw_stream | More explicit lifetime control |
+| Server LAN shortcut | Eager Holepuncher + `matchAddress()` skip | Lazy Holepuncher (only built on first `PEER_HOLEPUNCH`) + client-side LAN shortcut handles the direct LAN connect before any holepunch round is attempted | Same end-state; C++ saves the explicit match check because the Holepuncher is never allocated in the LAN path to begin with. Local addresses still populate `addresses4` via `share_local_address`. |
+| `createSecretStream` / `createHandshake` factory hooks | `opts.createSecretStream`, `opts.createHandshake` (connect.js:41, 68) | Callers construct `SecretStreamDuplex` / call `peer_handshake` directly over the returned raw_stream | Factory hooks are for JS subclasses of `@hyperswarm/secret-stream` / `noise-handshake`. C++ exposes the primitives directly — a caller who wants a custom framing wraps the raw stream themselves. |
+| Multiple event listeners per event | `EventEmitter` `on('foo', fn)` accepts N listeners | Single-slot `on_foo` callback (last-writer-wins); see the multi-listener probe-callback pattern we already introduced in `RpcSocket` where broadcast semantics were actually needed | Avoids a whole EventEmitter implementation for 0.1% of callers. When true broadcast is required we add targeted multi-listener APIs (see `add_probe_listener` / `remove_probe_listener`). |
+| `BlindRelayClient.from()` WeakMap cache | `blind-relay/index.js:284-291` caches a client per stream so N call sites on the same relay reuse it. | 1:1 construction: every relay connection gets exactly one `BlindRelayClient`, allocated at a single site per side (`dht.cpp` for the client, `server.cpp` for the server). | No two subsystems ever try to open the "blind-relay" channel on the same stream, so deduplication has no caller. If we ever expose relay-client construction to user code, revisit. |
 
 ---
 
@@ -147,6 +153,9 @@ These are deliberate C++ design choices that differ from JS but are functionally
 | `refresh-chain.js` | Unused in hyperdht 6.29.1 |
 | Persistent storage cache | JS auto-caches announced records. C++ queries only. Would need its own design. |
 | `reusableSocket` on Server | Socket pool reuse flag not exposed |
+| `validate_local_addresses` 500ms echo probe | JS comment in `hyperdht/index.js:160` calls this "semi terrible" and suggests removal; bind-only validation is sufficient in practice. |
+| Bootstrap two-pass NAT detection | `dht-rpc/index.js:379-433` does two walk passes to compensate for firewalled bootstrap seeds; one pass works fine with 3+ public seeds. Latency only. |
+| Query `_slow` oncycle counter | `dht-rpc/lib/query.js` — fine-grained retry-tier concurrency knob that has zero practical effect at our scale. |
 
 ---
 

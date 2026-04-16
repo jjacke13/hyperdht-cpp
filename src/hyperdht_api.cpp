@@ -80,6 +80,16 @@ void hyperdht_keypair_from_seed(hyperdht_keypair_t* out, const uint8_t seed[32])
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+void hyperdht_opts_default(hyperdht_opts_t* opts) {
+    if (!opts) return;
+    opts->port = 0;
+    opts->ephemeral = 1;
+    opts->use_public_bootstrap = 0;
+    // Sentinel: "keep the C++ default (5000 ms)". Callers can override
+    // with any value; 0 explicitly disables keep-alive.
+    opts->connection_keep_alive = UINT64_MAX;
+}
+
 hyperdht_t* hyperdht_create(uv_loop_t* loop, const hyperdht_opts_t* opts) {
     if (!loop) return nullptr;
 
@@ -94,6 +104,12 @@ hyperdht_t* hyperdht_create(uv_loop_t* loop, const hyperdht_opts_t* opts) {
         if (opts->use_public_bootstrap) {
             cpp_opts.bootstrap =
                 hyperdht::HyperDHT::default_bootstrap_nodes();
+        }
+        // Keep-alive: UINT64_MAX = unset (keep the C++ default), any other
+        // value is taken literally (including 0 for "disabled", matching
+        // JS `connectionKeepAlive: false`).
+        if (opts->connection_keep_alive != UINT64_MAX) {
+            cpp_opts.connection_keep_alive = opts->connection_keep_alive;
         }
     }
 

@@ -95,6 +95,22 @@ typedef struct {
      *     preserves offline-test behaviour.
      */
     int use_public_bootstrap;
+
+    /**
+     * Default keep-alive (ms) applied to `SecretStreamDuplex` instances
+     * constructed via `dht.make_duplex_options()` (and therefore to every
+     * stream opened through the Python / future-binding wrappers).
+     *
+     * Mirrors JS `new DHT({ connectionKeepAlive })`:
+     *   - any positive value (ms) → sent as keep-alive ping interval
+     *   - 0                       → disabled (same as JS `false`)
+     *   - UINT64_MAX              → "unset", use the C++ default (5000ms)
+     *
+     * NOTE: The sentinel is UINT64_MAX rather than 0 so that callers can
+     * *explicitly* disable keep-alive by passing 0. `= {0}` initializers
+     * would otherwise silently disable it.
+     */
+    uint64_t connection_keep_alive;
 } hyperdht_opts_t;
 
 /** Connection info — passed to connect and server callbacks */
@@ -148,6 +164,18 @@ HYPERDHT_API void hyperdht_keypair_from_seed(hyperdht_keypair_t* out, const uint
 /* =========================================================================
  * Lifecycle
  * ========================================================================= */
+
+/**
+ * Initialise `hyperdht_opts_t` with safe defaults (ephemeral, port=0,
+ * no bootstrap, keep-alive=unset). Strongly recommended: always call
+ * this before setting fields, so that new fields added in future C FFI
+ * versions pick up their sentinel values rather than stack garbage.
+ *
+ *     hyperdht_opts_t opts;
+ *     hyperdht_opts_default(&opts);
+ *     opts.port = 49737;
+ */
+HYPERDHT_API void hyperdht_opts_default(hyperdht_opts_t* opts);
 
 /**
  * Create a HyperDHT instance. The caller owns the uv_loop_t.

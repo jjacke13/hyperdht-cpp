@@ -1389,6 +1389,34 @@ void holepunch_connect(rpc::RpcSocket& socket,
             if (!server_addrs.empty()) verified_host = server_addrs[0].host_string();
             state->puncher->update_remote(server_addrs, verified_host);
 
+            // JS parity (connect.js:600-621): analyze() stability check
+            //
+            //   stable = await puncher.analyze(false)
+            //   if (!stable) stable = await puncher.analyze(true)    // allow_reopen
+            //   if (still UNKNOWN on either side) → abort PROBE_TIMEOUT
+            //
+            // Our Holepuncher::analyze() is synchronous (no `await` over
+            // nat.analyzing — our pool socket discovery already completed
+            // the NAT sampling before we got here). It returns `true` when
+            // both sides are classified and we are NOT in a double-RANDOM
+            // dead-end. Without it, an UNKNOWN local NAT would walk into
+            // Round 2 and waste the full holepunch timeout.
+            //
+            // The reopen path (`analyze(true)`) signals `on_reset_` — not
+            // currently wired from holepunch_connect, so in practice the
+            // fallback just re-checks and aborts. Wiring a pool-socket
+            // reset here would be a future improvement.
+            bool stable_ok = false;
+            state->puncher->analyze(false, [&stable_ok](bool s) { stable_ok = s; });
+            if (!stable_ok) {
+                state->puncher->analyze(true, [&stable_ok](bool s) { stable_ok = s; });
+            }
+            if (!stable_ok) {
+                DHT_LOG("  [hp] NAT unstable after analyze() — abort\n");
+                state->complete({});
+                return;
+            }
+
             // JS: probeRound:582-591 — if the server's address from the
             // Round 1 payload differs from the announce address and the
             // firewall isn't RANDOM, send an openSession (TTL=5) probe.

@@ -89,8 +89,26 @@ public:
     // on_connection is called for each new peer that connects.
     void listen(const noise::Keypair& keypair, OnConnectionCb on_connection);
 
-    // Stop listening: stop announcer, remove from router, clean up connections.
-    void close(std::function<void()> on_done = nullptr);
+    // JS: `emit('listening')` — server.js:195. Fires once the announcer
+    // has been started and the server is fully ready to accept peers.
+    // Our listen() is synchronous, so the callback fires on the same
+    // tick as listen() returns (unlike JS which awaits internal async).
+    //
+    // A later listen() / close()+listen() cycle re-arms the hook.
+    using OnListeningCb = std::function<void()>;
+    void on_listening(OnListeningCb cb) { on_listening_cb_ = std::move(cb); }
+
+    // Stop listening: stop announcer, remove from router, clean up
+    // connections.
+    //
+    // `force = false` (default): announcer emits UNANNOUNCE to its
+    // active relays before tearing down — peers learn we're gone.
+    //
+    // `force = true`: skip UNANNOUNCE emission; still stops libuv
+    // handles so the event loop can drain. Matches JS
+    // `dht.destroy({ force: true })` intent.
+    void close(bool force, std::function<void()> on_done = nullptr);
+    void close(std::function<void()> on_done = nullptr);  // force=false
 
     // Set firewall callback (return true to reject a connection)
     void set_firewall(FirewallCb cb) { firewall_ = std::move(cb); }
@@ -104,8 +122,14 @@ public:
         const std::vector<compact::Ipv4Address>& local_addrs)>;
     void set_holepunch(HolepunchCb cb) { holepunch_cb_ = std::move(cb); }
 
-    // Suspend: stop announcer, clear pending holepunches (JS: server.suspend())
-    void suspend();
+    // Suspend: stop announcer, clear pending holepunches (JS: server.suspend()).
+    //
+    // Optional `log` sink mirrors JS `server.suspend({ log })` where the
+    // log function is called with progress messages across the suspend
+    // phases (pre-listening gate, clear-all, announcer.suspend). Pass
+    // `nullptr` / default for a silent suspend.
+    using LogFn = std::function<void(const char*)>;
+    void suspend(LogFn log = nullptr);
     // Resume: restart announcer (JS: server.resume())
     void resume();
 
@@ -181,6 +205,7 @@ private:
     OnConnectionCb on_connection_;
     FirewallCb firewall_;
     HolepunchCb holepunch_cb_;
+    OnListeningCb on_listening_cb_;
 
     bool listening_ = false;
     bool closed_ = false;

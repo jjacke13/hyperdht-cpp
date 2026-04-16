@@ -519,6 +519,57 @@ TEST(Holepuncher, AnalyzeCallsResetOnUnstable) {
     uv_loop_close(&loop);
 }
 
+// JS parity: connect.js:600 — probeRound calls `analyze(false)` after Round 1
+// to gate Round 2 on NAT classification. The synchronous return-true path is
+// what the client-side holepunch_connect flow depends on.
+TEST(Holepuncher, AnalyzeFalseReturnsTrueWhenStable) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, true);
+    hp.set_local_firewall(FIREWALL_CONSISTENT);
+    hp.set_remote_firewall(FIREWALL_CONSISTENT);
+
+    // analyze(false) on stable NAT: no reset, no reopen increment, stable=true.
+    int reset_count = 0;
+    hp.on_reset([&]() { reset_count++; });
+
+    bool stable = false;
+    hp.analyze(false, [&](bool s) { stable = s; });
+    EXPECT_TRUE(stable);
+    EXPECT_EQ(reset_count, 0);
+    EXPECT_EQ(hp.reopen_count(), 0);
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// JS parity: connect.js:600 — analyze(false) returns false when unstable
+// (does NOT call on_reset — that only happens when allow_reopen=true).
+// holepunch_connect uses this to detect unstable NAT and abort cleanly.
+TEST(Holepuncher, AnalyzeFalseReturnsFalseOnUnstableNoReset) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, true);
+    hp.set_local_firewall(FIREWALL_UNKNOWN);  // unstable
+    hp.set_remote_firewall(FIREWALL_CONSISTENT);
+
+    int reset_count = 0;
+    hp.on_reset([&]() { reset_count++; });
+
+    bool stable = true;
+    hp.analyze(false, [&](bool s) { stable = s; });
+    EXPECT_FALSE(stable);
+    EXPECT_EQ(reset_count, 0);   // analyze(false) must NOT trigger reset
+    EXPECT_EQ(hp.reopen_count(), 0);
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
 // ---------------------------------------------------------------------------
 // localAddresses + matchAddress
 // ---------------------------------------------------------------------------

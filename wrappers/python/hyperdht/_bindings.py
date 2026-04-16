@@ -59,6 +59,8 @@ class _Opts(ctypes.Structure):
     _fields_ = [
         ("port", ctypes.c_uint16),
         ("ephemeral", ctypes.c_int),
+        ("use_public_bootstrap", ctypes.c_int),
+        ("connection_keep_alive", ctypes.c_uint64),
     ]
 
 
@@ -423,15 +425,43 @@ class HyperDHT:
         dht.destroy()
     """
 
-    def __init__(self, port=0, ephemeral=True):
+    def __init__(
+        self,
+        port: int = 0,
+        ephemeral: bool = True,
+        *,
+        use_public_bootstrap: bool = False,
+        connection_keep_alive: int | None = None,
+    ):
+        """Create a HyperDHT instance.
+
+        Parameters
+        ----------
+        port, ephemeral
+            Bind port (0 = ephemeral UDP port) and ephemeral-node flag.
+        use_public_bootstrap
+            If True, seed the routing table from the 3 canonical public
+            HyperDHT nodes (matches JS `new DHT()` default).
+        connection_keep_alive
+            Default keep-alive (ms) applied to every Noise-secret-stream
+            opened via this DHT. Mirrors JS ``new DHT({ connectionKeepAlive })``:
+            None → use the C++ default (5000 ms); 0 → disabled; any
+            positive int → used as keep-alive interval.
+        """
         # Allocate uv_loop
         loop_size = _uv.uv_loop_size()
         self._loop_buf = (ctypes.c_uint8 * loop_size)()
         self._loop = ctypes.cast(self._loop_buf, ctypes.c_void_p)
         _uv.uv_loop_init(self._loop)
 
-        # Create DHT
-        opts = _Opts(port=port, ephemeral=1 if ephemeral else 0)
+        # Create DHT. UINT64_MAX is the "unset" sentinel for keep-alive.
+        keep_alive = (1 << 64) - 1 if connection_keep_alive is None else connection_keep_alive
+        opts = _Opts(
+            port=port,
+            ephemeral=1 if ephemeral else 0,
+            use_public_bootstrap=1 if use_public_bootstrap else 0,
+            connection_keep_alive=keep_alive,
+        )
         self._handle = _lib.hyperdht_create(self._loop, ctypes.byref(opts))
         if not self._handle:
             raise RuntimeError("Failed to create HyperDHT instance")

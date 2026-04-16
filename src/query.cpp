@@ -266,6 +266,13 @@ void Query::visit(const PendingNode& node) {
 //     dht._filterNode + skipping our own id), and once enough results have
 //     come back turns the cold-start slowdown off.
 void Query::on_visit_response(const PendingNode& node, const messages::Response& resp) {
+    // Early termination: destroy() may have been called from a previous
+    // on_reply dispatch. Any in-flight responses that land afterwards
+    // must not re-enter the pipeline (would re-fire on_reply_, restart
+    // read_more, etc.). JS achieves the same via the destroyed flag in
+    // query.js:177.
+    if (done_) return;
+
     // Mark as done
     std::string key = node.addr.host_string() + ":" + std::to_string(node.addr.port);
     seen_[key] = NodeState::DONE;
@@ -341,6 +348,8 @@ void Query::on_visit_response(const PendingNode& node, const messages::Response&
 // replies rather than discounting silent peers. C++ matches the JS by
 // performing the disengage check only in `on_visit_response`.
 void Query::on_visit_timeout(const PendingNode& node) {
+    if (done_) return;  // destroy()'d — suppress late timeouts
+
     std::string key = node.addr.host_string() + ":" + std::to_string(node.addr.port);
     seen_[key] = NodeState::DOWN;
 
@@ -449,6 +458,17 @@ void Query::maybe_finish() {
             on_done_(closest_replies_);
         }
     }
+}
+
+void Query::destroy() {
+    if (done_) return;          // idempotent
+    done_ = true;
+    pending_.clear();           // stop fanning out
+    committing_ = true;         // short-circuit do_commit() if pending
+    // Fire on_done_ synchronously with the current closest_replies_ set.
+    // `inflight_` responses still outstanding will be dropped on arrival
+    // because `done_ && !committing_guard` filters them in on_reply_tick.
+    if (on_done_) on_done_(closest_replies_);
 }
 
 void Query::do_commit() {

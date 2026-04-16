@@ -149,6 +149,17 @@ public:
                      OnResponseCallback on_response,
                      OnTimeoutCallback on_timeout = nullptr);
 
+    // Cancel an in-flight request by transaction id. Fires neither
+    // on_response nor on_timeout — the request is silently discarded
+    // and its congestion budget returned. Returns true if a request
+    // with this tid was found and cancelled, false otherwise.
+    //
+    // Used by `rpc::Session::destroy()` to batch-cancel outstanding
+    // requests that belong to a logical operation (JS
+    // dht-rpc/lib/session.js:39-46 — `session.destroy()` iterates
+    // `this.inflight` and destroys each request).
+    bool cancel_request(uint16_t tid);
+
     // Send a DELAYED_PING — server replies after delay_ms milliseconds.
     // Matches JS dht.delayedPing(). Returns 0 if delay_ms > max_ping_delay_ms.
     uint16_t delayed_ping(const compact::Ipv4Address& to,
@@ -394,6 +405,49 @@ private:
                         const struct sockaddr* addr);
     void handle_message(const uint8_t* data, size_t len,
                         const struct sockaddr_in* addr);
+};
+
+// ---------------------------------------------------------------------------
+// Session — batched request cancellation wrapper
+// ---------------------------------------------------------------------------
+//
+// JS: dht-rpc/lib/session.js — a lightweight container that tracks all
+// outstanding requests issued through it. `destroy()` cancels every
+// tracked request in one call. Primary use case: a higher-level
+// operation (e.g. a Query walk) that fans out N parallel requests and
+// wants to cancel the whole batch atomically on abort.
+//
+// Usage:
+//   rpc::Session session(socket);
+//   auto tid = session.request(req, on_resp);
+//   ...
+//   session.destroy();  // cancels every request issued through `session`
+//
+// Requests issued directly on the RpcSocket (not through the session)
+// are unaffected.
+class Session {
+public:
+    explicit Session(RpcSocket& socket) : socket_(socket) {}
+    ~Session() { destroy(); }
+
+    Session(const Session&) = delete;
+    Session& operator=(const Session&) = delete;
+
+    // Issue a request that will be tracked by this session. Returns the
+    // transaction id, or 0 on congestion failure.
+    uint16_t request(const messages::Request& req,
+                     OnResponseCallback on_response,
+                     OnTimeoutCallback on_timeout = nullptr);
+
+    // Cancel every outstanding request attached to this session.
+    void destroy();
+
+    // Number of tracked requests (inflight AND queued).
+    size_t inflight_count() const { return tids_.size(); }
+
+private:
+    RpcSocket& socket_;
+    std::vector<uint16_t> tids_;
 };
 
 }  // namespace rpc

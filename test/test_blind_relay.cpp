@@ -376,6 +376,87 @@ TEST(ConnectOptions, RelayThroughSet) {
     EXPECT_EQ(opts.relay_keep_alive, 10000u);
 }
 
+// JS: connect.js:842-848 — selectRelay() precedence + shape coverage.
+TEST(ConnectOptions, SelectRelayThroughNone) {
+    ConnectOptions opts;
+    EXPECT_FALSE(opts.select_relay_through().has_value());
+}
+
+TEST(ConnectOptions, SelectRelayThroughSingleKey) {
+    ConnectOptions opts;
+    noise::PubKey pk;
+    pk.fill(0x11);
+    opts.relay_through = pk;
+
+    auto sel = opts.select_relay_through();
+    ASSERT_TRUE(sel.has_value());
+    EXPECT_EQ(*sel, pk);
+}
+
+TEST(ConnectOptions, SelectRelayThroughArrayDeterministic) {
+    ConnectOptions opts;
+    noise::PubKey a, b, c;
+    a.fill(0xAA); b.fill(0xBB); c.fill(0xCC);
+    opts.relay_through_array = {a, b, c};
+
+    // Deterministic PRNG — always returns 1 → picks element 1 % 3 = 1 (b).
+    auto sel = opts.select_relay_through(+[]() -> uint64_t { return 1; });
+    ASSERT_TRUE(sel.has_value());
+    EXPECT_EQ(*sel, b);
+
+    // Returns 5 → 5 % 3 = 2 (c).
+    auto sel2 = opts.select_relay_through(+[]() -> uint64_t { return 5; });
+    ASSERT_TRUE(sel2.has_value());
+    EXPECT_EQ(*sel2, c);
+}
+
+TEST(ConnectOptions, SelectRelayThroughFunctionWinsOverArrayAndSingle) {
+    // JS order: function → array → single. Function output should win
+    // even if the other two fields are populated.
+    ConnectOptions opts;
+    noise::PubKey fn_pk, array_pk, single_pk;
+    fn_pk.fill(0x11);
+    array_pk.fill(0x22);
+    single_pk.fill(0x33);
+
+    opts.relay_through_fn = [fn_pk]() -> std::optional<noise::PubKey> {
+        return fn_pk;
+    };
+    opts.relay_through_array = {array_pk};
+    opts.relay_through = single_pk;
+
+    auto sel = opts.select_relay_through();
+    ASSERT_TRUE(sel.has_value());
+    EXPECT_EQ(*sel, fn_pk);
+}
+
+TEST(ConnectOptions, SelectRelayThroughFunctionReturnsNull) {
+    // JS: `if (relayThrough === null) return null` — a function that
+    // returns nullopt disables the relay entirely (array/single ignored).
+    ConnectOptions opts;
+    noise::PubKey array_pk;
+    array_pk.fill(0x22);
+    opts.relay_through_fn = []() -> std::optional<noise::PubKey> {
+        return std::nullopt;
+    };
+    opts.relay_through_array = {array_pk};
+
+    EXPECT_FALSE(opts.select_relay_through().has_value());
+}
+
+TEST(ConnectOptions, SelectRelayThroughArrayWinsOverSingle) {
+    ConnectOptions opts;
+    noise::PubKey array_pk, single_pk;
+    array_pk.fill(0x22);
+    single_pk.fill(0x33);
+    opts.relay_through_array = {array_pk};
+    opts.relay_through = single_pk;
+
+    auto sel = opts.select_relay_through(+[]() -> uint64_t { return 0; });
+    ASSERT_TRUE(sel.has_value());
+    EXPECT_EQ(*sel, array_pk);
+}
+
 // ===========================================================================
 // Stats — relay stats type
 // ===========================================================================

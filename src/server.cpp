@@ -156,6 +156,12 @@ void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection)
 
     DHT_LOG( "  [server] Listening on %s\n",
             to_hex(keypair_.public_key.data(), 8).c_str());
+
+    // JS: server.js:195 — `emit('listening')` after announcer.start().
+    // Our listen() is synchronous, so fire the hook here on the same
+    // tick as listen() returns. Callers that registered on_listening()
+    // BEFORE listen() receive the notification immediately.
+    if (on_listening_cb_) on_listening_cb_();
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +179,10 @@ void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection)
 // ---------------------------------------------------------------------------
 
 void Server::close(std::function<void()> on_done) {
+    close(false, std::move(on_done));
+}
+
+void Server::close(bool force, std::function<void()> on_done) {
     if (closed_) {
         if (on_done) on_done();
         return;
@@ -181,8 +191,14 @@ void Server::close(std::function<void()> on_done) {
     listening_ = false;
 
     // Stop announcer
+    // JS parity: `force = true` skips the UNANNOUNCE RPC emissions but
+    // still shuts the timers down (otherwise the event loop can't drain).
     if (announcer_) {
-        announcer_->stop();
+        if (force) {
+            announcer_->stop_without_unannounce();
+        } else {
+            announcer_->stop();
+        }
         announcer_.reset();
     }
 
@@ -232,12 +248,25 @@ void Server::notify_online() {
 // synchronously: stop the announcer, walk our session_timers_ map and
 // uv_close each, clear connection / dedup state. Resume restarts the
 // announcer (no JS-style `_resumed` Signal needed in our timer model).
-void Server::suspend() {
-    if (suspended_) return;
+void Server::suspend(LogFn log) {
+    // JS: server.js:63-70 — phase markers mirror the await points in the
+    // async JS implementation. We run synchronously, but we still emit
+    // the same three breadcrumbs so operators can reason about where a
+    // suspend got stuck (e.g. the announcer failed to stop).
+    if (log) log("Suspending hyperdht server");
+
+    if (suspended_) {
+        if (log) log("Suspending hyperdht server (already suspended)");
+        return;
+    }
     suspended_ = true;
+
+    if (log) log("Suspending hyperdht server (post listening)");
 
     // Stop announcer
     if (announcer_) announcer_->stop();
+
+    if (log) log("Suspending hyperdht server (announcer stopped)");
 
     // Clear pending holepunches (UvTimer RAII handles stop + close)
     session_timers_.clear();
@@ -674,9 +703,22 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
         }
     }
 
+    // JS parity (server.js:553-574): rate-limit concurrent/too-frequent
+    // random-NAT punches at the DHT level. `PunchStats::can_random_punch()`
+    // returns false when we are over `random_punch_limit` concurrent random
+    // punches OR within `random_punch_interval` (20s) of the last one. The
+    // result is passed into handle_holepunch, which swaps the normal
+    // PEER_HOLEPUNCH response for `error = TRY_LATER` when appropriate.
+    bool random_throttled = false;
+    if (dht_) {
+        uint64_t now = uv_now(socket_.loop());
+        random_throttled = !dht_->punch_stats().can_random_punch(now);
+    }
+
     // Process the holepunch
     auto reply = server_connection::handle_holepunch(
-        conn, value, peer_address, our_fw, our_addrs, is_relay);
+        conn, value, peer_address, our_fw, our_addrs, is_relay,
+        random_throttled);
 
     // Send reply
     if (!reply.value.empty()) {
@@ -690,12 +732,13 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
         compact::Ipv4Address::from_string(peer_address.host_string(), peer_address.port),
         peer_address);
 
-    // A5: NAT freeze — lock classification before sending response
-    // JS: server.js:582-584 — `if (p.nat.firewall !== FIREWALL.UNKNOWN) p.nat.freeze()`
+    // A5: NAT freeze — lock classification before sending response.
+    // JS: server.js:582-584 — `if (p.nat.firewall !== FIREWALL.UNKNOWN) p.nat.freeze()`.
+    // Once we have told the peer our firewall classification in the
+    // holepunch reply, we must not let late NAT samples change it
+    // mid-round — the peer would otherwise get conflicting signals.
     if (socket_.nat_sampler().firewall() != peer_connect::FIREWALL_UNKNOWN) {
-        // NatSampler doesn't have freeze() yet — the classification is stable
-        // after enough samples. This is a documentation placeholder for parity.
-        // TODO: add NatSampler::freeze() if classification drift is observed.
+        socket_.nat_sampler().freeze();
     }
 
     if (reply.should_punch) {
@@ -704,15 +747,15 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                 reply.remote_addresses.size());
 
         // A6: Random punch throttle
-        // JS: server.js:553-574 — if either side RANDOM, check limits
-        // If throttled, respond with TRY_LATER (handle_holepunch already
-        // handles this in the response payload). Here we just log.
+        // Enforcement happens inside handle_holepunch (returns
+        // `reply.try_later = true` when `random_throttled` fires).
+        // The branch below will be short-circuited by the earlier guard
+        // (reply.should_punch is cleared in the throttled path).
         bool is_random = (reply.remote_firewall >= peer_connect::FIREWALL_RANDOM) ||
                          (our_fw >= peer_connect::FIREWALL_RANDOM);
         if (is_random) {
             DHT_LOG("  [server] Random NAT detected (remote=%u, local=%u)\n",
                     reply.remote_firewall, our_fw);
-            // TODO: enforce dht._randomPunches >= limit → TRY_LATER
         }
 
         // JS: server.js:544 — holepunch veto callback

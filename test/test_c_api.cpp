@@ -84,6 +84,7 @@ TEST(CAPI, CreateWithOptions) {
     uv_loop_init(&loop);
 
     hyperdht_opts_t opts;
+    hyperdht_opts_default(&opts);
     opts.port = 0;
     opts.ephemeral = 1;
 
@@ -92,6 +93,59 @@ TEST(CAPI, CreateWithOptions) {
 
     hyperdht_bind(dht, 0);
     EXPECT_GT(hyperdht_port(dht), 0);
+
+    // Defaults init leaves keep-alive at its sentinel → C++ default (5000 ms).
+    EXPECT_EQ(hyperdht_connection_keep_alive(dht), 5000u);
+
+    hyperdht_destroy(dht, NULL, NULL);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
+    uv_loop_close(&loop);
+}
+
+TEST(CAPI, OptsDefaultSetsSafeValues) {
+    // Verify the init helper zero-initialises other fields and sets the
+    // keep-alive sentinel (so the library uses its own default).
+    hyperdht_opts_t opts;
+    memset(&opts, 0xEE, sizeof(opts));  // poison to catch missing fields
+    hyperdht_opts_default(&opts);
+
+    EXPECT_EQ(opts.port, 0u);
+    EXPECT_EQ(opts.ephemeral, 1);
+    EXPECT_EQ(opts.use_public_bootstrap, 0);
+    EXPECT_EQ(opts.connection_keep_alive, UINT64_MAX);
+}
+
+TEST(CAPI, ConnectionKeepAliveCustomValue) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    hyperdht_opts_t opts;
+    hyperdht_opts_default(&opts);
+    opts.connection_keep_alive = 1234;
+
+    hyperdht_t* dht = hyperdht_create(&loop, &opts);
+    ASSERT_NE(dht, nullptr);
+    EXPECT_EQ(hyperdht_connection_keep_alive(dht), 1234u);
+
+    hyperdht_destroy(dht, NULL, NULL);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
+    uv_loop_close(&loop);
+}
+
+TEST(CAPI, ConnectionKeepAliveDisabled) {
+    // 0 = disabled (matches JS `connectionKeepAlive: false`).
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    hyperdht_opts_t opts;
+    hyperdht_opts_default(&opts);
+    opts.connection_keep_alive = 0;
+
+    hyperdht_t* dht = hyperdht_create(&loop, &opts);
+    ASSERT_NE(dht, nullptr);
+    EXPECT_EQ(hyperdht_connection_keep_alive(dht), 0u);
 
     hyperdht_destroy(dht, NULL, NULL);
     uv_run(&loop, UV_RUN_DEFAULT);

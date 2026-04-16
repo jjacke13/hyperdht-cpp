@@ -65,6 +65,9 @@ extern "C" {
 typedef struct hyperdht_s hyperdht_t;
 typedef struct hyperdht_server_s hyperdht_server_t;
 
+/** Opaque query handle — see `hyperdht_query_cancel()`. */
+typedef struct hyperdht_query_s hyperdht_query_t;
+
 /* =========================================================================
  * Data types
  * ========================================================================= */
@@ -111,6 +114,44 @@ typedef struct {
      * would otherwise silently disable it.
      */
     uint64_t connection_keep_alive;
+
+    /**
+     * Optional 32-byte seed for deterministic default keypair derivation.
+     * When non-zero (i.e. not all zeros), the DHT's default keypair is
+     * derived from this seed. Useful for mobile apps that want a stable
+     * identity across app launches without persisting a full secret key.
+     *
+     * If `seed_is_set` is 0, this field is ignored and a random keypair
+     * is generated (or the caller's pre-populated one is used). Because
+     * a zeroed seed is technically a valid seed, we require an explicit
+     * flag rather than treating all-zeros as "unset".
+     */
+    uint8_t seed[32];
+    int seed_is_set;
+
+    /**
+     * Optional bind host (interface). `NULL` or empty string → 0.0.0.0.
+     * Pointer is only borrowed during `hyperdht_create()` — the caller
+     * owns the string buffer.
+     */
+    const char* host;
+
+    /**
+     * Optional explicit bootstrap nodes. Overrides `use_public_bootstrap`
+     * when set. Accepts an array of `nodes_len` {host,port} pairs, each
+     * as a null-terminated string of the form "host:port".
+     *
+     *   const char* nodes[] = {"10.0.0.1:49737", "10.0.0.2:49737"};
+     *   opts.nodes = nodes;
+     *   opts.nodes_len = 2;
+     *
+     * Pointers are only borrowed during `hyperdht_create()`.
+     *
+     * Precedence: `nodes` > `use_public_bootstrap`. If BOTH are set,
+     * `nodes` wins (explicit list beats canonical defaults).
+     */
+    const char* const* nodes;
+    size_t nodes_len;
 } hyperdht_opts_t;
 
 /** Connection info — passed to connect and server callbacks */
@@ -229,6 +270,57 @@ HYPERDHT_API void hyperdht_default_keypair(const hyperdht_t* dht, hyperdht_keypa
  * @param userdata    passed to cb
  * @return            0 on success (async), negative on error
  */
+/**
+ * Full connect options. Pass to `hyperdht_connect_ex()` for fine-grained
+ * control over the outgoing connection. Mirrors C++ `ConnectOptions`.
+ *
+ * Always zero-init then override fields — new fields may be added.
+ */
+typedef struct {
+    /**
+     * Use a specific keypair for THIS connection (identity rotation,
+     * multi-account apps). NULL → use the DHT's default keypair.
+     */
+    const hyperdht_keypair_t* keypair;
+
+    /**
+     * Public key of a blind-relay node (32 bytes). When set, the server
+     * also receives the relay hint so both sides can dial the same
+     * relay as a holepunch-failure fallback. NULL → no relay.
+     */
+    const uint8_t* relay_through;
+
+    /** Keep-alive interval for the relay stream (ms). 0 → library default (5000). */
+    uint64_t relay_keep_alive_ms;
+
+    /**
+     * Fast-open optimization (JS parity). When enabled, the client sends
+     * its first holepunch probe before the server has fully replied,
+     * shaving ~1 RTT. Pass 0 to opt out, 1 to enable (default).
+     */
+    int fast_open;
+
+    /**
+     * Same-NAT LAN shortcut (JS parity). When enabled (default), the
+     * client tries the server's advertised private addresses before
+     * falling back to holepunch. Pass 0 to skip the LAN path.
+     */
+    int local_connection;
+} hyperdht_connect_opts_t;
+
+/** Initialise `hyperdht_connect_opts_t` with library defaults. */
+HYPERDHT_API void hyperdht_connect_opts_default(hyperdht_connect_opts_t* opts);
+
+/**
+ * Connect with full options. `opts == NULL` behaves identically to
+ * `hyperdht_connect()`.
+ */
+HYPERDHT_API int hyperdht_connect_ex(hyperdht_t* dht,
+                                      const uint8_t remote_pk[32],
+                                      const hyperdht_connect_opts_t* opts,
+                                      hyperdht_connect_cb cb,
+                                      void* userdata);
+
 HYPERDHT_API int hyperdht_connect(hyperdht_t* dht,
                      const uint8_t remote_pk[32],
                      hyperdht_connect_cb cb,
@@ -336,6 +428,23 @@ HYPERDHT_API int hyperdht_mutable_get(hyperdht_t* dht,
                          hyperdht_done_cb done_cb,
                          void* userdata);
 
+/** Cancelable variant of `hyperdht_immutable_get`.
+ *  Returns a handle usable with `hyperdht_query_cancel()`. */
+HYPERDHT_API hyperdht_query_t* hyperdht_immutable_get_ex(hyperdht_t* dht,
+                                                         const uint8_t target[32],
+                                                         hyperdht_value_cb cb,
+                                                         hyperdht_done_cb done_cb,
+                                                         void* userdata);
+
+/** Cancelable variant of `hyperdht_mutable_get`.
+ *  Returns a handle usable with `hyperdht_query_cancel()`. */
+HYPERDHT_API hyperdht_query_t* hyperdht_mutable_get_ex(hyperdht_t* dht,
+                                                       const uint8_t public_key[32],
+                                                       uint64_t min_seq,
+                                                       hyperdht_mutable_cb cb,
+                                                       hyperdht_done_cb done_cb,
+                                                       void* userdata);
+
 /* =========================================================================
  * Encrypted streams — read/write over established connections
  * ========================================================================= */
@@ -404,6 +513,7 @@ HYPERDHT_API int hyperdht_stream_is_open(const hyperdht_stream_t* stream);
 #define HYPERDHT_ERR_HOLEPUNCH_FAILED   (-5)
 #define HYPERDHT_ERR_HOLEPUNCH_TIMEOUT  (-6)
 #define HYPERDHT_ERR_RELAY_FAILED       (-7)
+#define HYPERDHT_ERR_CANCELLED          (-8)
 
 /* --- C2: DHT state --- */
 
@@ -433,6 +543,20 @@ typedef void (*hyperdht_peer_cb)(const uint8_t* value, size_t len,
                                   const char* from_host, uint16_t from_port,
                                   void* userdata);
 
+/**
+ * Query handle lifetime:
+ * - Returned live by the `_ex` variants (find_peer_ex, lookup_ex,
+ *   immutable_get_ex, mutable_get_ex).
+ * - Valid from issue site until the `on_done` callback fires
+ *   (cancelled or natural completion). `on_done` fires exactly once
+ *   either way; after it fires, the handle is invalid.
+ * - Pass to `hyperdht_query_cancel()` to abort a running walk
+ *   (useful when the app is backgrounded, the user cancels, etc.).
+ */
+
+/** Cancel an in-flight query. Safe to call at most once. */
+HYPERDHT_API void hyperdht_query_cancel(hyperdht_query_t* q);
+
 HYPERDHT_API int hyperdht_find_peer(hyperdht_t* dht,
                                      const uint8_t public_key[32],
                                      hyperdht_peer_cb on_reply,
@@ -451,6 +575,22 @@ HYPERDHT_API int hyperdht_announce(hyperdht_t* dht,
                                     hyperdht_done_cb on_done,
                                     void* userdata);
 
+/** Cancelable variants — return a query handle that can be passed to
+ *  `hyperdht_query_cancel()`. The handle is invalidated when `on_done`
+ *  fires; do not dereference it after that. Returns NULL on immediate
+ *  error (bad inputs). */
+HYPERDHT_API hyperdht_query_t* hyperdht_find_peer_ex(hyperdht_t* dht,
+                                                      const uint8_t public_key[32],
+                                                      hyperdht_peer_cb on_reply,
+                                                      hyperdht_done_cb on_done,
+                                                      void* userdata);
+
+HYPERDHT_API hyperdht_query_t* hyperdht_lookup_ex(hyperdht_t* dht,
+                                                   const uint8_t target[32],
+                                                   hyperdht_peer_cb on_reply,
+                                                   hyperdht_done_cb on_done,
+                                                   void* userdata);
+
 HYPERDHT_API int hyperdht_unannounce(hyperdht_t* dht,
                                       const uint8_t public_key[32],
                                       const hyperdht_keypair_t* kp,
@@ -462,6 +602,55 @@ HYPERDHT_API int hyperdht_unannounce(hyperdht_t* dht,
 HYPERDHT_API void hyperdht_suspend(hyperdht_t* dht);
 HYPERDHT_API void hyperdht_resume(hyperdht_t* dht);
 
+/**
+ * Log callback for suspend/resume. Each phase transition produces a
+ * `const char*` message, matching JS `dht.suspend({ log })`:
+ *   "Suspending all hyperdht servers"
+ *   "Done, clearing all raw streams"
+ *   "Done, suspending dht-rpc"
+ *   "Done, clearing raw streams again"
+ *   "Done, hyperdht fully suspended"
+ *
+ * Mobile apps use this to show a progress UI during background
+ * transitions. Passing a NULL callback is equivalent to the silent
+ * `hyperdht_suspend`/`hyperdht_resume`.
+ */
+typedef void (*hyperdht_log_cb)(const char* msg, void* userdata);
+
+HYPERDHT_API void hyperdht_suspend_logged(hyperdht_t* dht,
+                                          hyperdht_log_cb log_cb,
+                                          void* userdata);
+HYPERDHT_API void hyperdht_resume_logged(hyperdht_t* dht,
+                                         hyperdht_log_cb log_cb,
+                                         void* userdata);
+
+/**
+ * Force-destroy — skips `UNANNOUNCE` emission on each server. Use when
+ * the process is about to exit anyway (SIGTERM handler, crash path) and
+ * spending a round-trip to the network isn't worth the delay. Matches
+ * JS `dht.destroy({ force: true })`.
+ *
+ * Otherwise identical to `hyperdht_destroy` — caller still needs to
+ * run the event loop to drain close callbacks, then call `hyperdht_free`.
+ */
+HYPERDHT_API void hyperdht_destroy_force(hyperdht_t* dht,
+                                         hyperdht_close_cb cb,
+                                         void* userdata);
+
+/**
+ * Force-close a server — like `hyperdht_server_close` but skips the
+ * announcer's `UNANNOUNCE` emission. Timers and handles are still
+ * torn down so the event loop can drain.
+ */
+HYPERDHT_API void hyperdht_server_close_force(hyperdht_server_t* srv,
+                                              hyperdht_close_cb cb,
+                                              void* userdata);
+
+/** Server-level suspend with log (mirrors JS `server.suspend({ log })`). */
+HYPERDHT_API void hyperdht_server_suspend_logged(hyperdht_server_t* srv,
+                                                 hyperdht_log_cb log_cb,
+                                                 void* userdata);
+
 /* --- C6: DHT misc --- */
 
 /** BLAKE2b-256 hash of arbitrary data */
@@ -470,6 +659,53 @@ HYPERDHT_API void hyperdht_hash(const uint8_t* data, size_t len,
 
 /** Get connection keep-alive setting (ms) */
 HYPERDHT_API uint64_t hyperdht_connection_keep_alive(const hyperdht_t* dht);
+
+/**
+ * Snapshot the routing table — writes up to `cap` `{host, port}` pairs
+ * into the caller-provided parallel arrays. Returns the number of
+ * entries actually written.
+ *
+ * Intended use: mobile app going to background → snapshot the table,
+ * persist to disk, restore via `hyperdht_add_node()` on next launch.
+ * This lets the DHT skip a cold bootstrap walk.
+ *
+ * `hosts` must point to at least `cap` `char[46]` buffers. Hosts are
+ * null-terminated IPv4 dotted-quad strings.
+ *
+ * @param dht    DHT instance
+ * @param hosts  [out] array of char[46] — `hosts[i]` receives the host
+ * @param ports  [out] array of uint16_t — `ports[i]` receives the port
+ * @param cap    size of both output arrays
+ * @return number of entries written (≤ cap)
+ */
+HYPERDHT_API size_t hyperdht_to_array(const hyperdht_t* dht,
+                                       char (*hosts)[46],
+                                       uint16_t* ports,
+                                       size_t cap);
+
+/**
+ * Add a node to the routing table at runtime. Used by persistence
+ * restores (saved-table → add_node each entry on startup). Matches JS
+ * `dht.addNode({host, port})`.
+ *
+ * @return 0 on success, negative on error (invalid host string, etc.)
+ */
+HYPERDHT_API int hyperdht_add_node(hyperdht_t* dht,
+                                   const char* host, uint16_t port);
+
+/**
+ * Fill `out_host` (null-terminated) and `*out_port` with the DHT's
+ * public address as seen by the network (via NAT sampling).
+ *
+ * @param out_host  receives null-terminated IPv4 host, caller-provided
+ *                  buffer of at least 46 bytes
+ * @param out_port  receives the port
+ * @return 0 on success, -1 if the address is not yet known (firewalled,
+ *         no samples, or sampled port != bound port — JS parity)
+ */
+HYPERDHT_API int hyperdht_remote_address(const hyperdht_t* dht,
+                                          char out_host[46],
+                                          uint16_t* out_port);
 
 /* --- C7: Server state --- */
 
@@ -482,6 +718,26 @@ HYPERDHT_API int  hyperdht_server_is_listening(const hyperdht_server_t* srv);
 HYPERDHT_API int  hyperdht_server_public_key(const hyperdht_server_t* srv,
                                               uint8_t out[32]);
 
+/**
+ * Install a 'listening' event callback — fires ONCE after the announcer
+ * finishes its first cycle, when the server is fully ready to accept
+ * peers. JS parity: `server.on('listening', ...)` at server.js:195.
+ *
+ * A later `close() + listen()` cycle re-arms the hook.
+ */
+HYPERDHT_API void hyperdht_server_on_listening(hyperdht_server_t* srv,
+                                                hyperdht_event_cb cb,
+                                                void* userdata);
+
+/**
+ * Fill `out_host` + `*out_port` with the server's listening address
+ * (public address from NAT sampler). Returns 0 on success, -1 if not
+ * listening or address not yet known.
+ */
+HYPERDHT_API int hyperdht_server_address(const hyperdht_server_t* srv,
+                                          char out_host[46],
+                                          uint16_t* out_port);
+
 /* --- C8: Server config --- */
 
 /** Holepunch veto callback. Return 0 to allow, non-zero to reject.
@@ -493,6 +749,38 @@ typedef int (*hyperdht_holepunch_cb)(uint32_t remote_fw, uint32_t local_fw,
 HYPERDHT_API void hyperdht_server_set_holepunch(hyperdht_server_t* srv,
                                                  hyperdht_holepunch_cb cb,
                                                  void* userdata);
+
+/**
+ * Async firewall callback. Receives a completion handle the user must
+ * invoke EXACTLY once with the accept/reject decision:
+ *
+ *   int accept = 0;  // reject = 0 accepts, 1 rejects
+ *   hyperdht_firewall_done(done, accept);
+ *
+ * Mobile/server use case: the callback kicks off a DB lookup, ACL
+ * check, or remote policy decision, and calls `hyperdht_firewall_done`
+ * when the result arrives. The handshake response is deferred until
+ * then — mirrors JS `await this.firewall(...)`.
+ *
+ * Sync and async setters are mutually exclusive; installing one
+ * clears the other.
+ */
+typedef struct hyperdht_firewall_done_s hyperdht_firewall_done_t;
+
+typedef void (*hyperdht_firewall_async_cb)(const uint8_t remote_pk[32],
+                                            const char* peer_host,
+                                            uint16_t peer_port,
+                                            hyperdht_firewall_done_t* done,
+                                            void* userdata);
+
+/** Complete the async firewall check. `reject != 0` rejects the peer.
+ *  Safe to call at most once per callback invocation. */
+HYPERDHT_API void hyperdht_firewall_done(hyperdht_firewall_done_t* done,
+                                          int reject);
+
+HYPERDHT_API void hyperdht_server_set_firewall_async(hyperdht_server_t* srv,
+                                                      hyperdht_firewall_async_cb cb,
+                                                      void* userdata);
 
 /* ── Phase E: Blind Relay ─────────────────────────────────────────────── */
 
@@ -517,6 +805,32 @@ HYPERDHT_API void hyperdht_connect_relay(hyperdht_t* dht,
 HYPERDHT_API int hyperdht_relay_stats_attempts(hyperdht_t* dht);
 HYPERDHT_API int hyperdht_relay_stats_successes(hyperdht_t* dht);
 HYPERDHT_API int hyperdht_relay_stats_aborts(hyperdht_t* dht);
+
+/**
+ * Holepunch stats — per-strategy connect counts (JS parity:
+ * `dht.stats.punches.{consistent,random,open}`). Used for telemetry.
+ *
+ * - consistent: CONSISTENT+CONSISTENT NAT combo (fast punch)
+ * - random:     RANDOM NAT on either side (birthday-paradox / 1750-probe)
+ * - open:       OPEN on either side (direct connect, no probing)
+ */
+HYPERDHT_API int hyperdht_punch_stats_consistent(const hyperdht_t* dht);
+HYPERDHT_API int hyperdht_punch_stats_random(const hyperdht_t* dht);
+HYPERDHT_API int hyperdht_punch_stats_open(const hyperdht_t* dht);
+
+/**
+ * Ping a peer by host:port. Fires `cb(success, userdata)` when the
+ * ping completes (success=1) or times out (success=0). Does NOT
+ * traverse the DHT — it's a direct UDP round-trip.
+ *
+ * Useful as a reachability probe before attempting a full connect,
+ * or for monitoring known peers.
+ */
+typedef void (*hyperdht_ping_cb)(int success, void* userdata);
+
+HYPERDHT_API int hyperdht_ping(hyperdht_t* dht,
+                                const char* host, uint16_t port,
+                                hyperdht_ping_cb cb, void* userdata);
 
 #ifdef __cplusplus
 }

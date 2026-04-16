@@ -32,6 +32,23 @@ struct hyperdht_server_s {
     void* userdata = nullptr;
 };
 
+// FFI query handle — thin wrapper around a std::shared_ptr<Query>.
+// The shared_ptr owns the query; the handle owns the shared_ptr; the
+// `on_done` callback owns the handle (deletes it on fire).
+// `cancelled` lets the done-callback report HYPERDHT_ERR_CANCELLED
+// when the user called `hyperdht_query_cancel()`.
+//
+// Lifetime:
+//   - Allocated by hyperdht_*_ex()  — returned to the caller.
+//   - Freed in the on_done lambda   — covers both natural completion
+//                                     and the cancel path (cancel
+//                                     triggers Query::destroy() →
+//                                     fires on_done → deletes handle).
+struct hyperdht_query_s {
+    std::shared_ptr<hyperdht::query::Query> q;
+    bool cancelled = false;
+};
+
 // Helper: fill hyperdht_connection_t from C++ ConnectionInfo
 static void fill_connection(hyperdht_connection_t* out,
                              const hyperdht::noise::Key& tx,
@@ -54,6 +71,16 @@ static void fill_connection(hyperdht_connection_t* out,
     out->peer_port = addr.port;
     out->is_initiator = initiator ? 1 : 0;
     out->raw_stream = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Query cancellation (shared by all *_ex variants)
+// ---------------------------------------------------------------------------
+
+extern "C" void hyperdht_query_cancel(hyperdht_query_t* q) {
+    if (!q || !q->q) return;
+    q->cancelled = true;
+    q->q->destroy();  // idempotent — triggers the registered on_done
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +115,25 @@ void hyperdht_opts_default(hyperdht_opts_t* opts) {
     // Sentinel: "keep the C++ default (5000 ms)". Callers can override
     // with any value; 0 explicitly disables keep-alive.
     opts->connection_keep_alive = UINT64_MAX;
+    memset(opts->seed, 0, sizeof(opts->seed));
+    opts->seed_is_set = 0;
+    opts->host = nullptr;
+    opts->nodes = nullptr;
+    opts->nodes_len = 0;
+}
+
+// Helper: parse "host:port" → compact::Ipv4Address. Returns std::nullopt
+// on malformed input so the caller can decide whether to skip or error.
+static std::optional<hyperdht::compact::Ipv4Address>
+parse_host_port(const char* s) {
+    if (!s) return std::nullopt;
+    const char* colon = strrchr(s, ':');
+    if (!colon || colon == s) return std::nullopt;
+    std::string host(s, colon - s);
+    int port = std::atoi(colon + 1);
+    if (port <= 0 || port > 65535) return std::nullopt;
+    return hyperdht::compact::Ipv4Address::from_string(
+        host, static_cast<uint16_t>(port));
 }
 
 hyperdht_t* hyperdht_create(uv_loop_t* loop, const hyperdht_opts_t* opts) {
@@ -97,19 +143,38 @@ hyperdht_t* hyperdht_create(uv_loop_t* loop, const hyperdht_opts_t* opts) {
     if (opts) {
         cpp_opts.port = opts->port;
         cpp_opts.ephemeral = (opts->ephemeral != 0);
-        // §2: wire the `use_public_bootstrap` flag through to the C++
-        // layer. When set, the HyperDHT constructor stores the 3 public
-        // seed nodes in `opts_.bootstrap`, and `bind()` will launch a
-        // one-shot FIND_NODE(our_id) walk on behalf of the caller.
-        if (opts->use_public_bootstrap) {
+
+        // Bootstrap precedence: explicit `nodes[]` wins; otherwise
+        // `use_public_bootstrap` seeds the canonical 3-node list.
+        if (opts->nodes && opts->nodes_len > 0) {
+            cpp_opts.bootstrap.reserve(opts->nodes_len);
+            for (size_t i = 0; i < opts->nodes_len; ++i) {
+                auto parsed = parse_host_port(opts->nodes[i]);
+                if (parsed) cpp_opts.bootstrap.push_back(*parsed);
+            }
+        } else if (opts->use_public_bootstrap) {
             cpp_opts.bootstrap =
                 hyperdht::HyperDHT::default_bootstrap_nodes();
         }
+
         // Keep-alive: UINT64_MAX = unset (keep the C++ default), any other
         // value is taken literally (including 0 for "disabled", matching
         // JS `connectionKeepAlive: false`).
         if (opts->connection_keep_alive != UINT64_MAX) {
             cpp_opts.connection_keep_alive = opts->connection_keep_alive;
+        }
+
+        // Optional deterministic seed → derive default keypair at
+        // HyperDHT construction time. JS parity: `new DHT({ seed })`.
+        if (opts->seed_is_set) {
+            hyperdht::noise::Seed s{};
+            std::memcpy(s.data(), opts->seed, 32);
+            cpp_opts.seed = s;
+        }
+
+        // Optional bind interface.
+        if (opts->host && opts->host[0] != '\0') {
+            cpp_opts.host = opts->host;
         }
     }
 
@@ -160,6 +225,23 @@ void hyperdht_destroy(hyperdht_t* dht, hyperdht_close_cb cb, void* userdata) {
     if (cb) cb(userdata);
 }
 
+void hyperdht_destroy_force(hyperdht_t* dht,
+                            hyperdht_close_cb cb, void* userdata) {
+    if (!dht) {
+        if (cb) cb(userdata);
+        return;
+    }
+    if (!dht->dht) {
+        delete dht;
+        if (cb) cb(userdata);
+        return;
+    }
+    hyperdht::HyperDHT::DestroyOptions opts;
+    opts.force = true;
+    dht->dht->destroy(opts);
+    if (cb) cb(userdata);
+}
+
 void hyperdht_free(hyperdht_t* dht) {
     delete dht;
 }
@@ -175,38 +257,87 @@ void hyperdht_default_keypair(const hyperdht_t* dht, hyperdht_keypair_t* out) {
 // Client: connect
 // ---------------------------------------------------------------------------
 
+// Shared connect result → C callback bridge (used by both connect and
+// connect_ex). Converts ConnectResult into hyperdht_connection_t, manages
+// the pool-socket keepalive lifetime, and dispatches the user's cb.
+static void dispatch_connect_result(hyperdht_connect_cb cb, void* userdata,
+                                    int error,
+                                    const hyperdht::ConnectResult& result,
+                                    bool is_initiator) {
+    if (error != 0) {
+        cb(error, nullptr, userdata);
+        return;
+    }
+    hyperdht_connection_t conn{};
+    fill_connection(&conn, result.tx_key, result.rx_key,
+                    result.handshake_hash, result.remote_public_key,
+                    result.peer_address, result.remote_udx_id,
+                    result.local_udx_id, is_initiator);
+    conn.raw_stream = result.raw_stream;
+    conn.udx_socket = result.udx_socket;
+    conn._internal = result.socket_keepalive
+        ? new std::shared_ptr<void>(result.socket_keepalive)
+        : nullptr;
+    cb(0, &conn, userdata);
+    if (conn._internal) {
+        delete static_cast<std::shared_ptr<void>*>(conn._internal);
+    }
+}
+
 int hyperdht_connect(hyperdht_t* dht,
                      const uint8_t remote_pk[32],
                      hyperdht_connect_cb cb,
                      void* userdata) {
+    return hyperdht_connect_ex(dht, remote_pk, nullptr, cb, userdata);
+}
+
+void hyperdht_connect_opts_default(hyperdht_connect_opts_t* opts) {
+    if (!opts) return;
+    opts->keypair = nullptr;
+    opts->relay_through = nullptr;
+    opts->relay_keep_alive_ms = 0;  // 0 = library default (5000 ms)
+    opts->fast_open = 1;
+    opts->local_connection = 1;
+}
+
+int hyperdht_connect_ex(hyperdht_t* dht,
+                        const uint8_t remote_pk[32],
+                        const hyperdht_connect_opts_t* opts,
+                        hyperdht_connect_cb cb,
+                        void* userdata) {
     if (!dht || !dht->dht || !remote_pk || !cb) return -1;
 
     hyperdht::noise::PubKey pk{};
     memcpy(pk.data(), remote_pk, 32);
 
-    dht->dht->connect(pk, [cb, userdata](int error, const hyperdht::ConnectResult& result) {
-        if (error != 0) {
-            cb(error, nullptr, userdata);
-            return;
+    hyperdht::ConnectOptions cpp_opts;
+
+    if (opts) {
+        // Custom keypair: copy the 32-byte public + 64-byte secret into
+        // a noise::Keypair. The secret-key layout matches libsodium's
+        // (seed|public), which is what noise::Keypair expects.
+        if (opts->keypair) {
+            hyperdht::noise::Keypair kp;
+            std::memcpy(kp.public_key.data(), opts->keypair->public_key, 32);
+            std::memcpy(kp.secret_key.data(), opts->keypair->secret_key, 64);
+            cpp_opts.keypair = std::move(kp);
         }
-        hyperdht_connection_t conn{};
-        fill_connection(&conn, result.tx_key, result.rx_key,
-                        result.handshake_hash, result.remote_public_key,
-                        result.peer_address, result.remote_udx_id,
-                        result.local_udx_id, true);
-        conn.raw_stream = result.raw_stream;
-        conn.udx_socket = result.udx_socket;  // Socket from holepunch probe
-        // Stash the pool socket keepalive so hyperdht_stream_open can pick it up.
-        // Heap-allocated shared_ptr — stream_open takes ownership.
-        conn._internal = result.socket_keepalive
-            ? new std::shared_ptr<void>(result.socket_keepalive)
-            : nullptr;
-        cb(0, &conn, userdata);
-        // Clean up if user didn't call stream_open (didn't consume _internal)
-        if (conn._internal) {
-            delete static_cast<std::shared_ptr<void>*>(conn._internal);
+        if (opts->relay_through) {
+            hyperdht::noise::PubKey rpk{};
+            std::memcpy(rpk.data(), opts->relay_through, 32);
+            cpp_opts.relay_through = rpk;
         }
-    });
+        if (opts->relay_keep_alive_ms != 0) {
+            cpp_opts.relay_keep_alive = opts->relay_keep_alive_ms;
+        }
+        cpp_opts.fast_open = (opts->fast_open != 0);
+        cpp_opts.local_connection = (opts->local_connection != 0);
+    }
+
+    dht->dht->connect(pk, cpp_opts,
+        [cb, userdata](int error, const hyperdht::ConnectResult& result) {
+            dispatch_connect_result(cb, userdata, error, result, true);
+        });
 
     return 0;
 }
@@ -287,6 +418,28 @@ void hyperdht_server_close(hyperdht_server_t* srv,
     srv->server->close([srv, cb, userdata]() {
         delete srv;
         if (cb) cb(userdata);
+    });
+}
+
+void hyperdht_server_close_force(hyperdht_server_t* srv,
+                                 hyperdht_close_cb cb, void* userdata) {
+    if (!srv || !srv->server) {
+        if (cb) cb(userdata);
+        delete srv;
+        return;
+    }
+    srv->server->close(/*force=*/true, [srv, cb, userdata]() {
+        delete srv;
+        if (cb) cb(userdata);
+    });
+}
+
+void hyperdht_server_suspend_logged(hyperdht_server_t* srv,
+                                    hyperdht_log_cb log_cb, void* userdata) {
+    if (!srv || !srv->server) return;
+    if (!log_cb) { srv->server->suspend(); return; }
+    srv->server->suspend([log_cb, userdata](const char* msg) {
+        log_cb(msg, userdata);
     });
 }
 
@@ -381,6 +534,54 @@ int hyperdht_mutable_get(hyperdht_t* dht,
             if (done_cb) done_cb(0, userdata);
         });
     return 0;
+}
+
+hyperdht_query_t* hyperdht_immutable_get_ex(hyperdht_t* dht,
+                                             const uint8_t target[32],
+                                             hyperdht_value_cb cb,
+                                             hyperdht_done_cb done_cb,
+                                             void* userdata) {
+    if (!dht || !dht->dht || !target) return nullptr;
+
+    std::array<uint8_t, 32> t{};
+    memcpy(t.data(), target, 32);
+
+    auto* handle = new hyperdht_query_s;
+    handle->q = dht->dht->immutable_get(t,
+        [cb, userdata](const std::vector<uint8_t>& value) {
+            if (cb) cb(value.data(), value.size(), userdata);
+        },
+        [handle, done_cb, userdata](const hyperdht::HyperDHT::ImmutableGetResult&) {
+            int err = handle->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
+            if (done_cb) done_cb(err, userdata);
+            delete handle;
+        });
+    return handle;
+}
+
+hyperdht_query_t* hyperdht_mutable_get_ex(hyperdht_t* dht,
+                                           const uint8_t public_key[32],
+                                           uint64_t min_seq,
+                                           hyperdht_mutable_cb cb,
+                                           hyperdht_done_cb done_cb,
+                                           void* userdata) {
+    if (!dht || !dht->dht || !public_key) return nullptr;
+
+    hyperdht::noise::PubKey pk{};
+    memcpy(pk.data(), public_key, 32);
+
+    auto* handle = new hyperdht_query_s;
+    handle->q = dht->dht->mutable_get(pk, min_seq, /*latest=*/true,
+        [cb, userdata](const hyperdht::dht_ops::MutableResult& r) {
+            if (cb) cb(r.seq, r.value.data(), r.value.size(),
+                       r.signature.data(), userdata);
+        },
+        [handle, done_cb, userdata](const hyperdht::HyperDHT::MutableGetResult&) {
+            int err = handle->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
+            if (done_cb) done_cb(err, userdata);
+            delete handle;
+        });
+    return handle;
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +942,60 @@ int hyperdht_announce(hyperdht_t* dht,
     return 0;
 }
 
+hyperdht_query_t* hyperdht_find_peer_ex(hyperdht_t* dht,
+                                         const uint8_t public_key[32],
+                                         hyperdht_peer_cb on_reply,
+                                         hyperdht_done_cb on_done,
+                                         void* userdata) {
+    if (!dht || !dht->dht || !public_key) return nullptr;
+
+    hyperdht::noise::PubKey pk{};
+    memcpy(pk.data(), public_key, 32);
+
+    auto* handle = new hyperdht_query_s;
+    handle->q = dht->dht->find_peer(pk,
+        [on_reply, userdata](const hyperdht::query::QueryReply& reply) {
+            if (on_reply && reply.value.has_value() && !reply.value->empty()) {
+                auto host = reply.from_addr.host_string();
+                on_reply(reply.value->data(), reply.value->size(),
+                         host.c_str(), reply.from_addr.port, userdata);
+            }
+        },
+        [handle, on_done, userdata](const std::vector<hyperdht::query::QueryReply>&) {
+            int err = handle->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
+            if (on_done) on_done(err, userdata);
+            delete handle;
+        });
+    return handle;
+}
+
+hyperdht_query_t* hyperdht_lookup_ex(hyperdht_t* dht,
+                                      const uint8_t target[32],
+                                      hyperdht_peer_cb on_reply,
+                                      hyperdht_done_cb on_done,
+                                      void* userdata) {
+    if (!dht || !dht->dht || !target) return nullptr;
+
+    hyperdht::routing::NodeId t{};
+    memcpy(t.data(), target, 32);
+
+    auto* handle = new hyperdht_query_s;
+    handle->q = dht->dht->lookup(t,
+        [on_reply, userdata](const hyperdht::query::QueryReply& reply) {
+            if (on_reply && reply.value.has_value() && !reply.value->empty()) {
+                auto host = reply.from_addr.host_string();
+                on_reply(reply.value->data(), reply.value->size(),
+                         host.c_str(), reply.from_addr.port, userdata);
+            }
+        },
+        [handle, on_done, userdata](const std::vector<hyperdht::query::QueryReply>&) {
+            int err = handle->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
+            if (on_done) on_done(err, userdata);
+            delete handle;
+        });
+    return handle;
+}
+
 int hyperdht_unannounce(hyperdht_t* dht,
                          const uint8_t public_key[32],
                          const hyperdht_keypair_t* kp,
@@ -772,6 +1027,25 @@ void hyperdht_resume(hyperdht_t* dht) {
     if (dht && dht->dht) dht->dht->resume();
 }
 
+void hyperdht_suspend_logged(hyperdht_t* dht,
+                             hyperdht_log_cb log_cb, void* userdata) {
+    if (!dht || !dht->dht) return;
+    if (!log_cb) { dht->dht->suspend(); return; }
+    // Bridge C `const char*` callback → C++ std::function<void(const char*)>.
+    dht->dht->suspend([log_cb, userdata](const char* msg) {
+        log_cb(msg, userdata);
+    });
+}
+
+void hyperdht_resume_logged(hyperdht_t* dht,
+                            hyperdht_log_cb log_cb, void* userdata) {
+    if (!dht || !dht->dht) return;
+    if (!log_cb) { dht->dht->resume(); return; }
+    dht->dht->resume([log_cb, userdata](const char* msg) {
+        log_cb(msg, userdata);
+    });
+}
+
 // --- C6: DHT misc ---
 
 void hyperdht_hash(const uint8_t* data, size_t len, uint8_t out[32]) {
@@ -783,6 +1057,44 @@ void hyperdht_hash(const uint8_t* data, size_t len, uint8_t out[32]) {
 uint64_t hyperdht_connection_keep_alive(const hyperdht_t* dht) {
     if (!dht || !dht->dht) return 0;
     return dht->dht->connection_keep_alive();
+}
+
+size_t hyperdht_to_array(const hyperdht_t* dht,
+                         char (*hosts)[46], uint16_t* ports, size_t cap) {
+    if (!dht || !dht->dht || !hosts || !ports || cap == 0) return 0;
+    auto snapshot = dht->dht->to_array(cap);
+    size_t n = std::min(snapshot.size(), cap);
+    for (size_t i = 0; i < n; ++i) {
+        auto h = snapshot[i].host_string();
+        std::strncpy(hosts[i], h.c_str(), 45);
+        hosts[i][45] = '\0';
+        ports[i] = snapshot[i].port;
+    }
+    return n;
+}
+
+int hyperdht_add_node(hyperdht_t* dht, const char* host, uint16_t port) {
+    if (!dht || !dht->dht || !host) return -1;
+    // Validate via uv_ip4_addr so we don't insert malformed hosts into
+    // the routing table (the RoutingTable itself takes the string at
+    // face value).
+    struct sockaddr_in probe{};
+    if (uv_ip4_addr(host, port, &probe) != 0) return -2;
+    dht->dht->add_node(
+        hyperdht::compact::Ipv4Address::from_string(host, port));
+    return 0;
+}
+
+int hyperdht_remote_address(const hyperdht_t* dht,
+                            char out_host[46], uint16_t* out_port) {
+    if (!dht || !dht->dht || !out_host || !out_port) return -1;
+    auto addr = dht->dht->remote_address();
+    if (!addr) return -1;
+    auto h = addr->host_string();
+    std::strncpy(out_host, h.c_str(), 45);
+    out_host[45] = '\0';
+    *out_port = addr->port;
+    return 0;
 }
 
 // --- C7: Server state ---
@@ -813,6 +1125,26 @@ int hyperdht_server_public_key(const hyperdht_server_t* srv,
     return 0;
 }
 
+void hyperdht_server_on_listening(hyperdht_server_t* srv,
+                                  hyperdht_event_cb cb, void* userdata) {
+    if (!srv || !srv->server) return;
+    if (!cb) { srv->server->on_listening(nullptr); return; }
+    srv->server->on_listening([cb, userdata]() { cb(userdata); });
+}
+
+int hyperdht_server_address(const hyperdht_server_t* srv,
+                            char out_host[46], uint16_t* out_port) {
+    if (!srv || !srv->server || !out_host || !out_port) return -1;
+    auto info = srv->server->address();
+    if (!srv->server->is_listening() || info.host.empty() || info.port == 0) {
+        return -1;
+    }
+    std::strncpy(out_host, info.host.c_str(), 45);
+    out_host[45] = '\0';
+    *out_port = info.port;
+    return 0;
+}
+
 // --- C8: Server config ---
 
 void hyperdht_server_set_holepunch(hyperdht_server_t* srv,
@@ -833,6 +1165,48 @@ void hyperdht_server_set_holepunch(hyperdht_server_t* srv,
                       static_cast<int>(remote_addrs.size()),
                       static_cast<int>(local_addrs.size()),
                       userdata) == 0;
+        });
+}
+
+// The FFI firewall-done handle wraps the std::function the C++ layer
+// handed us. The user's C callback takes a pointer into this struct;
+// hyperdht_firewall_done() invokes the std::function and deletes the
+// wrapper so a second call is a safe no-op (nullptr fn).
+struct hyperdht_firewall_done_s {
+    hyperdht::server::Server::FirewallDoneCb fn;
+};
+
+void hyperdht_firewall_done(hyperdht_firewall_done_t* done, int reject) {
+    if (!done || !done->fn) return;  // already invoked — no-op
+    // Move the std::function out so a stale pointer can't call twice
+    // through us. The C++ side has its own once-guard; this is belt +
+    // braces for the FFI layer.
+    auto fn = std::move(done->fn);
+    done->fn = nullptr;
+    fn(reject != 0);
+    delete done;
+}
+
+void hyperdht_server_set_firewall_async(hyperdht_server_t* srv,
+                                         hyperdht_firewall_async_cb cb,
+                                         void* userdata) {
+    if (!srv || !srv->server) return;
+
+    if (!cb) {
+        srv->server->set_firewall_async(nullptr);
+        return;
+    }
+
+    srv->server->set_firewall_async(
+        [cb, userdata](const std::array<uint8_t, 32>& pk,
+                       const hyperdht::peer_connect::NoisePayload& /*payload*/,
+                       const hyperdht::compact::Ipv4Address& addr,
+                       hyperdht::server::Server::FirewallDoneCb done) {
+            auto* handle = new hyperdht_firewall_done_s{std::move(done)};
+            auto host = addr.host_string();
+            // C caller must call hyperdht_firewall_done(handle, reject)
+            // exactly once — we hand them ownership of `handle`.
+            cb(pk.data(), host.c_str(), addr.port, handle, userdata);
         });
 }
 
@@ -913,4 +1287,30 @@ int hyperdht_relay_stats_successes(hyperdht_t* dht) {
 int hyperdht_relay_stats_aborts(hyperdht_t* dht) {
     if (!dht || !dht->dht) return 0;
     return dht->dht->stats().relaying.aborts;
+}
+
+int hyperdht_punch_stats_consistent(const hyperdht_t* dht) {
+    if (!dht || !dht->dht) return 0;
+    return dht->dht->stats().punches.consistent;
+}
+int hyperdht_punch_stats_random(const hyperdht_t* dht) {
+    if (!dht || !dht->dht) return 0;
+    return dht->dht->stats().punches.random;
+}
+int hyperdht_punch_stats_open(const hyperdht_t* dht) {
+    if (!dht || !dht->dht) return 0;
+    return dht->dht->stats().punches.open;
+}
+
+int hyperdht_ping(hyperdht_t* dht,
+                  const char* host, uint16_t port,
+                  hyperdht_ping_cb cb, void* userdata) {
+    if (!dht || !dht->dht || !host || !cb) return -1;
+    struct sockaddr_in probe{};
+    if (uv_ip4_addr(host, port, &probe) != 0) return -2;
+    auto addr = hyperdht::compact::Ipv4Address::from_string(host, port);
+    dht->dht->ping(addr, [cb, userdata](bool ok) {
+        cb(ok ? 1 : 0, userdata);
+    });
+    return 0;
 }

@@ -243,3 +243,198 @@ TEST(CAPI, ServerListen) {
     hyperdht_free(dht);
     uv_loop_close(&loop);
 }
+
+// ============================================================================
+// Extended API (2026-04-17) — coverage for the new FFI surface
+// ============================================================================
+
+TEST(CAPI, OptsFromSeedDerivesDeterministicKeypair) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    uint8_t seed[32];
+    memset(seed, 0x37, 32);
+
+    hyperdht_opts_t opts;
+    hyperdht_opts_default(&opts);
+    memcpy(opts.seed, seed, 32);
+    opts.seed_is_set = 1;
+
+    hyperdht_t* dht = hyperdht_create(&loop, &opts);
+    ASSERT_NE(dht, nullptr);
+
+    hyperdht_keypair_t derived_from_seed;
+    hyperdht_keypair_from_seed(&derived_from_seed, seed);
+
+    hyperdht_keypair_t dht_default;
+    hyperdht_default_keypair(dht, &dht_default);
+
+    // Same seed → same public key via both code paths.
+    EXPECT_EQ(memcmp(derived_from_seed.public_key, dht_default.public_key, 32), 0);
+
+    hyperdht_destroy(dht, NULL, NULL);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
+    uv_loop_close(&loop);
+}
+
+TEST(CAPI, ConnectOptsDefaultHasSensibleValues) {
+    hyperdht_connect_opts_t opts;
+    hyperdht_connect_opts_default(&opts);
+    EXPECT_EQ(opts.keypair, nullptr);
+    EXPECT_EQ(opts.relay_through, nullptr);
+    EXPECT_EQ(opts.relay_keep_alive_ms, 0u);  // 0 = library default
+    EXPECT_EQ(opts.fast_open, 1);
+    EXPECT_EQ(opts.local_connection, 1);
+}
+
+TEST(CAPI, AddNodeRejectsInvalidHost) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    hyperdht_t* dht = hyperdht_create(&loop, NULL);
+    ASSERT_NE(dht, nullptr);
+    hyperdht_bind(dht, 0);
+
+    EXPECT_LT(hyperdht_add_node(dht, "not.a.valid.ip", 49737), 0);
+    EXPECT_LT(hyperdht_add_node(dht, nullptr, 49737), 0);
+    EXPECT_EQ(hyperdht_add_node(dht, "1.2.3.4", 49737), 0);
+
+    hyperdht_destroy(dht, NULL, NULL);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
+    uv_loop_close(&loop);
+}
+
+TEST(CAPI, ToArraySnapshotsRoutingTable) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    hyperdht_t* dht = hyperdht_create(&loop, NULL);
+    ASSERT_NE(dht, nullptr);
+    hyperdht_bind(dht, 0);
+
+    hyperdht_add_node(dht, "1.2.3.4", 49737);
+    hyperdht_add_node(dht, "5.6.7.8", 12345);
+
+    char hosts[16][46];
+    uint16_t ports[16];
+    size_t n = hyperdht_to_array(dht, hosts, ports, 16);
+    EXPECT_GE(n, 2u);
+
+    // limit = 0 → empty (JS parity)
+    EXPECT_EQ(hyperdht_to_array(dht, hosts, ports, 0), 0u);
+
+    hyperdht_destroy(dht, NULL, NULL);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
+    uv_loop_close(&loop);
+}
+
+TEST(CAPI, RemoteAddressNullWhenFirewalled) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    hyperdht_t* dht = hyperdht_create(&loop, NULL);
+    ASSERT_NE(dht, nullptr);
+    hyperdht_bind(dht, 0);
+
+    char host[46];
+    uint16_t port;
+    EXPECT_LT(hyperdht_remote_address(dht, host, &port), 0);
+
+    hyperdht_destroy(dht, NULL, NULL);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
+    uv_loop_close(&loop);
+}
+
+TEST(CAPI, SuspendResumeLoggedFiresCallbacks) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    hyperdht_t* dht = hyperdht_create(&loop, NULL);
+    ASSERT_NE(dht, nullptr);
+    hyperdht_bind(dht, 0);
+
+    struct Ctx { int count = 0; } ctx;
+    auto cb = +[](const char*, void* ud) {
+        static_cast<Ctx*>(ud)->count++;
+    };
+
+    hyperdht_suspend_logged(dht, cb, &ctx);
+    EXPECT_GE(ctx.count, 3);  // at least 3 phase breadcrumbs
+
+    int before = ctx.count;
+    hyperdht_resume_logged(dht, cb, &ctx);
+    EXPECT_GT(ctx.count, before);
+
+    hyperdht_destroy(dht, NULL, NULL);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
+    uv_loop_close(&loop);
+}
+
+TEST(CAPI, DestroyForceTearsDownWithoutHanging) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    hyperdht_t* dht = hyperdht_create(&loop, NULL);
+    ASSERT_NE(dht, nullptr);
+    hyperdht_bind(dht, 0);
+
+    hyperdht_destroy_force(dht, NULL, NULL);
+    EXPECT_EQ(hyperdht_is_destroyed(dht), 1);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
+    uv_loop_close(&loop);
+}
+
+TEST(CAPI, PunchStatsAccessorsReturnZeroOnFreshDHT) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    hyperdht_t* dht = hyperdht_create(&loop, NULL);
+    ASSERT_NE(dht, nullptr);
+
+    EXPECT_EQ(hyperdht_punch_stats_consistent(dht), 0);
+    EXPECT_EQ(hyperdht_punch_stats_random(dht), 0);
+    EXPECT_EQ(hyperdht_punch_stats_open(dht), 0);
+    EXPECT_EQ(hyperdht_relay_stats_attempts(dht), 0);
+
+    hyperdht_destroy(dht, NULL, NULL);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
+    uv_loop_close(&loop);
+}
+
+TEST(CAPI, QueryCancelStopsLookupCleanly) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    hyperdht_t* dht = hyperdht_create(&loop, NULL);
+    ASSERT_NE(dht, nullptr);
+    hyperdht_bind(dht, 0);
+
+    struct Ctx { int done_err = 999; } ctx;
+    uint8_t target[32] = {0};
+    target[0] = 0xAA;
+
+    auto on_reply = +[](const uint8_t*, size_t, const char*, uint16_t, void*) {};
+    auto on_done = +[](int err, void* ud) {
+        static_cast<Ctx*>(ud)->done_err = err;
+    };
+
+    hyperdht_query_t* q = hyperdht_lookup_ex(dht, target, on_reply, on_done, &ctx);
+    ASSERT_NE(q, nullptr);
+
+    hyperdht_query_cancel(q);
+    // cancel triggers done synchronously via Query::destroy()
+    EXPECT_EQ(ctx.done_err, HYPERDHT_ERR_CANCELLED);
+
+    hyperdht_destroy(dht, NULL, NULL);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
+    uv_loop_close(&loop);
+}

@@ -9,32 +9,43 @@
 //
 // C++ function                       Line  JS file (server.js)       JS lines
 // ─────────────────────────────────── ────  ────────────────────────  ────────
-// Server::listen                      124  server.js                143-196
-// Server::close                       174  server.js                 88-129
-// Server::refresh                     208  server.js                198-200
-// Server::notify_online               218  server.js                202-204
-// Server::suspend                     234  server.js                 63-76
-// Server::resume                      248  server.js                 72-76
+// Server::listen                      130  server.js                143-196
+// Server::close                       186  server.js                 88-129
+// Server::close(force)                190  server.js  129 (destroy {force})
+// Server::refresh                     236  server.js                198-200
+// Server::notify_online               246  server.js                202-204
+// Server::suspend(LogFn)              262  server.js                 63-76
+// Server::resume                      289  server.js                 72-76
+// Server::address                     298  server.js                 78-86
 //
-// Server::on_peer_handshake           298  server.js  464-481 (_onpeerhandshake)
+// Server::on_peer_handshake           339  server.js  464-481 (_onpeerhandshake)
 //                                                     210-443 (_addHandshake)
-//   ├─ Noise dedup                    310  server.js                265-279
-//   ├─ handle_handshake call          378  server.js                237-388
-//   ├─ rawStream + firewall           404  server.js                280-303
-//   ├─ blind relay start (Phase E)    423  server.js                397-399, 625-685
-//   ├─ OPEN shortcut → on_socket      560  server.js                390-394
-//   └─ session timer (UvTimer)        614  server.js  431, 440 (prepunching)
+//   ├─ Noise dedup                    345  server.js                265-279
+//   ├─ decode_handshake                    server_connection.cpp — Noise recv phase
+//   ├─ firewall dispatch              436  server.js  251 (sync OR await async)
+//   │    ├─ AsyncFirewallCb (deferred)     server.js  251 (await Promise)
+//   │    └─ FirewallCb (synchronous)       server.js  251 (sync bool)
+//   ├─ finalize_handshake                  server_connection.cpp — Noise send phase
+//   └─ on_handshake_result call            shared path (sync + async complete here)
 //
-// Server::on_peer_holepunch           644  server.js                483-600
-//   ├─ handle_holepunch call          672  server.js                492-516
-//   ├─ holepunch veto callback        727  server.js                544-546
-//   ├─ puncher creation               737  server.js                436-440
-//   ├─ puncher->punch()               778  server.js                576
-//   └─ probe echo listener (add_*)    790  server.js  (always-on echo handler)
+// Server::on_handshake_result         502  (shared by sync + async firewall paths)
+//   ├─ send reply_noise                    server.js  237 (return h)
+//   ├─ rawStream + firewall                server.js                280-303
+//   ├─ blind relay start (Phase E)         server.js                397-399, 625-685
+//   ├─ OPEN shortcut → on_socket           server.js                390-394
+//   └─ session timer (UvTimer)             server.js  431, 440 (prepunching)
 //
-// Server::on_socket                   803  server.js                305-342
-// Server::clear_session               842  server.js                450-462
-// Server::on_raw_stream_firewall      866  server.js                282-291
+// Server::on_peer_holepunch           772  server.js                483-600
+//   ├─ NAT add + freeze + fw snapshot 790  server.js  509-510, 582-584 (JS order)
+//   ├─ handle_holepunch call          821  server.js                492-516
+//   ├─ holepunch veto callback        840  server.js                544-546
+//   ├─ puncher creation               867  server.js                436-440
+//   ├─ puncher->punch()               908  server.js                576
+//   └─ probe echo listener (add_*)         server.js  (always-on echo handler)
+//
+// Server::on_socket                   954  server.js                305-342
+// Server::clear_session               993  server.js                450-462
+// Server::on_raw_stream_firewall     1017  server.js                282-291
 //
 // =========================================================================
 //

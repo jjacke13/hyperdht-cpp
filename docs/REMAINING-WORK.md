@@ -128,11 +128,28 @@ PEER_HANDSHAKE and exhaust memory (each handshake allocates session state).
 
 ### 8. Language bindings (beyond C FFI)
 
-- **Python** — existing `wrappers/python` via ctypes; add async/await support,
-  context managers, type hints, PEP 517 packaging
+The C FFI surface (75 fns as of commit c57b6cd) is now considered
+production-ready for mobile/cross-language consumers: no known UAFs,
+explicit `_free` contracts on owned handles, idempotent cancel,
+ABI-pinned struct layouts, async firewall completion that survives
+the callback frame. What remains is building idiomatic wrappers on
+top of it.
+
+- **Python** — existing `wrappers/python` via ctypes exposes basic
+  lifecycle, connect_stream, and the opts struct. Needs a pass to
+  wire the 23 new FFI symbols (seed, host, nodes, connect_ex,
+  suspend_logged, destroy_force, to_array, add_node, remote_address,
+  on_listening, server_address, firewall_async, punch_stats, ping,
+  query_cancel/free + *_ex variants). Add async/await support,
+  context managers, type hints, PEP 517 packaging.
 - **Go** — cgo wrapper with goroutine-friendly callbacks
 - **Rust** — `hyperdht-sys` crate + safe `hyperdht` wrapper
-- **Swift/Kotlin** — for mobile use (the target use case for mimiclaw eventually)
+- **Swift/Kotlin** — for mobile use (mimiclaw, future iOS/Android
+  apps). The C FFI was explicitly designed with these consumers in
+  mind: `HYPERDHT_PK_SIZE` / `HYPERDHT_HOST_STRIDE` constants, flat
+  `char*` out-buffers, explicit struct padding (`_pad0`), completion-
+  callback-style async firewall, and `_ex` query cancellation all
+  target Swift C-interop / JNI idioms directly.
 - **ESP-IDF component wrapper** — wrap the library as a reusable
   ESP-IDF component with a CMakeLists.txt registering the component
   against the IDF build system. Pair with an `HYPERDHT_EMBEDDED=ON`

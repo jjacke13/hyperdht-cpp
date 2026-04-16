@@ -2,18 +2,43 @@
 
 > **⚠️ Snapshot — may lag the header.** This file is a curated quick-start
 > for the most-used entry points. The authoritative source is
-> `include/hyperdht/hyperdht.h` (heavily commented). A generated reference
-> (Doxygen pass) is tracked in `docs/REMAINING-WORK.md` §9.
+> `include/hyperdht/hyperdht.h` (heavily commented, 75 FFI functions as
+> of commit c57b6cd). A generated reference (Doxygen pass) is tracked
+> in `docs/REMAINING-WORK.md` §9.
 >
-> Between commits 42b075f (Phase A-E) and ba319e2 we added ~30 FFI
-> functions: `hyperdht_opts_default`, state queries (`is_online`,
-> `is_degraded`, `is_persistent`, `is_bootstrapped`, `is_suspended`,
-> `connection_keep_alive`), event hooks (`on_bootstrapped`,
-> `on_network_change`, `on_network_update`, `on_persistent`), DHT ops
-> (`find_peer`, `lookup`, `announce`, `unannounce`, `ping`), lifecycle
-> (`suspend`, `resume`), server state/config, blind relay
-> (`connect_relay`, `server_set_relay_through`), and constants
-> (`HYPERDHT_FIREWALL_*`). When in doubt — read the header.
+> **Major additions since this file was last written:**
+>
+> *Phase A-E + §7 polish (~30 fns):* `hyperdht_opts_default`, state
+> queries (`is_online`, `is_degraded`, `is_persistent`,
+> `is_bootstrapped`, `is_suspended`, `connection_keep_alive`), event
+> hooks (`on_bootstrapped`, `on_network_change`, `on_network_update`,
+> `on_persistent`), DHT ops (`find_peer`, `lookup`, `announce`,
+> `unannounce`), lifecycle (`suspend`, `resume`), server state /
+> config (suspend/resume/notify_online/is_listening/public_key,
+> set_holepunch, set_relay_through), blind relay (`connect_relay`,
+> relay stats), constants (`HYPERDHT_FIREWALL_*`, `HYPERDHT_ERR_*`).
+>
+> *Mobile-focused FFI expansion (+23 fns, commit 47e81b8):*
+> `hyperdht_opts_t` extended with `seed[32]` / `seed_is_set` /
+> `host` / `nodes[]` / `nodes_len`. `hyperdht_connect_opts_t` +
+> `hyperdht_connect_ex` (custom keypair, relay_through, fast_open,
+> local_connection). Log-aware suspend / resume:
+> `hyperdht_suspend_logged`, `hyperdht_resume_logged`,
+> `hyperdht_server_suspend_logged`. Force variants: `hyperdht_destroy_force`,
+> `hyperdht_server_close_force`. Routing table persistence:
+> `hyperdht_to_array` (flat `char*` + `HYPERDHT_HOST_STRIDE`),
+> `hyperdht_add_node`, `hyperdht_remote_address`. Server listening
+> event + address: `hyperdht_server_on_listening`,
+> `hyperdht_server_address`. Async firewall:
+> `hyperdht_server_set_firewall_async` + `hyperdht_firewall_done`.
+> Telemetry + ping: `hyperdht_punch_stats_{consistent,random,open}`,
+> `hyperdht_ping`. Query cancellation: `hyperdht_query_t` opaque handle,
+> `hyperdht_query_cancel` (idempotent), `hyperdht_query_free`, and
+> cancelable `_ex` variants for `find_peer`/`lookup`/`immutable_get`/
+> `mutable_get`. New error code `HYPERDHT_ERR_CANCELLED` (-8), new
+> constants `HYPERDHT_PK_SIZE`, `HYPERDHT_HOST_STRIDE`.
+>
+> **When in doubt — read the header.**
 
 Header: `#include <hyperdht/hyperdht.h>`
 Link: `-lhyperdht -lsodium -luv` (static) or `-lhyperdht -lsodium -luv` (shared)

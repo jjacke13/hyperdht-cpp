@@ -10,40 +10,44 @@
 // ─────────────────────────────────── ────  ────────────────────────  ────────
 // client_raw_stream_firewall           62  connect.js               121-135
 //
-// HyperDHT::bind                     185  dht-rpc/index.js         157-159
-// HyperDHT::start_bootstrap_walk     296  dht-rpc/index.js         379-433
-// HyperDHT::refresh                  369  dht-rpc/index.js         435-438
-// HyperDHT::fire_network_change      425  dht-rpc/index.js         596-599
-// HyperDHT::create_raw_stream        561  hyperdht/index.js        460-462
-// HyperDHT::validate_local_addresses 602  hyperdht/index.js        135-184
-// HyperDHT::connect (entry)          672  hyperdht/index.js         80-82
+// HyperDHT::bind                     263  dht-rpc/index.js         157-159
+// HyperDHT::start_bootstrap_walk     445  dht-rpc/index.js         379-433
+// HyperDHT::refresh                  518  dht-rpc/index.js         435-438
+// HyperDHT::fire_network_change      574  dht-rpc/index.js         596-599
+// HyperDHT::create_raw_stream        724  hyperdht/index.js        460-462
+// HyperDHT::validate_local_addresses 765  hyperdht/index.js        135-184
+// HyperDHT::connect (entry)          835  hyperdht/index.js         80-82
 //
-// ConnState struct (file scope)     785  connect.js                57-93
-// do_connect                         885  connect.js                32-115
-// ├─ rawStream + firewall            923  connect.js                73, 121-135
-// ├─ Step 1: findPeer                986  connect.js               341-348
-// └─ Step 2: try_relay_fn           1004  connect.js               336-338, 355-368
-//    └─ peer_handshake              1059  connect.js               409-449
-//       └─ on_handshake_success()   (extracted, see below)
+// ConnState struct (file scope)      955  connect.js                57-93
+// do_connect                        1039  connect.js                32-115
+// ├─ rawStream + firewall                connect.js                73, 121-135
+// ├─ Step 1: findPeer                    connect.js               341-348
+// └─ Step 2: try_relay_fn                connect.js               336-338, 355-368
+//    └─ peer_handshake                   connect.js               409-449
+//       └─ on_handshake_success()        (static helper, see below)
 //
-// on_handshake_success              1576  connect.js               405-503
-// ├─ Cached firewall replay         1594  connect.js               493-496
-// ├─ BLIND RELAY start              1621  connect.js               489-491, 746-795
-// ├─ Direct connect (OPEN)          1651  connect.js               212-221
-// ├─ No-holepunch-info fallback     1670  connect.js               212-221
-// ├─ Passive wait (our fw OPEN)     1712  connect.js               228-231
-// ├─ LAN shortcut (§6)             1730  connect.js               234-251
-// └─ holepunch_connect              1775  connect.js               258-316
+// on_handshake_success              1792  connect.js               405-503
+// ├─ Cached firewall replay              connect.js               493-496
+// ├─ BLIND RELAY start                   connect.js               489-491, 746-795
+// ├─ Direct connect (OPEN)               connect.js               212-221
+// ├─ No-holepunch-info fallback          connect.js               212-221
+// ├─ Passive wait (our fw OPEN)          connect.js               228-231
+// ├─ LAN shortcut (§6)                   connect.js               234-251
+// └─ holepunch_connect                   connect.js               258-316
 //
-// start_relay_path                  1799  connect.js               746-795
-// ├─ dht.connect(relay_pk)          1826  connect.js                762
-// ├─ SecretStream + Protomux setup  1851  connect.js               764
-// ├─ BlindRelayClient.pair          1884  connect.js               767
-// └─ Wire rawStream through relay   1910  connect.js               778-784
+// start_relay_path                  2015  connect.js               746-795
+// ├─ dht.connect(relay_pk)               connect.js                762
+// ├─ SecretStream + Protomux setup       connect.js                764
+// ├─ BlindRelayClient.pair               connect.js                767
+// └─ Wire rawStream through relay        connect.js               778-784
 //
-// HyperDHT::suspend                 1529  hyperdht/index.js        106-120
-// HyperDHT::resume                  1544  hyperdht/index.js         96-104
-// HyperDHT::destroy                 1570  hyperdht/index.js        122-133
+// HyperDHT::suspend(LogFn)          1634  hyperdht/index.js        106-118
+// HyperDHT::resume(LogFn)           1669  hyperdht/index.js         96-104
+// HyperDHT::destroy                 1699  hyperdht/index.js        122-133
+// HyperDHT::destroy(DestroyOptions) 1703  hyperdht/index.js  122 (force=true)
+// HyperDHT::bootstrapper (static)        dht-rpc/index.js         104-120
+// HyperDHT::to_array / add_node          dht-rpc/index.js         216-237
+// HyperDHT::remote_address               dht-rpc/index.js         201-214
 // =========================================================================
 
 #include "hyperdht/dht.hpp"

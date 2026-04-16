@@ -8,7 +8,16 @@ Complete audit of `hyperdht-cpp` versus the JavaScript reference:
 - `@hyperswarm/secret-stream` 6.9.1
 - `blind-relay` 2.3.0
 
-**Last updated: 2026-04-16** (post reviewer-fix round 2 + live-test validation)
+**Last updated: 2026-04-16** (post reviewer-fix round 2 + live-test validation + full-surface audit)
+
+**Full-surface audit (2026-04-16):** systematic walk of all JS packages
+— `hyperdht`, `dht-rpc`, `blind-relay`, `@hyperswarm/secret-stream`,
+`noise-handshake`, `sodium-secretstream`, `protomux`,
+`compact-encoding`, `nat-sampler`, `kademlia-routing-table` — against
+our C++ tree. Wire format, protocol constants, error codes, event
+callbacks, SecretStream framing, bootstrap flow, blind relay, session
+lifecycle, and Python bindings all align. Six open API-surface items
+below; none are correctness-blocking.
 
 ---
 
@@ -140,6 +149,7 @@ exist when someone hits the ergonomics cliff.
 | 3 | `dht.toArray(opts)` | `dht-rpc/index.js:233-237` | Returns routing table as `[{host, port}, ...]`. | `socket().table()` exposes the same data via iteration. |
 | 4 | `dht.addNode({host, port})` at runtime | `dht-rpc/index.js:216-231` | We accept `opts.nodes` at construction only. | `socket_->table().add(node)` internally (not a public API). |
 | 5 | `dht.remoteAddress()` | `dht-rpc/index.js:201-214` | Return `{host, port}` of our public address as seen by the NAT sampler. | `socket().nat_sampler().host()` + `.port()` / `.addresses()[0]`. |
+| 6 | Async `firewall(pk, payload, addr)` callback | `hyperdht/lib/server.js:251` (`await this.firewall(...)`) | JS awaits the return value, so the callback can return a Promise — enabling async policy lookups (DB, remote check). Our `Server::FirewallCb` returns `bool` synchronously. | Pre-cache the allow/block set in memory before `set_firewall`, or refactor to a completion-callback signature `void(pk, payload, addr, std::function<void(bool)>)` when this actually matters for a consumer. Not a silent bug — a C++ lambda that tries to return a `std::future<bool>` fails to compile against the current signature. |
 
 ---
 

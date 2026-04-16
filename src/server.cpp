@@ -9,43 +9,51 @@
 //
 // C++ function                       Line  JS file (server.js)       JS lines
 // ─────────────────────────────────── ────  ────────────────────────  ────────
-// Server::listen                      116  server.js                143-196
-// Server::close                       166  server.js                 88-129
-// Server::refresh                     202  server.js                198-200
-// Server::notify_online               212  server.js                202-204
-// Server::suspend                     228  server.js                 63-76
-// Server::resume                      250  server.js                 72-76
-// Server::address                     259  server.js                 78-86
+// Server::listen                      124  server.js                143-196
+// Server::close                       174  server.js                 88-129
+// Server::refresh                     208  server.js                198-200
+// Server::notify_online               218  server.js                202-204
+// Server::suspend                     234  server.js                 63-76
+// Server::resume                      248  server.js                 72-76
 //
-// Server::on_peer_handshake           300  server.js  464-481 (_onpeerhandshake)
+// Server::on_peer_handshake           298  server.js  464-481 (_onpeerhandshake)
 //                                                     210-443 (_addHandshake)
 //   ├─ Noise dedup                    310  server.js                265-279
-//   ├─ handle_handshake call          366  server.js                237-388
-//   ├─ rawStream + firewall           387  server.js                280-303
-//   ├─ session timer (10s)            418  server.js  431, 440 (prepunching)
-//   └─ OPEN shortcut → on_socket      409  server.js                390-394
+//   ├─ handle_handshake call          378  server.js                237-388
+//   ├─ rawStream + firewall           404  server.js                280-303
+//   ├─ blind relay start (Phase E)    423  server.js                397-399, 625-685
+//   ├─ OPEN shortcut → on_socket      560  server.js                390-394
+//   └─ session timer (UvTimer)        614  server.js  431, 440 (prepunching)
 //
-// Server::on_peer_holepunch           454  server.js                483-600
-//   ├─ handle_holepunch call          487  server.js                492-516
-//   ├─ holepunch veto callback        502  server.js                544-546
-//   ├─ puncher creation               512  server.js                436-440
-//   └─ puncher->punch()               527  server.js                576
+// Server::on_peer_holepunch           644  server.js                483-600
+//   ├─ handle_holepunch call          672  server.js                492-516
+//   ├─ holepunch veto callback        727  server.js                544-546
+//   ├─ puncher creation               737  server.js                436-440
+//   ├─ puncher->punch()               778  server.js                576
+//   └─ probe echo listener (add_*)    790  server.js  (always-on echo handler)
 //
-// Server::on_socket                   557  server.js                305-342
-// Server::clear_session               596  server.js                450-462
-// Server::on_raw_stream_firewall      619  server.js                282-291
+// Server::on_socket                   803  server.js                305-342
+// Server::clear_session               842  server.js                450-462
+// Server::on_raw_stream_firewall      866  server.js                282-291
 //
 // =========================================================================
 //
 // C++ diffs from JS:
-//   - Per-session timers stored in `session_timers_` map<id,uv_timer_t*>
-//     vs JS clearing setTimeouts on the `hs` object directly.
+//   - Per-session timers stored in `session_timers_` map<id, unique_ptr<UvTimer>>
+//     vs JS clearing setTimeouts on the `hs` object directly. UvTimer is an
+//     RAII wrapper — timer stop + uv_close happen in its destructor, so erasing
+//     from the map is sufficient cleanup.
 //   - Handshake dedup uses `handshake_dedup_` map<noise_hex, hp_id>
 //     vs JS `_connects` Map<noise_hex, Promise<hs>>.
-//   - rawStream firewall ctx is heap-allocated `RawStreamCtx*` so the
-//     C callback can route back to `Server::on_raw_stream_firewall`.
+//   - rawStream firewall ctx (`RawStreamCtx*`) stored in stream->data; freed
+//     by the stream's on_close callback (RAII — guaranteed regardless of which
+//     libudx callback path fires first).
 //   - Holepunch state lives in unique_ptr<ServerConnection> in
 //     `connections_` (no JS-style sparse array of `_holepunches`).
+//   - Probe echo is a single global listener installed on first holepunch via
+//     `add_probe_listener` (multi-listener API), tracked in `probe_listener_id_`
+//     and removed on close(). Previously overwrote a single slot per session,
+//     which silently clobbered concurrent holepunch sessions.
 
 #include "hyperdht/server.hpp"
 
@@ -842,7 +850,8 @@ void Server::clear_session(uint32_t hp_id) {
     for (auto dit = handshake_dedup_.begin(); dit != handshake_dedup_.end(); ++dit) {
         if (dit->second == hp_id) { handshake_dedup_.erase(dit); break; }
     }
-    // Remove session timer (already fired, but clean the map)
+    // Erase session timer (UvTimer RAII handles stop + close).
+    // Safe whether the timer fired this call or is being cancelled early.
     session_timers_.erase(hp_id);
     // Erase connection (destructor handles raw_stream cleanup)
     connections_.erase(it);

@@ -18,19 +18,28 @@
 // HyperDHT::validate_local_addresses 602  hyperdht/index.js        135-184
 // HyperDHT::connect (entry)          672  hyperdht/index.js         80-82
 //
-// do_connect                         780  connect.js                32-115
-// ├─ ConnState struct                788  connect.js                57-93
-// ├─ relay state in ConnState        808  connect.js                86-92
-// ├─ rawStream + firewall            863  connect.js                73, 121-135
-// ├─ Step 1: findPeer                922  connect.js               341-348
-// ├─ Step 2: try_relay_fn            940  connect.js               336-338, 355-368
-// │  └─ peer_handshake (+ relay)     995  connect.js               409-449
-// ├─ BLIND RELAY start (Phase E)    1053  connect.js               489-491, 746-795
-// ├─ OPEN firewall shortcut         1127  connect.js               212-221
-// ├─ No-holepunch-info fallback     1146  connect.js               212-221
-// ├─ Passive wait (our fw OPEN)     1188  connect.js               228-231
-// ├─ LAN shortcut (§6)             1209  connect.js               234-251
-// └─ holepunch_connect              1297  connect.js               258-316
+// ConnState struct (file scope)     785  connect.js                57-93
+// do_connect                         885  connect.js                32-115
+// ├─ rawStream + firewall            923  connect.js                73, 121-135
+// ├─ Step 1: findPeer                986  connect.js               341-348
+// └─ Step 2: try_relay_fn           1004  connect.js               336-338, 355-368
+//    └─ peer_handshake              1059  connect.js               409-449
+//       └─ on_handshake_success()   (extracted, see below)
+//
+// on_handshake_success              1576  connect.js               405-503
+// ├─ Cached firewall replay         1594  connect.js               493-496
+// ├─ BLIND RELAY start              1621  connect.js               489-491, 746-795
+// ├─ Direct connect (OPEN)          1651  connect.js               212-221
+// ├─ No-holepunch-info fallback     1670  connect.js               212-221
+// ├─ Passive wait (our fw OPEN)     1712  connect.js               228-231
+// ├─ LAN shortcut (§6)             1730  connect.js               234-251
+// └─ holepunch_connect              1775  connect.js               258-316
+//
+// start_relay_path                  1799  connect.js               746-795
+// ├─ dht.connect(relay_pk)          1826  connect.js                762
+// ├─ SecretStream + Protomux setup  1851  connect.js               764
+// ├─ BlindRelayClient.pair          1884  connect.js               767
+// └─ Wire rawStream through relay   1910  connect.js               778-784
 //
 // HyperDHT::suspend                 1529  hyperdht/index.js        106-120
 // HyperDHT::resume                  1544  hyperdht/index.js         96-104
@@ -753,12 +762,22 @@ void HyperDHT::connect(const noise::PubKey& remote_public_key,
 }
 
 // ---------------------------------------------------------------------------
-// do_connect — orchestrates findPeer → handshake → holepunch → ready.
+// Connect pipeline — findPeer → handshake → (relay | direct | LAN | holepunch)
 //
 // JS: .analysis/js/hyperdht/lib/connect.js:176-194 (connectAndHolepunch)
 //     .analysis/js/hyperdht/lib/connect.js:318-384 (findAndConnect)
 //     .analysis/js/hyperdht/lib/connect.js:386-503 (connectThroughNode)
 //     .analysis/js/hyperdht/lib/connect.js:205-316 (holepunch)
+//     .analysis/js/hyperdht/lib/connect.js:746-795 (relayConnection)
+//
+// Structure (post-refactor):
+//   do_connect                 — setup, rawStream, findPeer, try_relay_fn
+//   └─ on_handshake_success    — post-handshake dispatch (6 paths)
+//      ├─ direct / OPEN        — no holepunch needed
+//      ├─ passive wait         — our firewall is OPEN, server probes us
+//      ├─ LAN shortcut (§6)    — same NAT, ping local address
+//      ├─ holepunch_connect    — full 2-round relay + UDP probe
+//      └─ start_relay_path     — blind relay (Phase E)
 //
 // C++ diffs from JS:
 //   - No async/await: a ConnState shared_ptr is threaded through nested
@@ -769,104 +788,125 @@ void HyperDHT::connect(const noise::PubKey& remote_public_key,
 //     two attempts up front but otherwise advances on failure.
 //   - `alive` weak_ptr sentinel replaces JS's `dht.destroyed` and
 //     `c.encryptedSocket.destroying` checks.
-//   - Client rawStream + firewall callback are created lazily (after the
-//     handshake completes) rather than at connect() time as in JS
-//     (connect.js:73). The firewall hook still mirrors JS's behaviour:
-//     fire `c.onsocket` when the server's first packet arrives.
+//   - Client rawStream + firewall callback are created eagerly at connect()
+//     time (matching JS connect.js:73). Server's first UDX packet that
+//     arrives before the handshake reply is cached via cached_fw_socket
+//     and replayed in on_handshake_success.
 //   - LAN shortcut (§6) and holepunch run in parallel — first to complete
 //     wins via `state->completed`. JS aborts on LAN ping failure
 //     (connect.js:243-246); we fall through to holepunch instead.
+//   - Blind relay (Phase E) also runs in parallel with holepunch — matches
+//     JS connect.js:489-491 (if either side has relayThrough, relay fires).
+// ---------------------------------------------------------------------------
+// ConnState — shared state for the async connect pipeline.
+// Extracted to namespace scope so helper functions (on_handshake_success,
+// start_relay_path) can reference it. Previously nested inside do_connect.
+// ---------------------------------------------------------------------------
+struct ConnState {
+    noise::PubKey remote_pk;
+    noise::Keypair keypair;
+    ConnectCallback on_done;
+    compact::Ipv4Address relay_addr;
+    std::vector<compact::Ipv4Address> relays;  // All relays from findPeer
+    int relay_idx = -1;  // Current retry index (counts down from end)
+    peer_connect::HandshakeResult hs_result;
+    std::shared_ptr<query::Query> query;
+    std::shared_ptr<std::function<void()>> try_relay_fn;  // Relay retry loop
+    std::weak_ptr<bool> alive;  // Sentinel — expired if HyperDHT destroyed
+    rpc::RpcSocket* socket = nullptr;  // Raw pointer, guarded by alive
+    HyperDHT* dht = nullptr;  // Raw pointer, guarded by alive
+    bool found = false;
+    uint32_t our_udx_id = 0;
+    udx_stream_t* raw_stream = nullptr;  // Client rawStream (like JS)
+    bool completed = false;
+
+    // Cached early firewall event — JS: c.serverSocket / c.serverAddress.
+    // If the server's first UDX packet arrives BEFORE the handshake reply,
+    // cache the firewall info here and replay it after hs_result is set.
+    udx_socket_t* cached_fw_socket = nullptr;
+    compact::Ipv4Address cached_fw_address;
+    // Passive wait timer (OPEN firewall path) — RAII
+    std::unique_ptr<async_utils::UvTimer> passive_timer;
+    // §6 ConnectOptions snapshot (copied, not referenced — opts may
+    // outlive the original scope once we enter async territory).
+    bool fast_open = true;
+    bool local_connection = true;
+
+    // Phase E: blind-relay config (from ConnectOptions)
+    std::optional<noise::PubKey> relay_through;
+    std::array<uint8_t, 32> relay_token{};
+    uint64_t relay_keep_alive = 5000;
+
+    // Phase E: relay connection state — RAII struct that guarantees
+    // correct teardown order regardless of destruction path.
+    struct RelayState {
+        bool paired = false;
+        std::unique_ptr<async_utils::UvTimer> timeout;
+        // Connection resources in dependency order (destroyed bottom-up):
+        std::unique_ptr<blind_relay::BlindRelayClient> client;
+        std::unique_ptr<protomux::Mux> mux;
+        std::unique_ptr<secret_stream::SecretStreamDuplex> duplex;
+        udx_stream_t* raw_stream = nullptr;  // owned by duplex
+
+        ~RelayState() {
+            client.reset();
+            mux.reset();
+            duplex.reset();
+            raw_stream = nullptr;
+            timeout.reset();  // UvTimer RAII handles stop + close
+        }
+    };
+    std::unique_ptr<RelayState> relay;
+
+    ~ConnState() {
+        // Clean up rawStream if not transferred to ConnectResult.
+        // Context is freed by the stream's on_close callback (RAII).
+        if (raw_stream) {
+            udx_stream_destroy(raw_stream);
+        }
+        // Relay cleanup is handled by RelayState's destructor
+        relay.reset();
+    }
+
+    void complete(int err, const ConnectResult& result = {}) {
+        if (completed) return;  // Prevent double invocation (firewall + holepunch race)
+        completed = true;
+        auto cb = std::move(on_done);
+        on_done = nullptr;
+        if (cb) cb(err, result);
+    }
+
+    // Transfer rawStream ownership to result, cleaning up firewall ctx
+    void take_raw_stream(ConnectResult& result) {
+        if (raw_stream) {
+            // Detach context — stream's on_close will handle cleanup
+            raw_stream->data = nullptr;
+            result.raw_stream = raw_stream;
+            raw_stream = nullptr;
+        }
+    }
+};
+
+// Forward declarations for helper functions extracted from do_connect.
+// See definitions below.
+static void on_handshake_success(std::shared_ptr<ConnState> state,
+                                  const peer_connect::HandshakeResult& hs);
+static void start_relay_path(std::shared_ptr<ConnState> state,
+                              bool is_initiator,
+                              noise::PubKey relay_pk,
+                              blind_relay::Token relay_token);
+
+// ---------------------------------------------------------------------------
+// do_connect — entry point for HyperDHT::connect().
+//
+// Orchestrates: findPeer → peer_handshake (with Semaphore(2) retry) →
+// on_handshake_success (post-handshake decision tree).
 // ---------------------------------------------------------------------------
 void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                            const noise::Keypair& keypair,
                            const ConnectOptions& opts,
                            ConnectCallback on_done) {
 
-    // State shared across the async pipeline
-    struct ConnState {
-        noise::PubKey remote_pk;
-        noise::Keypair keypair;
-        ConnectCallback on_done;
-        compact::Ipv4Address relay_addr;
-        std::vector<compact::Ipv4Address> relays;  // All relays from findPeer
-        int relay_idx = -1;  // Current retry index (counts down from end)
-        peer_connect::HandshakeResult hs_result;
-        std::shared_ptr<query::Query> query;
-        std::shared_ptr<std::function<void()>> try_relay_fn;  // Relay retry loop
-        std::weak_ptr<bool> alive;  // Sentinel — expired if HyperDHT destroyed
-        rpc::RpcSocket* socket = nullptr;  // Raw pointer, guarded by alive
-        HyperDHT* dht = nullptr;  // Raw pointer, guarded by alive
-        bool found = false;
-        uint32_t our_udx_id = 0;
-        udx_stream_t* raw_stream = nullptr;  // Client rawStream (like JS)
-        bool completed = false;
-
-        // Cached early firewall event — JS: c.serverSocket / c.serverAddress.
-        // If the server's first UDX packet arrives BEFORE the handshake reply,
-        // cache the firewall info here and replay it after hs_result is set.
-        udx_socket_t* cached_fw_socket = nullptr;
-        compact::Ipv4Address cached_fw_address;
-        // Passive wait timer (OPEN firewall path) — RAII
-        std::unique_ptr<async_utils::UvTimer> passive_timer;
-        // §6 ConnectOptions snapshot (copied, not referenced — opts may
-        // outlive the original scope once we enter async territory).
-        bool fast_open = true;
-        bool local_connection = true;
-
-        // Phase E: blind-relay config (from ConnectOptions)
-        std::optional<noise::PubKey> relay_through;
-        std::array<uint8_t, 32> relay_token{};
-        uint64_t relay_keep_alive = 5000;
-
-        // Phase E: relay connection state — RAII struct that guarantees
-        // correct teardown order regardless of destruction path.
-        struct RelayState {
-            bool paired = false;
-            std::unique_ptr<async_utils::UvTimer> timeout;
-            // Connection resources in dependency order (destroyed bottom-up):
-            std::unique_ptr<blind_relay::BlindRelayClient> client;
-            std::unique_ptr<protomux::Mux> mux;
-            std::unique_ptr<secret_stream::SecretStreamDuplex> duplex;
-            udx_stream_t* raw_stream = nullptr;  // owned by duplex
-
-            ~RelayState() {
-                client.reset();
-                mux.reset();
-                duplex.reset();
-                raw_stream = nullptr;
-                timeout.reset();  // UvTimer RAII handles stop + close
-            }
-        };
-        std::unique_ptr<RelayState> relay;
-
-        ~ConnState() {
-            // Clean up rawStream if not transferred to ConnectResult.
-            // Context is freed by the stream's on_close callback (RAII).
-            if (raw_stream) {
-                udx_stream_destroy(raw_stream);
-            }
-            // Relay cleanup is handled by RelayState's destructor
-            relay.reset();
-        }
-
-        void complete(int err, const ConnectResult& result = {}) {
-            if (completed) return;  // Prevent double invocation (firewall + holepunch race)
-            completed = true;
-            auto cb = std::move(on_done);
-            on_done = nullptr;
-            if (cb) cb(err, result);
-        }
-
-        // Transfer rawStream ownership to result, cleaning up firewall ctx
-        void take_raw_stream(ConnectResult& result) {
-            if (raw_stream) {
-                // Detach context — stream's on_close will handle cleanup
-                raw_stream->data = nullptr;
-                result.raw_stream = raw_stream;
-                raw_stream = nullptr;
-            }
-        }
-    };
 
     auto state = std::make_shared<ConnState>();
     state->remote_pk = remote_pk;
@@ -1082,441 +1122,8 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                         // address expects hs1's UDX IDs.
                         if (state->hs_result.success) return;
                         state->try_relay_fn.reset();  // Break cycle
-                    state->hs_result = hs;
-
-                    // Replay cached firewall event if server's first packet
-                    // arrived before the handshake reply. JS: connect.js:493-496
-                    //   if (c.serverSocket) { c.onsocket(c.serverSocket, ...); return }
-                    if (state->cached_fw_socket && !state->completed) {
-                        DHT_LOG("  [connect] Replaying cached firewall event\n");
-                        ConnectResult result;
-                        result.success = true;
-                        result.tx_key = hs.tx_key;
-                        result.rx_key = hs.rx_key;
-                        result.handshake_hash = hs.handshake_hash;
-                        result.remote_public_key = hs.remote_public_key;
-                        result.peer_address = state->cached_fw_address;
-                        result.udx_socket = state->cached_fw_socket;
-                        result.local_udx_id = state->our_udx_id;
-                        if (hs.remote_payload.udx.has_value()) {
-                            result.remote_udx_id = hs.remote_payload.udx->id;
-                        }
-                        state->take_raw_stream(result);
-                        state->complete(0, result);
-                        return;
-                    }
-
-                    // Log the server's handshake reply
-                    DHT_LOG("  [connect] Server reply: fw=%u, addrs4=%zu, hp=%s, relays=%zu, "
-                            "relayThrough=%s\n",
-                            hs.remote_payload.firewall,
-                            hs.remote_payload.addresses4.size(),
-                            hs.remote_payload.holepunch.has_value() ? "yes" : "no",
-                            hs.remote_payload.holepunch.has_value()
-                                ? hs.remote_payload.holepunch->relays.size() : 0,
-                            hs.remote_payload.relay_through.has_value() ? "yes" : "no");
-
-                    // Phase E: Start blind relay if either side has relayThrough.
-                    // JS: connect.js:489-491 — if (payload.relayThrough || c.relayThrough)
-                    //     relayConnection(c, c.relayThrough, payload, hs)
-                    // This runs in PARALLEL with holepunch (not sequential).
-                    // First to complete wins via state->completed.
-                    if (hs.remote_payload.relay_through.has_value() ||
-                        state->relay_through.has_value()) {
-                        // Determine role: who proposed the relay?
-                        bool is_initiator;
-                        noise::PubKey relay_pk;
-                        blind_relay::Token relay_token;
-
-                        if (hs.remote_payload.relay_through.has_value()) {
-                            // Server proposed relay — we're non-initiator
-                            is_initiator = false;
-                            relay_pk = hs.remote_payload.relay_through->public_key;
-                            relay_token = hs.remote_payload.relay_through->token;
-                        } else {
-                            // We proposed relay — we're initiator
-                            is_initiator = true;
-                            relay_pk = *state->relay_through;
-                            relay_token = state->relay_token;
-                        }
-                        state->relay_token = relay_token;
-
-                        DHT_LOG("  [connect] Starting blind relay: initiator=%d, "
-                                "relay_pk=%02x%02x...\n",
-                                is_initiator, relay_pk[0], relay_pk[1]);
-
-                        // Create relay state (RAII — destructor handles teardown)
-                        state->relay = std::make_unique<ConnState::RelayState>();
-
-                        if (state->dht) {
-                            state->dht->relay_stats().attempts++;
-                        }
-
-                        // 15-second timeout for relay pairing (RAII — auto-cleaned)
-                        // JS: connect.js:765 — c.relayTimeout = setTimeout(onabort, 15000)
-                        state->relay->timeout = std::make_unique<async_utils::UvTimer>(
-                            state->dht->loop());
-                        state->relay->timeout->start([state]() {
-                            if (!state->completed) {
-                                DHT_LOG("  [connect] Relay pairing timed out (15s)\n");
-                                if (state->dht) {
-                                    state->dht->relay_stats().aborts++;
-                                }
-                            }
-                        }, blind_relay::RELAY_TIMEOUT_MS);
-
-                        // Step 1: Connect to the relay node via normal DHT connect.
-                        // JS: connect.js:762 — c.relaySocket = c.dht.connect(publicKey)
-                        // This is a recursive connect() — we connect to the relay
-                        // node to get a SecretStream, then layer Protomux + blind-relay
-                        // over it to pair our rawStream through the relay.
-                        auto relay_is_initiator = is_initiator;
-                        auto relay_tok = relay_token;
-                        state->dht->connect(relay_pk,
-                            [state, relay_is_initiator, relay_tok](
-                                int err, const ConnectResult& relay_result) {
-                            if (state->completed || state->alive.expired()) return;
-                            if (err != 0 || !relay_result.success) {
-                                DHT_LOG("  [connect] Relay connect to relay node failed: %d\n", err);
-                                if (state->dht) state->dht->relay_stats().aborts++;
-                                return;  // Holepunch path may still succeed
-                            }
-
-                            DHT_LOG("  [connect] Connected to relay node, setting up Protomux\n");
-
-                            // Step 2: Create SecretStream over the relay connection.
-                            // JS: dht.connect() returns a NoiseSecretStream which wraps
-                            // the rawStream. We do the same: wrap relay_result.raw_stream
-                            // in a SecretStreamDuplex.
-                            state->relay->raw_stream = relay_result.raw_stream;
-
-                            secret_stream::DuplexHandshake relay_hs;
-                            relay_hs.tx_key = relay_result.tx_key;
-                            relay_hs.rx_key = relay_result.rx_key;
-                            relay_hs.handshake_hash = relay_result.handshake_hash;
-                            relay_hs.remote_public_key = relay_result.remote_public_key;
-                            relay_hs.is_initiator = true;
-
-                            auto duplex_opts = state->dht->make_duplex_options();
-                            duplex_opts.keep_alive_ms = state->relay_keep_alive;
-
-                            // Connect the raw stream to the relay node's address
-                            if (relay_result.udx_socket && relay_result.raw_stream) {
-                                struct sockaddr_in relay_addr{};
-                                relay_addr.sin_family = AF_INET;
-                                relay_addr.sin_port = htons(relay_result.peer_address.port);
-                                uv_ip4_addr(relay_result.peer_address.host_string().c_str(),
-                                            relay_result.peer_address.port,
-                                            &relay_addr);
-                                udx_stream_connect(relay_result.raw_stream,
-                                                   relay_result.udx_socket,
-                                                   relay_result.remote_udx_id,
-                                                   reinterpret_cast<const struct sockaddr*>(&relay_addr));
-                            }
-
-                            state->relay->duplex = std::make_unique<secret_stream::SecretStreamDuplex>(
-                                relay_result.raw_stream, relay_hs,
-                                state->dht->loop(), duplex_opts);
-
-                            // Step 3: Create Protomux over the SecretStream.
-                            // JS: Protomux.from(stream) — creates mux from stream
-                            state->relay->mux = std::make_unique<protomux::Mux>(
-                                [duplex = state->relay->duplex.get()](
-                                    const uint8_t* data, size_t len) -> bool {
-                                    if (!duplex) return false;
-                                    duplex->write(data, len, nullptr);
-                                    return true;
-                                });
-
-                            // Wire SecretStream on_message → Protomux on_data
-                            state->relay->duplex->on_message(
-                                [mux = state->relay->mux.get()](
-                                    const uint8_t* data, size_t len) {
-                                    if (mux && !mux->is_destroyed()) {
-                                        mux->on_data(data, len);
-                                    }
-                                });
-
-                            state->relay->duplex->start();
-
-                            // Step 4: Create BlindRelayClient over the Protomux channel.
-                            // JS: relay.Client.from(relaySocket, { id: relaySocket.publicKey })
-                            std::vector<uint8_t> channel_id(
-                                relay_result.remote_public_key.begin(),
-                                relay_result.remote_public_key.end());
-                            auto* channel = state->relay->mux->create_channel(
-                                blind_relay::PROTOCOL_NAME, channel_id, false);
-                            if (!channel) {
-                                DHT_LOG("  [connect] Failed to create blind-relay channel\n");
-                                if (state->dht) state->dht->relay_stats().aborts++;
-                                return;
-                            }
-
-                            state->relay->client = std::make_unique<blind_relay::BlindRelayClient>(channel);
-                            state->relay->client->open();
-
-                            // Step 5: Pair our rawStream through the relay.
-                            // JS: c.relayClient.pair(isInitiator, token, c.rawStream)
-                            //     .on('data', (remoteId) => { ... })
-                            state->relay->client->pair(
-                                relay_is_initiator, relay_tok, state->our_udx_id,
-                                [state](uint32_t remote_id) {
-                                    // Pair success!
-                                    if (state->completed || state->alive.expired()) return;
-
-                                    DHT_LOG("  [connect] Relay pairing succeeded! remote_id=%u\n",
-                                            remote_id);
-
-                                    // Cancel timeout (RAII handles cleanup)
-                                    state->relay->timeout.reset();
-
-                                    state->relay->paired = true;
-                                    if (state->dht) state->dht->relay_stats().successes++;
-
-                                    // Step 6: Wire our rawStream through the relay.
-                                    // JS: const { remotePort, remoteHost, socket } = c.relaySocket.rawStream
-                                    //     c.rawStream.connect(socket, remoteId, remotePort, remoteHost)
-                                    auto* relay_raw = state->relay->raw_stream;
-                                    if (!relay_raw || !state->raw_stream) {
-                                        DHT_LOG("  [connect] Relay paired but streams gone\n");
-                                        return;
-                                    }
-
-                                    // Extract relay node's address from the relay raw stream
-                                    auto* relay_addr = reinterpret_cast<const struct sockaddr_in*>(
-                                        &relay_raw->remote_addr);
-                                    udx_socket_t* relay_socket = relay_raw->socket;
-
-                                    // Connect our original rawStream through the relay
-                                    udx_stream_connect(state->raw_stream, relay_socket,
-                                                       remote_id,
-                                                       reinterpret_cast<const struct sockaddr*>(relay_addr));
-
-                                    // Complete the connection
-                                    ConnectResult result;
-                                    result.success = true;
-                                    result.tx_key = state->hs_result.tx_key;
-                                    result.rx_key = state->hs_result.rx_key;
-                                    result.handshake_hash = state->hs_result.handshake_hash;
-                                    result.remote_public_key = state->hs_result.remote_public_key;
-
-                                    char host[INET_ADDRSTRLEN];
-                                    uv_ip4_name(relay_addr, host, sizeof(host));
-                                    result.peer_address = compact::Ipv4Address::from_string(
-                                        host, ntohs(relay_addr->sin_port));
-
-                                    result.udx_socket = relay_socket;
-                                    result.local_udx_id = state->our_udx_id;
-                                    if (state->hs_result.remote_payload.udx.has_value()) {
-                                        result.remote_udx_id =
-                                            state->hs_result.remote_payload.udx->id;
-                                    }
-                                    state->take_raw_stream(result);
-                                    state->complete(0, result);
-                                },
-                                [state](int err) {
-                                    // Pair error — relay failed, holepunch may still work
-                                    if (state->completed) return;
-                                    DHT_LOG("  [connect] Relay pairing failed: %d\n", err);
-                                    if (state->dht) state->dht->relay_stats().aborts++;
-                                });
-                        });  // end dht->connect(relay_pk) callback
-                    }
-
-                    // Check for direct connect (OPEN firewall)
-                    holepunch::HolepunchResult hp_result;
-                    if (holepunch::try_direct_connect(hs, hp_result)) {
-                        ConnectResult result;
-                        result.success = true;
-                        result.tx_key = hs.tx_key;
-                        result.rx_key = hs.rx_key;
-                        result.handshake_hash = hs.handshake_hash;
-                        result.remote_public_key = hs.remote_public_key;
-                        result.peer_address = hp_result.address;
-                        result.local_udx_id = state->our_udx_id;
-                        if (hs.remote_payload.udx.has_value()) {
-                            result.remote_udx_id = hs.remote_payload.udx->id;
-                        }
-                        state->take_raw_stream(result);
-                        state->complete(0, result);
-                        return;
-                    }
-
-                    // JS: if no holepunch info (server is OPEN or unreachable
-                    // for holepunching), try direct connect using addresses
-                    if (!hs.remote_payload.holepunch.has_value() ||
-                        hs.remote_payload.holepunch->relays.empty()) {
-                        // Use first address from the server's payload
-                        if (!hs.remote_payload.addresses4.empty()) {
-                            ConnectResult result;
-                            result.success = true;
-                            result.tx_key = hs.tx_key;
-                            result.rx_key = hs.rx_key;
-                            result.handshake_hash = hs.handshake_hash;
-                            result.remote_public_key = hs.remote_public_key;
-                            result.peer_address = hs.remote_payload.addresses4[0];
-                            result.local_udx_id = state->our_udx_id;
-                            if (hs.remote_payload.udx.has_value()) {
-                                result.remote_udx_id = hs.remote_payload.udx->id;
-                            }
-                            state->take_raw_stream(result);
-                            state->complete(0, result);
-                        } else {
-                            state->complete(ConnectError::NO_ADDRESSES);
-                        }
-                        return;
-                    }
-
-                    auto& hp_info = *hs.remote_payload.holepunch;
-
-                    // Use handshake relay if in holepunch relay list
-                    auto hp_relay = hp_info.relays[0].relay_address;
-                    auto hp_peer = hp_info.relays[0].peer_address;
-                    for (const auto& r : hp_info.relays) {
-                        if (r.relay_address.host_string() == state->relay_addr.host_string() &&
-                            r.relay_address.port == state->relay_addr.port) {
-                            hp_relay = r.relay_address;
-                            hp_peer = r.peer_address;
-                            break;
-                        }
-                    }
-
-                    auto fw = state->socket->nat_sampler().firewall();
-                    auto addrs = state->socket->nat_sampler().addresses();
-
-                    // JS: if our firewall is OPEN, wait passively for server
-                    // to probe us (via rawStream firewall callback). 10s timeout.
-                    // JS: connect.js:228-231 — passive wait when our firewall is OPEN
-                    if (fw == peer_connect::FIREWALL_OPEN) {
-                        DHT_LOG("  [connect] Our firewall is OPEN, waiting passively (10s)\n");
-                        // B7: JS cancels this timer explicitly in onsocket.
-                        // C++ uses `completed` guard instead — the timer fires
-                        // as a harmless no-op if rawStream firewall already completed.
-                        // Functionally equivalent, minor resource difference.
-                        state->passive_timer = std::make_unique<async_utils::UvTimer>(
-                            state->socket->loop());
-                        state->passive_timer->start([state]() {
-                            if (!state->completed) {
-                                state->complete(ConnectError::HOLEPUNCH_TIMEOUT);
-                            }
-                        }, 10000);
-                        return;
-                    }
-
-                    // --- §6: localConnection LAN shortcut ------------------
-                    // JS: connect.js:234-251 — if (a) the connection went
-                    // through a relay (server's address differs from the
-                    // relay's), AND (b) our public IP matches the server's
-                    // public IP (both behind the same NAT), AND (c) the
-                    // server advertises addresses we can match against,
-                    // pick the best match (fall back to addresses[0] when
-                    // no octet match), ping it, and short-circuit holepunch.
-                    //
-                    // Differences from JS:
-                    //   - JS uses `clientAddress.host === serverAddress.host`
-                    //     where clientAddress is from the peerHandshake reply's
-                    //     `to` field. We approximate with the NAT-sampler host
-                    //     (our public IP as seen by other nodes). Close enough:
-                    //     both represent "our public-facing IP".
-                    //   - JS filters by `isReserved()` (loopback/multicast/etc).
-                    //     We pass server addresses through as-is. Worst case
-                    //     is a wasted ping to 127.0.0.1 — defensive filtering
-                    //     can be a follow-up if it ever bites in production.
-                    //     Tracked in docs/JS-PARITY-GAPS.md §6 polish.
-                    //   - On ping failure, JS aborts the connect. We fall
-                    //     through to the holepunch path instead (more robust
-                    //     when the LAN link is flaky but the public path works).
-                    {
-                        const bool relayed = !hs.remote_payload.addresses4.empty() &&
-                            (hs.remote_payload.addresses4[0] != state->relay_addr);
-
-                        if (state->local_connection && relayed &&
-                            !state->socket->nat_sampler().host().empty() &&
-                            state->socket->nat_sampler().host() ==
-                                hs.remote_payload.addresses4[0].host_string()) {
-
-                            // Port=0: only the host octets matter for matching.
-                            // local_addresses() walks libuv interface enumeration.
-                            auto my_local = holepunch::local_addresses(0);
-                            auto matched = holepunch::match_address(
-                                my_local, hs.remote_payload.addresses4);
-
-                            // JS fallback (connect.js:239):
-                            //   const addr = matchAddress(...) || serverAddresses[0]
-                            // Use the first server address when no octet match.
-                            auto lan_addr = matched.value_or(
-                                hs.remote_payload.addresses4[0]);
-
-                            DHT_LOG("  [connect] LAN shortcut: target %s:%u "
-                                    "(matched=%s)\n",
-                                    lan_addr.host_string().c_str(), lan_addr.port,
-                                    matched.has_value() ? "yes" : "fallback");
-
-                            // state->dht is set unconditionally in do_connect
-                            // setup, so the assert documents the invariant.
-                            assert(state->dht && "ConnState::dht must be set");
-                            state->dht->ping(lan_addr,
-                                [state, lan_addr](bool ok) {
-                                    if (state->completed) return;
-                                    if (!ok) {
-                                        DHT_LOG("  [connect] LAN ping failed, "
-                                                "falling back to holepunch\n");
-                                        return;  // holepunch path runs in parallel
-                                    }
-                                    DHT_LOG("  [connect] LAN ping OK — "
-                                            "short-circuiting connect\n");
-                                    ConnectResult result;
-                                    result.success = true;
-                                    result.tx_key = state->hs_result.tx_key;
-                                    result.rx_key = state->hs_result.rx_key;
-                                    result.handshake_hash =
-                                        state->hs_result.handshake_hash;
-                                    result.remote_public_key =
-                                        state->hs_result.remote_public_key;
-                                    result.peer_address = lan_addr;
-                                    result.local_udx_id = state->our_udx_id;
-                                    if (state->hs_result.remote_payload.udx
-                                            .has_value()) {
-                                        result.remote_udx_id =
-                                            state->hs_result.remote_payload.udx->id;
-                                    }
-                                    state->take_raw_stream(result);
-                                    state->complete(0, result);
-                                });
-                            // Note: we do NOT return here. The holepunch below
-                            // runs in parallel so a slow LAN ping doesn't block
-                            // the connect — whichever path completes first wins
-                            // via `state->completed`.
-                        }
-                    }
-                    // --- end §6 LAN shortcut ------------------------------
-
-                    holepunch::holepunch_connect(*state->socket, hs,
-                        hp_relay, hp_peer, hp_info.id, fw, addrs,
-                        [state](const holepunch::HolepunchResult& hp) {
-                            if (state->completed) return;  // rawStream firewall already connected
-                            if (state->alive.expired() || !hp.success) {
-                                state->complete(ConnectError::HOLEPUNCH_FAILED);
-                                return;
-                            }
-
-                            ConnectResult result;
-                            result.success = true;
-                            result.tx_key = state->hs_result.tx_key;
-                            result.rx_key = state->hs_result.rx_key;
-                            result.handshake_hash = state->hs_result.handshake_hash;
-                            result.remote_public_key = state->hs_result.remote_public_key;
-                            result.peer_address = hp.address;
-                            result.udx_socket = hp.socket;  // JS: ref.socket from probe
-                            result.socket_keepalive = hp.socket_keepalive;
-                            result.local_udx_id = state->our_udx_id;
-                            if (state->hs_result.remote_payload.udx.has_value()) {
-                                result.remote_udx_id = state->hs_result.remote_payload.udx->id;
-                            }
-                            state->take_raw_stream(result);
-                            state->complete(0, result);
-                        },
-                        state->fast_open);  // §6 opts.fast_open
+                        state->hs_result = hs;
+                        on_handshake_success(state, hs);
                 });
             };
             // Fire first attempt
@@ -1966,6 +1573,417 @@ void HyperDHT::destroy(std::function<void()> on_done) {
     }
 
     if (on_done) on_done();
+}
+
+// ---------------------------------------------------------------------------
+// on_handshake_success — post-handshake decision tree.
+//
+// Called from do_connect's peer_handshake callback after the handshake
+// succeeds. Dispatches to one of the following paths:
+//   1. Cached firewall replay (server sent data before handshake reply)
+//   2. Blind relay (if either side has relayThrough)
+//   3. Direct connect (OPEN firewall or no holepunch info)
+//   4. Passive wait (our firewall is OPEN)
+//   5. LAN shortcut (same NAT)
+//   6. Holepunch
+//
+// Paths 2, 4, 5, 6 can run in parallel — first to complete wins via
+// state->completed guard.
+//
+// JS: .analysis/js/hyperdht/lib/connect.js:405-503 (post-handshake block
+// inside connectThroughNode)
+// ---------------------------------------------------------------------------
+static void on_handshake_success(std::shared_ptr<ConnState> state,
+                                  const peer_connect::HandshakeResult& hs) {
+    // Replay cached firewall event if server's first packet arrived before
+    // the handshake reply. JS: connect.js:493-496
+    //   if (c.serverSocket) { c.onsocket(c.serverSocket, ...); return }
+    if (state->cached_fw_socket && !state->completed) {
+        DHT_LOG("  [connect] Replaying cached firewall event\n");
+        ConnectResult result;
+        result.success = true;
+        result.tx_key = hs.tx_key;
+        result.rx_key = hs.rx_key;
+        result.handshake_hash = hs.handshake_hash;
+        result.remote_public_key = hs.remote_public_key;
+        result.peer_address = state->cached_fw_address;
+        result.udx_socket = state->cached_fw_socket;
+        result.local_udx_id = state->our_udx_id;
+        if (hs.remote_payload.udx.has_value()) {
+            result.remote_udx_id = hs.remote_payload.udx->id;
+        }
+        state->take_raw_stream(result);
+        state->complete(0, result);
+        return;
+    }
+
+    // Log the server's handshake reply
+    DHT_LOG("  [connect] Server reply: fw=%u, addrs4=%zu, hp=%s, relays=%zu, "
+            "relayThrough=%s\n",
+            hs.remote_payload.firewall,
+            hs.remote_payload.addresses4.size(),
+            hs.remote_payload.holepunch.has_value() ? "yes" : "no",
+            hs.remote_payload.holepunch.has_value()
+                ? hs.remote_payload.holepunch->relays.size() : 0,
+            hs.remote_payload.relay_through.has_value() ? "yes" : "no");
+
+    // Phase E: Start blind relay if either side has relayThrough.
+    // JS: connect.js:489-491 — if (payload.relayThrough || c.relayThrough)
+    //     relayConnection(c, c.relayThrough, payload, hs)
+    // This runs in PARALLEL with holepunch (not sequential).
+    // First to complete wins via state->completed.
+    if (hs.remote_payload.relay_through.has_value() ||
+        state->relay_through.has_value()) {
+        bool is_initiator;
+        noise::PubKey relay_pk;
+        blind_relay::Token relay_token;
+
+        if (hs.remote_payload.relay_through.has_value()) {
+            // Server proposed relay — we're non-initiator
+            is_initiator = false;
+            relay_pk = hs.remote_payload.relay_through->public_key;
+            relay_token = hs.remote_payload.relay_through->token;
+        } else {
+            // We proposed relay — we're initiator
+            is_initiator = true;
+            relay_pk = *state->relay_through;
+            relay_token = state->relay_token;
+        }
+        state->relay_token = relay_token;
+        start_relay_path(state, is_initiator, relay_pk, relay_token);
+    }
+
+    // Check for direct connect (OPEN firewall)
+    holepunch::HolepunchResult hp_result;
+    if (holepunch::try_direct_connect(hs, hp_result)) {
+        ConnectResult result;
+        result.success = true;
+        result.tx_key = hs.tx_key;
+        result.rx_key = hs.rx_key;
+        result.handshake_hash = hs.handshake_hash;
+        result.remote_public_key = hs.remote_public_key;
+        result.peer_address = hp_result.address;
+        result.local_udx_id = state->our_udx_id;
+        if (hs.remote_payload.udx.has_value()) {
+            result.remote_udx_id = hs.remote_payload.udx->id;
+        }
+        state->take_raw_stream(result);
+        state->complete(0, result);
+        return;
+    }
+
+    // JS: if no holepunch info (server is OPEN or unreachable for holepunching),
+    // try direct connect using addresses
+    if (!hs.remote_payload.holepunch.has_value() ||
+        hs.remote_payload.holepunch->relays.empty()) {
+        if (!hs.remote_payload.addresses4.empty()) {
+            ConnectResult result;
+            result.success = true;
+            result.tx_key = hs.tx_key;
+            result.rx_key = hs.rx_key;
+            result.handshake_hash = hs.handshake_hash;
+            result.remote_public_key = hs.remote_public_key;
+            result.peer_address = hs.remote_payload.addresses4[0];
+            result.local_udx_id = state->our_udx_id;
+            if (hs.remote_payload.udx.has_value()) {
+                result.remote_udx_id = hs.remote_payload.udx->id;
+            }
+            state->take_raw_stream(result);
+            state->complete(0, result);
+        } else {
+            state->complete(ConnectError::NO_ADDRESSES);
+        }
+        return;
+    }
+
+    auto& hp_info = *hs.remote_payload.holepunch;
+
+    // Use handshake relay if in holepunch relay list
+    auto hp_relay = hp_info.relays[0].relay_address;
+    auto hp_peer = hp_info.relays[0].peer_address;
+    for (const auto& r : hp_info.relays) {
+        if (r.relay_address.host_string() == state->relay_addr.host_string() &&
+            r.relay_address.port == state->relay_addr.port) {
+            hp_relay = r.relay_address;
+            hp_peer = r.peer_address;
+            break;
+        }
+    }
+
+    auto fw = state->socket->nat_sampler().firewall();
+    auto addrs = state->socket->nat_sampler().addresses();
+
+    // JS: if our firewall is OPEN, wait passively for server to probe us
+    // (via rawStream firewall callback). 10s timeout.
+    // JS: connect.js:228-231 — passive wait when our firewall is OPEN
+    if (fw == peer_connect::FIREWALL_OPEN) {
+        DHT_LOG("  [connect] Our firewall is OPEN, waiting passively (10s)\n");
+        state->passive_timer = std::make_unique<async_utils::UvTimer>(
+            state->socket->loop());
+        state->passive_timer->start([state]() {
+            if (!state->completed) {
+                state->complete(ConnectError::HOLEPUNCH_TIMEOUT);
+            }
+        }, 10000);
+        return;
+    }
+
+    // --- §6: localConnection LAN shortcut ------------------
+    // JS: connect.js:234-251 — same-NAT shortcut. See file header for details.
+    {
+        const bool relayed = !hs.remote_payload.addresses4.empty() &&
+            (hs.remote_payload.addresses4[0] != state->relay_addr);
+
+        if (state->local_connection && relayed &&
+            !state->socket->nat_sampler().host().empty() &&
+            state->socket->nat_sampler().host() ==
+                hs.remote_payload.addresses4[0].host_string()) {
+
+            auto my_local = holepunch::local_addresses(0);
+            auto matched = holepunch::match_address(
+                my_local, hs.remote_payload.addresses4);
+
+            auto lan_addr = matched.value_or(hs.remote_payload.addresses4[0]);
+
+            DHT_LOG("  [connect] LAN shortcut: target %s:%u (matched=%s)\n",
+                    lan_addr.host_string().c_str(), lan_addr.port,
+                    matched.has_value() ? "yes" : "fallback");
+
+            assert(state->dht && "ConnState::dht must be set");
+            state->dht->ping(lan_addr,
+                [state, lan_addr](bool ok) {
+                    if (state->completed) return;
+                    if (!ok) {
+                        DHT_LOG("  [connect] LAN ping failed, "
+                                "falling back to holepunch\n");
+                        return;  // holepunch path runs in parallel
+                    }
+                    DHT_LOG("  [connect] LAN ping OK — short-circuiting\n");
+                    ConnectResult result;
+                    result.success = true;
+                    result.tx_key = state->hs_result.tx_key;
+                    result.rx_key = state->hs_result.rx_key;
+                    result.handshake_hash = state->hs_result.handshake_hash;
+                    result.remote_public_key = state->hs_result.remote_public_key;
+                    result.peer_address = lan_addr;
+                    result.local_udx_id = state->our_udx_id;
+                    if (state->hs_result.remote_payload.udx.has_value()) {
+                        result.remote_udx_id =
+                            state->hs_result.remote_payload.udx->id;
+                    }
+                    state->take_raw_stream(result);
+                    state->complete(0, result);
+                });
+            // Note: we do NOT return here. The holepunch below runs in
+            // parallel so a slow LAN ping doesn't block the connect —
+            // whichever path completes first wins via state->completed.
+        }
+    }
+    // --- end §6 LAN shortcut ------------------------------
+
+    holepunch::holepunch_connect(*state->socket, hs,
+        hp_relay, hp_peer, hp_info.id, fw, addrs,
+        [state](const holepunch::HolepunchResult& hp) {
+            if (state->completed) return;  // rawStream firewall already connected
+            if (state->alive.expired() || !hp.success) {
+                state->complete(ConnectError::HOLEPUNCH_FAILED);
+                return;
+            }
+            ConnectResult result;
+            result.success = true;
+            result.tx_key = state->hs_result.tx_key;
+            result.rx_key = state->hs_result.rx_key;
+            result.handshake_hash = state->hs_result.handshake_hash;
+            result.remote_public_key = state->hs_result.remote_public_key;
+            result.peer_address = hp.address;
+            result.udx_socket = hp.socket;  // JS: ref.socket from probe
+            result.socket_keepalive = hp.socket_keepalive;
+            result.local_udx_id = state->our_udx_id;
+            if (state->hs_result.remote_payload.udx.has_value()) {
+                result.remote_udx_id = state->hs_result.remote_payload.udx->id;
+            }
+            state->take_raw_stream(result);
+            state->complete(0, result);
+        },
+        state->fast_open);  // §6 opts.fast_open
+}
+
+// ---------------------------------------------------------------------------
+// start_relay_path — blind relay connection chain.
+//
+// dht.connect(relay_pk) → SecretStream → Protomux → BlindRelayClient →
+// pair → wire rawStream through relay.
+//
+// JS: .analysis/js/hyperdht/lib/connect.js:746-795 (relayConnection function)
+// ---------------------------------------------------------------------------
+static void start_relay_path(std::shared_ptr<ConnState> state,
+                              bool is_initiator,
+                              noise::PubKey relay_pk,
+                              blind_relay::Token relay_token) {
+    DHT_LOG("  [connect] Starting blind relay: initiator=%d, "
+            "relay_pk=%02x%02x...\n",
+            is_initiator, relay_pk[0], relay_pk[1]);
+
+    // Create relay state (RAII — destructor handles teardown)
+    state->relay = std::make_unique<ConnState::RelayState>();
+
+    if (state->dht) {
+        state->dht->relay_stats().attempts++;
+    }
+
+    // 15-second timeout for relay pairing (RAII — auto-cleaned)
+    // JS: connect.js:765 — c.relayTimeout = setTimeout(onabort, 15000)
+    state->relay->timeout = std::make_unique<async_utils::UvTimer>(
+        state->dht->loop());
+    state->relay->timeout->start([state]() {
+        if (!state->completed) {
+            DHT_LOG("  [connect] Relay pairing timed out (15s)\n");
+            if (state->dht) {
+                state->dht->relay_stats().aborts++;
+            }
+        }
+    }, blind_relay::RELAY_TIMEOUT_MS);
+
+    // Step 1: Connect to the relay node via normal DHT connect.
+    // JS: connect.js:762 — c.relaySocket = c.dht.connect(publicKey)
+    state->dht->connect(relay_pk,
+        [state, is_initiator, relay_token](
+            int err, const ConnectResult& relay_result) {
+        if (state->completed || state->alive.expired()) return;
+        if (err != 0 || !relay_result.success) {
+            DHT_LOG("  [connect] Relay connect to relay node failed: %d\n", err);
+            if (state->dht) state->dht->relay_stats().aborts++;
+            return;  // Holepunch path may still succeed
+        }
+
+        DHT_LOG("  [connect] Connected to relay node, setting up Protomux\n");
+
+        // Step 2: Create SecretStream over the relay connection.
+        state->relay->raw_stream = relay_result.raw_stream;
+
+        secret_stream::DuplexHandshake relay_hs;
+        relay_hs.tx_key = relay_result.tx_key;
+        relay_hs.rx_key = relay_result.rx_key;
+        relay_hs.handshake_hash = relay_result.handshake_hash;
+        relay_hs.remote_public_key = relay_result.remote_public_key;
+        relay_hs.is_initiator = true;
+
+        auto duplex_opts = state->dht->make_duplex_options();
+        duplex_opts.keep_alive_ms = state->relay_keep_alive;
+
+        // Connect the raw stream to the relay node's address
+        if (relay_result.udx_socket && relay_result.raw_stream) {
+            struct sockaddr_in relay_addr{};
+            relay_addr.sin_family = AF_INET;
+            relay_addr.sin_port = htons(relay_result.peer_address.port);
+            uv_ip4_addr(relay_result.peer_address.host_string().c_str(),
+                        relay_result.peer_address.port,
+                        &relay_addr);
+            udx_stream_connect(relay_result.raw_stream,
+                               relay_result.udx_socket,
+                               relay_result.remote_udx_id,
+                               reinterpret_cast<const struct sockaddr*>(&relay_addr));
+        }
+
+        state->relay->duplex = std::make_unique<secret_stream::SecretStreamDuplex>(
+            relay_result.raw_stream, relay_hs,
+            state->dht->loop(), duplex_opts);
+
+        // Step 3: Create Protomux over the SecretStream.
+        state->relay->mux = std::make_unique<protomux::Mux>(
+            [duplex = state->relay->duplex.get()](
+                const uint8_t* data, size_t len) -> bool {
+                if (!duplex) return false;
+                duplex->write(data, len, nullptr);
+                return true;
+            });
+
+        state->relay->duplex->on_message(
+            [mux = state->relay->mux.get()](
+                const uint8_t* data, size_t len) {
+                if (mux && !mux->is_destroyed()) {
+                    mux->on_data(data, len);
+                }
+            });
+
+        state->relay->duplex->start();
+
+        // Step 4: Create BlindRelayClient over the Protomux channel.
+        // JS: relay.Client.from(relaySocket, { id: relaySocket.publicKey })
+        std::vector<uint8_t> channel_id(
+            relay_result.remote_public_key.begin(),
+            relay_result.remote_public_key.end());
+        auto* channel = state->relay->mux->create_channel(
+            blind_relay::PROTOCOL_NAME, channel_id, false);
+        if (!channel) {
+            DHT_LOG("  [connect] Failed to create blind-relay channel\n");
+            if (state->dht) state->dht->relay_stats().aborts++;
+            return;
+        }
+
+        state->relay->client = std::make_unique<blind_relay::BlindRelayClient>(channel);
+        state->relay->client->open();
+
+        // Step 5: Pair our rawStream through the relay.
+        // JS: c.relayClient.pair(isInitiator, token, c.rawStream)
+        state->relay->client->pair(
+            is_initiator, relay_token, state->our_udx_id,
+            [state](uint32_t remote_id) {
+                // Pair success!
+                if (state->completed || state->alive.expired()) return;
+
+                DHT_LOG("  [connect] Relay pairing succeeded! remote_id=%u\n",
+                        remote_id);
+
+                // Cancel timeout (RAII handles cleanup)
+                state->relay->timeout.reset();
+
+                state->relay->paired = true;
+                if (state->dht) state->dht->relay_stats().successes++;
+
+                // Step 6: Wire our rawStream through the relay.
+                auto* relay_raw = state->relay->raw_stream;
+                if (!relay_raw || !state->raw_stream) {
+                    DHT_LOG("  [connect] Relay paired but streams gone\n");
+                    return;
+                }
+
+                auto* relay_addr = reinterpret_cast<const struct sockaddr_in*>(
+                    &relay_raw->remote_addr);
+                udx_socket_t* relay_socket = relay_raw->socket;
+
+                udx_stream_connect(state->raw_stream, relay_socket,
+                                   remote_id,
+                                   reinterpret_cast<const struct sockaddr*>(relay_addr));
+
+                ConnectResult result;
+                result.success = true;
+                result.tx_key = state->hs_result.tx_key;
+                result.rx_key = state->hs_result.rx_key;
+                result.handshake_hash = state->hs_result.handshake_hash;
+                result.remote_public_key = state->hs_result.remote_public_key;
+
+                char host[INET_ADDRSTRLEN];
+                uv_ip4_name(relay_addr, host, sizeof(host));
+                result.peer_address = compact::Ipv4Address::from_string(
+                    host, ntohs(relay_addr->sin_port));
+
+                result.udx_socket = relay_socket;
+                result.local_udx_id = state->our_udx_id;
+                if (state->hs_result.remote_payload.udx.has_value()) {
+                    result.remote_udx_id =
+                        state->hs_result.remote_payload.udx->id;
+                }
+                state->take_raw_stream(result);
+                state->complete(0, result);
+            },
+            [state](int err) {
+                // Pair error — relay failed, holepunch may still work
+                if (state->completed) return;
+                DHT_LOG("  [connect] Relay pairing failed: %d\n", err);
+                if (state->dht) state->dht->relay_stats().aborts++;
+            });
+    });
 }
 
 }  // namespace hyperdht

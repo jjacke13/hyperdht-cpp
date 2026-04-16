@@ -486,6 +486,10 @@ void RpcSocket::on_recv(udx_socket_t* socket, ssize_t nread, const uv_buf_t* buf
                          static_cast<size_t>(nread), addr_in);
 }
 
+// Register a new holepunch probe listener. Returns an ID for later removal.
+// Multiple listeners are supported so concurrent holepunch sessions don't
+// clobber each other (previous single-slot API was a concurrency bug).
+// IDs start at 1 — 0 is reserved as "not installed" sentinel in callers.
 uint32_t RpcSocket::add_probe_listener(OnProbeCallback cb) {
     uint32_t id = next_probe_id_++;
     probe_listeners_[id] = std::move(cb);

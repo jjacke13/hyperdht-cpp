@@ -1,5 +1,20 @@
 # C API Reference
 
+> **⚠️ Snapshot — may lag the header.** This file is a curated quick-start
+> for the most-used entry points. The authoritative source is
+> `include/hyperdht/hyperdht.h` (heavily commented). A generated reference
+> (Doxygen pass) is tracked in `docs/REMAINING-WORK.md` §9.
+>
+> Between commits 42b075f (Phase A-E) and ba319e2 we added ~30 FFI
+> functions: `hyperdht_opts_default`, state queries (`is_online`,
+> `is_degraded`, `is_persistent`, `is_bootstrapped`, `is_suspended`,
+> `connection_keep_alive`), event hooks (`on_bootstrapped`,
+> `on_network_change`, `on_network_update`, `on_persistent`), DHT ops
+> (`find_peer`, `lookup`, `announce`, `unannounce`, `ping`), lifecycle
+> (`suspend`, `resume`), server state/config, blind relay
+> (`connect_relay`, `server_set_relay_through`), and constants
+> (`HYPERDHT_FIREWALL_*`). When in doubt — read the header.
+
 Header: `#include <hyperdht/hyperdht.h>`
 Link: `-lhyperdht -lsodium -luv` (static) or `-lhyperdht -lsodium -luv` (shared)
 

@@ -31,7 +31,14 @@ hyperdht/
 │   ├── messages.js             ✅ dht_messages.hpp/cpp + peer_connect.cpp
 │   ├── nat.js                  ✅ nat_sampler.hpp / nat_sampler.cpp
 │   ├── noise-wrap.js           ✅ noise_wrap.hpp / noise_wrap.cpp
-│   ├── persistent.js           ⚠️ rpc.cpp (ephemeral/persistent toggle)
+│   ├── persistent.js           ✅ rpc_handlers.hpp/cpp — all server-side
+│                                 storage handlers (find_peer / lookup /
+│                                 announce / unannounce / mutable_{put,get}
+│                                 / immutable_{put,get}) + LRU + GC timer.
+│                                 Separately, rpc.cpp owns the
+│                                 ephemeral↔persistent node-state toggle.
+│                                 JS `bumps` cache for refresh-chain is
+│                                 intentionally deferred (see JS-PARITY-GAPS).
 │   ├── raw-stream-set.js       ⬜ not needed (no raw stream tracking in C++)
 │   ├── refresh-chain.js        🚫 unused in hyperdht 6.29.1
 │   ├── router.js               ✅ router.hpp / router.cpp
@@ -57,7 +64,7 @@ dht-rpc/
     ├── io.js                   ✅ rpc.hpp / rpc.cpp + messages.hpp / messages.cpp
     ├── peer.js                 ⬜ inline in routing_table.hpp
     ├── query.js                ✅ query.hpp / query.cpp
-    └── session.js              ⚠️ internal in rpc.cpp (no public Session API)
+    └── session.js              ✅ rpc.hpp (rpc::Session) + RpcSocket::cancel_request
 ```
 
 ## protomux (3.10.1)
@@ -77,20 +84,25 @@ protomux/
     └── handshake.js            ✅ secret_stream.cpp (header exchange)
 ```
 
-## blind-relay (1.4.0)
+## blind-relay (2.3.0)
 
 ```
 blind-relay/
-├── index.js                    ❌ DEFERRED — relay fallback (~5% of connections)
+├── index.js                    ✅ blind_relay.hpp / blind_relay.cpp
+│                                 (BlindRelayClient/Server/Session +
+│                                  Pair/Unpair messages + udx_stream_relay_to)
 └── lib/
-    └── errors.js               ❌ DEFERRED
+    └── errors.js               ⬜ inline in blind_relay.hpp (RelayError namespace)
 ```
 
 ## compact-encoding-bitfield (2.0.0)
 
 ```
 compact-encoding-bitfield/
-└── index.js                    ❌ DEFERRED — only used by blind-relay (flags field)
+└── index.js                    ⬜ inline in blind_relay.cpp — the only usage is
+                                   a single 1-byte `bitfield(7)` on the Pair
+                                   message (bit 0 = isInitiator). A general
+                                   bitfield codec would be over-engineering.
 ```
 
 ## compact-encoding (2.19.0)

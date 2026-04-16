@@ -1,5 +1,26 @@
 # C++ API Reference
 
+> **⚠️ Snapshot — may lag the headers.** This file is a curated
+> quick-start aimed at the most common operations. The authoritative
+> source is the headers in `include/hyperdht/` — every option field,
+> method, and callback type is documented inline there. A generated
+> reference (Doxygen pass) is tracked in `docs/REMAINING-WORK.md` §9.
+>
+> Since this file was written, the following have been added to the
+> C++ API (non-exhaustive): `DhtOptions::{host, nodes, seed,
+> connection_keep_alive, filter_node, random_punch_interval,
+> max_size, max_age_ms, storage_ttl_ms}`; `HyperDHT::{suspend(LogFn),
+> resume(LogFn), listening(), to_array(), add_node(), remote_address(),
+> unannounce(), ping(), immutable_{get,put}, mutable_{get,put},
+> on_bootstrapped, on_network_change, on_network_update, on_persistent,
+> is_online, is_degraded, is_persistent, is_bootstrapped, is_suspended,
+> stats(), bootstrapper(), connect_raw_stream(), hash(), key_pair(),
+> FIREWALL, BOOTSTRAP(), DestroyOptions}`; `Server::{set_firewall_async,
+> set_holepunch, notify_online, on_listening, relay_through}`;
+> `rpc::Session`, `Query::destroy()`, and the full `peer_connect`
+> / `holepunch` / `blind_relay` / `secret_stream` / `protomux` /
+> `dht_ops` / `query` namespaces. When in doubt — read the header.
+
 Header: `#include <hyperdht/dht.hpp>`
 Namespace: `hyperdht`
 Link: `-lhyperdht -lsodium -luv`

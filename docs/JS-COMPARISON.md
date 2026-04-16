@@ -214,6 +214,11 @@ hyperdht_free(dht);
 
 ## What's NOT in the C/C++ API (yet)
 
-- **Readable/Writable streams**: JS gives you a `socket` object with `.write()` and `.on('data')`. Our API gives you the encryption keys and peer address — you build the UDX stream + SecretStream on top. The building blocks are there (`udx.hpp`, `secret_stream.hpp`), but there's no convenience wrapper yet.
-- **`dht.lookup()` as async iterator**: JS uses `for await (const node of query)`. C++ uses callbacks on the `Query` object.
+- **Readable/Writable streams in C/C++**: JS gives you a `socket` object with `.write()` and `.on('data')`. Our C/C++ API gives you the encryption keys and peer address — you build the UDX stream + SecretStream on top. The building blocks are there (`udx.hpp`, `secret_stream.hpp`), but there's no convenience wrapper at the C/C++ level.
+  - **Note**: the Python wrapper (`wrappers/python/hyperdht`) *does*
+    provide the JS-style API. `dht.connect_stream(pk, on_open, on_data,
+    on_close, on_error)` returns a stream you can `.write()` to
+    immediately — queued writes flush after `on_open` fires. See
+    `wrappers/python/example.py`.
+- **`dht.lookup()` as async iterator**: JS uses `for await (const node of query)`. C++ uses callbacks on the `Query` object. `Query::destroy()` equivalents JS's early `return` from the loop.
 - **`dht.findPeer()` as async iterator**: Same — callbacks instead of iterator.

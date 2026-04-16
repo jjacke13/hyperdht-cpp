@@ -118,6 +118,48 @@ std::optional<ServerConnection> handle_handshake(
     const std::optional<peer_connect::RelayThroughInfo>& relay_through = std::nullopt);
 
 // ---------------------------------------------------------------------------
+// Async firewall split — two-phase handshake
+// ---------------------------------------------------------------------------
+//
+// The standard `handle_handshake()` above runs synchronously: firewall
+// callback returns a bool and the reply Noise msg2 is built inline.
+//
+// For the async firewall case (JS `await this.firewall(...)`), split
+// the work in two:
+//
+//   1. `decode_handshake()`  — parse msg1, extract the client's
+//      public key + payload, return the live `NoiseIK` responder
+//      state in a `PendingHandshake` wrapper. Cheap + synchronous.
+//   2. Caller runs its async firewall policy check, then...
+//   3. `finalize_handshake(std::move(pending), ..., rejected)` —
+//      resumes the Noise exchange with the decision, builds msg2,
+//      produces the populated `ServerConnection`.
+//
+// The sync wrapper `handle_handshake()` is now a thin composition
+// over these two (kept for source compatibility with existing callers).
+//
+// PendingHandshake owns the in-flight NoiseIK responder and cannot be
+// copied — callers should `std::move` it into finalize_handshake.
+struct PendingHandshake {
+    noise::NoiseIK noise_ik;
+    noise::PubKey remote_public_key{};
+    peer_connect::NoisePayload remote_payload{};
+};
+
+std::optional<PendingHandshake> decode_handshake(
+    const noise::Keypair& server_keypair,
+    const std::vector<uint8_t>& noise_msg1);
+
+std::optional<ServerConnection> finalize_handshake(
+    PendingHandshake pending,
+    int holepunch_id,
+    const std::vector<compact::Ipv4Address>& our_addresses,
+    const std::vector<peer_connect::RelayInfo>& relay_infos,
+    bool firewall_rejected,
+    bool has_remote_address = false,
+    const std::optional<peer_connect::RelayThroughInfo>& relay_through = std::nullopt);
+
+// ---------------------------------------------------------------------------
 // handle_holepunch — process incoming PEER_HOLEPUNCH on the server side
 // ---------------------------------------------------------------------------
 

@@ -168,6 +168,65 @@ TEST(ServerHandshake, FirewallRejects) {
     EXPECT_FALSE(result->reply_noise.empty());
 }
 
+// Two-phase split — decode_handshake() followed by finalize_handshake()
+// must produce a ServerConnection bit-identical to handle_handshake().
+// Used by the async firewall path at Server::on_peer_handshake so the
+// firewall callback sees the client's decoded public key before we
+// commit to the response.
+TEST(ServerHandshake, DecodeThenFinalizeMatchesSync) {
+    noise::Seed server_seed{}; server_seed.fill(0x11);
+    auto server_kp = noise::generate_keypair(server_seed);
+    noise::Seed client_seed{}; client_seed.fill(0x22);
+    auto client_kp = noise::generate_keypair(client_seed);
+
+    auto client = make_client_msg1(client_kp, server_kp.public_key, 1);
+
+    auto pending = decode_handshake(server_kp, client.noise_msg1);
+    ASSERT_TRUE(pending.has_value());
+
+    // Public key should match the client's static.
+    EXPECT_EQ(pending->remote_public_key, client_kp.public_key);
+
+    auto result = finalize_handshake(std::move(*pending), 42, {}, {},
+                                      /*firewall_rejected=*/false,
+                                      /*has_remote_address=*/false);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->firewalled);
+    EXPECT_FALSE(result->has_error);
+    EXPECT_EQ(result->id, 42);
+}
+
+// Finalizing with rejected=true yields the same ERROR_ABORTED response
+// as the sync-wrapper handle_handshake with a reject-all firewall — so
+// the async firewall path produces a wire-identical reply.
+TEST(ServerHandshake, FinalizeRejectedEqualsSyncReject) {
+    noise::Seed server_seed{}; server_seed.fill(0x11);
+    auto server_kp = noise::generate_keypair(server_seed);
+    noise::Seed client_seed{}; client_seed.fill(0x22);
+    auto client_kp = noise::generate_keypair(client_seed);
+
+    auto client = make_client_msg1(client_kp, server_kp.public_key, 1);
+
+    auto pending = decode_handshake(server_kp, client.noise_msg1);
+    ASSERT_TRUE(pending.has_value());
+
+    auto async_result = finalize_handshake(std::move(*pending), 0, {}, {},
+                                            /*firewall_rejected=*/true,
+                                            /*has_remote_address=*/false);
+    ASSERT_TRUE(async_result.has_value());
+    EXPECT_TRUE(async_result->firewalled);
+    EXPECT_EQ(async_result->error_code, peer_connect::ERROR_ABORTED);
+
+    // Fresh decode for the sync call (Noise state is single-use).
+    auto client2 = make_client_msg1(client_kp, server_kp.public_key, 1);
+    auto sync_result = handle_handshake(server_kp, client2.noise_msg1,
+        compact::Ipv4Address::from_string("10.0.0.1", 5000), 0, {}, {},
+        [](const auto&, const auto&, const auto&) { return true; });
+    ASSERT_TRUE(sync_result.has_value());
+    EXPECT_TRUE(sync_result->firewalled);
+    EXPECT_EQ(sync_result->error_code, async_result->error_code);
+}
+
 TEST(ServerHandshake, HolepunchInfoWhenNotOpen) {
     noise::Seed server_seed{};
     server_seed.fill(0x11);

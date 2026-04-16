@@ -222,6 +222,12 @@ public:
     bool is_firewalled() const { return firewalled_; }
     const health::HealthMonitor& health() const { return health_; }
 
+    // Override firewall classification explicitly — used by
+    // `HyperDHT::bootstrapper()` to construct a node that advertises
+    // itself as non-firewalled before any NAT sampling has occurred.
+    // JS: `firewalled: false` in `DHT.bootstrapper()` opts.
+    void set_firewalled(bool v) { firewalled_ = v; }
+
     // Callbacks for state changes (caller wires these to query engine)
     using OnRefreshCallback = std::function<void()>;
     using OnStateCallback = std::function<void()>;

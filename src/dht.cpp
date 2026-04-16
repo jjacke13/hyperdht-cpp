@@ -53,6 +53,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <stdexcept>
 
 #include "hyperdht/announce_sig.hpp"
 #include "hyperdht/blind_relay.hpp"
@@ -342,6 +343,47 @@ std::array<uint8_t, 32> HyperDHT::hash(const uint8_t* data, size_t len) {
     std::array<uint8_t, 32> out{};
     crypto_generichash(out.data(), 32, data, len, nullptr, 0);
     return out;
+}
+
+// JS: DHT.bootstrapper — dht-rpc/index.js:104-120.
+std::unique_ptr<HyperDHT> HyperDHT::bootstrapper(
+    uv_loop_t* loop,
+    uint16_t port,
+    const std::string& host,
+    DhtOptions opts) {
+
+    if (port == 0) throw std::invalid_argument("Port is required");
+    if (host.empty()) throw std::invalid_argument("Host is required");
+    if (host == "0.0.0.0" || host == "::") throw std::invalid_argument("Invalid host");
+    // IPv4 sanity: uv_ip4_addr parses the dotted-quad form. Anything it
+    // rejects (IPv6, hostname, garbage) trips the check.
+    struct sockaddr_in probe{};
+    if (uv_ip4_addr(host.c_str(), port, &probe) != 0) {
+        throw std::invalid_argument("Host must be an IPv4 address");
+    }
+
+    opts.port = port;
+    opts.host = host;
+    opts.ephemeral = false;
+    opts.bootstrap.clear();  // A bootstrap node has no upstream bootstrap.
+
+    auto dht = std::make_unique<HyperDHT>(loop, std::move(opts));
+
+    // JS: `firewalled: false` — advertise as OPEN. Our `firewalled_`
+    // field defaults to true; force it false so the bootstrap node
+    // doesn't claim to be behind a NAT.
+    if (dht->socket_) dht->socket_->set_firewalled(false);
+
+    // JS: `dht._nat.add(host, port)` — seed the NAT sampler with our
+    // own public address so `remoteAddress()` returns something
+    // sensible immediately (the sampler would otherwise stay UNKNOWN
+    // until real peers start contacting us).
+    auto self_addr = compact::Ipv4Address::from_string(host, port);
+    if (dht->socket_) {
+        dht->socket_->nat_sampler().add(self_addr, self_addr);
+    }
+
+    return dht;
 }
 
 // JS: HyperDHT.connectRawStream — hyperdht/index.js:452-458.
@@ -1587,22 +1629,33 @@ connection_pool::ConnectionPool HyperDHT::pool() {
 //     each connect overload (connect.js:49-51).
 // ---------------------------------------------------------------------------
 
-void HyperDHT::suspend() {
+void HyperDHT::suspend() { suspend(nullptr); }
+
+void HyperDHT::suspend(LogFn log) {
     if (suspended_) return;
     suspended_ = true;
 
-    // Suspend all servers
+    // JS: hyperdht/index.js:106-118 — phase markers match.
+    if (log) log("Suspending all hyperdht servers");
+
+    // Suspend all servers (propagate log hook to each).
     for (auto& srv : servers_) {
-        srv->suspend();
+        srv->suspend(log);
     }
+
+    if (log) log("Suspending dht-rpc");
 
     // Stop RPC ticks (JS: dht.suspend() stops tick timer)
     if (socket_) {
         socket_->stop_tick();
     }
+
+    if (log) log("Done, hyperdht fully suspended");
 }
 
-void HyperDHT::resume() {
+void HyperDHT::resume() { resume(nullptr); }
+
+void HyperDHT::resume(LogFn log) {
     if (!suspended_) return;
     suspended_ = false;
 
@@ -1613,6 +1666,8 @@ void HyperDHT::resume() {
         punch_stats_.last_random_punch = uv_now(loop_);
     }
 
+    if (log) log("Resuming hyperdht servers");
+
     // Resume all servers
     for (auto& srv : servers_) {
         srv->resume();
@@ -1622,6 +1677,8 @@ void HyperDHT::resume() {
     if (socket_) {
         socket_->start_tick();
     }
+
+    if (log) log("Done, hyperdht fully resumed");
 }
 
 // ---------------------------------------------------------------------------

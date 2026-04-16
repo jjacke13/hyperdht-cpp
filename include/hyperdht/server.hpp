@@ -71,6 +71,33 @@ public:
         const peer_connect::NoisePayload& payload,
         const compact::Ipv4Address& client_addr)>;
 
+    // Async firewall callback — receives a completion handler the user
+    // must invoke with the accept/reject decision. JS parity for
+    // `await this.firewall(...)` at server.js:251: enables policy
+    // lookups that hit a DB / remote service without blocking the
+    // event loop.
+    //
+    // Usage:
+    //   server->set_firewall_async([](auto pk, auto payload, auto addr,
+    //                                 auto done) {
+    //       db->check(pk, [done](bool found) {
+    //           done(/*reject=*/!found);
+    //       });
+    //   });
+    //
+    // The completion handler must be invoked EXACTLY once. If it's
+    // never called, the handshake stalls until the session timer
+    // (`handshake_clear_wait`, default 10s) GCs the state.
+    //
+    // Sync and async callbacks are mutually exclusive. Installing one
+    // clears the other.
+    using FirewallDoneCb = std::function<void(bool reject)>;
+    using AsyncFirewallCb = std::function<void(
+        const std::array<uint8_t, 32>& remote_pk,
+        const peer_connect::NoisePayload& payload,
+        const compact::Ipv4Address& client_addr,
+        FirewallDoneCb done)>;
+
     // Forward declaration — server can call back into the DHT for the
     // cached validated local-address list (§16).
     Server(rpc::RpcSocket& socket, router::Router& router);
@@ -111,7 +138,16 @@ public:
     void close(std::function<void()> on_done = nullptr);  // force=false
 
     // Set firewall callback (return true to reject a connection)
-    void set_firewall(FirewallCb cb) { firewall_ = std::move(cb); }
+    // Install a synchronous firewall callback. Clears any async callback.
+    void set_firewall(FirewallCb cb) {
+        firewall_ = std::move(cb);
+        firewall_async_ = nullptr;
+    }
+    // Install an async firewall callback. Clears any sync callback.
+    void set_firewall_async(AsyncFirewallCb cb) {
+        firewall_async_ = std::move(cb);
+        firewall_ = nullptr;
+    }
 
     // Holepunch veto callback (JS: opts.holepunch)
     // Called during holepunch negotiation. Return false to abort.
@@ -204,6 +240,7 @@ private:
     std::unique_ptr<announcer::Announcer> announcer_;
     OnConnectionCb on_connection_;
     FirewallCb firewall_;
+    AsyncFirewallCb firewall_async_;
     HolepunchCb holepunch_cb_;
     OnListeningCb on_listening_cb_;
 
@@ -246,6 +283,19 @@ private:
     void on_peer_holepunch(const std::vector<uint8_t>& value,
                            const compact::Ipv4Address& peer_address,
                            std::function<void(std::vector<uint8_t>)> reply_fn);
+
+    // Common post-handshake work: send reply, set up rawStream, attach
+    // blind-relay (if configured), store session state, arm session timer.
+    // Shared by the sync firewall path (called inline from
+    // on_peer_handshake) and the async firewall path (called from the
+    // user completion callback).
+    void on_handshake_result(
+        uint32_t hp_id,
+        std::string noise_key,
+        bool has_remote_addr,
+        std::optional<peer_connect::RelayThroughInfo> relay_through_info,
+        std::function<void(std::vector<uint8_t>)> reply_fn,
+        std::optional<server_connection::ServerConnection> result);
 
     // Called when holepunch or direct connect succeeds
     void on_socket(server_connection::ServerConnection& conn,

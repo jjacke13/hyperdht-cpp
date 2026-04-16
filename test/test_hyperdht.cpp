@@ -485,6 +485,164 @@ TEST(HyperDHT, ConnectRawStreamRejectsUnconnectedBase) {
     EXPECT_LT(HyperDHT::connect_raw_stream(ok, nullptr, 42), 0);
 }
 
+// JS: dht-rpc/index.js:201-214 `remoteAddress()` — returns our public
+// address when NAT classification + bound port agree; null otherwise.
+TEST(HyperDHT, RemoteAddressNullBeforeBind) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    EXPECT_FALSE(dht.remote_address().has_value());
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, RemoteAddressNullWhenFirewalled) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    dht.bind();
+    // Default state: firewalled=true, no NAT samples yet.
+    EXPECT_FALSE(dht.remote_address().has_value());
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// JS: dht-rpc/index.js:216-231 `addNode({host, port})` — runtime insert.
+TEST(HyperDHT, AddNodeInsertsIntoRoutingTable) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    dht.bind();
+
+    auto before = dht.socket().table().size();
+    dht.add_node(compact::Ipv4Address::from_string("1.2.3.4", 49737));
+    dht.add_node(compact::Ipv4Address::from_string("5.6.7.8", 12345));
+    EXPECT_EQ(dht.socket().table().size(), before + 2);
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// JS: dht-rpc/index.js:233-237 `toArray()` — routing table snapshot.
+TEST(HyperDHT, ToArrayReflectsAddedNodes) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    dht.bind();
+
+    dht.add_node(compact::Ipv4Address::from_string("1.2.3.4", 49737));
+    dht.add_node(compact::Ipv4Address::from_string("5.6.7.8", 12345));
+    dht.add_node(compact::Ipv4Address::from_string("9.10.11.12", 443));
+
+    auto nodes = dht.to_array();
+    EXPECT_GE(nodes.size(), 3u);  // filter_node blocklist also absent
+
+    // Explicit 0 limit → empty (JS parity).
+    EXPECT_EQ(dht.to_array(0).size(), 0u);
+
+    // limit=2 caps.
+    EXPECT_EQ(dht.to_array(2).size(), 2u);
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// JS: dht-rpc/index.js:104-120 `DHT.bootstrapper(port, host)`.
+TEST(HyperDHT, BootstrapperFactoryProducesOpenNode) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    auto dht = HyperDHT::bootstrapper(&loop, 49737, "127.0.0.1");
+    ASSERT_NE(dht, nullptr);
+
+    // Non-firewalled by construction.
+    EXPECT_FALSE(dht->socket().is_firewalled());
+
+    // NAT sampler was pre-seeded with our advertised addr (populates
+    // host/port even before the 3-sample classification threshold).
+    EXPECT_EQ(dht->socket().nat_sampler().host(), "127.0.0.1");
+    EXPECT_EQ(dht->socket().nat_sampler().port(), 49737);
+
+    // remote_address() is gated on the bound socket port matching the
+    // sampled port — pre-bind there's no bound port so the guard
+    // returns nullopt. (After bind(0), port drifts to a random
+    // ephemeral value unless the caller binds to 49737 explicitly.)
+    EXPECT_FALSE(dht->remote_address().has_value());
+
+    dht->destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, BootstrapperRejectsInvalidInputs) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    EXPECT_THROW(HyperDHT::bootstrapper(&loop, 0, "127.0.0.1"),
+                 std::invalid_argument);
+    EXPECT_THROW(HyperDHT::bootstrapper(&loop, 49737, ""),
+                 std::invalid_argument);
+    EXPECT_THROW(HyperDHT::bootstrapper(&loop, 49737, "0.0.0.0"),
+                 std::invalid_argument);
+    EXPECT_THROW(HyperDHT::bootstrapper(&loop, 49737, "::"),
+                 std::invalid_argument);
+    EXPECT_THROW(HyperDHT::bootstrapper(&loop, 49737, "not.an.ip"),
+                 std::invalid_argument);
+
+    uv_loop_close(&loop);
+}
+
+// JS: hyperdht/index.js:106-118 — dht.suspend({log}) propagates log to
+// every server.suspend({log}) AND emits its own phase breadcrumbs
+// ("Suspending all hyperdht servers", "Suspending dht-rpc", "Done").
+TEST(HyperDHT, SuspendResumeLogHook) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    dht.bind();
+    auto* srv = dht.create_server();
+    noise::Seed seed{}; seed.fill(0x44);
+    srv->listen(noise::generate_keypair(seed),
+                [](const server::ConnectionInfo&) {});
+
+    std::vector<std::string> logs;
+    dht.suspend([&logs](const char* msg) { logs.emplace_back(msg); });
+
+    auto contains = [&logs](const char* needle) {
+        return std::any_of(logs.begin(), logs.end(),
+            [needle](const std::string& s) {
+                return s.find(needle) != std::string::npos;
+            });
+    };
+
+    EXPECT_TRUE(contains("Suspending all hyperdht servers"));
+    EXPECT_TRUE(contains("Suspending dht-rpc"));
+    EXPECT_TRUE(contains("Done, hyperdht fully suspended"));
+    // Nested Server::suspend(log) breadcrumbs also arrived.
+    EXPECT_TRUE(contains("Suspending hyperdht server"));
+    EXPECT_TRUE(contains("post listening"));
+
+    logs.clear();
+    dht.resume([&logs](const char* msg) { logs.emplace_back(msg); });
+    EXPECT_TRUE(contains("Resuming hyperdht servers"));
+    EXPECT_TRUE(contains("Done, hyperdht fully resumed"));
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
 // JS parity: hyperdht/index.js:122-127 — destroy({ force: true })
 // skips the UNANNOUNCE emission but still must tear down libuv handles
 // so the event loop drains. Verifies both: (a) the force=true path

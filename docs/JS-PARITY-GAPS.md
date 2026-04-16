@@ -133,23 +133,29 @@ See "Deferred by design" table below for items with negligible practical value:
 `validate_local_addresses` echo probe, bootstrap two-pass NAT detection,
 Query `_slow` oncycle counter.
 
-### LOW — API surface completeness (open — one-liners each)
+### LOW — API surface completeness (resolved)
 
-Audit 2026-04-16 (post commit `6ba2501`) found 5 JS HyperDHT methods
-still missing from our public C++ API. None block any current consumer
-(nospoon, Python wrapper) because they have equivalent lower-level
-access via `socket()` / `nat_sampler()` / `table()`. Each one is a
-thin wrapper over existing state; listed here so we remember they
-exist when someone hits the ergonomics cliff.
+All 6 items from the 2026-04-16 audit resolved:
 
-| # | JS | JS ref | C++ gap | Workaround today |
-|---|----|--------|---------|------------------|
-| 1 | `HyperDHT.suspend({log})` / `resume({log})` | `hyperdht/index.js:96-110` | `{log}` hook exists on `Server::suspend` but not on `HyperDHT::suspend` (which iterates servers). | Call `Server::suspend(log)` on each via `dht.listening()`. |
-| 2 | `static HyperDHT.bootstrapper(port, host, opts)` | `dht-rpc/index.js:104-120` | Convenience factory for a non-ephemeral, non-firewalled, fixed-port node. | Construct `HyperDHT` with `opts.port` / `opts.ephemeral=false` manually. |
-| 3 | `dht.toArray(opts)` | `dht-rpc/index.js:233-237` | Returns routing table as `[{host, port}, ...]`. | `socket().table()` exposes the same data via iteration. |
-| 4 | `dht.addNode({host, port})` at runtime | `dht-rpc/index.js:216-231` | We accept `opts.nodes` at construction only. | `socket_->table().add(node)` internally (not a public API). |
-| 5 | `dht.remoteAddress()` | `dht-rpc/index.js:201-214` | Return `{host, port}` of our public address as seen by the NAT sampler. | `socket().nat_sampler().host()` + `.port()` / `.addresses()[0]`. |
-| 6 | Async `firewall(pk, payload, addr)` callback | `hyperdht/lib/server.js:251` (`await this.firewall(...)`) | JS awaits the return value, so the callback can return a Promise — enabling async policy lookups (DB, remote check). Our `Server::FirewallCb` returns `bool` synchronously. | Pre-cache the allow/block set in memory before `set_firewall`, or refactor to a completion-callback signature `void(pk, payload, addr, std::function<void(bool)>)` when this actually matters for a consumer. Not a silent bug — a C++ lambda that tries to return a `std::future<bool>` fails to compile against the current signature. |
+- **`HyperDHT::suspend(LogFn)` / `resume(LogFn)`**: phase breadcrumbs
+  ("Suspending all hyperdht servers", "Suspending dht-rpc", "Done...")
+  propagated to every `Server::suspend(log)` via `listening()`.
+- **`HyperDHT::bootstrapper(loop, port, host, opts)` static factory**:
+  throws `std::invalid_argument` on bad host/port, pre-seeds NAT
+  sampler with our public address, sets `firewalled=false`.
+- **`HyperDHT::to_array(limit = SIZE_MAX)`**: iterates every routing
+  table bucket and emits `Ipv4Address` entries; `limit=0` returns
+  empty (matches JS `{limit: 0}`).
+- **`HyperDHT::add_node(addr)`**: runtime insert via
+  `routing::RoutingTable::add` with peer id computed by
+  `rpc::compute_peer_id(addr)`; tick fields seeded from `socket_->tick()`.
+- **`HyperDHT::remote_address()`**: returns `std::optional<Ipv4Address>`
+  gated on `!firewalled && bound && nat_sampler_port == socket_port`.
+- **Async firewall callback (`Server::set_firewall_async`)**: new
+  `AsyncFirewallCb` signature takes `FirewallDoneCb done` completion
+  handler. Flow: `decode_handshake` → invoke async firewall → on
+  completion, `finalize_handshake(rejected)` + `on_handshake_result`.
+  Sync and async setters are mutually exclusive.
 
 ---
 

@@ -109,49 +109,58 @@ ServerConnection& ServerConnection::operator=(ServerConnection&& other) noexcept
 //     this at server.js:368.
 // ---------------------------------------------------------------------------
 
-std::optional<ServerConnection> handle_handshake(
+// Phase 1 — decode Noise msg1 and extract the client's payload.
+// Returns a PendingHandshake that holds the in-flight NoiseIK
+// responder; callers pass it into finalize_handshake() to produce
+// the eventual msg2 + ServerConnection.
+std::optional<PendingHandshake> decode_handshake(
     const noise::Keypair& server_keypair,
-    const std::vector<uint8_t>& noise_msg1,
-    const compact::Ipv4Address& client_address,
-    int holepunch_id,
-    const std::vector<compact::Ipv4Address>& our_addresses,
-    const std::vector<peer_connect::RelayInfo>& relay_infos,
-    FirewallFn firewall,
-    bool has_remote_address,
-    const std::optional<peer_connect::RelayThroughInfo>& relay_through) {
+    const std::vector<uint8_t>& noise_msg1) {
 
-    ServerConnection conn;
-    conn.id = holepunch_id;
-    conn.our_addresses = our_addresses;
-
-    // Step 1: Create Noise IK responder
-    // Responder doesn't know the remote's static key ahead of time (learns from msg1)
+    // Noise IK responder — doesn't know the remote's static key ahead
+    // of time (learns from msg1).
     const auto& prol = dht_messages::ns_peer_handshake();
     noise::NoiseIK noise_ik(false, server_keypair, prol.data(), prol.size());
 
-    // Step 2: Receive Noise msg1 — decrypts client's payload
     auto decrypted = noise_ik.recv(noise_msg1.data(), noise_msg1.size());
     if (!decrypted.has_value()) {
         return std::nullopt;
     }
 
-    // Decode client's NoisePayload
-    conn.remote_payload = peer_connect::decode_noise_payload(
+    PendingHandshake out{std::move(noise_ik), {}, {}};
+    out.remote_public_key = out.noise_ik.remote_public_key();
+    out.remote_payload = peer_connect::decode_noise_payload(
         decrypted->data(), decrypted->size());
+    return out;
+}
 
-    // Extract client's public key from the Noise handshake
-    conn.remote_public_key = noise_ik.remote_public_key();
+// Phase 2 — build the response NoisePayload + msg2 given the firewall
+// decision. `firewall_rejected == true` encodes the same outcome as
+// the sync callback returning true: the Noise exchange still
+// completes and a reply is sent with `error = ERROR_ABORTED`, so the
+// client sees a clean refusal instead of a hang.
+std::optional<ServerConnection> finalize_handshake(
+    PendingHandshake pending,
+    int holepunch_id,
+    const std::vector<compact::Ipv4Address>& our_addresses,
+    const std::vector<peer_connect::RelayInfo>& relay_infos,
+    bool firewall_rejected,
+    bool has_remote_address,
+    const std::optional<peer_connect::RelayThroughInfo>& relay_through) {
 
-    // Step 3: Firewall check
-    if (firewall) {
-        bool rejected = firewall(conn.remote_public_key,
-                                  conn.remote_payload, client_address);
-        if (rejected) {
-            conn.firewalled = true;
-            conn.has_error = true;
-            conn.error_code = peer_connect::ERROR_ABORTED;
-            // Still need to send a reply (with error) so the client doesn't hang
-        }
+    noise::NoiseIK noise_ik = std::move(pending.noise_ik);
+
+    ServerConnection conn;
+    conn.id = holepunch_id;
+    conn.our_addresses = our_addresses;
+    conn.remote_payload = std::move(pending.remote_payload);
+    conn.remote_public_key = pending.remote_public_key;
+
+    // Step 3: apply firewall decision provided by caller.
+    if (firewall_rejected) {
+        conn.firewalled = true;
+        conn.has_error = true;
+        conn.error_code = peer_connect::ERROR_ABORTED;
     }
 
     // Step 4: Determine error code
@@ -247,6 +256,32 @@ std::optional<ServerConnection> handle_handshake(
     }
 
     return conn;
+}
+
+// Sync wrapper kept for source compatibility (and for callers whose
+// firewall policy is synchronous, which is the common case).
+std::optional<ServerConnection> handle_handshake(
+    const noise::Keypair& server_keypair,
+    const std::vector<uint8_t>& noise_msg1,
+    const compact::Ipv4Address& client_address,
+    int holepunch_id,
+    const std::vector<compact::Ipv4Address>& our_addresses,
+    const std::vector<peer_connect::RelayInfo>& relay_infos,
+    FirewallFn firewall,
+    bool has_remote_address,
+    const std::optional<peer_connect::RelayThroughInfo>& relay_through) {
+
+    auto pending = decode_handshake(server_keypair, noise_msg1);
+    if (!pending) return std::nullopt;
+
+    const bool rejected = firewall
+        ? firewall(pending->remote_public_key,
+                   pending->remote_payload, client_address)
+        : false;
+
+    return finalize_handshake(std::move(*pending), holepunch_id,
+                              our_addresses, relay_infos,
+                              rejected, has_remote_address, relay_through);
 }
 
 // ---------------------------------------------------------------------------

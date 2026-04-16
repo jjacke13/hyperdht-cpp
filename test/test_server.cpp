@@ -213,6 +213,160 @@ TEST(Server, FirewallRejectsConnection) {
     uv_loop_close(&loop);
 }
 
+// JS: server.js:251 `await this.firewall(...)` — the async firewall
+// callback receives a completion handler and the handshake response
+// is deferred until the callback fires.
+TEST(Server, AsyncFirewallDeferredAccept) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed server_seed{}; server_seed.fill(0x11);
+    auto server_kp = noise::generate_keypair(server_seed);
+
+    srv.listen(server_kp, [](const ConnectionInfo&) {});
+
+    // Capture the `done` completion handler — invoke it LATER.
+    Server::FirewallDoneCb deferred_done;
+    std::array<uint8_t, 32> captured_pk{};
+    int fw_calls = 0;
+
+    srv.set_firewall_async(
+        [&](const std::array<uint8_t, 32>& pk, const peer_connect::NoisePayload&,
+            const compact::Ipv4Address&, Server::FirewallDoneCb done) {
+            fw_calls++;
+            captured_pk = pk;
+            deferred_done = std::move(done);
+        });
+
+    // Build + send a client handshake via the router.
+    noise::Seed client_seed{}; client_seed.fill(0x22);
+    auto client_kp = noise::generate_keypair(client_seed);
+
+    const auto& prol = dht_messages::ns_peer_handshake();
+    noise::NoiseIK client_noise(true, client_kp, prol.data(), prol.size(),
+                                 &server_kp.public_key);
+
+    peer_connect::NoisePayload client_payload;
+    client_payload.version = 1;
+    client_payload.firewall = peer_connect::FIREWALL_OPEN;
+    client_payload.udx = peer_connect::UdxInfo{1, false, 1, 0};
+    client_payload.has_secret_stream = true;
+    client_payload.addresses4.push_back(
+        compact::Ipv4Address::from_string("10.0.0.1", 5000));
+
+    auto payload_bytes = peer_connect::encode_noise_payload(client_payload);
+    auto msg1 = client_noise.send(payload_bytes.data(), payload_bytes.size());
+
+    peer_connect::HandshakeMessage hs_msg;
+    hs_msg.mode = peer_connect::MODE_FROM_CLIENT;
+    hs_msg.noise = msg1;
+
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32,
+                       server_kp.public_key.data(), 32, nullptr, 0);
+
+    messages::Request req;
+    req.target = target;
+    req.value = peer_connect::encode_handshake_msg(hs_msg);
+    req.from.addr = compact::Ipv4Address::from_string("10.0.0.1", 5000);
+    req.tid = 1;
+
+    bool reply_sent = false;
+    router.handle_peer_handshake(
+        req,
+        [&reply_sent](const messages::Response&) { reply_sent = true; },
+        [](const messages::Request&) {});
+
+    // Firewall was invoked exactly once, but the reply is still
+    // pending — `done` wasn't called yet.
+    EXPECT_EQ(fw_calls, 1);
+    EXPECT_EQ(captured_pk, client_kp.public_key);
+    EXPECT_FALSE(reply_sent);
+    ASSERT_TRUE(deferred_done);
+
+    // User accepts asynchronously → reply flows now.
+    deferred_done(/*reject=*/false);
+    EXPECT_TRUE(reply_sent);
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// async firewall that rejects: handshake completes, reply is sent
+// with ERROR_ABORTED, session not registered.
+TEST(Server, AsyncFirewallDeferredReject) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed server_seed{}; server_seed.fill(0x11);
+    auto server_kp = noise::generate_keypair(server_seed);
+    srv.listen(server_kp, [](const ConnectionInfo&) {});
+
+    Server::FirewallDoneCb deferred_done;
+    srv.set_firewall_async(
+        [&](const auto&, const auto&, const auto&,
+            Server::FirewallDoneCb done) { deferred_done = std::move(done); });
+
+    // Build handshake msg1
+    noise::Seed client_seed{}; client_seed.fill(0x22);
+    auto client_kp = noise::generate_keypair(client_seed);
+    const auto& prol = dht_messages::ns_peer_handshake();
+    noise::NoiseIK client_noise(true, client_kp, prol.data(), prol.size(),
+                                 &server_kp.public_key);
+    peer_connect::NoisePayload client_payload;
+    client_payload.version = 1;
+    client_payload.firewall = peer_connect::FIREWALL_OPEN;
+    client_payload.udx = peer_connect::UdxInfo{1, false, 1, 0};
+    client_payload.has_secret_stream = true;
+    client_payload.addresses4.push_back(
+        compact::Ipv4Address::from_string("10.0.0.1", 5000));
+    auto payload_bytes = peer_connect::encode_noise_payload(client_payload);
+    auto msg1 = client_noise.send(payload_bytes.data(), payload_bytes.size());
+    peer_connect::HandshakeMessage hs_msg;
+    hs_msg.mode = peer_connect::MODE_FROM_CLIENT;
+    hs_msg.noise = msg1;
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32,
+                       server_kp.public_key.data(), 32, nullptr, 0);
+    messages::Request req;
+    req.target = target;
+    req.value = peer_connect::encode_handshake_msg(hs_msg);
+    req.from.addr = compact::Ipv4Address::from_string("10.0.0.1", 5000);
+    req.tid = 1;
+
+    bool reply_sent = false;
+    router.handle_peer_handshake(req,
+        [&reply_sent](const messages::Response&) { reply_sent = true; },
+        [](const messages::Request&) {});
+
+    ASSERT_TRUE(deferred_done);
+    deferred_done(/*reject=*/true);
+    // Reply still goes out — but with ERROR_ABORTED inside the Noise
+    // payload. Client sees a clean refusal instead of a hang.
+    EXPECT_TRUE(reply_sent);
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
 TEST(Server, DoubleListenNoop) {
     uv_loop_t loop;
     uv_loop_init(&loop);

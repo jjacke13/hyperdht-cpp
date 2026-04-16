@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -453,6 +454,28 @@ public:
     // JS: HyperDHT.hash(data) — hyperdht/index.js:448-450
     static std::array<uint8_t, 32> hash(const uint8_t* data, size_t len);
 
+    // JS: dht-rpc/index.js:104-120 `DHT.bootstrapper(port, host, opts)`.
+    //
+    // Convenience factory for nodes that want to RUN as a public
+    // bootstrap seed (the kind of node listed in the 3-address
+    // `BOOTSTRAP` set). Produces a HyperDHT that is:
+    //   - non-ephemeral (participates in storage + announce)
+    //   - non-firewalled (advertises itself as OPEN)
+    //   - bound to the given fixed port (not auto-ephemeral)
+    //   - initialised with an empty bootstrap list (it IS the bootstrap)
+    //
+    // Throws `std::invalid_argument` on invalid inputs (port 0,
+    // empty / wildcard / non-IPv4 host).
+    //
+    // The caller still has to call `bind()` to actually open the
+    // socket — the factory only constructs the instance so caller
+    // code can inject test hooks before bind.
+    static std::unique_ptr<HyperDHT> bootstrapper(
+        uv_loop_t* loop,
+        uint16_t port,
+        const std::string& host,
+        DhtOptions opts = {});
+
     // JS: HyperDHT.connectRawStream(encryptedStream, rawStream, remoteId)
     // — hyperdht/index.js:452-458.
     //
@@ -676,11 +699,24 @@ public:
 
     // --- Lifecycle ---
 
-    // Suspend: stop all servers, clear pending connects (JS: dht.suspend())
-    void suspend();
+    // Suspend: stop all servers, clear pending connects.
+    //
+    // JS: hyperdht/index.js:106-118 `suspend({ log })` — iterates every
+    // listening server and awaits server.suspend(), then suspends the
+    // base dht-rpc layer. Emits progress messages at each phase.
+    //
+    // Optional `log` hook mirrors JS. Pass `nullptr` for silent suspend.
+    // Same signature as `Server::suspend(LogFn)`.
+    using LogFn = std::function<void(const char*)>;
+    void suspend(LogFn log);
+    void suspend();  // convenience: suspend(nullptr)
 
-    // Resume: resume all servers (JS: dht.resume())
-    void resume();
+    // Resume: resume all servers.
+    //
+    // JS: hyperdht/index.js:96-104 `resume({ log })` — resumes the base
+    // layer then each server. `log` hook matches suspend.
+    void resume(LogFn log);
+    void resume();  // convenience: resume(nullptr)
 
     // JS parity: hyperdht/index.js:122-133 `destroy({ force = false })`.
     //
@@ -719,6 +755,75 @@ public:
     const noise::Keypair& default_keypair() const { return opts_.default_keypair; }
     uint16_t port() const { return socket_ ? socket_->port() : 0; }
     bool is_bound() const { return bound_; }
+
+    // JS: dht-rpc/index.js:233-237 `toArray({limit})` — snapshot the
+    // routing table as a flat list of `{host, port}` entries. Callers
+    // use this to persist known peers across process restarts (feed
+    // the result back into `DhtOptions::nodes` on re-bind) or to dump
+    // the table for observability.
+    //
+    // `limit` caps the output; default (`SIZE_MAX`) returns every
+    // node. Iteration walks buckets in ascending-distance order, which
+    // is close enough to JS's `reverse: true` most-recently-seen
+    // ordering for the typical persistence use case. Explicit 0 limit
+    // returns an empty vector, matching JS `{limit: 0}` semantics.
+    std::vector<compact::Ipv4Address> to_array(
+        size_t limit = std::numeric_limits<size_t>::max()) const {
+        std::vector<compact::Ipv4Address> out;
+        if (!socket_ || limit == 0) return out;
+        for (size_t i = 0; i < routing::ID_BITS; ++i) {
+            for (const auto& n : socket_->table().bucket(i).nodes()) {
+                out.push_back(
+                    compact::Ipv4Address::from_string(n.host, n.port));
+                if (out.size() >= limit) return out;
+            }
+        }
+        return out;
+    }
+
+    // JS: dht-rpc/index.js:216-231 `addNode({host, port})` — insert a
+    // node into the routing table at runtime (construction-time
+    // injection is `DhtOptions::nodes`). The peer id is computed by
+    // `rpc::compute_peer_id(addr)` so the table stores it under the
+    // same BLAKE2b-256 hash a real network response would use.
+    //
+    // The node's tick fields are seeded from the current RPC tick so
+    // it immediately looks "fresh" — matches JS `added: this._tick`.
+    // No-op if not bound.
+    void add_node(const compact::Ipv4Address& addr) {
+        if (!socket_) return;
+        routing::Node node;
+        node.id = rpc::compute_peer_id(addr);
+        node.host = addr.host_string();
+        node.port = addr.port;
+        const uint32_t now = socket_->tick();
+        node.added = now;
+        node.pinged = now;
+        node.seen = now;
+        socket_->table().add(node);
+    }
+
+    // JS: dht-rpc/index.js:201-214 `remoteAddress()` — returns our
+    // public address as seen by the DHT (from NAT sampling), or
+    // `std::nullopt` if:
+    //   - we're firewalled (NAT unknown)
+    //   - no samples yet (nat_sampler has no addresses)
+    //   - our bound port doesn't match the sampled port (our socket
+    //     moved underneath us — reject as stale)
+    //
+    // Useful for advertising our reachability to peers, or for
+    // confirming we're properly bootstrapped before issuing queries.
+    std::optional<compact::Ipv4Address> remote_address() const {
+        if (!socket_ || !bound_) return std::nullopt;
+        if (socket_->is_firewalled()) return std::nullopt;
+        const auto& addrs = socket_->nat_sampler().addresses();
+        if (addrs.empty()) return std::nullopt;
+        const auto& top = addrs.front();
+        // JS parity: drop the sample if our current bound port has
+        // drifted away from what the sampler saw.
+        if (top.port != socket_->port()) return std::nullopt;
+        return top;
+    }
 
     // §7 accessors — read the tuning knobs that consumer apps may need
     // to apply to stream wrappers / connection setup.

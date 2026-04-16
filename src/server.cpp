@@ -382,14 +382,6 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         relay_infos = announcer_->relays();
     }
 
-    // Wrap the firewall callback
-    server_connection::FirewallFn fw_cb = nullptr;
-    if (firewall_) {
-        fw_cb = [this](const auto& pk, const auto& payload, const auto& addr) {
-            return firewall_(pk, payload, addr);
-        };
-    }
-
     // JS: server.js:271 — `const ourRemoteAddr = this.dht.remoteAddress()`
     // If the server knows its public address (!firewalled), the response
     // omits holepunch info → client connects directly without holepunch rounds.
@@ -406,21 +398,88 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         relay_through_info = rt;
     }
 
-    // Process the handshake
-    auto result = server_connection::handle_handshake(
-        keypair_, noise, peer_address, hp_id,
-        our_addrs, relay_infos, fw_cb, has_remote_addr, relay_through_info);
-
-    if (!result.has_value()) {
-        DHT_LOG( "  [server] Noise handshake FAILED (recv or send error)\n");
+    // Phase 1 of the handshake — decode Noise msg1 + extract the
+    // client's payload. Keep the NoiseIK responder alive inside the
+    // returned PendingHandshake so we can finalise with an async
+    // firewall decision without re-running Noise.
+    auto pending = server_connection::decode_handshake(keypair_, noise);
+    if (!pending) {
+        DHT_LOG("  [server] Noise handshake FAILED (decode)\n");
         return;
     }
-    DHT_LOG( "  [server] Noise handshake OK, error=%u\n", result->error_code);
+
+    // Dispatch on firewall type. Each path eventually calls
+    // `on_handshake_result(...)` with the finalised ServerConnection
+    // (or std::nullopt on failure).
+    if (firewall_async_) {
+        // Async path — JS parity: server.js:251 `await this.firewall(...)`.
+        // We hand the decoded payload to the user callback; it completes
+        // with a bool (reject) via the `done` completion handler.
+        //
+        // `done` is heap-owned via shared_ptr so the user can invoke it
+        // from any callback tick without us caring about lifetime.
+        auto pending_shared = std::make_shared<server_connection::PendingHandshake>(
+            std::move(*pending));
+        auto relay_through_shared = relay_through_info;
+
+        firewall_async_(pending_shared->remote_public_key,
+                        pending_shared->remote_payload, peer_address,
+                        [this, pending_shared, hp_id,
+                         noise_key, has_remote_addr,
+                         relay_through_shared, our_addrs, relay_infos,
+                         reply_fn](bool reject) {
+            if (closed_) return;
+            auto res = server_connection::finalize_handshake(
+                std::move(*pending_shared), hp_id,
+                our_addrs, relay_infos, reject,
+                has_remote_addr, relay_through_shared);
+            on_handshake_result(hp_id, noise_key, has_remote_addr,
+                                relay_through_shared, reply_fn, std::move(res));
+        });
+        return;
+    }
+
+    // Sync path — either no firewall (reject=false) or the legacy
+    // synchronous FirewallCb.
+    bool rejected = false;
+    if (firewall_) {
+        rejected = firewall_(pending->remote_public_key,
+                             pending->remote_payload, peer_address);
+    }
+
+    auto result = server_connection::finalize_handshake(
+        std::move(*pending), hp_id,
+        our_addrs, relay_infos, rejected,
+        has_remote_addr, relay_through_info);
+
+    on_handshake_result(hp_id, noise_key, has_remote_addr,
+                        relay_through_info, reply_fn, std::move(result));
+}
+
+// JS parity: post-handshake work (send reply, rawStream wiring,
+// blind-relay bootstrap, session timer). Shared by the sync and
+// async firewall paths so neither has to duplicate the ~200 lines
+// of state setup below.
+void Server::on_handshake_result(
+    uint32_t hp_id,
+    std::string noise_key,
+    bool has_remote_addr,
+    std::optional<peer_connect::RelayThroughInfo> relay_through_info,
+    std::function<void(std::vector<uint8_t>)> reply_fn,
+    std::optional<server_connection::ServerConnection> result) {
+
+    if (closed_ || suspended_) return;
+
+    if (!result.has_value()) {
+        DHT_LOG("  [server] Noise handshake FAILED (finalize error)\n");
+        return;
+    }
+    DHT_LOG("  [server] Noise handshake OK, error=%u\n", result->error_code);
 
     auto& conn = *result;
 
     // Send the Noise msg2 reply
-    DHT_LOG( "  [server] Sending reply: %zu noise bytes\n", conn.reply_noise.size());
+    DHT_LOG("  [server] Sending reply: %zu noise bytes\n", conn.reply_noise.size());
     auto reply_noise = conn.reply_noise;
     reply_fn(std::move(reply_noise));
 

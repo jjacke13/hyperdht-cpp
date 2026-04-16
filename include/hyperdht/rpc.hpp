@@ -430,8 +430,16 @@ public:
     explicit Session(RpcSocket& socket) : socket_(socket) {}
     ~Session() { destroy(); }
 
+    // Non-copyable AND non-movable: lambdas registered with
+    // RpcSocket::request capture the raw `this` pointer into
+    // `tids_`, so relocating the Session object (move-construct out
+    // of a container, etc.) would leave dangling pointers in the
+    // socket's inflight table. Stick to stack or fixed-storage
+    // (unique_ptr) ownership.
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
+    Session(Session&&) = delete;
+    Session& operator=(Session&&) = delete;
 
     // Issue a request that will be tracked by this session. Returns the
     // transaction id, or 0 on congestion failure.

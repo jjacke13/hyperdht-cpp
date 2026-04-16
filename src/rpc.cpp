@@ -27,6 +27,7 @@
 #include <cstring>
 #include <memory>
 #include <random>
+#include <utility>
 
 #include <sodium.h>
 
@@ -920,11 +921,12 @@ uint16_t Session::request(const messages::Request& req,
 }
 
 void Session::destroy() {
-    // Swap first so callbacks that fire during cancel (shouldn't —
-    // cancel_request is silent — but defensive) don't re-enter and
-    // mutate the vector we're iterating.
-    auto local = std::move(tids_);
-    tids_.clear();
+    // Atomically swap out the tid list with an empty one, then iterate
+    // the snapshot. This keeps us safe from any callback that might
+    // re-enter via cancel_request (cancel_request itself is silent, but
+    // `this` is captured in every outstanding request closure we
+    // registered — defensive).
+    auto local = std::exchange(tids_, {});
     for (auto tid : local) {
         socket_.cancel_request(tid);
     }

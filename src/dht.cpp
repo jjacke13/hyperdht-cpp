@@ -152,17 +152,34 @@ HyperDHT::HyperDHT(uv_loop_t* loop, DhtOptions opts)
     // dht-rpc's lower-level surface. Bundling them here ensures every
     // HyperDHT instance ignores the known-bad testnet nodes without a
     // caller having to know they exist.
+    //
+    // Matching uses the packed 4-byte host + uint16 port directly — no
+    // `host_string()` allocations — because this lambda is on the hot
+    // path: every closer-nodes entry from every DHT query response, and
+    // every incoming RPC that the routing table would accept.
     auto user_filter = opts_.filter_node;
     socket_->set_filter_node(
         [user_filter](const routing::NodeId& id,
                       const compact::Ipv4Address& addr) {
-            // Built-in JS testnet blocklist (index.js:585-592).
-            const std::string host = addr.host_string();
-            const uint16_t port = addr.port;
-            if (port == 49738 &&
-                (host == "134.209.28.98" || host == "167.99.142.185")) return false;
-            if (port == 9400 && host == "35.233.47.252") return false;
-            if (host == "150.136.142.116") return false;
+            // Built-in JS testnet blocklist (hyperdht/index.js:585-592).
+            //   134.209.28.98:49738, 167.99.142.185:49738  (accidentally
+            //   left as testnet seeds), 35.233.47.252:9400 (out-of-spec
+            //   port), 150.136.142.116 (any port — misconfigured peer).
+            struct Entry {
+                std::array<uint8_t, 4> host;
+                uint16_t port;             // 0 = "any port"
+            };
+            static constexpr std::array<Entry, 4> kTestnetBlocklist = {{
+                {{134, 209,  28,  98}, 49738},
+                {{167,  99, 142, 185}, 49738},
+                {{ 35, 233,  47, 252},  9400},
+                {{150, 136, 142, 116},     0},
+            }};
+            for (const auto& e : kTestnetBlocklist) {
+                if (addr.host != e.host) continue;
+                if (e.port != 0 && addr.port != e.port) continue;
+                return false;
+            }
             // Then the caller-supplied filter, if any.
             if (user_filter) return user_filter(id, addr);
             return true;

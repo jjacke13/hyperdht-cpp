@@ -687,7 +687,32 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
 
     auto& conn = *it->second;
 
-    // Get our NAT info
+    // JS parity — server.js:509-584 order:
+    //   1. nat.add(req.to, req.from)        ← feed sampler from request
+    //   2. await nat.analyze(false/true)    ← classification (no-op here — our
+    //                                         sampler is synchronous, classification
+    //                                         updates inside add() already)
+    //   3. if (firewall !== UNKNOWN) nat.freeze()   ← lock classification
+    //   4. build reply using p.nat.firewall  ← uses post-add, post-freeze value
+    //
+    // Previous implementation ran steps 3/4 AFTER reply_fn, which left a
+    // tiny window where the reply carried our *pre-add* firewall. Matches
+    // JS exactly now.
+
+    // A2: feed NAT sampler from the holepunch request. We always feed
+    // because we use a single socket (no pool socket on the server).
+    socket_.nat_sampler().add(
+        compact::Ipv4Address::from_string(peer_address.host_string(), peer_address.port),
+        peer_address);
+
+    // A5: NAT freeze — once we have a firm classification, lock it so
+    // late samples cannot contradict what the reply is about to say.
+    if (socket_.nat_sampler().firewall() != peer_connect::FIREWALL_UNKNOWN) {
+        socket_.nat_sampler().freeze();
+    }
+
+    // Capture NAT state AFTER add/freeze — this is what the reply
+    // advertises (JS server.js:590: `firewall: p.nat.firewall`).
     auto our_fw = socket_.nat_sampler().firewall();
     auto our_addrs = socket_.nat_sampler().addresses();
 
@@ -723,22 +748,6 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     // Send reply
     if (!reply.value.empty()) {
         reply_fn(std::move(reply.value));
-    }
-
-    // A2: Feed NAT sampler from holepunch request
-    // JS: server.js:509-510 — `if (req.socket === p.socket) p.nat.add(req.to, req.from)`
-    // We always feed since we use a single socket (no pool socket on server)
-    socket_.nat_sampler().add(
-        compact::Ipv4Address::from_string(peer_address.host_string(), peer_address.port),
-        peer_address);
-
-    // A5: NAT freeze — lock classification before sending response.
-    // JS: server.js:582-584 — `if (p.nat.firewall !== FIREWALL.UNKNOWN) p.nat.freeze()`.
-    // Once we have told the peer our firewall classification in the
-    // holepunch reply, we must not let late NAT samples change it
-    // mid-round — the peer would otherwise get conflicting signals.
-    if (socket_.nat_sampler().firewall() != peer_connect::FIREWALL_UNKNOWN) {
-        socket_.nat_sampler().freeze();
     }
 
     if (reply.should_punch) {

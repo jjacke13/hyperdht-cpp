@@ -148,6 +148,22 @@ private:
     int inflight_ = 0;
     int commit_inflight_ = 0;
 
+    // Re-entrancy state for destroy() / on_done_ scheduling.
+    //   dispatching_reply_   : true while on_visit_response is inside
+    //                          `on_reply_(reply)`. destroy() called in
+    //                          that window defers on_done_ firing to
+    //                          the end of on_visit_response.
+    //   pending_done_        : set by destroy() when dispatching_reply_
+    //                          was true. Drained at the end of
+    //                          on_visit_response.
+    //   pending_done_fired_  : idempotency guard so on_done_ cannot
+    //                          fire twice even if destroy() is called
+    //                          from both the re-entrant and the
+    //                          external paths.
+    bool dispatching_reply_ = false;
+    bool pending_done_ = false;
+    bool pending_done_fired_ = false;
+
     // JS parity: slowdown optimisation + table-fallback.
     //   from_table_: set true when the frontier was filled from the routing
     //                table. When it stays false (caller pre-seeded), both
@@ -222,6 +238,11 @@ private:
 
     // Commit phase — send to k closest with tokens
     void do_commit();
+
+    // Idempotent on_done_ dispatch. All completion paths (maybe_finish,
+    // do_commit, destroy) go through this so on_done_ fires AT MOST once
+    // across the lifetime of a Query.
+    void fire_done_once();
 };
 
 }  // namespace query

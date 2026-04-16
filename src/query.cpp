@@ -329,13 +329,27 @@ void Query::on_visit_response(const PendingNode& node, const messages::Response&
         slowdown_ = false;
     }
 
-    // Notify caller
+    // Notify caller. Set `dispatching_reply_` so that a `destroy()`
+    // call from inside this callback defers its on_done_ firing to
+    // after `read_more()` unwinds below. That keeps the completion
+    // hook off the same call stack as an in-progress visit — JS-style
+    // event-loop semantics without needing a timer.
     if (on_reply_) {
+        dispatching_reply_ = true;
         on_reply_(reply);
+        dispatching_reply_ = false;
     }
 
-    // Continue iterating
+    // Continue iterating. read_more() checks `done_` and no-ops if
+    // destroy() ran during on_reply_.
     read_more();
+
+    // If destroy() was deferred from inside on_reply_, fire on_done_
+    // now that we're about to unwind past this frame.
+    if (pending_done_) {
+        pending_done_ = false;
+        fire_done_once();
+    }
 }
 
 // JS: query.js:298-310 — _onerror(err, req): marks DOWN if the error code
@@ -454,9 +468,7 @@ void Query::maybe_finish() {
         do_commit();
     } else {
         done_ = true;
-        if (on_done_) {
-            on_done_(closest_replies_);
-        }
+        fire_done_once();
     }
 }
 
@@ -465,10 +477,33 @@ void Query::destroy() {
     done_ = true;
     pending_.clear();           // stop fanning out
     committing_ = true;         // short-circuit do_commit() if pending
-    // Fire on_done_ synchronously with the current closest_replies_ set.
-    // `inflight_` responses still outstanding will be dropped on arrival
-    // because `done_ && !committing_guard` filters them in on_reply_tick.
-    if (on_done_) on_done_(closest_replies_);
+
+    // When destroy() is invoked from inside an on_reply_ callback (the
+    // typical "I found what I was looking for" pattern — see
+    // dht_ops::immutable_get / mutable_get(latest=false)), firing
+    // on_done_ here would run the caller's completion handler while
+    // on_visit_response is still executing on the stack. Any future
+    // work after the on_reply_ invocation in on_visit_response would
+    // then be touching a query whose caller already saw "done". That's
+    // brittle, even though the current on_visit_response body doesn't
+    // actually touch `this` after on_reply_.
+    //
+    // Solution: defer the on_done_ firing to after on_visit_response
+    // unwinds. For externally-initiated destroy() (no reply dispatch
+    // in progress) we fire immediately, preserving idempotency for
+    // callers that just want to tear the query down synchronously.
+    if (dispatching_reply_) {
+        pending_done_ = true;
+    } else {
+        fire_done_once();
+    }
+}
+
+void Query::fire_done_once() {
+    if (!pending_done_fired_ && on_done_) {
+        pending_done_fired_ = true;
+        on_done_(closest_replies_);
+    }
 }
 
 void Query::do_commit() {
@@ -477,7 +512,7 @@ void Query::do_commit() {
 
     if (closest_replies_.empty()) {
         done_ = true;
-        if (on_done_) on_done_(closest_replies_);
+        fire_done_once();
         return;
     }
 
@@ -490,7 +525,7 @@ void Query::do_commit() {
             self->commit_inflight_--;
             if (self->commit_inflight_ == 0) {
                 self->done_ = true;
-                if (self->on_done_) self->on_done_(self->closest_replies_);
+                self->fire_done_once();
             }
         });
     }
@@ -498,7 +533,7 @@ void Query::do_commit() {
     // If no commits were sent (no tokens), finish immediately
     if (commit_inflight_ == 0) {
         done_ = true;
-        if (on_done_) on_done_(closest_replies_);
+        fire_done_once();
     }
 }
 

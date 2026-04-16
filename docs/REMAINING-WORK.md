@@ -128,12 +128,39 @@ PEER_HANDSHAKE and exhaust memory (each handshake allocates session state).
 
 ### 8. Language bindings (beyond C FFI)
 
-The C FFI surface (75 fns as of commit c57b6cd) is now considered
+The C FFI surface (76 fns as of commit 41ff514) is now considered
 production-ready for mobile/cross-language consumers: no known UAFs,
 explicit `_free` contracts on owned handles, idempotent cancel,
 ABI-pinned struct layouts, async firewall completion that survives
-the callback frame. What remains is building idiomatic wrappers on
-top of it.
+the callback frame.
+
+#### 8.0. C FFI — remaining exposures
+
+Audit 2026-04-17 against the C++ public surface found a handful of
+C++ methods still not exposed through the C FFI. None block any
+current consumer (Python wrapper works end-to-end with what's
+available today), but a true feature-parity C FFI would cover them.
+
+| C++ method | Priority | Why it matters |
+|------------|----------|----------------|
+| `HyperDHT::pool()` → connection pool | MEDIUM | Multi-peer apps (nospoon swarm, mobile messaging) want connection dedup. Currently every `connect()` is independent — repeated connects to the same peer build repeated sessions. |
+| `HyperDHT::listening()` snapshot | LOW | Enumerate active servers. Wrappers can track their own list instead, but an accessor is cheap. |
+| `HyperDHT::lookup_and_unannounce()` combined op | LOW | JS `dht.lookupAndUnannounce()`. Caller can do lookup + unannounce separately today. |
+| `HyperDHT::BOOTSTRAP()` getter | TRIVIAL | Returns the 3 canonical seed nodes as a const list. Currently `HYPERDHT_BOOTSTRAP_*` is a constant-based workaround — a proper getter would be ~5 lines. |
+
+Explicitly **NOT** planned for the C FFI (implementation details or
+documented non-goals):
+
+| C++ method | Why excluded |
+|------------|--------------|
+| `HyperDHT::bootstrapper()` static factory | For running a public bootstrap node — niche server-side use case; not a mobile/app concern. |
+| `HyperDHT::connect_raw_stream()` static | Advanced multi-stream piggyback — leaks libudx primitives into the C FFI. |
+| `HyperDHT::validate_local_addresses()` | JS itself comments this is "semi terrible"; a 500ms echo probe per interface. Rarely needed. |
+| `HyperDHT::create_raw_stream()` | Returns a raw `udx_stream_t*` — exposes libudx through the boundary; wrappers should stay above that layer. |
+| `rpc::Session` | Batched request cancellation. `hyperdht_query_cancel()` covers the common case (one query at a time); Session is for query-heavy internal code paths. |
+
+What remains is building idiomatic wrappers on top of the current
+surface.
 
 - **Python** — existing `wrappers/python` via ctypes exposes basic
   lifecycle, connect_stream, and the opts struct. Needs a pass to

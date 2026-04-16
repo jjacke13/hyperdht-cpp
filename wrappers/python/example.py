@@ -52,6 +52,7 @@ def cmd_server():
 
 
 def cmd_connect(pk_hex):
+    """JS-style: one call returns a ready-to-use stream."""
     remote_pk = bytes.fromhex(pk_hex)
 
     dht = HyperDHT()
@@ -59,24 +60,38 @@ def cmd_connect(pk_hex):
 
     connected = False
 
-    def on_done(error, conn):
+    def on_open(stream):
         nonlocal connected
-        if error:
-            print(f"Connection failed: {error}")
-        else:
-            connected = True
-            print(f"Connected!")
-            print(f"  Remote key: {conn.remote_key[:16].hex()}...")
-            print(f"  Peer: {conn.peer_host}:{conn.peer_port}")
+        connected = True
+        print("Connected! Sending hello...")
+        stream.write(b"hello from python")
+
+    def on_data(data):
+        print(f"Received: {data!r}")
+
+    def on_close():
+        print("Stream closed")
+        dht.destroy()
+
+    def on_error(code):
+        print(f"Connection failed: {code}")
+        dht.destroy()
 
     print(f"Connecting to {pk_hex[:32]}...")
-    dht.connect(remote_pk, on_done)
+    stream = dht.connect_stream(
+        remote_pk,
+        on_open=on_open,
+        on_data=on_data,
+        on_close=on_close,
+        on_error=on_error,
+    )
+    # You can even queue a write before on_open fires:
+    # stream.write(b"queued before open")
+
     dht.run()
 
     if connected:
         print("Success!")
-
-    dht.destroy()
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ Complete audit of `hyperdht-cpp` versus the JavaScript reference:
 - `@hyperswarm/secret-stream` 6.9.1
 - `blind-relay` 2.3.0
 
-**Last updated: 2026-04-14** (post Phase A-E finalization)
+**Last updated: 2026-04-16** (post reviewer-fix round 2 + live-test validation)
 
 ---
 
@@ -154,10 +154,29 @@ These are deliberate C++ design choices that differ from JS but are functionally
 
 - [x] `ctest` — 555/556 tests pass (only pre-existing `test_server_live` failure)
 - [x] 32 blind relay unit tests pass
-- [ ] C++ client → JS server (public IP): rawStream, zero punches
-- [ ] C++ client → JS server (behind NAT): holepunch succeeds
-- [ ] JS client → C++ server (public IP): rawStream, zero punches
-- [ ] JS client → C++ server (behind NAT): rawStream or holepunch
-- [ ] C++ client → JS server with relay fallback (blind relay)
+- [x] ASAN-clean (fixed 2 pre-existing bugs: PoolSocket UAF, interface watcher double-close)
+- [x] C++ client → JS server (public IP): PASS — full echo round-trip in ~5s
+- [x] JS client → C++ server (our NAT): PASS — connection received via rawStream firewall
+- [x] JS client → C++ server (aarch64 NAT): PASS — NAT-to-NAT holepunch succeeded
+- [x] JS client → C++ server (x86_64 NAT): PASS — NAT-to-NAT with nospoon on peer
+- [ ] C++ client → JS server (behind NAT, clean machine): **pending** — nospoon interferes
+- [ ] C++ client → C++ server (NAT-to-NAT, clean machine): **pending** — nospoon interferes
+- [ ] C++ client → JS server with blind relay fallback: **pending** — no deployed relay node to test against
 - [ ] Every JS public method has a C++ equivalent (API parity matrix above)
 - [ ] Every C++ public method has a C FFI equivalent
+
+## Recent changes (2026-04-16)
+
+Post-Phase-E cleanup (cpp-reviewer round 2 findings):
+
+- **RAII `UvTimer` wrapper** (`async_utils.hpp`) — replaced raw `new uv_timer_t` +
+  manual close callback pattern in dht.cpp, server.cpp, holepunch.cpp. Eliminates
+  class of timer-leak bugs at teardown.
+- **Multi-listener probe callbacks** (`rpc.hpp`) — `add_probe_listener` /
+  `remove_probe_listener` replaces single-slot `on_holepunch_probe`. Fixes
+  concurrent-session collision bug where second holepunch silently replaced
+  first's echo handler. Matches JS per-socket isolation pattern.
+- **`do_connect` decomposition** — 1192-line monolith split into `do_connect`
+  (232 lines: setup + findPeer + retry loop), `on_handshake_success` (245 lines:
+  post-handshake decision tree), `start_relay_path` (243 lines: blind relay chain).
+  Max lambda nesting dropped from 5 to ~3 levels. `ConnState` now at file scope.

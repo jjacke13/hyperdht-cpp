@@ -269,6 +269,51 @@ class Stream:
             self._handle = None
 
 
+class PendingStream:
+    """Handle returned by ``HyperDHT.connect_stream()`` before the
+    encrypted channel is established.
+
+    Writes made before ``on_open`` fires are buffered and flushed once
+    the stream is ready. Mirrors the JS ``NoiseSecretStream`` pattern
+    where you can subscribe to events and queue writes synchronously.
+    """
+
+    def __init__(self):
+        self.stream = None           # populated when connect succeeds
+        self._pending_writes = []    # queued until stream is ready
+        self._pending_close = False
+
+    def write(self, data: bytes):
+        """Write to the stream. Buffered if not yet open."""
+        if self.stream and self.stream.is_open:
+            self.stream.write(data)
+        else:
+            self._pending_writes.append(data)
+            # If the underlying Stream exists but hasn't opened yet, its
+            # on_open callback will flush — handled by connect_stream.
+
+    def close(self):
+        """Close the stream (or cancel if not yet opened)."""
+        if self.stream:
+            self.stream.close()
+        else:
+            self._pending_close = True
+
+    @property
+    def is_open(self):
+        return self.stream is not None and self.stream.is_open
+
+    def _flush_pending(self):
+        """Called by connect_stream's on_open once Stream is live."""
+        if not self.stream:
+            return
+        for buf in self._pending_writes:
+            self.stream.write(buf)
+        self._pending_writes.clear()
+        if self._pending_close:
+            self.stream.close()
+
+
 class KeyPair:
     """Ed25519 keypair for HyperDHT identity."""
 
@@ -443,6 +488,63 @@ class HyperDHT:
         if not handle:
             raise RuntimeError("Failed to create server")
         return Server(handle, self)
+
+    def connect_stream(self, remote_public_key: bytes,
+                       on_open=None, on_data=None, on_close=None,
+                       on_error=None) -> "PendingStream":
+        """
+        Connect to a peer and open an encrypted stream in one call.
+        Mirrors the JS ``dht.connect(pk)`` API — returns a stream handle
+        immediately; events fire as the async chain progresses.
+
+        The stream wiring (findPeer → handshake → holepunch/relay →
+        SecretStream start) happens asynchronously. Callbacks fire on
+        the event loop:
+
+            on_open(stream)        — stream is ready for write()
+            on_data(data: bytes)   — decrypted data received
+            on_close()             — stream closed cleanly
+            on_error(code: int)    — connect failed (no stream created)
+
+        Args:
+            remote_public_key: 32-byte Ed25519 public key of the peer
+            on_open: called with the Stream once the encrypted channel
+                     is established
+            on_data: called for each decrypted payload received
+            on_close: called when the stream closes
+            on_error: called if the connect phase fails
+
+        Returns:
+            PendingStream — a handle that will be populated with the
+            real Stream when on_open fires. Keep a reference to it for
+            the duration of the connection.
+        """
+        pending = PendingStream()
+
+        def _on_connect(error, conn):
+            if error != 0:
+                if on_error:
+                    on_error(error)
+                return
+
+            def _on_stream_open():
+                # Called by open_stream when the SecretStream handshake
+                # completes. Flush any writes the caller queued while
+                # the connection was pending, then deliver the Stream.
+                pending._flush_pending()
+                if on_open:
+                    on_open(pending.stream)
+
+            stream = self.open_stream(
+                conn,
+                on_open=_on_stream_open,
+                on_data=on_data,
+                on_close=on_close,
+            )
+            pending.stream = stream
+
+        self.connect(remote_public_key, _on_connect)
+        return pending
 
     def open_stream(self, connection: Connection, on_open=None,
                     on_data=None, on_close=None) -> Stream:

@@ -202,24 +202,72 @@ surface.
 
 ---
 
-## Prioritization
+## Release plan
 
-If shipping to nospoon as the first real consumer:
+The low-level systems code is solid. The work in this doc is about
+making the library *shippable*, not making it correct.
+
+### Phase 1 — v0.1 beta to nospoon (~3 hours total)
+
+Goal: a known consumer exercising the library in production.
+
+**Blocking:**
+- **Python wrapper pass** — expose the 23 new FFI symbols added in
+  commits 47e81b8 + c57b6cd (see §8 Python entry). Without this the
+  Python consumer can't reach most of what the FFI now offers.
+  Mechanical ctypes work, ~1-2 hours.
 
 **Must have:**
-- Python FFI smoke (confirms bindings work)
-- CLAUDE.md documentation pass
-- A real soak test (even just 30 minutes of continuous connects)
+- Python FFI smoke test (`wrappers/python/test_*.py` — connect, echo
+  round-trip, end to end under Python)
+- 30-min soak test (open a connection, exchange data every 5min,
+  verify keepalive + no drift)
+- CLAUDE.md documentation pass (update phase table, note the new
+  RAII patterns added since)
 
-**Should have before v1.0:**
+**Tag v0.1.0.** nospoon integrates, reports real-world issues.
+
+### Phase 2 — v1.0 public release
+
+**Must have before tagging:**
+- Address whatever v0.1 consumer finds in production
 - Observability hooks (structured logger + metrics)
 - Runtime-configurable timeouts
-- API stability declaration + semver
+- API stability declaration (C FFI ABI guarantees, semver)
+- CHANGELOG.md
+
+**Strong should-have:**
+- Fuzzing CI (runs on every push, not ad-hoc)
+- aarch64 CI (we build on aarch64 NixOS manually today)
+- Clean-machine NAT-to-NAT live test (rules out nospoon interference)
+- Full ASAN test suite pass (no hot-path leaks; pre-existing libudx
+  teardown leaks documented as acceptable)
 
 **Nice to have:**
-- Fuzzing CI
-- Rate limiting
-- Additional language bindings
+- Rate limiting / DoS protection (§5)
+- Static analysis CI (clang-tidy, cppcheck)
+- Noise implementation crypto audit (§6)
+- IPv6 validation (§10)
 
-The low-level systems code is solid. The work above is all about making it
-*shippable as a library* — operational concerns, not correctness concerns.
+### Phase 3 — language + platform expansion
+
+Parallel to v1.0, driven by downstream consumer needs:
+
+- **Kotlin / Swift wrappers** for mimiclaw / iOS / Android targets —
+  the C FFI was designed for these consumers specifically, but no
+  wrappers exist yet.
+- **ESP-IDF component wrapper** + `HYPERDHT_EMBEDDED=ON` trim for
+  ESP32-S3 target.
+- **Go / Rust wrappers** (lower priority — no active consumer).
+- **Public bootstrap node deployment** (§10 real-world validation).
+
+### What it takes to NOT ship
+
+- ❌ Don't ship if ASAN reports a hot-path leak (every test run, not
+  just teardown).
+- ❌ Don't ship if the fuzzer finds a new decoder crash.
+- ❌ Don't ship if the soak test shows memory growth over 30 min.
+- ❌ Don't ship if a live test against JS regresses.
+
+None of these are true today — the tree is in a shippable state
+modulo the Phase 1 items above.

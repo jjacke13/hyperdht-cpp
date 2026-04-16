@@ -105,9 +105,9 @@ All MEDIUM gaps resolved:
 - **`selectRelay()` array/function**: `ConnectOptions::{relay_through_fn, relay_through_array}` + `select_relay_through()` helper.
 - **C FFI `connection_keep_alive`**: `hyperdht_opts_t` field + `hyperdht_opts_default()` helper.
 
-### LOW — none remaining
+### LOW — polish (resolved)
 
-All LOW gaps resolved:
+All prior LOW gaps resolved:
 - **`filterNode` option**: `DhtOptions::filter_node` + built-in JS testnet blocklist composed with caller filter.
 - **`suspend`/`resume` logging hook**: `Server::suspend(LogFn)` overload with phase breadcrumbs.
 - **`destroy({ force })`**: `HyperDHT::DestroyOptions{force}` skips announcer UNANNOUNCE while still tearing down handles.
@@ -123,6 +123,23 @@ See "Architectural differences" table below for items that are not gaps:
 See "Deferred by design" table below for items with negligible practical value:
 `validate_local_addresses` echo probe, bootstrap two-pass NAT detection,
 Query `_slow` oncycle counter.
+
+### LOW — API surface completeness (open — one-liners each)
+
+Audit 2026-04-16 (post commit `6ba2501`) found 5 JS HyperDHT methods
+still missing from our public C++ API. None block any current consumer
+(nospoon, Python wrapper) because they have equivalent lower-level
+access via `socket()` / `nat_sampler()` / `table()`. Each one is a
+thin wrapper over existing state; listed here so we remember they
+exist when someone hits the ergonomics cliff.
+
+| # | JS | JS ref | C++ gap | Workaround today |
+|---|----|--------|---------|------------------|
+| 1 | `HyperDHT.suspend({log})` / `resume({log})` | `hyperdht/index.js:96-110` | `{log}` hook exists on `Server::suspend` but not on `HyperDHT::suspend` (which iterates servers). | Call `Server::suspend(log)` on each via `dht.listening()`. |
+| 2 | `static HyperDHT.bootstrapper(port, host, opts)` | `dht-rpc/index.js:104-120` | Convenience factory for a non-ephemeral, non-firewalled, fixed-port node. | Construct `HyperDHT` with `opts.port` / `opts.ephemeral=false` manually. |
+| 3 | `dht.toArray(opts)` | `dht-rpc/index.js:233-237` | Returns routing table as `[{host, port}, ...]`. | `socket().table()` exposes the same data via iteration. |
+| 4 | `dht.addNode({host, port})` at runtime | `dht-rpc/index.js:216-231` | We accept `opts.nodes` at construction only. | `socket_->table().add(node)` internally (not a public API). |
+| 5 | `dht.remoteAddress()` | `dht-rpc/index.js:201-214` | Return `{host, port}` of our public address as seen by the NAT sampler. | `socket().nat_sampler().host()` + `.port()` / `.addresses()[0]`. |
 
 ---
 

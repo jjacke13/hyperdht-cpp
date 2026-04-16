@@ -637,6 +637,14 @@ void HyperDHT::stop_interface_watcher() {
     // events automatically (libudx/src/udx.c:1879). Calling close manually
     // AND letting teardown close it causes the close callback to fire after
     // the udx_t is freed → use-after-free in ref_dec(event->udx).
+    //
+    // Trade-off accepted: the `udx_interface_event_t` heap struct leaks
+    // ~232 bytes per HyperDHT instance at process exit, because libudx
+    // teardown closes its listener handles but our `on_udx_interface_close`
+    // deleter never fires in that path. Fixable only by patching libudx
+    // to invoke the user close callback from its teardown loop. Since
+    // the leak is bounded per process lifetime (one per HyperDHT)
+    // and not per-operation, we accept it.
     interface_watcher_ = nullptr;
 }
 
@@ -1677,6 +1685,15 @@ void HyperDHT::destroy(DestroyOptions opts, std::function<void()> on_done) {
 
     // Clear router
     router_.clear();
+
+    // Reset handlers_ BEFORE closing the socket (and therefore before
+    // the caller's `uv_run()` drain). RpcHandlers owns a heap-allocated
+    // `gc_timer_` whose `uv_close` + deleter lambda must be scheduled
+    // while the loop is still alive — otherwise the deleter never runs,
+    // leaking the timer struct. Previously `handlers_` was released
+    // implicitly by ~HyperDHT, which runs AFTER the test's final
+    // `uv_loop_close()` → the uv_close was posted to a dead loop.
+    handlers_.reset();
 
     // Close socket
     if (socket_) {

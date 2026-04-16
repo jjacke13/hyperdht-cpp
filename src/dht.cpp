@@ -1635,7 +1635,12 @@ void HyperDHT::suspend(LogFn log) {
     if (suspended_) return;
     suspended_ = true;
 
-    // JS: hyperdht/index.js:106-118 — phase markers match.
+    // JS parity: hyperdht/index.js:106-118. JS emits five breadcrumbs —
+    // the two "clearing raw streams" markers bracket a `rawStreams.clear()`
+    // call that does not have a direct C++ counterpart (our raw streams
+    // live inside individual connect/server contexts, not in a global
+    // pool). We still emit the markers so log output matches the JS
+    // shape an operator would see from the reference implementation.
     if (log) log("Suspending all hyperdht servers");
 
     // Suspend all servers (propagate log hook to each).
@@ -1643,12 +1648,18 @@ void HyperDHT::suspend(LogFn log) {
         srv->suspend(log);
     }
 
-    if (log) log("Suspending dht-rpc");
+    if (log) log("Done, clearing all raw streams");
+    // (no-op: see comment above)
+
+    if (log) log("Done, suspending dht-rpc");
 
     // Stop RPC ticks (JS: dht.suspend() stops tick timer)
     if (socket_) {
         socket_->stop_tick();
     }
+
+    if (log) log("Done, clearing raw streams again");
+    // (no-op: see comment above)
 
     if (log) log("Done, hyperdht fully suspended");
 }

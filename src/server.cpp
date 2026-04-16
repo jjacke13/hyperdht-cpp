@@ -106,6 +106,11 @@ Server::~Server() {
     if (listening_ && !closed_) {
         close();
     }
+    // Belt-and-suspenders: even if close() was called already, ensure
+    // any async continuation lambdas holding a weak_ptr to alive_ see
+    // `expired()`-equivalent semantics via the stored bool flipping
+    // false before the shared_ptr control block goes out of scope.
+    *alive_ = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +194,12 @@ void Server::close(bool force, std::function<void()> on_done) {
     }
     closed_ = true;
     listening_ = false;
+
+    // Signal any outstanding async `FirewallDoneCb` lambdas that this
+    // Server is no longer valid. They capture `weak_ptr<bool>(alive_)`
+    // and bail out when they see this flip, preventing a UAF on
+    // `this` after the Server has been destroyed.
+    *alive_ = false;
 
     // Stop announcer
     // JS parity: `force = true` skips the UNANNOUNCE RPC emissions but
@@ -413,22 +424,50 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     // (or std::nullopt on failure).
     if (firewall_async_) {
         // Async path — JS parity: server.js:251 `await this.firewall(...)`.
-        // We hand the decoded payload to the user callback; it completes
-        // with a bool (reject) via the `done` completion handler.
+        // Hand the decoded payload to the user callback; it completes
+        // with a bool (reject) via the `done` continuation.
         //
-        // `done` is heap-owned via shared_ptr so the user can invoke it
-        // from any callback tick without us caring about lifetime.
+        // Lifetime hazards handled inside the continuation:
+        //   (1) Server destroyed before `done` fires — `weak_alive`
+        //       sentinel captured by weak_ptr. Lock returns null (or
+        //       `*alive == false`) once the Server is torn down in
+        //       close() / ~Server, and we bail BEFORE dereferencing
+        //       the captured raw `this`.
+        //   (2) User calls `done` more than once — `fired_once` flag
+        //       (single-threaded event loop, plain bool is enough)
+        //       short-circuits subsequent calls. A repeat invocation
+        //       would otherwise move-from an already-moved
+        //       PendingHandshake → NoiseIK::send() with zeroed key
+        //       material → a garbage second ServerConnection → a
+        //       leaked udx_stream_t when on_handshake_result overwrites
+        //       the `connections_` entry.
+        //   (3) User completes while Server is suspended — the inner
+        //       on_handshake_result already guards on
+        //       `closed_ || suspended_`, but we short-circuit here too
+        //       to skip the wasted Noise send + UDX id allocation.
         auto pending_shared = std::make_shared<server_connection::PendingHandshake>(
             std::move(*pending));
         auto relay_through_shared = relay_through_info;
+        auto fired_once = std::make_shared<bool>(false);
+        std::weak_ptr<bool> weak_alive = alive_;
 
         firewall_async_(pending_shared->remote_public_key,
                         pending_shared->remote_payload, peer_address,
-                        [this, pending_shared, hp_id,
-                         noise_key, has_remote_addr,
+                        [this, weak_alive, fired_once, pending_shared,
+                         hp_id, noise_key, has_remote_addr,
                          relay_through_shared, our_addrs, relay_infos,
-                         reply_fn](bool reject) {
-            if (closed_) return;
+                         reply_fn](bool reject) mutable {
+            // (2) Once-guard.
+            if (*fired_once) return;
+            *fired_once = true;
+
+            // (1) Liveness guard — Server may be destroyed already.
+            auto alive = weak_alive.lock();
+            if (!alive || !*alive) return;
+
+            // (3) Early-out on close/suspend BEFORE finalize work.
+            if (closed_ || suspended_) return;
+
             auto res = server_connection::finalize_handshake(
                 std::move(*pending_shared), hp_id,
                 our_addrs, relay_infos, reject,

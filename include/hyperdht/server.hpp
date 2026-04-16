@@ -248,6 +248,17 @@ private:
     bool closed_ = false;
     bool suspended_ = false;
 
+    // Liveness sentinel for async callbacks. Captured by `std::weak_ptr`
+    // in user-facing continuation lambdas (notably the `FirewallDoneCb`
+    // passed to `AsyncFirewallCb`) so they can safely detect a
+    // destroyed Server without dereferencing `this`. Flipped to `false`
+    // in `close()` and the destructor — any lambda that locks the
+    // weak_ptr and sees `*alive_ == false` must bail out.
+    //
+    // Matches the `HyperDHT::alive_` pattern (src/dht.cpp, the
+    // `*alive_ = false` line in `destroy()`).
+    std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
+
     // Probe echo listener ID (0 = not installed).
     // Installed once on first holepunch, removed on close.
     uint32_t probe_listener_id_ = 0;

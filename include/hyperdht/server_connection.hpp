@@ -144,6 +144,21 @@ struct PendingHandshake {
     noise::NoiseIK noise_ik;
     noise::PubKey remote_public_key{};
     peer_connect::NoisePayload remote_payload{};
+
+    // Move-only. Silently copying would split the NoiseIK state into
+    // two responders that both think they are mid-handshake at msg1,
+    // producing two different ephemeral keys on `send()` — a
+    // protocol-level split-brain. Enforce at compile time.
+    PendingHandshake() = default;
+    PendingHandshake(noise::NoiseIK ik, noise::PubKey pk,
+                     peer_connect::NoisePayload pl)
+        : noise_ik(std::move(ik)),
+          remote_public_key(pk),
+          remote_payload(std::move(pl)) {}
+    PendingHandshake(const PendingHandshake&) = delete;
+    PendingHandshake& operator=(const PendingHandshake&) = delete;
+    PendingHandshake(PendingHandshake&&) = default;
+    PendingHandshake& operator=(PendingHandshake&&) = default;
 };
 
 std::optional<PendingHandshake> decode_handshake(

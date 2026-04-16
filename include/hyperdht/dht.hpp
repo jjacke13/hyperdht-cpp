@@ -763,10 +763,18 @@ public:
     // the table for observability.
     //
     // `limit` caps the output; default (`SIZE_MAX`) returns every
-    // node. Iteration walks buckets in ascending-distance order, which
-    // is close enough to JS's `reverse: true` most-recently-seen
-    // ordering for the typical persistence use case. Explicit 0 limit
-    // returns an empty vector, matching JS `{limit: 0}` semantics.
+    // node. Explicit 0 limit returns an empty vector, matching JS
+    // `{limit: 0}` semantics.
+    //
+    // **Ordering difference from JS.** JS uses a time-ordered set
+    // (`reverse: true` → most-recently-seen first), so a small `limit`
+    // preferentially keeps the nodes most likely to still be online.
+    // We iterate Kademlia buckets in ascending XOR distance (bucket 0
+    // first, bucket ID_BITS-1 last), i.e. closest peers first, which
+    // is orthogonal to recency. For the typical persistence use case
+    // the difference is benign (closest nodes tend to be active too),
+    // but callers that specifically want the "live peers for cold
+    // restart" semantic should be aware.
     std::vector<compact::Ipv4Address> to_array(
         size_t limit = std::numeric_limits<size_t>::max()) const {
         std::vector<compact::Ipv4Address> out;
@@ -796,10 +804,14 @@ public:
         node.id = rpc::compute_peer_id(addr);
         node.host = addr.host_string();
         node.port = addr.port;
-        const uint32_t now = socket_->tick();
-        node.added = now;
-        node.pinged = now;
-        node.seen = now;
+        // JS parity (dht-rpc/index.js:216-230): `added: this._tick,
+        // pinged: 0, seen: 0`. Only `added` is stamped; `pinged` /
+        // `seen` stay at zero so the node is immediately eligible
+        // for the ping-and-swap eviction cycle if its bucket is
+        // already full.
+        node.added = socket_->tick();
+        node.pinged = 0;
+        node.seen = 0;
         socket_->table().add(node);
     }
 

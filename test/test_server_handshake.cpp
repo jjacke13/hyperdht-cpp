@@ -169,10 +169,12 @@ TEST(ServerHandshake, FirewallRejects) {
 }
 
 // Two-phase split — decode_handshake() followed by finalize_handshake()
-// must produce a ServerConnection bit-identical to handle_handshake().
-// Used by the async firewall path at Server::on_peer_handshake so the
-// firewall callback sees the client's decoded public key before we
-// commit to the response.
+// must produce an equivalent ServerConnection (same error code,
+// firewall flag, holepunch id, public key). NOT a byte-identical msg2
+// check: NoiseIK picks a fresh ephemeral on every recv(), so the two
+// responses necessarily differ in the ephemeral field. Byte-identity
+// would require pinning ephemerals via `set_ephemeral()`, which we
+// don't do here.
 TEST(ServerHandshake, DecodeThenFinalizeMatchesSync) {
     noise::Seed server_seed{}; server_seed.fill(0x11);
     auto server_kp = noise::generate_keypair(server_seed);

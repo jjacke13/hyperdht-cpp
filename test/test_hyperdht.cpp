@@ -626,8 +626,11 @@ TEST(HyperDHT, SuspendResumeLogHook) {
             });
     };
 
+    // Five JS-parity phase breadcrumbs (hyperdht/index.js:106-118).
     EXPECT_TRUE(contains("Suspending all hyperdht servers"));
-    EXPECT_TRUE(contains("Suspending dht-rpc"));
+    EXPECT_TRUE(contains("Done, clearing all raw streams"));
+    EXPECT_TRUE(contains("Done, suspending dht-rpc"));
+    EXPECT_TRUE(contains("Done, clearing raw streams again"));
     EXPECT_TRUE(contains("Done, hyperdht fully suspended"));
     // Nested Server::suspend(log) breadcrumbs also arrived.
     EXPECT_TRUE(contains("Suspending hyperdht server"));

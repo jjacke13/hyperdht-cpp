@@ -301,6 +301,146 @@ TEST(Server, AsyncFirewallDeferredAccept) {
     uv_loop_close(&loop);
 }
 
+// Calling `done` twice is a silent no-op on the second call. Previous
+// implementation would have moved-from an already-moved
+// PendingHandshake and produced a garbage second ServerConnection
+// that leaks a udx_stream_t.
+TEST(Server, AsyncFirewallDoneCalledTwiceIsNoop) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed server_seed{}; server_seed.fill(0x11);
+    auto server_kp = noise::generate_keypair(server_seed);
+    srv.listen(server_kp, [](const ConnectionInfo&) {});
+
+    Server::FirewallDoneCb deferred_done;
+    srv.set_firewall_async(
+        [&](const auto&, const auto&, const auto&,
+            Server::FirewallDoneCb done) { deferred_done = std::move(done); });
+
+    // Build + dispatch handshake
+    noise::Seed client_seed{}; client_seed.fill(0x22);
+    auto client_kp = noise::generate_keypair(client_seed);
+    const auto& prol = dht_messages::ns_peer_handshake();
+    noise::NoiseIK client_noise(true, client_kp, prol.data(), prol.size(),
+                                 &server_kp.public_key);
+    peer_connect::NoisePayload cp;
+    cp.version = 1;
+    cp.firewall = peer_connect::FIREWALL_OPEN;
+    cp.udx = peer_connect::UdxInfo{1, false, 1, 0};
+    cp.has_secret_stream = true;
+    cp.addresses4.push_back(
+        compact::Ipv4Address::from_string("10.0.0.1", 5000));
+    auto cpb = peer_connect::encode_noise_payload(cp);
+    auto msg1 = client_noise.send(cpb.data(), cpb.size());
+
+    peer_connect::HandshakeMessage hs_msg;
+    hs_msg.mode = peer_connect::MODE_FROM_CLIENT;
+    hs_msg.noise = msg1;
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32,
+                       server_kp.public_key.data(), 32, nullptr, 0);
+    messages::Request req;
+    req.target = target;
+    req.value = peer_connect::encode_handshake_msg(hs_msg);
+    req.from.addr = compact::Ipv4Address::from_string("10.0.0.1", 5000);
+    req.tid = 1;
+
+    int reply_count = 0;
+    router.handle_peer_handshake(req,
+        [&reply_count](const messages::Response&) { reply_count++; },
+        [](const messages::Request&) {});
+
+    ASSERT_TRUE(deferred_done);
+    deferred_done(/*reject=*/false);
+    EXPECT_EQ(reply_count, 1);
+
+    // Second call must be a silent no-op.
+    deferred_done(/*reject=*/true);
+    EXPECT_EQ(reply_count, 1) << "second done() must not produce another reply";
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// If the Server is closed BEFORE the async firewall completes,
+// invoking `done` must be a silent no-op (no dispatch, no UAF).
+TEST(Server, AsyncFirewallAfterServerCloseIsNoop) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed server_seed{}; server_seed.fill(0x11);
+    auto server_kp = noise::generate_keypair(server_seed);
+    srv.listen(server_kp, [](const ConnectionInfo&) {});
+
+    Server::FirewallDoneCb deferred_done;
+    srv.set_firewall_async(
+        [&](const auto&, const auto&, const auto&,
+            Server::FirewallDoneCb done) { deferred_done = std::move(done); });
+
+    noise::Seed client_seed{}; client_seed.fill(0x22);
+    auto client_kp = noise::generate_keypair(client_seed);
+    const auto& prol = dht_messages::ns_peer_handshake();
+    noise::NoiseIK client_noise(true, client_kp, prol.data(), prol.size(),
+                                 &server_kp.public_key);
+    peer_connect::NoisePayload cp;
+    cp.version = 1;
+    cp.firewall = peer_connect::FIREWALL_OPEN;
+    cp.udx = peer_connect::UdxInfo{1, false, 1, 0};
+    cp.has_secret_stream = true;
+    cp.addresses4.push_back(
+        compact::Ipv4Address::from_string("10.0.0.1", 5000));
+    auto cpb = peer_connect::encode_noise_payload(cp);
+    auto msg1 = client_noise.send(cpb.data(), cpb.size());
+    peer_connect::HandshakeMessage hs_msg;
+    hs_msg.mode = peer_connect::MODE_FROM_CLIENT;
+    hs_msg.noise = msg1;
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32,
+                       server_kp.public_key.data(), 32, nullptr, 0);
+    messages::Request req;
+    req.target = target;
+    req.value = peer_connect::encode_handshake_msg(hs_msg);
+    req.from.addr = compact::Ipv4Address::from_string("10.0.0.1", 5000);
+    req.tid = 1;
+
+    int reply_count = 0;
+    router.handle_peer_handshake(req,
+        [&reply_count](const messages::Response&) { reply_count++; },
+        [](const messages::Request&) {});
+    ASSERT_TRUE(deferred_done);
+
+    // Tear down the server BEFORE the user completes the firewall.
+    srv.close();
+
+    // done() must not touch `this` (UAF guard via weak_ptr alive_).
+    // Can't actually delete the Server here — its stack scope covers
+    // the entire test — but close() flips *alive_=false, which the
+    // weak_ptr guard treats as "expired".
+    deferred_done(/*reject=*/false);
+    EXPECT_EQ(reply_count, 0) << "post-close done() must not produce a reply";
+
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
 // async firewall that rejects: handshake completes, reply is sent
 // with ERROR_ABORTED, session not registered.
 TEST(Server, AsyncFirewallDeferredReject) {

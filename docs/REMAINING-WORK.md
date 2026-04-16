@@ -133,6 +133,14 @@ PEER_HANDSHAKE and exhaust memory (each handshake allocates session state).
 - **Go** — cgo wrapper with goroutine-friendly callbacks
 - **Rust** — `hyperdht-sys` crate + safe `hyperdht` wrapper
 - **Swift/Kotlin** — for mobile use (the target use case for mimiclaw eventually)
+- **ESP-IDF component wrapper** — wrap the library as a reusable
+  ESP-IDF component with a CMakeLists.txt registering the component
+  against the IDF build system. Pair with an `HYPERDHT_EMBEDDED=ON`
+  CMake option that trims memory-heavy features for the ESP32-S3
+  target (8MB PSRAM): shrink the routing table (256 → 64 buckets),
+  shrink the congestion window (80 → 16 inflight), strip the
+  mutable/immutable storage codecs (device is client-only), and
+  lower default buffer sizes. Estimated ~50 lines.
 
 ### 9. Documentation
 

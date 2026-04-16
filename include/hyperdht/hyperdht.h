@@ -36,7 +36,20 @@
  *   uv_loop_t event loop. This library is single-threaded by design
  *   (matching libuv's concurrency model). Do not call any hyperdht_*
  *   function from a background thread.
+ *
+ *   Exceptions: NONE. Even `hyperdht_firewall_done()` — which exists
+ *   to complete a user's async policy check — must ultimately be
+ *   called from the loop thread. If your ACL/DB lookup runs on a
+ *   worker thread, marshal the completion back to the loop thread
+ *   via `uv_async_send()` before invoking `hyperdht_firewall_done()`.
  */
+
+/**
+ * Size of an Ed25519 public key in bytes. Exposed as a #define so
+ * FFI consumers (ctypes, JNI, Swift) can allocate fixed-size buffers
+ * without hard-coding the magic number.
+ */
+#define HYPERDHT_PK_SIZE 32
 
 #include <stddef.h>
 #include <stdint.h>
@@ -128,6 +141,16 @@ typedef struct {
      */
     uint8_t seed[32];
     int seed_is_set;
+
+    /**
+     * Explicit padding to pin struct layout under all ABIs. On 64-bit
+     * platforms `int` is 4 bytes; the next field (`host*`) is 8-byte
+     * aligned, so the compiler inserts 4 bytes of padding here
+     * implicitly. Pinning it explicitly means Python ctypes /
+     * Kotlin @CStruct / Swift struct mirrors can declare the layout
+     * without platform-specific padding calculations.
+     */
+    uint32_t _pad0;
 
     /**
      * Optional bind host (interface). `NULL` or empty string → 0.0.0.0.
@@ -263,18 +286,12 @@ HYPERDHT_API void hyperdht_default_keypair(const hyperdht_t* dht, hyperdht_keypa
  * ========================================================================= */
 
 /**
- * Connect to a remote peer by public key.
- * Orchestrates: findPeer → handshake → holepunch → ready.
- * @param remote_pk   32-byte public key of the target
- * @param cb          called when connection succeeds or fails
- * @param userdata    passed to cb
- * @return            0 on success (async), negative on error
- */
-/**
  * Full connect options. Pass to `hyperdht_connect_ex()` for fine-grained
  * control over the outgoing connection. Mirrors C++ `ConnectOptions`.
  *
- * Always zero-init then override fields — new fields may be added.
+ * Always call `hyperdht_connect_opts_default()` first — new fields may
+ * be added to the tail of this struct in future versions, and the
+ * default helper zero-inits them to their sentinel values.
  */
 typedef struct {
     /**
@@ -321,6 +338,14 @@ HYPERDHT_API int hyperdht_connect_ex(hyperdht_t* dht,
                                       hyperdht_connect_cb cb,
                                       void* userdata);
 
+/**
+ * Connect to a remote peer by public key.
+ * Orchestrates: findPeer → handshake → holepunch → ready.
+ * @param remote_pk   32-byte public key of the target
+ * @param cb          called when connection succeeds or fails
+ * @param userdata    passed to cb
+ * @return            0 on success (async), negative on error
+ */
 HYPERDHT_API int hyperdht_connect(hyperdht_t* dht,
                      const uint8_t remote_pk[32],
                      hyperdht_connect_cb cb,
@@ -544,18 +569,48 @@ typedef void (*hyperdht_peer_cb)(const uint8_t* value, size_t len,
                                   void* userdata);
 
 /**
- * Query handle lifetime:
- * - Returned live by the `_ex` variants (find_peer_ex, lookup_ex,
- *   immutable_get_ex, mutable_get_ex).
- * - Valid from issue site until the `on_done` callback fires
- *   (cancelled or natural completion). `on_done` fires exactly once
- *   either way; after it fires, the handle is invalid.
- * - Pass to `hyperdht_query_cancel()` to abort a running walk
- *   (useful when the app is backgrounded, the user cancels, etc.).
+ * Query handle lifetime (two-call ownership):
+ *
+ *   1. Obtained from an `_ex` variant (find_peer_ex, lookup_ex,
+ *      immutable_get_ex, mutable_get_ex).
+ *   2. Valid until the user calls `hyperdht_query_free()`.
+ *
+ * `on_done` fires exactly once per query (natural completion OR
+ * cancel). The handle REMAINS VALID after `on_done` — you still
+ * need to call `hyperdht_query_free()` to release it. This is the
+ * same pattern as `hyperdht_create()`/`hyperdht_free()`.
+ *
+ * All three operations (cancel, free, and late completion via the
+ * lambda) are safe to interleave in any order:
+ *
+ *   - `cancel` + `free`  → callback fires with HYPERDHT_ERR_CANCELLED,
+ *                          then handle is released.
+ *   - `free` + natural completion → callback is detached at free time,
+ *                          late completion silently no-ops.
+ *   - `cancel` + `cancel` → second call is a no-op (idempotent).
+ *   - `free` + `cancel`  → cancel on a freed handle is UB (you must
+ *                          not use the pointer after free, same rule
+ *                          as any C handle).
  */
 
-/** Cancel an in-flight query. Safe to call at most once. */
+/**
+ * Cancel an in-flight query. Idempotent — safe to call any number of
+ * times as long as the handle has not been freed. A cancel after the
+ * query has already completed naturally is a silent no-op.
+ */
 HYPERDHT_API void hyperdht_query_cancel(hyperdht_query_t* q);
+
+/**
+ * Release the query handle. Must be called exactly once per `_ex`
+ * call, AFTER the done callback has fired OR after `hyperdht_query_cancel()`.
+ * Safe to call from inside the done callback itself.
+ *
+ * If free is called BEFORE the query completes, the completion
+ * callback is detached — the query will still finish internally but
+ * the user's `done_cb` will not fire. Useful for abandon-don't-wait
+ * patterns.
+ */
+HYPERDHT_API void hyperdht_query_free(hyperdht_query_t* q);
 
 HYPERDHT_API int hyperdht_find_peer(hyperdht_t* dht,
                                      const uint8_t public_key[32],
@@ -661,25 +716,35 @@ HYPERDHT_API void hyperdht_hash(const uint8_t* data, size_t len,
 HYPERDHT_API uint64_t hyperdht_connection_keep_alive(const hyperdht_t* dht);
 
 /**
+ * Fixed stride of the `hosts_flat` buffer in `hyperdht_to_array`.
+ * Each entry occupies `HYPERDHT_HOST_STRIDE` bytes, null-terminated
+ * IPv4 dotted-quad string (e.g. "192.168.1.1\0...").
+ */
+#define HYPERDHT_HOST_STRIDE 46
+
+/**
  * Snapshot the routing table — writes up to `cap` `{host, port}` pairs
- * into the caller-provided parallel arrays. Returns the number of
+ * into the caller-provided output buffers. Returns the number of
  * entries actually written.
  *
  * Intended use: mobile app going to background → snapshot the table,
  * persist to disk, restore via `hyperdht_add_node()` on next launch.
  * This lets the DHT skip a cold bootstrap walk.
  *
- * `hosts` must point to at least `cap` `char[46]` buffers. Hosts are
- * null-terminated IPv4 dotted-quad strings.
+ * `hosts_flat` is a flat buffer of `cap * HYPERDHT_HOST_STRIDE` bytes.
+ * Entry `i` lives at `hosts_flat + i * HYPERDHT_HOST_STRIDE`, as a
+ * null-terminated string. This flat layout is FFI-friendly — maps
+ * directly onto Python `ctypes.c_char * (cap * 46)`, Java/Kotlin
+ * `ByteBuffer`, and Swift `UnsafeMutablePointer<CChar>`.
  *
- * @param dht    DHT instance
- * @param hosts  [out] array of char[46] — `hosts[i]` receives the host
- * @param ports  [out] array of uint16_t — `ports[i]` receives the port
- * @param cap    size of both output arrays
+ * @param dht         DHT instance
+ * @param hosts_flat  [out] at least `cap * HYPERDHT_HOST_STRIDE` bytes
+ * @param ports       [out] `cap` uint16_t entries
+ * @param cap         size of both output arrays (in entries)
  * @return number of entries written (≤ cap)
  */
 HYPERDHT_API size_t hyperdht_to_array(const hyperdht_t* dht,
-                                       char (*hosts)[46],
+                                       char* hosts_flat,
                                        uint16_t* ports,
                                        size_t cap);
 

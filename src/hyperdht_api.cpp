@@ -32,22 +32,68 @@ struct hyperdht_server_s {
     void* userdata = nullptr;
 };
 
-// FFI query handle — thin wrapper around a std::shared_ptr<Query>.
-// The shared_ptr owns the query; the handle owns the shared_ptr; the
-// `on_done` callback owns the handle (deletes it on fire).
-// `cancelled` lets the done-callback report HYPERDHT_ERR_CANCELLED
-// when the user called `hyperdht_query_cancel()`.
+// FFI query handle — two-layer ownership to make cancel, done, and
+// free all UAF-safe regardless of order.
 //
-// Lifetime:
-//   - Allocated by hyperdht_*_ex()  — returned to the caller.
-//   - Freed in the on_done lambda   — covers both natural completion
-//                                     and the cancel path (cancel
-//                                     triggers Query::destroy() →
-//                                     fires on_done → deletes handle).
-struct hyperdht_query_s {
+//   QueryState (heap, shared_ptr):
+//     owned by two parties:
+//       1. `hyperdht_query_s` (user's wrapper)
+//       2. the on_done lambda closure
+//     Destroyed when BOTH refs drop — never before.
+//
+//   hyperdht_query_s (heap, raw ptr returned to user):
+//     exactly one instance per query, holds ONE shared_ptr<QueryState>.
+//     Deleted by `hyperdht_query_free()`. Safe to delete at any time —
+//     the state lives on via the lambda's ref until completion.
+//
+// Guarantees this gives FFI consumers:
+//
+//   - `hyperdht_query_cancel(h)` is idempotent. Checks `state->done`
+//     first; flips `state->cancelled`; triggers Query::destroy().
+//   - `hyperdht_query_cancel(h)` AFTER done fired is a no-op (saw
+//     `state->done == true`).
+//   - `hyperdht_query_free(h)` detaches the user's callback then
+//     releases the user's ref. Outstanding lambda refs keep the state
+//     alive silently (callback detached → late completion is a no-op).
+//   - Double-free is prevented by the usual `delete h` UB rule — user
+//     must not call free twice (same rule as any C handle).
+struct QueryState {
     std::shared_ptr<hyperdht::query::Query> q;
+    hyperdht_done_cb done_cb = nullptr;
+    void* userdata = nullptr;
+    bool done = false;
     bool cancelled = false;
 };
+
+struct hyperdht_query_s {
+    std::shared_ptr<QueryState> state;
+};
+
+// Helper: allocate handle + state, wire the done callback location.
+static hyperdht_query_t* make_query_handle(hyperdht_done_cb done_cb,
+                                            void* userdata) {
+    auto* h = new hyperdht_query_s;
+    h->state = std::make_shared<QueryState>();
+    h->state->done_cb = done_cb;
+    h->state->userdata = userdata;
+    return h;
+}
+
+// Helper: build an on_done lambda that fires the user's done_cb
+// through `state`. Reads `done_cb` / `userdata` AT INVOCATION TIME so
+// that `hyperdht_query_free()` can detach by nulling them — a late
+// completion after free becomes silent.
+template <class Result>
+static std::function<void(const Result&)>
+make_done_fn(std::shared_ptr<QueryState> state) {
+    return [state](const Result&) {
+        state->done = true;
+        if (state->done_cb) {
+            int err = state->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
+            state->done_cb(err, state->userdata);
+        }
+    };
+}
 
 // Helper: fill hyperdht_connection_t from C++ ConnectionInfo
 static void fill_connection(hyperdht_connection_t* out,
@@ -78,9 +124,22 @@ static void fill_connection(hyperdht_connection_t* out,
 // ---------------------------------------------------------------------------
 
 extern "C" void hyperdht_query_cancel(hyperdht_query_t* q) {
-    if (!q || !q->q) return;
-    q->cancelled = true;
-    q->q->destroy();  // idempotent — triggers the registered on_done
+    if (!q || !q->state) return;
+    auto& st = *q->state;
+    if (st.done) return;        // already completed — idempotent no-op
+    st.cancelled = true;
+    if (st.q) st.q->destroy();  // triggers on_done (which sets st.done)
+}
+
+extern "C" void hyperdht_query_free(hyperdht_query_t* q) {
+    if (!q) return;
+    // Detach the callback so any late completion is silent — the lambda
+    // still holds `state` alive until it fires, but won't reach user code.
+    if (q->state) {
+        q->state->done_cb = nullptr;
+        q->state->userdata = nullptr;
+    }
+    delete q;  // state may still be alive via lambda ref, which is fine
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +176,7 @@ void hyperdht_opts_default(hyperdht_opts_t* opts) {
     opts->connection_keep_alive = UINT64_MAX;
     memset(opts->seed, 0, sizeof(opts->seed));
     opts->seed_is_set = 0;
+    opts->_pad0 = 0;  // explicit layout pinning
     opts->host = nullptr;
     opts->nodes = nullptr;
     opts->nodes_len = 0;
@@ -546,15 +606,20 @@ hyperdht_query_t* hyperdht_immutable_get_ex(hyperdht_t* dht,
     std::array<uint8_t, 32> t{};
     memcpy(t.data(), target, 32);
 
-    auto* handle = new hyperdht_query_s;
-    handle->q = dht->dht->immutable_get(t,
-        [cb, userdata](const std::vector<uint8_t>& value) {
-            if (cb) cb(value.data(), value.size(), userdata);
+    auto* handle = make_query_handle(done_cb, userdata);
+    auto state = handle->state;
+    handle->state->q = dht->dht->immutable_get(t,
+        [state, cb](const std::vector<uint8_t>& value) {
+            if (!state->done_cb) return;  // detached via free
+            if (cb) cb(value.data(), value.size(), state->userdata);
         },
-        [handle, done_cb, userdata](const hyperdht::HyperDHT::ImmutableGetResult&) {
-            int err = handle->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
-            if (done_cb) done_cb(err, userdata);
-            delete handle;
+        // Immutable's done signature differs but make_done_fn adapts via auto&
+        [state](const hyperdht::HyperDHT::ImmutableGetResult&) {
+            state->done = true;
+            if (state->done_cb) {
+                int err = state->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
+                state->done_cb(err, state->userdata);
+            }
         });
     return handle;
 }
@@ -570,16 +635,20 @@ hyperdht_query_t* hyperdht_mutable_get_ex(hyperdht_t* dht,
     hyperdht::noise::PubKey pk{};
     memcpy(pk.data(), public_key, 32);
 
-    auto* handle = new hyperdht_query_s;
-    handle->q = dht->dht->mutable_get(pk, min_seq, /*latest=*/true,
-        [cb, userdata](const hyperdht::dht_ops::MutableResult& r) {
+    auto* handle = make_query_handle(done_cb, userdata);
+    auto state = handle->state;
+    handle->state->q = dht->dht->mutable_get(pk, min_seq, /*latest=*/true,
+        [state, cb](const hyperdht::dht_ops::MutableResult& r) {
+            if (!state->done_cb) return;
             if (cb) cb(r.seq, r.value.data(), r.value.size(),
-                       r.signature.data(), userdata);
+                       r.signature.data(), state->userdata);
         },
-        [handle, done_cb, userdata](const hyperdht::HyperDHT::MutableGetResult&) {
-            int err = handle->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
-            if (done_cb) done_cb(err, userdata);
-            delete handle;
+        [state](const hyperdht::HyperDHT::MutableGetResult&) {
+            state->done = true;
+            if (state->done_cb) {
+                int err = state->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
+                state->done_cb(err, state->userdata);
+            }
         });
     return handle;
 }
@@ -942,6 +1011,7 @@ int hyperdht_announce(hyperdht_t* dht,
     return 0;
 }
 
+
 hyperdht_query_t* hyperdht_find_peer_ex(hyperdht_t* dht,
                                          const uint8_t public_key[32],
                                          hyperdht_peer_cb on_reply,
@@ -952,20 +1022,20 @@ hyperdht_query_t* hyperdht_find_peer_ex(hyperdht_t* dht,
     hyperdht::noise::PubKey pk{};
     memcpy(pk.data(), public_key, 32);
 
-    auto* handle = new hyperdht_query_s;
-    handle->q = dht->dht->find_peer(pk,
-        [on_reply, userdata](const hyperdht::query::QueryReply& reply) {
+    auto* handle = make_query_handle(on_done, userdata);
+    auto state = handle->state;  // shared copy for lambdas
+    handle->state->q = dht->dht->find_peer(pk,
+        [state, on_reply](const hyperdht::query::QueryReply& reply) {
+            // on_reply fires per-visit while query is alive; silent no-op
+            // if the user freed (done_cb-less snapshot of userdata).
+            if (!state->done_cb) return;  // detached via free
             if (on_reply && reply.value.has_value() && !reply.value->empty()) {
                 auto host = reply.from_addr.host_string();
                 on_reply(reply.value->data(), reply.value->size(),
-                         host.c_str(), reply.from_addr.port, userdata);
+                         host.c_str(), reply.from_addr.port, state->userdata);
             }
         },
-        [handle, on_done, userdata](const std::vector<hyperdht::query::QueryReply>&) {
-            int err = handle->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
-            if (on_done) on_done(err, userdata);
-            delete handle;
-        });
+        make_done_fn<std::vector<hyperdht::query::QueryReply>>(state));
     return handle;
 }
 
@@ -979,20 +1049,18 @@ hyperdht_query_t* hyperdht_lookup_ex(hyperdht_t* dht,
     hyperdht::routing::NodeId t{};
     memcpy(t.data(), target, 32);
 
-    auto* handle = new hyperdht_query_s;
-    handle->q = dht->dht->lookup(t,
-        [on_reply, userdata](const hyperdht::query::QueryReply& reply) {
+    auto* handle = make_query_handle(on_done, userdata);
+    auto state = handle->state;
+    handle->state->q = dht->dht->lookup(t,
+        [state, on_reply](const hyperdht::query::QueryReply& reply) {
+            if (!state->done_cb) return;
             if (on_reply && reply.value.has_value() && !reply.value->empty()) {
                 auto host = reply.from_addr.host_string();
                 on_reply(reply.value->data(), reply.value->size(),
-                         host.c_str(), reply.from_addr.port, userdata);
+                         host.c_str(), reply.from_addr.port, state->userdata);
             }
         },
-        [handle, on_done, userdata](const std::vector<hyperdht::query::QueryReply>&) {
-            int err = handle->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
-            if (on_done) on_done(err, userdata);
-            delete handle;
-        });
+        make_done_fn<std::vector<hyperdht::query::QueryReply>>(state));
     return handle;
 }
 
@@ -1060,14 +1128,15 @@ uint64_t hyperdht_connection_keep_alive(const hyperdht_t* dht) {
 }
 
 size_t hyperdht_to_array(const hyperdht_t* dht,
-                         char (*hosts)[46], uint16_t* ports, size_t cap) {
-    if (!dht || !dht->dht || !hosts || !ports || cap == 0) return 0;
+                         char* hosts_flat, uint16_t* ports, size_t cap) {
+    if (!dht || !dht->dht || !hosts_flat || !ports || cap == 0) return 0;
     auto snapshot = dht->dht->to_array(cap);
     size_t n = std::min(snapshot.size(), cap);
     for (size_t i = 0; i < n; ++i) {
         auto h = snapshot[i].host_string();
-        std::strncpy(hosts[i], h.c_str(), 45);
-        hosts[i][45] = '\0';
+        char* slot = hosts_flat + i * HYPERDHT_HOST_STRIDE;
+        std::strncpy(slot, h.c_str(), HYPERDHT_HOST_STRIDE - 1);
+        slot[HYPERDHT_HOST_STRIDE - 1] = '\0';
         ports[i] = snapshot[i].port;
     }
     return n;
@@ -1172,8 +1241,21 @@ void hyperdht_server_set_holepunch(hyperdht_server_t* srv,
 // handed us. The user's C callback takes a pointer into this struct;
 // hyperdht_firewall_done() invokes the std::function and deletes the
 // wrapper so a second call is a safe no-op (nullptr fn).
+//
+// Also owns snapshots of `remote_pk` and `peer_host`: the C++ layer
+// hands us references that are valid only for the synchronous call
+// window into the user callback. The async firewall pattern requires
+// those values to outlive the callback frame (user might hand them
+// to a DB lookup that completes seconds later), so we copy them into
+// this struct and expose pointers to OUR storage instead. The user
+// may safely read these via the `remote_pk` / `peer_host` fields
+// passed to their callback, AND may retain those pointers until they
+// invoke `hyperdht_firewall_done()` — at which point this whole
+// struct is destroyed.
 struct hyperdht_firewall_done_s {
     hyperdht::server::Server::FirewallDoneCb fn;
+    std::array<uint8_t, 32> pk_copy{};
+    char host_copy[46] = {0};
 };
 
 void hyperdht_firewall_done(hyperdht_firewall_done_t* done, int reject) {
@@ -1202,11 +1284,22 @@ void hyperdht_server_set_firewall_async(hyperdht_server_t* srv,
                        const hyperdht::peer_connect::NoisePayload& /*payload*/,
                        const hyperdht::compact::Ipv4Address& addr,
                        hyperdht::server::Server::FirewallDoneCb done) {
-            auto* handle = new hyperdht_firewall_done_s{std::move(done)};
+            // C1 fix: snapshot pk + host INTO the handle before calling
+            // the user. The C callback is expected to store the handle
+            // and call hyperdht_firewall_done() after an async policy
+            // check — by which point the original `pk` and `addr.host_string()`
+            // would be out of scope. Pointers we hand to the user MUST
+            // stay valid until they call us back.
+            auto* handle = new hyperdht_firewall_done_s{};
+            handle->fn = std::move(done);
+            handle->pk_copy = pk;
             auto host = addr.host_string();
+            std::strncpy(handle->host_copy, host.c_str(),
+                         sizeof(handle->host_copy) - 1);
             // C caller must call hyperdht_firewall_done(handle, reject)
             // exactly once — we hand them ownership of `handle`.
-            cb(pk.data(), host.c_str(), addr.port, handle, userdata);
+            cb(handle->pk_copy.data(), handle->host_copy,
+               addr.port, handle, userdata);
         });
 }
 

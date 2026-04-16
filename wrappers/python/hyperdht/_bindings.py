@@ -56,11 +56,24 @@ class _Keypair(ctypes.Structure):
 
 
 class _Opts(ctypes.Structure):
+    """Mirror of `hyperdht_opts_t` in include/hyperdht/hyperdht.h.
+
+    Layout MUST match the C struct exactly. New fields at the tail
+    are added in the same order here as in the header. `_pad0` pins
+    the 4-byte implicit padding between `seed_is_set` and `host` for
+    ABI stability across platforms.
+    """
     _fields_ = [
         ("port", ctypes.c_uint16),
         ("ephemeral", ctypes.c_int),
         ("use_public_bootstrap", ctypes.c_int),
         ("connection_keep_alive", ctypes.c_uint64),
+        ("seed", ctypes.c_uint8 * 32),
+        ("seed_is_set", ctypes.c_int),
+        ("_pad0", ctypes.c_uint32),
+        ("host", ctypes.c_char_p),
+        ("nodes", ctypes.POINTER(ctypes.c_char_p)),
+        ("nodes_len", ctypes.c_size_t),
     ]
 
 

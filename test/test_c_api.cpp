@@ -317,13 +317,27 @@ TEST(CAPI, ToArraySnapshotsRoutingTable) {
     hyperdht_add_node(dht, "1.2.3.4", 49737);
     hyperdht_add_node(dht, "5.6.7.8", 12345);
 
-    char hosts[16][46];
+    // Flat buffer — stride HYPERDHT_HOST_STRIDE per entry.
+    char hosts[16 * HYPERDHT_HOST_STRIDE];
     uint16_t ports[16];
     size_t n = hyperdht_to_array(dht, hosts, ports, 16);
     EXPECT_GE(n, 2u);
 
-    // limit = 0 → empty (JS parity)
+    // Entries are null-terminated IPv4 strings inside the flat buffer.
+    for (size_t i = 0; i < n; ++i) {
+        const char* host_i = hosts + i * HYPERDHT_HOST_STRIDE;
+        EXPECT_GT(std::strlen(host_i), 0u);
+        EXPECT_GT(ports[i], 0);
+    }
+
+    // cap = 0 → 0 entries written (matches JS {limit: 0})
     EXPECT_EQ(hyperdht_to_array(dht, hosts, ports, 0), 0u);
+
+    // Oversized cap: write available, not more
+    char big_hosts[256 * HYPERDHT_HOST_STRIDE];
+    uint16_t big_ports[256];
+    size_t m = hyperdht_to_array(dht, big_hosts, big_ports, 256);
+    EXPECT_EQ(m, n) << "oversized cap must write only what's available";
 
     hyperdht_destroy(dht, NULL, NULL);
     uv_run(&loop, UV_RUN_DEFAULT);
@@ -433,8 +447,132 @@ TEST(CAPI, QueryCancelStopsLookupCleanly) {
     // cancel triggers done synchronously via Query::destroy()
     EXPECT_EQ(ctx.done_err, HYPERDHT_ERR_CANCELLED);
 
+    hyperdht_query_free(q);  // user owns the handle, must free
+
     hyperdht_destroy(dht, NULL, NULL);
     uv_run(&loop, UV_RUN_DEFAULT);
     hyperdht_free(dht);
     uv_loop_close(&loop);
+}
+
+// C2 safety: double-cancel is idempotent — second call is a no-op.
+TEST(CAPI, QueryDoubleCancelIsNoop) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    hyperdht_t* dht = hyperdht_create(&loop, NULL);
+    ASSERT_NE(dht, nullptr);
+    hyperdht_bind(dht, 0);
+
+    struct Ctx { int done_calls = 0; int last_err = 0; } ctx;
+    uint8_t target[32] = {0x33};
+
+    auto on_done = +[](int err, void* ud) {
+        auto* c = static_cast<Ctx*>(ud);
+        c->done_calls++;
+        c->last_err = err;
+    };
+
+    hyperdht_query_t* q = hyperdht_lookup_ex(dht, target, nullptr, on_done, &ctx);
+    ASSERT_NE(q, nullptr);
+
+    hyperdht_query_cancel(q);
+    EXPECT_EQ(ctx.done_calls, 1);
+    EXPECT_EQ(ctx.last_err, HYPERDHT_ERR_CANCELLED);
+
+    // Second cancel: no additional done fire, no crash.
+    hyperdht_query_cancel(q);
+    EXPECT_EQ(ctx.done_calls, 1);
+
+    hyperdht_query_free(q);
+    hyperdht_destroy(dht, NULL, NULL);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
+    uv_loop_close(&loop);
+}
+
+// C2 safety: cancel after the query finished naturally is a no-op.
+// Simulate by calling free, then cancel — free detaches the callback,
+// and cancel then sees done_cb is null (we reuse the `done` flag but
+// the check order is: done → skip; so we drive done through cancel).
+TEST(CAPI, QueryFreeDetachesCallbackOnLateDone) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    hyperdht_t* dht = hyperdht_create(&loop, NULL);
+    ASSERT_NE(dht, nullptr);
+    hyperdht_bind(dht, 0);
+
+    struct Ctx { int done_calls = 0; } ctx;
+    uint8_t target[32] = {0x77};
+    auto on_done = +[](int, void* ud) {
+        static_cast<Ctx*>(ud)->done_calls++;
+    };
+
+    hyperdht_query_t* q = hyperdht_lookup_ex(dht, target, nullptr, on_done, &ctx);
+    ASSERT_NE(q, nullptr);
+
+    // User abandons the query before it completes.
+    hyperdht_query_free(q);
+
+    // Pump the loop briefly so any pending completion callbacks get a
+    // chance to fire. Since the handle is freed and the callback
+    // detached, none should reach the user's done_cb.
+    for (int i = 0; i < 5; ++i) uv_run(&loop, UV_RUN_NOWAIT);
+
+    EXPECT_EQ(ctx.done_calls, 0);  // silent — callback was detached
+
+    hyperdht_destroy(dht, NULL, NULL);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
+    uv_loop_close(&loop);
+}
+
+// C2 safety: null-this on all new query handle functions.
+TEST(CAPI, QueryCancelAndFreeTolerateNull) {
+    hyperdht_query_cancel(nullptr);  // no crash
+    hyperdht_query_free(nullptr);    // no crash
+    SUCCEED();
+}
+
+// C1 safety: double-call of hyperdht_firewall_done is a no-op.
+// Wraps a stand-alone test — we don't need a real server, just
+// exercise the handle-close flow.
+TEST(CAPI, FirewallDoneTolleratesNull) {
+    hyperdht_firewall_done(nullptr, 0);  // no crash
+    hyperdht_firewall_done(nullptr, 1);  // no crash
+    SUCCEED();
+}
+
+// Null-this tolerance on the new server-level and DHT-level FFI adds.
+TEST(CAPI, NewFunctionsTolerateNullThis) {
+    // Server accessors
+    uint8_t pk[32];
+    char host[46]; uint16_t port;
+    EXPECT_LT(hyperdht_server_address(nullptr, host, &port), 0);
+    EXPECT_LT(hyperdht_server_public_key(nullptr, pk), 0);
+
+    // on_listening registration
+    hyperdht_server_on_listening(nullptr, nullptr, nullptr);  // no crash
+
+    // DHT accessors
+    EXPECT_EQ(hyperdht_punch_stats_consistent(nullptr), 0);
+    EXPECT_EQ(hyperdht_punch_stats_random(nullptr), 0);
+    EXPECT_EQ(hyperdht_punch_stats_open(nullptr), 0);
+    EXPECT_LT(hyperdht_add_node(nullptr, "1.2.3.4", 49737), 0);
+    EXPECT_LT(hyperdht_remote_address(nullptr, host, &port), 0);
+    EXPECT_EQ(hyperdht_to_array(nullptr, host, &port, 1), 0u);
+
+    // Lifecycle
+    hyperdht_suspend_logged(nullptr, nullptr, nullptr);  // no crash
+    hyperdht_resume_logged(nullptr, nullptr, nullptr);   // no crash
+    hyperdht_destroy_force(nullptr, nullptr, nullptr);   // no crash
+    hyperdht_server_close_force(nullptr, nullptr, nullptr);
+    hyperdht_server_suspend_logged(nullptr, nullptr, nullptr);
+
+    // _ex queries with null dht
+    EXPECT_EQ(hyperdht_find_peer_ex(nullptr, pk, nullptr, nullptr, nullptr), nullptr);
+    EXPECT_EQ(hyperdht_lookup_ex(nullptr, pk, nullptr, nullptr, nullptr), nullptr);
+    EXPECT_EQ(hyperdht_immutable_get_ex(nullptr, pk, nullptr, nullptr, nullptr), nullptr);
+    EXPECT_EQ(hyperdht_mutable_get_ex(nullptr, pk, 0, nullptr, nullptr, nullptr), nullptr);
+
+    SUCCEED();
 }

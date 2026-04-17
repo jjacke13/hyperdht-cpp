@@ -31,11 +31,32 @@ cd examples/python
 
 This builds `libhyperdht.so` in `build-shared/` at the repo root.
 
-## Run
+## Finding the library
+
+The Python wrapper needs `libhyperdht.so` and `libuv.so` at runtime. It searches in this order:
+
+1. **`HYPERDHT_LIB` env var** -- explicit path to the `.so` file
+2. **`LD_LIBRARY_PATH`** -- standard library search path
+3. **System paths** -- `/usr/lib`, `/usr/local/lib` (via `ldconfig`)
+4. **Relative to the package** -- `../../build-shared/` (for development)
+
+Pick whichever works for your setup:
 
 ```bash
-export HYPERDHT_LIB=../../build-shared/libhyperdht.so
+# Option 1: env var (recommended for development)
+export HYPERDHT_LIB=/path/to/build-shared/libhyperdht.so
+
+# Option 2: LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/path/to/build-shared:$LD_LIBRARY_PATH
+
+# Option 3: system install
+sudo cp build-shared/libhyperdht.so /usr/local/lib/
+sudo ldconfig
 ```
+
+`libuv` is usually already installed system-wide (`libuv.so.1`). If not, install it with your package manager.
+
+## Run
 
 ### Quick demos (offline, no network needed)
 

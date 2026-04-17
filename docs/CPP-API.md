@@ -1,220 +1,144 @@
 # C++ API Reference
 
-> **⚠️ Snapshot — may lag the headers.** This file is a curated
-> quick-start aimed at the most common operations. The authoritative
-> source is the headers in `include/hyperdht/` — every option field,
-> method, and callback type is documented inline there. A generated
-> reference (Doxygen pass) is tracked in `docs/REMAINING-WORK.md` §9.
->
-> Since this file was written, the following have been added to the
-> C++ API (non-exhaustive): `DhtOptions::{host, nodes, seed,
-> connection_keep_alive, filter_node, random_punch_interval,
-> max_size, max_age_ms, storage_ttl_ms}`; `HyperDHT::{suspend(LogFn),
-> resume(LogFn), listening(), to_array(), add_node(), remote_address(),
-> unannounce(), ping(), immutable_{get,put}, mutable_{get,put},
-> on_bootstrapped, on_network_change, on_network_update, on_persistent,
-> is_online, is_degraded, is_persistent, is_bootstrapped, is_suspended,
-> stats(), bootstrapper(), connect_raw_stream(), hash(), key_pair(),
-> FIREWALL, BOOTSTRAP(), DestroyOptions}`; `Server::{set_firewall_async,
-> set_holepunch, notify_online, on_listening, relay_through}`;
-> `rpc::Session`, `Query::destroy()`, and the full `peer_connect`
-> / `holepunch` / `blind_relay` / `secret_stream` / `protomux` /
-> `dht_ops` / `query` namespaces. When in doubt — read the header.
+Headers: [`include/hyperdht/*.hpp`](../include/hyperdht/) (authoritative, every method documented inline)
 
-Header: `#include <hyperdht/dht.hpp>`
-Namespace: `hyperdht`
-Link: `-lhyperdht -lsodium -luv`
+For FFI consumers (Python, Go, Swift, Kotlin), use the [C API](C-API.md) instead.
 
-The C++ API provides direct access to the HyperDHT classes. For FFI consumers (Python, Go, etc.), use the [C API](C-API.md) instead.
+## Core classes
 
-## Core Classes
+| Class | Header | Purpose |
+|-------|--------|---------|
+| `HyperDHT` | `dht.hpp` | Main entry point -- DHT node, connect, create_server, queries, storage |
+| `Server` | `server.hpp` | Listen for connections, firewall, holepunch veto, relay |
+| `SecretStreamDuplex` | `secret_stream.hpp` | Encrypted stream (XChaCha20-Poly1305) over UDX |
+| `Mux` / `Channel` | `protomux.hpp` | Channel multiplexing over SecretStream |
+| `BlindRelayClient/Server` | `blind_relay.hpp` | Relay fallback for double-NAT |
+| `Query` | `query.hpp` | Iterative Kademlia query engine |
+| `RoutingTable` | `routing_table.hpp` | k=20, 256 buckets, closest-node lookup |
+| `RpcSocket` | `rpc.hpp` | DHT RPC transport, retry, congestion control |
 
-### `hyperdht::HyperDHT`
+## Conventions
 
-The main entry point. Owns the RPC socket, routing table, handlers, and servers.
+- **Event loop**: single-threaded libuv. Every JS `await` becomes a callback chain.
+- **Error handling**: error codes, not exceptions (targets embedded). `std::optional` for maybe-values.
+- **Ownership**: RAII everywhere. `std::unique_ptr`, `std::shared_ptr`, `UvTimer` wrapper.
+- **Immutability**: create new objects rather than mutating in place.
+- **Naming**: `snake_case` for methods, `PascalCase` for types.
+
+## HyperDHT (main class)
 
 ```cpp
 #include <hyperdht/dht.hpp>
 
-uv_loop_t loop;
-uv_loop_init(&loop);
-
-hyperdht::HyperDHT dht(&loop);
-dht.bind();
-
-// Client: connect to a peer
-dht.connect(remote_public_key, [](int err, const hyperdht::ConnectResult& result) {
-    if (err == 0) {
-        // Encrypted connection established
-        // result.tx_key, result.rx_key — Noise-derived encryption keys
-        // result.remote_public_key — verified peer identity
-        // result.peer_address — direct UDP address after holepunch
-    }
-});
-
-// Server: listen for connections
-auto* srv = dht.create_server();
-srv->listen(keypair, [](const hyperdht::server::ConnectionInfo& info) {
-    // info.remote_public_key, info.tx_key, info.rx_key, etc.
-});
-
-// Cleanup
-dht.destroy();
-uv_run(&loop, UV_RUN_DEFAULT);
-uv_loop_close(&loop);
-```
-
-#### Constructor
-```cpp
 HyperDHT(uv_loop_t* loop, DhtOptions opts = {});
 ```
 
-#### Methods
+### Lifecycle
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `bind()` | `int` | Bind UDP socket (0 = success) |
-| `connect(pk, callback)` | `void` | Connect to peer by public key |
-| `connect(pk, keypair, callback)` | `void` | Connect with specific keypair |
-| `create_server()` | `Server*` | Create a listening server |
-| `find_peer(pk, on_reply, on_done)` | `shared_ptr<Query>` | Find peer's announcement |
-| `lookup(target, on_reply, on_done)` | `shared_ptr<Query>` | Generic DHT lookup |
-| `announce(target, value, on_done)` | `shared_ptr<Query>` | Announce + commit to k closest |
-| `destroy(on_done)` | `void` | Close everything |
-| `port()` | `uint16_t` | Bound port |
-| `is_bound()` | `bool` | Whether socket is bound |
-| `is_destroyed()` | `bool` | Whether destroy was called |
-| `default_keypair()` | `const Keypair&` | Auto-generated keypair |
+| Method | Description |
+|--------|-------------|
+| `bind()` | Bind UDP socket |
+| `port()` | Bound port |
+| `destroy(opts, cb)` / `destroy(cb)` | Close everything |
+| `suspend(log)` / `resume(log)` | Mobile background transitions |
+| `default_keypair()` | Auto-generated Ed25519 keypair |
 
-### `hyperdht::DhtOptions`
-```cpp
-struct DhtOptions {
-    uint16_t port = 0;                            // 0 = ephemeral
-    std::vector<compact::Ipv4Address> bootstrap;  // Empty = public bootstrap
-    noise::Keypair default_keypair;               // Auto-generated if zero
-    bool ephemeral = true;
-};
-```
+### Connect
 
-### `hyperdht::ConnectResult`
-```cpp
-struct ConnectResult {
-    bool success = false;
-    noise::Key tx_key{};                          // 32-byte encryption key
-    noise::Key rx_key{};                          // 32-byte decryption key
-    noise::Hash handshake_hash{};                 // 64-byte Noise hash
-    std::array<uint8_t, 32> remote_public_key{};
-    compact::Ipv4Address peer_address;
-    uint32_t remote_udx_id = 0;
-    uint32_t local_udx_id = 0;
-};
-```
+| Method | Description |
+|--------|-------------|
+| `connect(pk, cb)` | Connect to peer (full pipeline: findPeer + handshake + holepunch) |
+| `connect(pk, opts, cb)` | With options (keypair, relay, fast_open, local_connection) |
 
-### `hyperdht::server::Server`
+### Server
 
-Created by `HyperDHT::create_server()`. Owned by the HyperDHT instance.
+| Method | Description |
+|--------|-------------|
+| `create_server()` | Returns `Server*` (owned by HyperDHT) |
+
+### Queries
+
+| Method | Description |
+|--------|-------------|
+| `find_peer(pk, on_reply, on_done)` | Find peer's announcement |
+| `lookup(target, on_reply, on_done)` | Generic DHT lookup |
+| `announce(target, value, on_done)` | Announce + commit to k closest |
+| `unannounce(pk, kp, on_done)` | Remove announcement |
+
+### Storage
+
+| Method | Description |
+|--------|-------------|
+| `immutable_put(value, cb)` | Store content-addressed value |
+| `immutable_get(target, on_value, on_done)` | Retrieve by BLAKE2b hash |
+| `mutable_put(kp, value, seq, cb)` | Store signed value |
+| `mutable_get(pk, min_seq, on_value, on_done)` | Retrieve latest signed value |
+
+### State
+
+| Method | Description |
+|--------|-------------|
+| `is_online()` / `is_degraded()` | Health monitoring |
+| `is_persistent()` / `is_bootstrapped()` | Node state |
+| `is_destroyed()` / `is_suspended()` | Lifecycle state |
+| `remote_address()` | Public IP from NAT sampling |
+| `stats()` | Punch/relay counters |
+
+### Events
+
+| Method | Description |
+|--------|-------------|
+| `on_bootstrapped(cb)` | Bootstrap walk complete |
+| `on_network_change(cb)` | Network interface changed |
+| `on_network_update(cb)` | Online/degraded/offline transition |
+| `on_persistent(cb)` | Ephemeral -> persistent |
+
+### Utilities
+
+| Method | Description |
+|--------|-------------|
+| `hash(data, len)` | BLAKE2b-256 (static) |
+| `key_pair()` / `key_pair(seed)` | Generate keypair (static) |
+| `add_node(addr)` | Add to routing table |
+| `to_array(limit)` | Snapshot routing table |
+| `ping(addr, cb)` | Direct UDP ping |
+
+## Server
 
 ```cpp
 auto* srv = dht.create_server();
-
-// Listen with a keypair
-srv->listen(keypair, [](const server::ConnectionInfo& info) {
-    // New encrypted connection from info.remote_public_key
-});
-
-// Optional: firewall callback
-srv->set_firewall([](const auto& remote_pk, const auto& payload, const auto& addr) {
-    return false;  // false = accept, true = reject
-});
-
-// Stop
-srv->close();
+srv->listen(keypair, on_connection);
 ```
 
-### `hyperdht::server::ConnectionInfo`
+| Method | Description |
+|--------|-------------|
+| `listen(kp, cb)` | Start listening + announcing |
+| `close(cb)` / `close(force, cb)` | Stop + unannounce |
+| `refresh()` | Force re-announcement |
+| `suspend(log)` / `resume()` | Mobile transitions |
+| `set_firewall(cb)` | Sync accept/reject |
+| `set_firewall_async(cb)` | Async accept/reject (DB lookup, ACL) |
+| `set_holepunch(cb)` | Holepunch veto |
+| `relay_through` | Blind relay public key |
+| `is_listening()` / `public_key()` / `address()` | State queries |
+| `on_listening(cb)` | Ready to accept peers |
+| `notify_online()` | Network came back |
+
+## DhtOptions
+
 ```cpp
-struct ConnectionInfo {
-    noise::Key tx_key;
-    noise::Key rx_key;
-    noise::Hash handshake_hash;
-    std::array<uint8_t, 32> remote_public_key;
-    compact::Ipv4Address peer_address;
-    uint32_t remote_udx_id = 0;
-    uint32_t local_udx_id = 0;
-    bool is_initiator = false;
+struct DhtOptions {
+    uint16_t port = 0;
+    bool ephemeral = true;
+    std::vector<compact::Ipv4Address> bootstrap;  // empty = public nodes
+    noise::Keypair default_keypair;               // zero = auto-generate
+    uint64_t connection_keep_alive = 5000;         // ms
+    noise::Seed seed;                              // deterministic keypair
+    std::string host;                              // bind interface
+    // ... see dht.hpp for full list
 };
 ```
 
-## DHT Operations
+## Thread safety
 
-### `hyperdht::dht_ops`
-
-Standalone functions for DHT queries. All return `shared_ptr<Query>`.
-
-**LIFETIME:** The caller must ensure `socket` outlives the returned Query.
-
-```cpp
-#include <hyperdht/dht_ops.hpp>
-
-// Find a peer's announcement
-auto q = dht_ops::find_peer(socket, public_key,
-    [](const query::QueryReply& reply) { /* each result */ },
-    [](const auto&) { /* done */ });
-
-// Immutable put (target = BLAKE2b(value))
-auto q = dht_ops::immutable_put(socket, value,
-    [](const auto&) { /* done */ });
-
-// Immutable get
-auto q = dht_ops::immutable_get(socket, target_hash,
-    [](const std::vector<uint8_t>& value) { /* verified result */ },
-    [](const auto&) { /* done */ });
-
-// Mutable put (signed, target = BLAKE2b(publicKey))
-auto q = dht_ops::mutable_put(socket, keypair, value, seq,
-    [](const auto&) { /* done */ });
-
-// Mutable get (verifies signature)
-auto q = dht_ops::mutable_get(socket, public_key, min_seq,
-    [](const dht_ops::MutableResult& result) {
-        // result.seq, result.value, result.signature
-    },
-    [](const auto&) { /* done */ });
-```
-
-## Crypto Types
-
-### `hyperdht::noise`
-
-```cpp
-#include <hyperdht/noise_wrap.hpp>
-
-using Key = std::array<uint8_t, 32>;
-using PubKey = std::array<uint8_t, 32>;
-using SecKey = std::array<uint8_t, 64>;
-using Seed = std::array<uint8_t, 32>;
-using Hash = std::array<uint8_t, 64>;  // BLAKE2b-512
-
-struct Keypair {
-    PubKey public_key;
-    SecKey secret_key;
-};
-
-// Generate random keypair
-Keypair generate_keypair();
-
-// Generate from seed (deterministic)
-Keypair generate_keypair(const Seed& seed);
-```
-
-## Error Handling
-
-The library uses error codes, not exceptions (targets embedded platforms):
-- Functions returning `int`: 0 = success, negative = error
-- Functions returning pointers: non-NULL = success, NULL = failure
-- `std::optional` for values that may not exist
-- `state.error` flag in compact encoding
-
-## Thread Safety
-
-All classes are single-threaded. All operations must be called from the `uv_loop_t` thread. This matches libuv's concurrency model — every JS `await` becomes a callback chain.
+All classes are single-threaded. All operations must be called from the `uv_loop_t` thread. This matches libuv's concurrency model.

@@ -197,9 +197,12 @@ BlindRelayClient::BlindRelayClient(protomux::Channel* channel)
 BlindRelayClient::~BlindRelayClient() {
     // Invalidate sentinel so any pending callbacks become no-ops
     alive_.reset();
-    // Clear channel callbacks to break ref cycles
-    channel_->on_close = nullptr;
-    channel_->on_destroy = nullptr;
+    // Clear channel callbacks to break ref cycles — but only if the
+    // channel hasn't already been destroyed by the Mux teardown.
+    if (!destroyed_ && channel_) {
+        channel_->on_close = nullptr;
+        channel_->on_destroy = nullptr;
+    }
 }
 
 void BlindRelayClient::open(const uint8_t* handshake, size_t handshake_len) {

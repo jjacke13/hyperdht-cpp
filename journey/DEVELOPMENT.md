@@ -55,7 +55,7 @@ After the fix: JS client -> C++ server: **CONNECTED**.
 
 Also on Day 4: All 10 HyperDHT commands implemented (client + server). Ed25519 signature verification on ANNOUNCE/UNANNOUNCE. Mutable/immutable storage (both directions cross-tested with JS). Hardening -- ASan/UBSan clean, 5 fuzz targets (36M runs), crypto review.
 
-### Day 5 (2026-04-04): First Release
+### Day 5 (2026-04-04)
 
 C API (`hyperdht.h`) for FFI consumers. Python ctypes wrapper. CMake install rules + pkg-config. Nix package (static + shared). Three production bugs fixed (LRU cache for storage, timer UAF, socket lifetime). Python holesail tunnel serving a web page to a phone over the public DHT.
 
@@ -140,7 +140,7 @@ Non-obvious details that caused surprises:
 
 8. **libudx is single-threaded** -- calling any UDX function from a non-event-loop thread corrupts internal state silently. No error, no warning, just eventual crash.
 
-## Previous Attempts (all failed)
+## Previous Attempts
 
 | Project | Language | Year | What Went Wrong |
 |---------|----------|------|-----------------|

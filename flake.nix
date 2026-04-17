@@ -153,6 +153,10 @@
         }
       );
 
-      nixosModules.holesail = import ./nix/module.nix;
+      nixosModules.holesail = { config, lib, pkgs, ... }: {
+        imports = [ ./nix/module.nix ];
+        config.services.holesail.package = lib.mkDefault
+          self.packages.${pkgs.system}.holesail;
+      };
     };
 }

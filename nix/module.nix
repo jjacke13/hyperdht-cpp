@@ -40,8 +40,8 @@ in
 
     secure = lib.mkOption {
       type = lib.types.bool;
-      default = false;
-      description = "Reject peers that don't know the seed.";
+      default = true;
+      description = "Reject peers that don't know the seed (recommended).";
     };
 
     webserver = {

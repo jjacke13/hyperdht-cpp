@@ -162,13 +162,10 @@ documented non-goals):
 What remains is building idiomatic wrappers on top of the current
 surface.
 
-- **Python** — existing `wrappers/python` via ctypes exposes basic
-  lifecycle, connect_stream, and the opts struct. Needs a pass to
-  wire the 23 new FFI symbols (seed, host, nodes, connect_ex,
-  suspend_logged, destroy_force, to_array, add_node, remote_address,
-  on_listening, server_address, firewall_async, punch_stats, ping,
-  query_cancel/free + *_ex variants). Add async/await support,
-  context managers, type hints, PEP 517 packaging.
+- **Python** — ✅ DONE (commit f6cc594). Full parity: 76 FFI
+  functions exposed, 4 modules (_ffi, _bindings, _server, __init__),
+  22 tests, holesail server live-tested. Remaining: async/await
+  support, PEP 517 packaging.
 - **Go** — cgo wrapper with goroutine-friendly callbacks
 - **Rust** — `hyperdht-sys` crate + safe `hyperdht` wrapper
 - **Swift/Kotlin** — for mobile use (mimiclaw, future iOS/Android
@@ -200,6 +197,93 @@ surface.
 - **Mobile network test** — 4G/5G NAT behavior, esp. carrier-grade NAT
 - **IPv6 validation** — protocol has IPv6 fields (`addresses6`); we don't exercise them
 
+### 11. ESP32 / embedded porting
+
+**Goal:** run hyperdht-cpp on ESP32-S3 (and any FreeRTOS + lwIP device)
+so that $5 microcontrollers become first-class peers on the HyperDHT
+network — no cloud broker, no relay server.
+
+**The one blocker: libuv doesn't run on FreeRTOS.** No existing port
+exists. The libuv maintainers rejected an ESP-IDF PR ([#4132](https://github.com/libuv/libuv/discussions/4132))
+to avoid ifdef soup. Everything else (libsodium, our C++ code, libudx)
+is portable.
+
+**Approach: `libuv-esp32` shim component (~500 lines)**
+
+A standalone ESP-IDF component implementing only the libuv subset that
+libudx calls. libudx and hyperdht-cpp compile unmodified.
+
+| libuv function | ESP-IDF equivalent |
+|---|---|
+| `uv_loop_init` / `uv_run` / `uv_loop_close` | `select()` loop in a FreeRTOS task |
+| `uv_udp_init` / `uv_udp_bind` / `uv_udp_send` / `uv_udp_recv_start` | `lwip_socket`, `lwip_sendto`, `lwip_recvfrom` |
+| `uv_timer_init` / `uv_timer_start` / `uv_timer_stop` | `xTimerCreate` or `esp_timer` |
+| `uv_hrtime` | `esp_timer_get_time() * 1000` (us → ns) |
+| `uv_async_send` | self-pipe or `xTaskNotify` to wake the select loop |
+| `uv_interface_addresses` | `esp_netif_get_ip_info()` |
+
+NOT needed: filesystem, processes, pipes, TTY, signals, thread pool.
+
+libuv already has a `posix-poll.c` backend (used by QNX, Haiku) that
+uses `poll()` instead of `epoll` — this is the template for the FreeRTOS
+backend since lwIP's `poll()` works via `select()` internally.
+
+**Memory budget (ESP32-S3, 8MB PSRAM):**
+
+| Component | Full node | Client-only |
+|---|---|---|
+| Routing table (k=20, 256 buckets) | ~400KB | ~100KB (k=5) |
+| Crypto state per connection | ~2KB | ~2KB |
+| UDX buffers per stream | ~64KB | ~16KB |
+| Code (.text) + libsodium | ~300KB | ~250KB |
+| **Total** | **~800KB** | **~400KB** |
+
+A stripped connect-only profile fits in ~400KB — well within the
+8MB PSRAM budget. Even 2MB PSRAM devices are viable.
+
+**Compile-time trim knob (`HYPERDHT_EMBEDDED=ON`):**
+- Routing table: 256 → 64 buckets, k=20 → k=5
+- Congestion window: 80 → 16 inflight
+- Strip mutable/immutable storage codecs (client-only)
+- Lower default UDX buffer sizes
+
+**Integration pattern (mimiclaw-tested):**
+
+mimiclaw already uses FreeRTOS tasks + queues + lwIP (via
+`esp_http_client`). HyperDHT would run as one more task:
+
+```c
+xTaskCreatePinnedToCore(hyperdht_task, "dht", 8192, NULL, 5, NULL, 1);
+
+void hyperdht_task(void* arg) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    hyperdht_t* dht = hyperdht_create(&loop, &opts);
+    hyperdht_bind(dht, 0);
+    uv_run(&loop, UV_RUN_DEFAULT);  // blocks on this core
+}
+```
+
+Messages flow through the existing message bus (`xQueue`) — same
+pattern as the telegram/feishu bot tasks.
+
+**What this enables:**
+- **Device-to-device P2P** — two ESP32s find each other on the
+  internet via DHT, holepunch through NAT, encrypted channel.
+  No server, no MQTT broker.
+- **Phone → ESP32 direct** — mobile app (Kotlin/Swift wrapper)
+  connects to ESP32 from anywhere. No port forwarding.
+- **ESP32 as holesail server** — plug into any network, expose a
+  local service (serial, camera, GPIO) over HyperDHT.
+- **P2P firmware updates** — one device announces new firmware on
+  DHT, others discover and download. No OTA server.
+- **Mesh of cheap sensors** — self-organizing, no infrastructure
+  beyond the 3 public bootstrap nodes.
+
+**Effort estimate:** ~1 week for the libuv-esp32 shim + build
+integration + basic testing on real hardware. The protocol code,
+crypto, and C FFI layer are untouched.
+
 ---
 
 ## Release plan
@@ -211,15 +295,10 @@ making the library *shippable*, not making it correct.
 
 Goal: a known consumer exercising the library in production.
 
-**Blocking:**
-- **Python wrapper pass** — expose the 23 new FFI symbols added in
-  commits 47e81b8 + c57b6cd (see §8 Python entry). Without this the
-  Python consumer can't reach most of what the FFI now offers.
-  Mechanical ctypes work, ~1-2 hours.
+**Blocking:** nothing — Python wrapper is done (commit f6cc594),
+holesail live-tested end-to-end with JS client (2026-04-17).
 
 **Must have:**
-- Python FFI smoke test (`wrappers/python/test_*.py` — connect, echo
-  round-trip, end to end under Python)
 - 30-min soak test (open a connection, exchange data every 5min,
   verify keepalive + no drift)
 - CLAUDE.md documentation pass (update phase table, note the new
@@ -256,8 +335,8 @@ Parallel to v1.0, driven by downstream consumer needs:
 - **Kotlin / Swift wrappers** for mimiclaw / iOS / Android targets —
   the C FFI was designed for these consumers specifically, but no
   wrappers exist yet.
-- **ESP-IDF component wrapper** + `HYPERDHT_EMBEDDED=ON` trim for
-  ESP32-S3 target.
+- **ESP32 porting** via `libuv-esp32` shim + `HYPERDHT_EMBEDDED=ON`
+  trim — see §11 for full technical plan.
 - **Go / Rust wrappers** (lower priority — no active consumer).
 - **Public bootstrap node deployment** (§10 real-world validation).
 

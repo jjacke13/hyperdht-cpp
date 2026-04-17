@@ -172,229 +172,74 @@ if(HYPERDHT_BUILD_TESTS)
 
     enable_testing()
 
-    add_executable(test_compact test/test_compact.cpp)
-    target_link_libraries(test_compact PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_compact COMMAND test_compact)
-
-    add_executable(test_compact_cross test/test_compact_cross.cpp)
-    target_link_libraries(test_compact_cross PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_compact_cross COMMAND test_compact_cross)
-
-    add_executable(test_udx test/test_udx.cpp)
-    target_link_libraries(test_udx PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_udx COMMAND test_udx)
-
-    add_executable(test_udx_cross test/test_udx_cross.cpp)
-    target_link_libraries(test_udx_cross PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_udx_cross COMMAND test_udx_cross)
-
-    add_executable(test_udx_packet_capture test/test_udx_packet_capture.cpp)
-    target_link_libraries(test_udx_packet_capture PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_udx_packet_capture COMMAND test_udx_packet_capture)
-
-    add_executable(test_noise test/test_noise.cpp)
-    target_link_libraries(test_noise PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_noise COMMAND test_noise)
-
-    add_executable(test_noise_cross test/test_noise_cross.cpp)
-    target_link_libraries(test_noise_cross PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_noise_cross COMMAND test_noise_cross)
-
-    add_executable(test_secret_stream test/test_secret_stream.cpp)
-    target_link_libraries(test_secret_stream PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_secret_stream COMMAND test_secret_stream)
-
-    add_executable(test_crypto_verify test/test_crypto_verify.cpp)
-    target_link_libraries(test_crypto_verify PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_crypto_verify COMMAND test_crypto_verify)
-
-    add_executable(test_routing_table test/test_routing_table.cpp)
-    target_link_libraries(test_routing_table PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_routing_table COMMAND test_routing_table)
-
+    # ── Unit tests (offline, automated) ─────────────────────────────
     include(GoogleTest)
-    gtest_discover_tests(test_compact)
-    gtest_discover_tests(test_compact_cross)
-    gtest_discover_tests(test_udx)
-    gtest_discover_tests(test_udx_cross)
-    gtest_discover_tests(test_udx_packet_capture)
-    gtest_discover_tests(test_noise)
-    gtest_discover_tests(test_noise_cross)
-    gtest_discover_tests(test_secret_stream)
-    gtest_discover_tests(test_crypto_verify)
 
-    add_executable(test_wire_compat test/test_wire_compat.cpp)
-    target_link_libraries(test_wire_compat PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_wire_compat COMMAND test_wire_compat)
-    gtest_discover_tests(test_wire_compat)
+    # Helper: define a unit test executable with label "unit"
+    macro(add_unit_test name)
+        add_executable(${name} test/${name}.cpp)
+        target_link_libraries(${name} PRIVATE hyperdht GTest::gtest_main)
+        gtest_discover_tests(${name} PROPERTIES LABELS "unit")
+    endmacro()
 
-    add_executable(test_edge_cases test/test_edge_cases.cpp)
-    target_link_libraries(test_edge_cases PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_edge_cases COMMAND test_edge_cases)
-    gtest_discover_tests(test_edge_cases)
+    add_unit_test(test_compact)
+    add_unit_test(test_compact_cross)
+    add_unit_test(test_udx)
+    add_unit_test(test_udx_cross)
+    add_unit_test(test_udx_packet_capture)
+    add_unit_test(test_noise)
+    add_unit_test(test_noise_cross)
+    add_unit_test(test_secret_stream)
+    add_unit_test(test_crypto_verify)
+    add_unit_test(test_routing_table)
+    add_unit_test(test_wire_compat)
+    add_unit_test(test_edge_cases)
+    add_unit_test(test_lru_cache)
+    add_unit_test(test_c_api)
+    add_unit_test(test_tokens)
+    add_unit_test(test_messages)
+    add_unit_test(test_rpc_ping)
+    add_unit_test(test_rpc_bootstrap)
+    add_unit_test(test_rpc_handlers)
+    add_unit_test(test_announce)
+    add_unit_test(test_query)
+    add_unit_test(test_dht_ops)
+    add_unit_test(test_holepunch)
+    add_unit_test(test_hyperdht)
+    add_unit_test(test_server)
+    add_unit_test(test_announcer)
+    add_unit_test(test_server_holepunch)
+    add_unit_test(test_server_handshake)
+    add_unit_test(test_router)
+    add_unit_test(test_announce_sig)
+    add_unit_test(test_dht_messages)
+    add_unit_test(test_protomux)
+    add_unit_test(test_protomux_secretstream)
+    add_unit_test(test_blind_relay)
+    add_unit_test(test_health)
+    add_unit_test(test_nat_sampler)
+    add_unit_test(test_socket_pool)
+    add_unit_test(test_connection_pool)
+    add_unit_test(test_async_utils)
 
-    add_executable(test_lru_cache test/test_lru_cache.cpp)
-    target_link_libraries(test_lru_cache PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_lru_cache COMMAND test_lru_cache)
-    gtest_discover_tests(test_lru_cache)
+    # ── Live tests (need network / external peers) ───────────────
+    # Run with: ctest -L live
 
-    add_executable(test_c_api test/test_c_api.cpp)
-    target_link_libraries(test_c_api PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_c_api COMMAND test_c_api)
-    gtest_discover_tests(test_c_api)
-    gtest_discover_tests(test_routing_table)
+    macro(add_live_test name)
+        add_executable(${name} test/${name}.cpp)
+        target_link_libraries(${name} PRIVATE hyperdht GTest::gtest_main)
+        gtest_discover_tests(${name} PROPERTIES LABELS "live")
+    endmacro()
 
-    add_executable(test_tokens test/test_tokens.cpp)
-    target_link_libraries(test_tokens PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_tokens COMMAND test_tokens)
-    gtest_discover_tests(test_tokens)
+    add_live_test(test_server_live)
+    add_live_test(test_live_connect)
+    add_live_test(test_storage_live)
 
-    add_executable(test_messages test/test_messages.cpp)
-    target_link_libraries(test_messages PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_messages COMMAND test_messages)
-    gtest_discover_tests(test_messages)
+    # Bootstrap walk against the public HyperDHT network.
+    # Skips automatically when unreachable.
+    add_live_test(test_live_bootstrap_smoke)
 
-    add_executable(test_rpc_ping test/test_rpc_ping.cpp)
-    target_link_libraries(test_rpc_ping PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_rpc_ping COMMAND test_rpc_ping)
-    gtest_discover_tests(test_rpc_ping)
-
-    add_executable(test_rpc_bootstrap test/test_rpc_bootstrap.cpp)
-    target_link_libraries(test_rpc_bootstrap PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_rpc_bootstrap COMMAND test_rpc_bootstrap)
-    gtest_discover_tests(test_rpc_bootstrap)
-
-    add_executable(test_rpc_handlers test/test_rpc_handlers.cpp)
-    target_link_libraries(test_rpc_handlers PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_rpc_handlers COMMAND test_rpc_handlers)
-    gtest_discover_tests(test_rpc_handlers)
-
-    add_executable(test_announce test/test_announce.cpp)
-    target_link_libraries(test_announce PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_announce COMMAND test_announce)
-    gtest_discover_tests(test_announce)
-
-    add_executable(test_query test/test_query.cpp)
-    target_link_libraries(test_query PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_query COMMAND test_query)
-    gtest_discover_tests(test_query)
-
-    add_executable(test_dht_ops test/test_dht_ops.cpp)
-    target_link_libraries(test_dht_ops PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_dht_ops COMMAND test_dht_ops)
-    gtest_discover_tests(test_dht_ops)
-
-    add_executable(test_holepunch test/test_holepunch.cpp)
-    target_link_libraries(test_holepunch PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_holepunch COMMAND test_holepunch)
-    gtest_discover_tests(test_holepunch)
-
-    add_executable(test_server_live test/test_server_live.cpp)
-    target_link_libraries(test_server_live PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_server_live COMMAND test_server_live)
-    gtest_discover_tests(test_server_live)
-
-    add_executable(test_hyperdht test/test_hyperdht.cpp)
-    target_link_libraries(test_hyperdht PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_hyperdht COMMAND test_hyperdht)
-    gtest_discover_tests(test_hyperdht)
-
-    add_executable(test_server test/test_server.cpp)
-    target_link_libraries(test_server PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_server COMMAND test_server)
-    gtest_discover_tests(test_server)
-
-    add_executable(test_announcer test/test_announcer.cpp)
-    target_link_libraries(test_announcer PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_announcer COMMAND test_announcer)
-    gtest_discover_tests(test_announcer)
-
-    add_executable(test_server_holepunch test/test_server_holepunch.cpp)
-    target_link_libraries(test_server_holepunch PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_server_holepunch COMMAND test_server_holepunch)
-    gtest_discover_tests(test_server_holepunch)
-
-    add_executable(test_server_handshake test/test_server_handshake.cpp)
-    target_link_libraries(test_server_handshake PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_server_handshake COMMAND test_server_handshake)
-    gtest_discover_tests(test_server_handshake)
-
-    add_executable(test_router test/test_router.cpp)
-    target_link_libraries(test_router PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_router COMMAND test_router)
-    gtest_discover_tests(test_router)
-
-    add_executable(test_announce_sig test/test_announce_sig.cpp)
-    target_link_libraries(test_announce_sig PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_announce_sig COMMAND test_announce_sig)
-    gtest_discover_tests(test_announce_sig)
-
-    add_executable(test_dht_messages test/test_dht_messages.cpp)
-    target_link_libraries(test_dht_messages PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_dht_messages COMMAND test_dht_messages)
-    gtest_discover_tests(test_dht_messages)
-
-    add_executable(test_protomux test/test_protomux.cpp)
-    target_link_libraries(test_protomux PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_protomux COMMAND test_protomux)
-    gtest_discover_tests(test_protomux)
-
-    add_executable(test_protomux_secretstream test/test_protomux_secretstream.cpp)
-    target_link_libraries(test_protomux_secretstream PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_protomux_secretstream COMMAND test_protomux_secretstream)
-    gtest_discover_tests(test_protomux_secretstream)
-
-    add_executable(test_blind_relay test/test_blind_relay.cpp)
-    target_link_libraries(test_blind_relay PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_blind_relay COMMAND test_blind_relay)
-    gtest_discover_tests(test_blind_relay)
-
-    add_executable(test_health test/test_health.cpp)
-    target_link_libraries(test_health PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_health COMMAND test_health)
-    gtest_discover_tests(test_health)
-
-    add_executable(test_nat_sampler test/test_nat_sampler.cpp)
-    target_link_libraries(test_nat_sampler PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_nat_sampler COMMAND test_nat_sampler)
-    gtest_discover_tests(test_nat_sampler)
-
-    add_executable(test_socket_pool test/test_socket_pool.cpp)
-    target_link_libraries(test_socket_pool PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_socket_pool COMMAND test_socket_pool)
-    gtest_discover_tests(test_socket_pool)
-
-    add_executable(test_connection_pool test/test_connection_pool.cpp)
-    target_link_libraries(test_connection_pool PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_connection_pool COMMAND test_connection_pool)
-    gtest_discover_tests(test_connection_pool)
-
-    add_executable(test_async_utils test/test_async_utils.cpp)
-    target_link_libraries(test_async_utils PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_async_utils COMMAND test_async_utils)
-    gtest_discover_tests(test_async_utils)
-
-    add_executable(test_live_connect test/test_live_connect.cpp)
-    target_link_libraries(test_live_connect PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_live_connect COMMAND test_live_connect)
-    gtest_discover_tests(test_live_connect)
-
-    add_executable(test_storage_live test/test_storage_live.cpp)
-    target_link_libraries(test_storage_live PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_storage_live COMMAND test_storage_live)
-    gtest_discover_tests(test_storage_live)
-
-    # §2 live smoke: full bootstrap walk against the public HyperDHT.
-    # Skips automatically when the public network is unreachable.
-    add_executable(test_live_bootstrap_smoke test/test_live_bootstrap_smoke.cpp)
-    target_link_libraries(test_live_bootstrap_smoke PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_live_bootstrap_smoke COMMAND test_live_bootstrap_smoke)
-    gtest_discover_tests(test_live_bootstrap_smoke)
-
-    # Echo test against the permanent JS test fixture.
-    # Skips when SERVER_KEY is not set. Uses the C FFI end-to-end.
-    add_executable(test_echo_fixture test/test_echo_fixture.cpp)
-    target_link_libraries(test_echo_fixture PRIVATE hyperdht GTest::gtest_main)
-    add_test(NAME test_echo_fixture COMMAND test_echo_fixture)
-    gtest_discover_tests(test_echo_fixture)
+    # Echo test against the permanent JS fixture.
+    # Skips when SERVER_KEY env var is not set.
+    add_live_test(test_echo_fixture)
 endif()

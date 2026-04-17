@@ -43,7 +43,7 @@
 
         meta = {
           description = "C++ HyperDHT implementation — wire-compatible with JS HyperDHT";
-          license = pkgs.lib.licenses.asl20;
+          license = pkgs.lib.licenses.lgpl3Only;
           platforms = pkgs.lib.platforms.linux;
         };
       };
@@ -55,6 +55,12 @@
           default = mkHyperdht pkgs {};
           static = mkHyperdht pkgs {};
           shared = mkHyperdht pkgs { shared = true; };
+
+          holesail = import ./nix/holesail.nix {
+            inherit pkgs;
+            sharedLib = mkHyperdht pkgs { shared = true; };
+            src = self;
+          };
 
           # Minimal server test binary — for live cross-testing on remote machines.
           # Usage: nix build .#server-test && ./result/bin/test_server_live
@@ -136,15 +142,17 @@
               echo "  python3: $(python3 --version)"
               echo ""
               echo "  Run the holesail demo:"
-              echo "    cd wrappers/python"
-              echo "    python3 holesail_server.py 8080"
+              echo "    cd examples/python"
+              echo "    python3 holesail_server.py --live 8080"
               echo ""
               echo "  Or import directly:"
-              echo "    cd wrappers/python"
+              echo "    cd examples/python"
               echo "    python3 -c 'from hyperdht import KeyPair; print(KeyPair.generate())'"
             '';
           };
         }
       );
+
+      nixosModules.holesail = import ./nix/module.nix;
     };
 }

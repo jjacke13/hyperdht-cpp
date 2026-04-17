@@ -1,12 +1,11 @@
 # Journey
 
-The story of building hyperdht-cpp — from zero to working P2P in 5 days.
+The story of building hyperdht-cpp -- from first connection to production-ready library.
 
 | Document | Description |
 |----------|-------------|
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Full development narrative: timeline, discoveries, bugs, what worked |
 
 See also:
-- [../STATUS.md](../STATUS.md) — Current project status and roadmap
-- [../VERSIONS.md](../VERSIONS.md) — Dependency versions and verification checklist
-- [../docs/](../docs/) — Technical reference documentation
+- [../docs/REMAINING-WORK.md](../docs/REMAINING-WORK.md) -- Outstanding verification + production tasks
+- [../docs/](../docs/) -- Technical reference documentation

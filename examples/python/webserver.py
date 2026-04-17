@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Minimal HTTP server on localhost:8080."""
+"""
+Minimal HTTP server for holesail demo.
+
+Usage:
+    python webserver.py [port]    # default: 8080
+"""
+
+import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 HTML = b"""<!DOCTYPE html>
@@ -25,4 +32,6 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-HTTPServer(("127.0.0.1", 8080), H).serve_forever()
+port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+print(f"Serving on 127.0.0.1:{port}")
+HTTPServer(("127.0.0.1", port), H).serve_forever()

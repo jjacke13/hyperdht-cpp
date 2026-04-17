@@ -11,6 +11,35 @@
 
 let
   cfg = config.services.holesail;
+
+  webserverScript = pkgs.writeText "holesail-webserver.py" ''
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    HTML = b"""<!DOCTYPE html>
+    <html>
+    <head><title>hyperdht-cpp</title></head>
+    <body style="font-family:monospace;max-width:600px;margin:80px auto;text-align:center">
+    <h1>It works!</h1>
+    <p>This page is served over a P2P tunnel powered by
+    <strong>libhyperdht</strong> (C++) + Python.</p>
+    <p>The connection is end-to-end encrypted (Noise IK + SecretStream)
+    and traversed your NAT via holepunching.</p>
+    <p><code>holesail-py + hyperdht-cpp</code></p>
+    </body>
+    </html>
+    """
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(HTML)
+        def log_message(self, *a):
+            pass
+
+    HTTPServer(("127.0.0.1", ${toString cfg.port}), H).serve_forever()
+  '';
 in
 {
   options.services.holesail = {
@@ -45,12 +74,10 @@ in
     };
 
     webserver = {
-      enable = lib.mkEnableOption "built-in demo webserver behind the tunnel";
-
-      port = lib.mkOption {
-        type = lib.types.port;
-        default = 8080;
-        description = "Port for the built-in webserver.";
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Run the built-in demo webserver behind the tunnel.";
       };
     };
 
@@ -61,7 +88,7 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # Built-in webserver (optional)
+    # Built-in webserver
     systemd.services.holesail-webserver = lib.mkIf cfg.webserver.enable {
       description = "Holesail demo webserver";
       wantedBy = [ "multi-user.target" ];
@@ -69,7 +96,7 @@ in
       serviceConfig = {
         Type = "simple";
         DynamicUser = true;
-        ExecStart = "${pkgs.python3}/bin/python3 -m http.server ${toString cfg.webserver.port} --bind 127.0.0.1";
+        ExecStart = "${pkgs.python3}/bin/python3 ${webserverScript}";
         Restart = "on-failure";
       };
     };

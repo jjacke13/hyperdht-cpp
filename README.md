@@ -9,7 +9,7 @@ Node.js runtime.
 - **Event loop**: libuv (single-threaded, same concurrency model as the JS reference)
 - **Transport**: libudx (reliable UDP with BBR congestion control)
 - **Crypto**: libsodium (Ed25519, BLAKE2b, ChaCha20-Poly1305, secretstream)
-- **License**: Apache-2.0
+- **License**: LGPL-3.0
 
 ## Status
 

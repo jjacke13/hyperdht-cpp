@@ -440,7 +440,8 @@ int hyperdht_server_listen(hyperdht_server_t* srv,
                             info.handshake_hash, info.remote_public_key,
                             info.peer_address, info.remote_udx_id,
                             info.local_udx_id, info.is_initiator);
-            conn.raw_stream = info.raw_stream;  // Pass pre-created rawStream
+            conn.raw_stream = info.raw_stream;
+            conn.udx_socket = info.udx_socket;
             srv->cb(&conn, srv->userdata);
         });
 

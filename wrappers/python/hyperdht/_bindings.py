@@ -1,241 +1,81 @@
 """
-Low-level ctypes bindings to libhyperdht.so + libuv.so.
+Python-friendly wrappers for the hyperdht-cpp C FFI.
+
+Low-level ctypes declarations live in ``_ffi.py``.
 """
 
+from __future__ import annotations
+
 import ctypes
-import ctypes.util
-import os
-import sys
-from pathlib import Path
+from typing import Callable, NamedTuple
+
+from hyperdht._ffi import (
+    CLOSE_CB,
+    CONNECT_CB,
+    DATA_CB,
+    DONE_CB,
+    EVENT_CB,
+    HOST_STRIDE,
+    LOG_CB,
+    MUTABLE_CB,
+    PEER_CB,
+    PING_CB,
+    UV_RUN_DEFAULT,
+    UV_RUN_NOWAIT,
+    UV_RUN_ONCE,
+    VALUE_CB,
+    ConnectOpts as _ConnectOpts,
+    Connection as _Connection,
+    Keypair as _Keypair,
+    Opts as _Opts,
+    lib as _lib,
+    uv as _uv,
+)
+from hyperdht._server import Server
 
 
 # ---------------------------------------------------------------------------
-# Library loading
+# Data types
 # ---------------------------------------------------------------------------
 
-def _find_lib(name, so_name):
-    """Find a shared library by searching common locations."""
-    # 1. Environment variable
-    env_path = os.environ.get(f"{name.upper()}_LIB")
-    if env_path and os.path.exists(env_path):
-        return env_path
-
-    # 2. LD_LIBRARY_PATH
-    for d in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
-        p = os.path.join(d, so_name)
-        if os.path.exists(p):
-            return p
-
-    # 3. System
-    found = ctypes.util.find_library(name)
-    if found:
-        return found
-
-    # 4. Relative to this file (for development)
-    for rel in ["../../../build-shared", "../../../build"]:
-        p = Path(__file__).parent / rel / so_name
-        if p.exists():
-            return str(p)
-
-    return so_name  # Let ctypes try
+class PunchStats(NamedTuple):
+    """Holepunch connect counts by strategy."""
+    consistent: int
+    random: int
+    open: int
 
 
-_lib = ctypes.CDLL(_find_lib("hyperdht", "libhyperdht.so"))
-_uv = ctypes.CDLL(_find_lib("uv", "libuv.so.1"))
+class RelayStats(NamedTuple):
+    """Blind-relay counters."""
+    attempts: int
+    successes: int
+    aborts: int
+
+
+class Address(NamedTuple):
+    """A host:port pair."""
+    host: str
+    port: int
 
 
 # ---------------------------------------------------------------------------
-# C types
-# ---------------------------------------------------------------------------
-
-class _Keypair(ctypes.Structure):
-    _fields_ = [
-        ("public_key", ctypes.c_uint8 * 32),
-        ("secret_key", ctypes.c_uint8 * 64),
-    ]
-
-
-class _Opts(ctypes.Structure):
-    """Mirror of `hyperdht_opts_t` in include/hyperdht/hyperdht.h.
-
-    Layout MUST match the C struct exactly. New fields at the tail
-    are added in the same order here as in the header. `_pad0` pins
-    the 4-byte implicit padding between `seed_is_set` and `host` for
-    ABI stability across platforms.
-    """
-    _fields_ = [
-        ("port", ctypes.c_uint16),
-        ("ephemeral", ctypes.c_int),
-        ("use_public_bootstrap", ctypes.c_int),
-        ("connection_keep_alive", ctypes.c_uint64),
-        ("seed", ctypes.c_uint8 * 32),
-        ("seed_is_set", ctypes.c_int),
-        ("_pad0", ctypes.c_uint32),
-        ("host", ctypes.c_char_p),
-        ("nodes", ctypes.POINTER(ctypes.c_char_p)),
-        ("nodes_len", ctypes.c_size_t),
-    ]
-
-
-class _Connection(ctypes.Structure):
-    _fields_ = [
-        ("remote_public_key", ctypes.c_uint8 * 32),
-        ("tx_key", ctypes.c_uint8 * 32),
-        ("rx_key", ctypes.c_uint8 * 32),
-        ("handshake_hash", ctypes.c_uint8 * 64),
-        ("remote_udx_id", ctypes.c_uint32),
-        ("local_udx_id", ctypes.c_uint32),
-        ("peer_host", ctypes.c_char * 46),
-        ("peer_port", ctypes.c_uint16),
-        ("is_initiator", ctypes.c_int),
-    ]
-
-
-# Callback types
-_CONNECT_CB = ctypes.CFUNCTYPE(
-    None, ctypes.c_int, ctypes.POINTER(_Connection), ctypes.c_void_p)
-_CONNECTION_CB = ctypes.CFUNCTYPE(
-    None, ctypes.POINTER(_Connection), ctypes.c_void_p)
-_CLOSE_CB = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
-_FIREWALL_CB = ctypes.CFUNCTYPE(
-    ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_char_p,
-    ctypes.c_uint16, ctypes.c_void_p)
-_VALUE_CB = ctypes.CFUNCTYPE(
-    None, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_void_p)
-_MUTABLE_CB = ctypes.CFUNCTYPE(
-    None, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
-    ctypes.POINTER(ctypes.c_uint8), ctypes.c_void_p)
-_DONE_CB = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
-
-
-# ---------------------------------------------------------------------------
-# Function signatures
-# ---------------------------------------------------------------------------
-
-# Keypair
-_lib.hyperdht_keypair_generate.argtypes = [ctypes.POINTER(_Keypair)]
-_lib.hyperdht_keypair_generate.restype = None
-
-_lib.hyperdht_keypair_from_seed.argtypes = [
-    ctypes.POINTER(_Keypair), ctypes.POINTER(ctypes.c_uint8)]
-_lib.hyperdht_keypair_from_seed.restype = None
-
-# Lifecycle
-_lib.hyperdht_create.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Opts)]
-_lib.hyperdht_create.restype = ctypes.c_void_p
-
-_lib.hyperdht_bind.argtypes = [ctypes.c_void_p, ctypes.c_uint16]
-_lib.hyperdht_bind.restype = ctypes.c_int
-
-_lib.hyperdht_port.argtypes = [ctypes.c_void_p]
-_lib.hyperdht_port.restype = ctypes.c_uint16
-
-_lib.hyperdht_is_destroyed.argtypes = [ctypes.c_void_p]
-_lib.hyperdht_is_destroyed.restype = ctypes.c_int
-
-_lib.hyperdht_destroy.argtypes = [ctypes.c_void_p, _CLOSE_CB, ctypes.c_void_p]
-_lib.hyperdht_destroy.restype = None
-
-_lib.hyperdht_free.argtypes = [ctypes.c_void_p]
-_lib.hyperdht_free.restype = None
-
-_lib.hyperdht_default_keypair.argtypes = [
-    ctypes.c_void_p, ctypes.POINTER(_Keypair)]
-_lib.hyperdht_default_keypair.restype = None
-
-# Connect
-_lib.hyperdht_connect.argtypes = [
-    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), _CONNECT_CB, ctypes.c_void_p]
-_lib.hyperdht_connect.restype = ctypes.c_int
-
-# Server
-_lib.hyperdht_server_create.argtypes = [ctypes.c_void_p]
-_lib.hyperdht_server_create.restype = ctypes.c_void_p
-
-_lib.hyperdht_server_listen.argtypes = [
-    ctypes.c_void_p, ctypes.POINTER(_Keypair), _CONNECTION_CB, ctypes.c_void_p]
-_lib.hyperdht_server_listen.restype = ctypes.c_int
-
-_lib.hyperdht_server_close.argtypes = [ctypes.c_void_p, _CLOSE_CB, ctypes.c_void_p]
-_lib.hyperdht_server_close.restype = None
-
-_lib.hyperdht_server_refresh.argtypes = [ctypes.c_void_p]
-_lib.hyperdht_server_refresh.restype = None
-
-_lib.hyperdht_server_set_firewall.argtypes = [
-    ctypes.c_void_p, _FIREWALL_CB, ctypes.c_void_p]
-_lib.hyperdht_server_set_firewall.restype = None
-
-# Storage
-_lib.hyperdht_immutable_put.argtypes = [
-    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
-    _DONE_CB, ctypes.c_void_p]
-_lib.hyperdht_immutable_put.restype = ctypes.c_int
-
-_lib.hyperdht_immutable_get.argtypes = [
-    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),
-    _VALUE_CB, _DONE_CB, ctypes.c_void_p]
-_lib.hyperdht_immutable_get.restype = ctypes.c_int
-
-_lib.hyperdht_mutable_put.argtypes = [
-    ctypes.c_void_p, ctypes.POINTER(_Keypair),
-    ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_uint64,
-    _DONE_CB, ctypes.c_void_p]
-_lib.hyperdht_mutable_put.restype = ctypes.c_int
-
-_lib.hyperdht_mutable_get.argtypes = [
-    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint64,
-    _MUTABLE_CB, _DONE_CB, ctypes.c_void_p]
-_lib.hyperdht_mutable_get.restype = ctypes.c_int
-
-# Stream
-_DATA_CB = ctypes.CFUNCTYPE(
-    None, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_void_p)
-
-_lib.hyperdht_stream_open.argtypes = [
-    ctypes.c_void_p, ctypes.POINTER(_Connection),
-    _CLOSE_CB, _DATA_CB, _CLOSE_CB, ctypes.c_void_p]
-_lib.hyperdht_stream_open.restype = ctypes.c_void_p
-
-_lib.hyperdht_stream_write.argtypes = [
-    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
-_lib.hyperdht_stream_write.restype = ctypes.c_int
-
-_lib.hyperdht_stream_close.argtypes = [ctypes.c_void_p]
-_lib.hyperdht_stream_close.restype = None
-
-_lib.hyperdht_stream_is_open.argtypes = [ctypes.c_void_p]
-_lib.hyperdht_stream_is_open.restype = ctypes.c_int
-
-# libuv
-_uv.uv_loop_init.argtypes = [ctypes.c_void_p]
-_uv.uv_loop_init.restype = ctypes.c_int
-
-_uv.uv_run.argtypes = [ctypes.c_void_p, ctypes.c_int]
-_uv.uv_run.restype = ctypes.c_int
-
-_uv.uv_loop_close.argtypes = [ctypes.c_void_p]
-_uv.uv_loop_close.restype = ctypes.c_int
-
-_uv.uv_loop_size.argtypes = []
-_uv.uv_loop_size.restype = ctypes.c_size_t
-
-UV_RUN_DEFAULT = 0
-UV_RUN_ONCE = 1
-UV_RUN_NOWAIT = 2
-
-
-# ---------------------------------------------------------------------------
-# Python-friendly classes
+# Connection
 # ---------------------------------------------------------------------------
 
 class Connection:
     """Represents an established encrypted connection."""
 
-    def __init__(self, c_conn):
+    __slots__ = (
+        "_c_conn", "remote_key", "tx_key", "rx_key", "handshake_hash",
+        "remote_udx_id", "local_udx_id", "peer_host", "peer_port",
+        "is_initiator",
+    )
+
+    def __init__(self, c_conn: _Connection) -> None:
         self._c_conn = _Connection()
-        ctypes.memmove(ctypes.byref(self._c_conn), ctypes.byref(c_conn),
-                       ctypes.sizeof(_Connection))
+        ctypes.memmove(
+            ctypes.byref(self._c_conn), ctypes.byref(c_conn),
+            ctypes.sizeof(_Connection))
         self.remote_key = bytes(c_conn.remote_public_key)
         self.tx_key = bytes(c_conn.tx_key)
         self.rx_key = bytes(c_conn.rx_key)
@@ -246,68 +86,116 @@ class Connection:
         self.peer_port = c_conn.peer_port
         self.is_initiator = bool(c_conn.is_initiator)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (f"Connection(peer={self.peer_host}:{self.peer_port}, "
                 f"key={self.remote_key[:8].hex()}...)")
 
 
+# ---------------------------------------------------------------------------
+# KeyPair
+# ---------------------------------------------------------------------------
+
+class KeyPair:
+    """Ed25519 keypair for HyperDHT identity."""
+
+    __slots__ = ("public_key", "secret_key")
+
+    def __init__(self, public_key: bytes, secret_key: bytes) -> None:
+        if len(public_key) != 32:
+            raise ValueError("public_key must be 32 bytes")
+        if len(secret_key) != 64:
+            raise ValueError("secret_key must be 64 bytes")
+        self.public_key = public_key
+        self.secret_key = secret_key
+
+    @classmethod
+    def generate(cls) -> KeyPair:
+        """Generate a random keypair."""
+        kp = _Keypair()
+        _lib.hyperdht_keypair_generate(ctypes.byref(kp))
+        return cls(bytes(kp.public_key), bytes(kp.secret_key))
+
+    @classmethod
+    def from_seed(cls, seed: bytes) -> KeyPair:
+        """Generate a deterministic keypair from a 32-byte seed."""
+        if len(seed) != 32:
+            raise ValueError("seed must be 32 bytes")
+        kp = _Keypair()
+        seed_arr = (ctypes.c_uint8 * 32)(*seed)
+        _lib.hyperdht_keypair_from_seed(ctypes.byref(kp), seed_arr)
+        return cls(bytes(kp.public_key), bytes(kp.secret_key))
+
+    def _to_c(self) -> _Keypair:
+        kp = _Keypair()
+        ctypes.memmove(kp.public_key, self.public_key, 32)
+        ctypes.memmove(kp.secret_key, self.secret_key, 64)
+        return kp
+
+    def __repr__(self) -> str:
+        return f"KeyPair(pk={self.public_key[:8].hex()}...)"
+
+
+# ---------------------------------------------------------------------------
+# Stream
+# ---------------------------------------------------------------------------
+
 class Stream:
     """Encrypted read/write stream over an established connection."""
 
-    def __init__(self, handle, dht):
+    def __init__(self, handle: ctypes.c_void_p, dht: HyperDHT) -> None:
         self._handle = handle
         self._dht = dht
-        self._callbacks = []
+        self._callbacks: list = []
         self._on_data = None
         self._on_close = None
         self._on_open = None
 
     @property
-    def is_open(self):
+    def is_open(self) -> bool:
         if not self._handle:
             return False
         return bool(_lib.hyperdht_stream_is_open(self._handle))
 
-    def write(self, data: bytes):
+    def write(self, data: bytes) -> None:
         """Write data to the encrypted stream."""
         if not self._handle:
             raise RuntimeError("Stream is closed")
         buf = (ctypes.c_uint8 * len(data))(*data)
         rc = _lib.hyperdht_stream_write(self._handle, buf, len(data))
-        if rc != 0:
+        if rc < 0:
             raise RuntimeError(f"stream_write failed: {rc}")
 
-    def close(self):
+    def close(self) -> None:
         """Close the stream."""
         if self._handle:
             _lib.hyperdht_stream_close(self._handle)
             self._handle = None
 
 
+# ---------------------------------------------------------------------------
+# PendingStream
+# ---------------------------------------------------------------------------
+
 class PendingStream:
     """Handle returned by ``HyperDHT.connect_stream()`` before the
     encrypted channel is established.
 
-    Writes made before ``on_open`` fires are buffered and flushed once
-    the stream is ready. Mirrors the JS ``NoiseSecretStream`` pattern
-    where you can subscribe to events and queue writes synchronously.
+    Writes before ``on_open`` are buffered and flushed automatically.
     """
 
-    def __init__(self):
-        self.stream = None           # populated when connect succeeds
-        self._pending_writes = []    # queued until stream is ready
+    def __init__(self) -> None:
+        self.stream: Stream | None = None
+        self._pending_writes: list[bytes] = []
         self._pending_close = False
 
-    def write(self, data: bytes):
+    def write(self, data: bytes) -> None:
         """Write to the stream. Buffered if not yet open."""
         if self.stream and self.stream.is_open:
             self.stream.write(data)
         else:
             self._pending_writes.append(data)
-            # If the underlying Stream exists but hasn't opened yet, its
-            # on_open callback will flush — handled by connect_stream.
 
-    def close(self):
+    def close(self) -> None:
         """Close the stream (or cancel if not yet opened)."""
         if self.stream:
             self.stream.close()
@@ -315,11 +203,10 @@ class PendingStream:
             self._pending_close = True
 
     @property
-    def is_open(self):
+    def is_open(self) -> bool:
         return self.stream is not None and self.stream.is_open
 
-    def _flush_pending(self):
-        """Called by connect_stream's on_open once Stream is live."""
+    def _flush_pending(self) -> None:
         if not self.stream:
             return
         for buf in self._pending_writes:
@@ -329,112 +216,63 @@ class PendingStream:
             self.stream.close()
 
 
-class KeyPair:
-    """Ed25519 keypair for HyperDHT identity."""
+# ---------------------------------------------------------------------------
+# Query
+# ---------------------------------------------------------------------------
 
-    def __init__(self, public_key: bytes, secret_key: bytes):
-        if len(public_key) != 32:
-            raise ValueError("public_key must be 32 bytes")
-        if len(secret_key) != 64:
-            raise ValueError("secret_key must be 64 bytes")
-        self.public_key = public_key
-        self.secret_key = secret_key
+class Query:
+    """Handle for an in-flight DHT query (find_peer, lookup, etc.).
 
-    @classmethod
-    def generate(cls) -> "KeyPair":
-        """Generate a random keypair."""
-        kp = _Keypair()
-        _lib.hyperdht_keypair_generate(ctypes.byref(kp))
-        return cls(bytes(kp.public_key), bytes(kp.secret_key))
+    Obtained from ``_ex`` methods. Must be freed after use::
 
-    @classmethod
-    def from_seed(cls, seed: bytes) -> "KeyPair":
-        """Generate a deterministic keypair from a 32-byte seed."""
-        if len(seed) != 32:
-            raise ValueError("seed must be 32 bytes")
-        kp = _Keypair()
-        seed_arr = (ctypes.c_uint8 * 32)(*seed)
-        _lib.hyperdht_keypair_from_seed(ctypes.byref(kp), seed_arr)
-        return cls(bytes(kp.public_key), bytes(kp.secret_key))
+        query = dht.find_peer_ex(pk, on_reply=..., on_done=...)
+        query.cancel()   # optional
+        query.free()     # required
 
-    def _to_c(self):
-        kp = _Keypair()
-        ctypes.memmove(kp.public_key, self.public_key, 32)
-        ctypes.memmove(kp.secret_key, self.secret_key, 64)
-        return kp
+    Or as a context manager::
 
-    def __repr__(self):
-        return f"KeyPair(pk={self.public_key[:8].hex()}...)"
+        with dht.find_peer_ex(pk, on_reply=...) as q:
+            dht.run()
+        # auto-freed on exit
+    """
 
-
-class Server:
-    """HyperDHT server — listens for incoming connections."""
-
-    def __init__(self, handle, dht):
+    def __init__(self, handle: ctypes.c_void_p) -> None:
         self._handle = handle
-        self._dht = dht  # prevent GC
-        self._cb = None  # prevent GC of callback
 
-    def listen(self, keypair: KeyPair, on_connection):
-        """
-        Start listening for connections.
-
-        Args:
-            keypair: KeyPair to listen on (determines the server's public key)
-            on_connection: callable(Connection) — called for each connection
-        """
-        c_kp = keypair._to_c()
-
-        @_CONNECTION_CB
-        def cb(conn_ptr, ud):
-            if conn_ptr:
-                conn = Connection(conn_ptr.contents)
-                on_connection(conn)
-
-        self._cb = cb  # prevent GC
-        rc = _lib.hyperdht_server_listen(self._handle, ctypes.byref(c_kp), cb, None)
-        if rc != 0:
-            raise RuntimeError(f"server_listen failed: {rc}")
-
-    def set_firewall(self, callback):
-        """
-        Set firewall callback. Return True to reject, False to accept.
-
-        Args:
-            callback: callable(remote_pk: bytes, host: str, port: int) → bool
-        """
-        @_FIREWALL_CB
-        def cb(pk_ptr, host, port, ud):
-            remote_pk = bytes(pk_ptr[:32])
-            reject = callback(remote_pk, host.decode(), port)
-            return 1 if reject else 0
-
-        self._firewall_cb = cb
-        _lib.hyperdht_server_set_firewall(self._handle, cb, None)
-
-    def close(self):
-        """Stop listening and unannounce."""
-        _lib.hyperdht_server_close(self._handle, _CLOSE_CB(0), None)
-        self._handle = None
-
-    def refresh(self):
-        """Force re-announcement."""
+    def cancel(self) -> None:
+        """Cancel the query. Idempotent."""
         if self._handle:
-            _lib.hyperdht_server_refresh(self._handle)
+            _lib.hyperdht_query_cancel(self._handle)
 
+    def free(self) -> None:
+        """Release the query handle. Must be called exactly once."""
+        if self._handle:
+            _lib.hyperdht_query_free(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> Query:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.free()
+
+    def __del__(self) -> None:
+        self.free()
+
+
+# ---------------------------------------------------------------------------
+# HyperDHT
+# ---------------------------------------------------------------------------
 
 class HyperDHT:
-    """
-    HyperDHT node — connect to peers, listen for connections, store data.
+    """HyperDHT node -- connect to peers, listen for connections, store data.
 
-    Usage:
-        dht = HyperDHT()
+    Usage::
+
+        dht = HyperDHT(use_public_bootstrap=True)
         dht.bind()
-        print(f"Port: {dht.port}")
-
-        # ... set up connect/listen callbacks ...
-
-        dht.run()      # Blocks until all operations complete
+        dht.on_bootstrapped(lambda: print("Ready!"))
+        dht.run()
         dht.destroy()
     """
 
@@ -445,43 +283,56 @@ class HyperDHT:
         *,
         use_public_bootstrap: bool = False,
         connection_keep_alive: int | None = None,
-    ):
-        """Create a HyperDHT instance.
-
-        Parameters
-        ----------
-        port, ephemeral
-            Bind port (0 = ephemeral UDP port) and ephemeral-node flag.
-        use_public_bootstrap
-            If True, seed the routing table from the 3 canonical public
-            HyperDHT nodes (matches JS `new DHT()` default).
-        connection_keep_alive
-            Default keep-alive (ms) applied to every Noise-secret-stream
-            opened via this DHT. Mirrors JS ``new DHT({ connectionKeepAlive })``:
-            None → use the C++ default (5000 ms); 0 → disabled; any
-            positive int → used as keep-alive interval.
-        """
+        seed: bytes | None = None,
+        host: str | None = None,
+        nodes: list[str] | None = None,
+    ) -> None:
         # Allocate uv_loop
         loop_size = _uv.uv_loop_size()
         self._loop_buf = (ctypes.c_uint8 * loop_size)()
         self._loop = ctypes.cast(self._loop_buf, ctypes.c_void_p)
         _uv.uv_loop_init(self._loop)
 
-        # Create DHT. UINT64_MAX is the "unset" sentinel for keep-alive.
-        keep_alive = (1 << 64) - 1 if connection_keep_alive is None else connection_keep_alive
-        opts = _Opts(
-            port=port,
-            ephemeral=1 if ephemeral else 0,
-            use_public_bootstrap=1 if use_public_bootstrap else 0,
-            connection_keep_alive=keep_alive,
-        )
+        # Build opts via the C default helper for forward compatibility
+        opts = _Opts()
+        _lib.hyperdht_opts_default(ctypes.byref(opts))
+        opts.port = port
+        opts.ephemeral = 1 if ephemeral else 0
+        opts.use_public_bootstrap = 1 if use_public_bootstrap else 0
+
+        if connection_keep_alive is not None:
+            opts.connection_keep_alive = connection_keep_alive
+
+        if seed is not None:
+            if len(seed) != 32:
+                raise ValueError("seed must be 32 bytes")
+            ctypes.memmove(opts.seed, seed, 32)
+            opts.seed_is_set = 1
+
+        # Keep borrowed-pointer references alive for the create() call
+        self._host_buf: bytes | None = None
+        if host is not None:
+            self._host_buf = host.encode()
+            opts.host = self._host_buf
+
+        self._node_bufs: list[bytes] | None = None
+        self._nodes_arr = None
+        if nodes is not None:
+            self._node_bufs = [n.encode() for n in nodes]
+            arr = (ctypes.c_char_p * len(nodes))(*self._node_bufs)
+            self._nodes_arr = arr
+            opts.nodes = arr
+            opts.nodes_len = len(nodes)
+
         self._handle = _lib.hyperdht_create(self._loop, ctypes.byref(opts))
         if not self._handle:
             raise RuntimeError("Failed to create HyperDHT instance")
 
-        self._callbacks = []  # prevent GC
+        self._callbacks: list = []
 
-    def bind(self, port=0):
+    # -- Lifecycle --
+
+    def bind(self, port: int = 0) -> None:
         """Bind the UDP socket."""
         rc = _lib.hyperdht_bind(self._handle, port)
         if rc != 0:
@@ -489,79 +340,225 @@ class HyperDHT:
 
     @property
     def port(self) -> int:
-        """Get the bound port."""
         return _lib.hyperdht_port(self._handle)
 
     @property
     def default_keypair(self) -> KeyPair:
-        """Get the auto-generated default keypair."""
         kp = _Keypair()
         _lib.hyperdht_default_keypair(self._handle, ctypes.byref(kp))
         return KeyPair(bytes(kp.public_key), bytes(kp.secret_key))
 
-    def connect(self, remote_public_key: bytes, on_done):
-        """
-        Connect to a peer by public key.
+    @property
+    def connection_keep_alive(self) -> int:
+        """Keep-alive setting (ms)."""
+        return _lib.hyperdht_connection_keep_alive(self._handle)
 
-        Args:
-            remote_public_key: 32-byte Ed25519 public key
-            on_done: callable(error: int, connection: Connection or None)
-        """
+    def destroy(self, force: bool = False) -> None:
+        """Destroy the instance and free all resources."""
+        if self._handle:
+            fn = _lib.hyperdht_destroy_force if force else _lib.hyperdht_destroy
+            fn(self._handle, CLOSE_CB(0), None)
+            _uv.uv_run(self._loop, UV_RUN_DEFAULT)
+            _lib.hyperdht_free(self._handle)
+            self._handle = None
+        _uv.uv_loop_close(self._loop)
+
+    def run(self, mode: str = "default") -> None:
+        """Run the libuv event loop."""
+        modes = {
+            "default": UV_RUN_DEFAULT,
+            "once": UV_RUN_ONCE,
+            "nowait": UV_RUN_NOWAIT,
+        }
+        _uv.uv_run(self._loop, modes.get(mode, UV_RUN_DEFAULT))
+
+    def suspend(self, log: Callable | None = None) -> None:
+        """Suspend the DHT."""
+        if log:
+            @LOG_CB
+            def cb(msg, ud):
+                log(msg.decode() if msg else "")
+
+            self._callbacks.append(cb)
+            _lib.hyperdht_suspend_logged(self._handle, cb, None)
+        else:
+            _lib.hyperdht_suspend(self._handle)
+
+    def resume(self, log: Callable | None = None) -> None:
+        """Resume the DHT."""
+        if log:
+            @LOG_CB
+            def cb(msg, ud):
+                log(msg.decode() if msg else "")
+
+            self._callbacks.append(cb)
+            _lib.hyperdht_resume_logged(self._handle, cb, None)
+        else:
+            _lib.hyperdht_resume(self._handle)
+
+    # -- State --
+
+    @property
+    def is_online(self) -> bool:
+        return bool(_lib.hyperdht_is_online(self._handle))
+
+    @property
+    def is_degraded(self) -> bool:
+        return bool(_lib.hyperdht_is_degraded(self._handle))
+
+    @property
+    def is_destroyed(self) -> bool:
+        return bool(_lib.hyperdht_is_destroyed(self._handle))
+
+    @property
+    def is_persistent(self) -> bool:
+        return bool(_lib.hyperdht_is_persistent(self._handle))
+
+    @property
+    def is_bootstrapped(self) -> bool:
+        return bool(_lib.hyperdht_is_bootstrapped(self._handle))
+
+    @property
+    def is_suspended(self) -> bool:
+        return bool(_lib.hyperdht_is_suspended(self._handle))
+
+    @property
+    def remote_address(self) -> Address | None:
+        """Public address from NAT sampling, or None if unknown."""
+        host_buf = ctypes.create_string_buffer(46)
+        port = ctypes.c_uint16()
+        rc = _lib.hyperdht_remote_address(
+            self._handle, host_buf, ctypes.byref(port))
+        if rc != 0:
+            return None
+        return Address(host_buf.value.decode(), port.value)
+
+    @property
+    def punch_stats(self) -> PunchStats:
+        return PunchStats(
+            consistent=_lib.hyperdht_punch_stats_consistent(self._handle),
+            random=_lib.hyperdht_punch_stats_random(self._handle),
+            open=_lib.hyperdht_punch_stats_open(self._handle),
+        )
+
+    @property
+    def relay_stats(self) -> RelayStats:
+        return RelayStats(
+            attempts=_lib.hyperdht_relay_stats_attempts(self._handle),
+            successes=_lib.hyperdht_relay_stats_successes(self._handle),
+            aborts=_lib.hyperdht_relay_stats_aborts(self._handle),
+        )
+
+    # -- Events --
+
+    def on_bootstrapped(self, callback: Callable) -> None:
+        """Register callback for bootstrap completion."""
+        @EVENT_CB
+        def cb(ud):
+            callback()
+
+        self._callbacks.append(cb)
+        _lib.hyperdht_on_bootstrapped(self._handle, cb, None)
+
+    def on_network_change(self, callback: Callable) -> None:
+        @EVENT_CB
+        def cb(ud):
+            callback()
+
+        self._callbacks.append(cb)
+        _lib.hyperdht_on_network_change(self._handle, cb, None)
+
+    def on_network_update(self, callback: Callable) -> None:
+        @EVENT_CB
+        def cb(ud):
+            callback()
+
+        self._callbacks.append(cb)
+        _lib.hyperdht_on_network_update(self._handle, cb, None)
+
+    def on_persistent(self, callback: Callable) -> None:
+        @EVENT_CB
+        def cb(ud):
+            callback()
+
+        self._callbacks.append(cb)
+        _lib.hyperdht_on_persistent(self._handle, cb, None)
+
+    # -- Connect --
+
+    def connect(
+        self,
+        remote_public_key: bytes,
+        on_done: Callable,
+        *,
+        keypair: KeyPair | None = None,
+        relay_through: bytes | None = None,
+        relay_keep_alive_ms: int = 0,
+        fast_open: bool = True,
+        local_connection: bool = True,
+    ) -> None:
+        """Connect to a peer by public key."""
         if len(remote_public_key) != 32:
             raise ValueError("remote_public_key must be 32 bytes")
 
         pk = (ctypes.c_uint8 * 32)(*remote_public_key)
 
-        @_CONNECT_CB
+        @CONNECT_CB
         def cb(error, conn_ptr, ud):
             if error != 0:
                 on_done(error, None)
             else:
-                conn = Connection(conn_ptr.contents)
-                on_done(0, conn)
+                on_done(0, Connection(conn_ptr.contents))
 
         self._callbacks.append(cb)
-        rc = _lib.hyperdht_connect(self._handle, pk, cb, None)
+
+        has_opts = (
+            keypair is not None
+            or relay_through is not None
+            or relay_keep_alive_ms != 0
+            or not fast_open
+            or not local_connection
+        )
+
+        if has_opts:
+            c_opts = _ConnectOpts()
+            _lib.hyperdht_connect_opts_default(ctypes.byref(c_opts))
+
+            c_kp = None
+            if keypair is not None:
+                c_kp = keypair._to_c()
+                c_opts.keypair = ctypes.pointer(c_kp)
+
+            relay_arr = None
+            if relay_through is not None:
+                if len(relay_through) != 32:
+                    raise ValueError("relay_through must be 32 bytes")
+                relay_arr = (ctypes.c_uint8 * 32)(*relay_through)
+                c_opts.relay_through = relay_arr
+
+            c_opts.relay_keep_alive_ms = relay_keep_alive_ms
+            c_opts.fast_open = 1 if fast_open else 0
+            c_opts.local_connection = 1 if local_connection else 0
+
+            self._callbacks.extend([c_kp, relay_arr])
+            rc = _lib.hyperdht_connect_ex(
+                self._handle, pk, ctypes.byref(c_opts), cb, None)
+        else:
+            rc = _lib.hyperdht_connect(self._handle, pk, cb, None)
+
         if rc != 0:
             raise RuntimeError(f"connect failed: {rc}")
 
-    def create_server(self) -> Server:
-        """Create a server instance."""
-        handle = _lib.hyperdht_server_create(self._handle)
-        if not handle:
-            raise RuntimeError("Failed to create server")
-        return Server(handle, self)
-
-    def connect_stream(self, remote_public_key: bytes,
-                       on_open=None, on_data=None, on_close=None,
-                       on_error=None) -> "PendingStream":
-        """
-        Connect to a peer and open an encrypted stream in one call.
-        Mirrors the JS ``dht.connect(pk)`` API — returns a stream handle
-        immediately; events fire as the async chain progresses.
-
-        The stream wiring (findPeer → handshake → holepunch/relay →
-        SecretStream start) happens asynchronously. Callbacks fire on
-        the event loop:
-
-            on_open(stream)        — stream is ready for write()
-            on_data(data: bytes)   — decrypted data received
-            on_close()             — stream closed cleanly
-            on_error(code: int)    — connect failed (no stream created)
-
-        Args:
-            remote_public_key: 32-byte Ed25519 public key of the peer
-            on_open: called with the Stream once the encrypted channel
-                     is established
-            on_data: called for each decrypted payload received
-            on_close: called when the stream closes
-            on_error: called if the connect phase fails
-
-        Returns:
-            PendingStream — a handle that will be populated with the
-            real Stream when on_open fires. Keep a reference to it for
-            the duration of the connection.
-        """
+    def connect_stream(
+        self,
+        remote_public_key: bytes,
+        on_open: Callable | None = None,
+        on_data: Callable | None = None,
+        on_close: Callable | None = None,
+        on_error: Callable | None = None,
+        **connect_kwargs,
+    ) -> PendingStream:
+        """Connect and open encrypted stream in one call."""
         pending = PendingStream()
 
         def _on_connect(error, conn):
@@ -571,9 +568,6 @@ class HyperDHT:
                 return
 
             def _on_stream_open():
-                # Called by open_stream when the SecretStream handshake
-                # completes. Flush any writes the caller queued while
-                # the connection was pending, then deliver the Stream.
                 pending._flush_pending()
                 if on_open:
                     on_open(pending.stream)
@@ -586,31 +580,39 @@ class HyperDHT:
             )
             pending.stream = stream
 
-        self.connect(remote_public_key, _on_connect)
+        self.connect(remote_public_key, _on_connect, **connect_kwargs)
         return pending
 
-    def open_stream(self, connection: Connection, on_open=None,
-                    on_data=None, on_close=None) -> Stream:
-        """
-        Open an encrypted read/write stream over a connection.
+    # -- Server --
 
-        Args:
-            connection: Connection from connect() or server listen callback
-            on_open: callable() — stream is ready for read/write
-            on_data: callable(data: bytes) — received decrypted data
-            on_close: callable() — stream closed
-        """
-        @_CLOSE_CB
+    def create_server(self) -> Server:
+        """Create a server instance."""
+        handle = _lib.hyperdht_server_create(self._handle)
+        if not handle:
+            raise RuntimeError("Failed to create server")
+        return Server(handle, self)
+
+    # -- Stream --
+
+    def open_stream(
+        self,
+        connection: Connection,
+        on_open: Callable | None = None,
+        on_data: Callable | None = None,
+        on_close: Callable | None = None,
+    ) -> Stream:
+        """Open encrypted stream over a connection."""
+        @CLOSE_CB
         def open_cb(ud):
             if on_open:
                 on_open()
 
-        @_DATA_CB
+        @DATA_CB
         def data_cb(data_ptr, length, ud):
             if on_data and data_ptr and length > 0:
                 on_data(bytes(data_ptr[:length]))
 
-        @_CLOSE_CB
+        @CLOSE_CB
         def close_cb(ud):
             if on_close:
                 on_close()
@@ -618,79 +620,244 @@ class HyperDHT:
         handle = _lib.hyperdht_stream_open(
             self._handle, ctypes.byref(connection._c_conn),
             open_cb, data_cb, close_cb, None)
-
         if not handle:
             raise RuntimeError("Failed to open stream")
 
         stream = Stream(handle, self)
-        stream._on_open = open_cb      # prevent GC
+        stream._on_open = open_cb
         stream._on_data = data_cb
         stream._on_close = close_cb
         return stream
 
-    def immutable_put(self, value: bytes, on_done=None):
-        """Store an immutable value (target = BLAKE2b(value))."""
+    # -- DHT queries --
+
+    def find_peer(
+        self,
+        public_key: bytes,
+        on_reply: Callable | None = None,
+        on_done: Callable | None = None,
+    ) -> None:
+        """Find a peer by public key."""
+        if len(public_key) != 32:
+            raise ValueError("public_key must be 32 bytes")
+        pk = (ctypes.c_uint8 * 32)(*public_key)
+        reply_cb, done_cb = self._make_query_cbs(on_reply, on_done)
+        rc = _lib.hyperdht_find_peer(
+            self._handle, pk, reply_cb, done_cb, None)
+        if rc != 0:
+            raise RuntimeError(f"find_peer failed: {rc}")
+
+    def find_peer_ex(
+        self,
+        public_key: bytes,
+        on_reply: Callable | None = None,
+        on_done: Callable | None = None,
+    ) -> Query:
+        """Find a peer, returning a cancelable Query handle."""
+        if len(public_key) != 32:
+            raise ValueError("public_key must be 32 bytes")
+        pk = (ctypes.c_uint8 * 32)(*public_key)
+        reply_cb, done_cb = self._make_query_cbs(on_reply, on_done)
+        handle = _lib.hyperdht_find_peer_ex(
+            self._handle, pk, reply_cb, done_cb, None)
+        if not handle:
+            raise RuntimeError("find_peer_ex failed")
+        return Query(handle)
+
+    def lookup(
+        self,
+        target: bytes,
+        on_reply: Callable | None = None,
+        on_done: Callable | None = None,
+    ) -> None:
+        """Look up a target hash on the DHT."""
+        if len(target) != 32:
+            raise ValueError("target must be 32 bytes")
+        t = (ctypes.c_uint8 * 32)(*target)
+        reply_cb, done_cb = self._make_query_cbs(on_reply, on_done)
+        rc = _lib.hyperdht_lookup(
+            self._handle, t, reply_cb, done_cb, None)
+        if rc != 0:
+            raise RuntimeError(f"lookup failed: {rc}")
+
+    def lookup_ex(
+        self,
+        target: bytes,
+        on_reply: Callable | None = None,
+        on_done: Callable | None = None,
+    ) -> Query:
+        """Look up, returning a cancelable Query handle."""
+        if len(target) != 32:
+            raise ValueError("target must be 32 bytes")
+        t = (ctypes.c_uint8 * 32)(*target)
+        reply_cb, done_cb = self._make_query_cbs(on_reply, on_done)
+        handle = _lib.hyperdht_lookup_ex(
+            self._handle, t, reply_cb, done_cb, None)
+        if not handle:
+            raise RuntimeError("lookup_ex failed")
+        return Query(handle)
+
+    def announce(
+        self,
+        target: bytes,
+        value: bytes,
+        on_done: Callable | None = None,
+    ) -> None:
+        """Announce on the DHT."""
+        if len(target) != 32:
+            raise ValueError("target must be 32 bytes")
+        t = (ctypes.c_uint8 * 32)(*target)
         buf = (ctypes.c_uint8 * len(value))(*value)
 
-        @_DONE_CB
+        @DONE_CB
         def cb(error, ud):
             if on_done:
                 on_done(error)
 
         self._callbacks.append(cb)
-        rc = _lib.hyperdht_immutable_put(self._handle, buf, len(value), cb, None)
+        rc = _lib.hyperdht_announce(
+            self._handle, t, buf, len(value), cb, None)
+        if rc != 0:
+            raise RuntimeError(f"announce failed: {rc}")
+
+    def unannounce(
+        self,
+        public_key: bytes,
+        keypair: KeyPair,
+        on_done: Callable | None = None,
+    ) -> None:
+        """Remove announcement from the DHT."""
+        if len(public_key) != 32:
+            raise ValueError("public_key must be 32 bytes")
+        pk = (ctypes.c_uint8 * 32)(*public_key)
+        c_kp = keypair._to_c()
+
+        @DONE_CB
+        def cb(error, ud):
+            if on_done:
+                on_done(error)
+
+        self._callbacks.append(cb)
+        rc = _lib.hyperdht_unannounce(
+            self._handle, pk, ctypes.byref(c_kp), cb, None)
+        if rc != 0:
+            raise RuntimeError(f"unannounce failed: {rc}")
+
+    # -- Storage --
+
+    def immutable_put(
+        self, value: bytes, on_done: Callable | None = None,
+    ) -> None:
+        """Store an immutable value (target = BLAKE2b(value))."""
+        buf = (ctypes.c_uint8 * len(value))(*value)
+
+        @DONE_CB
+        def cb(error, ud):
+            if on_done:
+                on_done(error)
+
+        self._callbacks.append(cb)
+        rc = _lib.hyperdht_immutable_put(
+            self._handle, buf, len(value), cb, None)
         if rc != 0:
             raise RuntimeError(f"immutable_put failed: {rc}")
 
-    def immutable_get(self, target: bytes, on_value=None, on_done=None):
+    def immutable_get(
+        self,
+        target: bytes,
+        on_value: Callable | None = None,
+        on_done: Callable | None = None,
+    ) -> None:
         """Retrieve an immutable value by hash."""
         if len(target) != 32:
             raise ValueError("target must be 32 bytes")
         t = (ctypes.c_uint8 * 32)(*target)
 
-        @_VALUE_CB
+        @VALUE_CB
         def val_cb(value_ptr, length, ud):
             if on_value and value_ptr and length > 0:
                 on_value(bytes(value_ptr[:length]))
 
-        @_DONE_CB
+        @DONE_CB
         def done_cb(error, ud):
             if on_done:
                 on_done(error)
 
         self._callbacks.extend([val_cb, done_cb])
-        rc = _lib.hyperdht_immutable_get(self._handle, t, val_cb, done_cb, None)
+        rc = _lib.hyperdht_immutable_get(
+            self._handle, t, val_cb, done_cb, None)
         if rc != 0:
             raise RuntimeError(f"immutable_get failed: {rc}")
 
-    def mutable_put(self, keypair: KeyPair, value: bytes, seq: int, on_done=None):
+    def immutable_get_ex(
+        self,
+        target: bytes,
+        on_value: Callable | None = None,
+        on_done: Callable | None = None,
+    ) -> Query:
+        """Cancelable immutable_get."""
+        if len(target) != 32:
+            raise ValueError("target must be 32 bytes")
+        t = (ctypes.c_uint8 * 32)(*target)
+
+        @VALUE_CB
+        def val_cb(value_ptr, length, ud):
+            if on_value and value_ptr and length > 0:
+                on_value(bytes(value_ptr[:length]))
+
+        @DONE_CB
+        def done_cb(error, ud):
+            if on_done:
+                on_done(error)
+
+        self._callbacks.extend([val_cb, done_cb])
+        handle = _lib.hyperdht_immutable_get_ex(
+            self._handle, t, val_cb, done_cb, None)
+        if not handle:
+            raise RuntimeError("immutable_get_ex failed")
+        return Query(handle)
+
+    def mutable_put(
+        self,
+        keypair: KeyPair,
+        value: bytes,
+        seq: int,
+        on_done: Callable | None = None,
+    ) -> None:
         """Store a signed mutable value."""
         c_kp = keypair._to_c()
         buf = (ctypes.c_uint8 * len(value))(*value)
 
-        @_DONE_CB
+        @DONE_CB
         def cb(error, ud):
             if on_done:
                 on_done(error)
 
         self._callbacks.append(cb)
         rc = _lib.hyperdht_mutable_put(
-            self._handle, ctypes.byref(c_kp), buf, len(value), seq, cb, None)
+            self._handle, ctypes.byref(c_kp),
+            buf, len(value), seq, cb, None)
         if rc != 0:
             raise RuntimeError(f"mutable_put failed: {rc}")
 
-    def mutable_get(self, public_key: bytes, min_seq=0, on_value=None, on_done=None):
+    def mutable_get(
+        self,
+        public_key: bytes,
+        min_seq: int = 0,
+        on_value: Callable | None = None,
+        on_done: Callable | None = None,
+    ) -> None:
         """Retrieve a signed mutable value."""
         if len(public_key) != 32:
             raise ValueError("public_key must be 32 bytes")
         pk = (ctypes.c_uint8 * 32)(*public_key)
 
-        @_MUTABLE_CB
+        @MUTABLE_CB
         def val_cb(seq, value_ptr, length, sig_ptr, ud):
             if on_value and value_ptr and length > 0:
                 on_value(seq, bytes(value_ptr[:length]), bytes(sig_ptr[:64]))
 
-        @_DONE_CB
+        @DONE_CB
         def done_cb(error, ud):
             if on_done:
                 on_done(error)
@@ -701,16 +868,91 @@ class HyperDHT:
         if rc != 0:
             raise RuntimeError(f"mutable_get failed: {rc}")
 
-    def run(self, mode="default"):
-        """Run the libuv event loop. Blocks until all operations complete."""
-        modes = {"default": UV_RUN_DEFAULT, "once": UV_RUN_ONCE, "nowait": UV_RUN_NOWAIT}
-        _uv.uv_run(self._loop, modes.get(mode, UV_RUN_DEFAULT))
+    def mutable_get_ex(
+        self,
+        public_key: bytes,
+        min_seq: int = 0,
+        on_value: Callable | None = None,
+        on_done: Callable | None = None,
+    ) -> Query:
+        """Cancelable mutable_get."""
+        if len(public_key) != 32:
+            raise ValueError("public_key must be 32 bytes")
+        pk = (ctypes.c_uint8 * 32)(*public_key)
 
-    def destroy(self):
-        """Destroy the instance and free all resources."""
-        if self._handle:
-            _lib.hyperdht_destroy(self._handle, _CLOSE_CB(0), None)
-            _uv.uv_run(self._loop, UV_RUN_DEFAULT)
-            _lib.hyperdht_free(self._handle)
-            self._handle = None
-        _uv.uv_loop_close(self._loop)
+        @MUTABLE_CB
+        def val_cb(seq, value_ptr, length, sig_ptr, ud):
+            if on_value and value_ptr and length > 0:
+                on_value(seq, bytes(value_ptr[:length]), bytes(sig_ptr[:64]))
+
+        @DONE_CB
+        def done_cb(error, ud):
+            if on_done:
+                on_done(error)
+
+        self._callbacks.extend([val_cb, done_cb])
+        handle = _lib.hyperdht_mutable_get_ex(
+            self._handle, pk, min_seq, val_cb, done_cb, None)
+        if not handle:
+            raise RuntimeError("mutable_get_ex failed")
+        return Query(handle)
+
+    # -- Utilities --
+
+    @staticmethod
+    def hash(data: bytes) -> bytes:
+        """BLAKE2b-256 hash."""
+        out = (ctypes.c_uint8 * 32)()
+        buf = (ctypes.c_uint8 * len(data))(*data)
+        _lib.hyperdht_hash(buf, len(data), out)
+        return bytes(out)
+
+    def add_node(self, host: str, port: int) -> None:
+        """Add a node to the routing table."""
+        rc = _lib.hyperdht_add_node(self._handle, host.encode(), port)
+        if rc != 0:
+            raise RuntimeError(f"add_node failed: {rc}")
+
+    def to_array(self, cap: int = 256) -> list[Address]:
+        """Snapshot the routing table as (host, port) pairs."""
+        hosts = ctypes.create_string_buffer(cap * HOST_STRIDE)
+        ports = (ctypes.c_uint16 * cap)()
+        n = _lib.hyperdht_to_array(self._handle, hosts, ports, cap)
+        result: list[Address] = []
+        for i in range(n):
+            offset = i * HOST_STRIDE
+            host = hosts[offset:offset + HOST_STRIDE]
+            host = host.split(b"\x00")[0].decode()
+            result.append(Address(host, ports[i]))
+        return result
+
+    def ping(
+        self, host: str, port: int, on_done: Callable | None = None,
+    ) -> None:
+        """Ping a peer directly (UDP round-trip)."""
+        @PING_CB
+        def cb(success, ud):
+            if on_done:
+                on_done(bool(success))
+
+        self._callbacks.append(cb)
+        rc = _lib.hyperdht_ping(self._handle, host.encode(), port, cb, None)
+        if rc != 0:
+            raise RuntimeError(f"ping failed: {rc}")
+
+    # -- Private helpers --
+
+    def _make_query_cbs(self, on_reply, on_done):
+        """Build and retain PEER_CB + DONE_CB for query methods."""
+        @PEER_CB
+        def reply_cb(value_ptr, length, host, port, ud):
+            if on_reply and value_ptr and length > 0:
+                on_reply(bytes(value_ptr[:length]), host.decode(), port)
+
+        @DONE_CB
+        def done_cb(error, ud):
+            if on_done:
+                on_done(error)
+
+        self._callbacks.extend([reply_cb, done_cb])
+        return reply_cb, done_cb

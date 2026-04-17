@@ -47,7 +47,7 @@ python3 example.py server
 python3 example.py connect <public_key_hex>
 
 # Holesail-compatible P2P tunnel
-python3 holesail_server.py 8080
+python3 holesail_server.py --live 8080
 ```
 
 ## What's here
@@ -55,9 +55,29 @@ python3 holesail_server.py 8080
 | File | What it does |
 |------|-------------|
 | `example.py` | CLI: `server`, `connect`, `keygen` |
-| `holesail_server.py` | P2P tunnel server (holesail-compatible `hs://` links) |
+| `holesail_server.py` | P2P tunnel server (`--live <port>`, holesail-compatible `hs://` links) |
 | `test_wrapper.py` | Smoke tests for the Python bindings |
 | `hyperdht/` | ctypes bindings — the actual Python library |
+
+## Important: threading and callback rules
+
+The library uses a libuv event loop internally. Three rules you must follow:
+
+1. **Single-threaded** — all `hyperdht` calls must happen on the same thread
+   that runs `dht.run()`. Never call `stream.write()`, `dht.connect()`, or
+   any other library function from a background thread. If you need to bridge
+   blocking I/O (like TCP sockets), use `selectors` or `uv_async_send` to
+   marshal work back to the event loop thread.
+
+2. **Wait for `on_open`** — after `dht.open_stream()`, the SecretStream header
+   exchange must complete before you can write. The `on_open` callback signals
+   readiness. Writes before `on_open` return error code -1. If you're bridging
+   to a TCP socket, don't start reading from TCP until `on_open` fires.
+
+3. **Callback lifetime** — keep references to all ctypes callback objects
+   (the decorated `@CFUNCTYPE` functions) for as long as they might be called.
+   If Python garbage-collects a callback while the C library still holds a
+   pointer to it, you get a segfault.
 
 ## How it works
 

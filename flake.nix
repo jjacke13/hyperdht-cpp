@@ -34,6 +34,11 @@
             src = self;
           };
 
+          echo-server = import ./nix/echo-server.nix {
+            inherit pkgs;
+            staticLib = hyperdhtLib.mkHyperdht {};
+          };
+
           server-test = import ./nix/server-test.nix {
             inherit pkgs;
             inherit (hyperdhtLib) sourceFilter libudxPostUnpack;
@@ -90,6 +95,12 @@
         imports = [ ./nix/module.nix ];
         config.services.holesail.package = lib.mkDefault
           self.packages.${pkgs.system}.holesail;
+      };
+
+      nixosModules.echo-server = { config, lib, pkgs, ... }: {
+        imports = [ ./nix/echo-module.nix ];
+        config.services.hyperdht-echo.package = lib.mkDefault
+          self.packages.${pkgs.system}.echo-server;
       };
     };
 }

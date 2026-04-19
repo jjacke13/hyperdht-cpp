@@ -754,6 +754,13 @@ void Server::on_handshake_result(
     connections_[hp_id] = std::move(conn_ptr);
     handshake_dedup_[noise_key] = hp_id;
 
+    // Register rawStream for firewall detection — must happen HERE (at
+    // handshake time), not in on_peer_holepunch, so that LAN connections
+    // (which skip holepunch entirely) still trigger on_raw_stream_firewall.
+    if (connections_[hp_id]->raw_stream) {
+        pending_punch_streams_[connections_[hp_id]->local_udx_id] = hp_id;
+    }
+
     // Per-session timeout (RAII) — JS: server.js:445-462 (_clearLater + _clear)
     auto session_timer = std::make_unique<async_utils::UvTimer>(socket_.loop());
     session_timer->start([this, hp_id]() {
@@ -930,10 +937,8 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
         conn.puncher->set_remote_addresses(valid_addrs);
         conn.puncher->punch();
 
-        // Register for rawStream firewall detection
-        if (conn.raw_stream) {
-            pending_punch_streams_[conn.local_udx_id] = hp_msg.id;
-        }
+        // Note: rawStream is already registered in pending_punch_streams_
+        // at handshake time (line ~756). No need to register again here.
 
         // Install probe echo listener ONCE — echoes probes from ALL clients.
         // Uses add_probe_listener so it doesn't clobber other listeners.

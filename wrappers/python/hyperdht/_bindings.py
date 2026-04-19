@@ -14,6 +14,7 @@ from hyperdht._ffi import (
     CONNECT_CB,
     DATA_CB,
     DONE_CB,
+    DRAIN_CB,
     EVENT_CB,
     HOST_STRIDE,
     LOG_CB,
@@ -22,6 +23,7 @@ from hyperdht._ffi import (
     PING_CB,
     POLL_CB,
     POLL_READABLE,
+    POLL_WRITABLE,
     UV_RUN_DEFAULT,
     UV_RUN_NOWAIT,
     UV_RUN_ONCE,
@@ -162,10 +164,28 @@ class Stream:
         """Write data to the encrypted stream."""
         if not self._handle:
             raise RuntimeError("Stream is closed")
-        buf = (ctypes.c_uint8 * len(data))(*data)
-        rc = _lib.hyperdht_stream_write(self._handle, buf, len(data))
+        rc = _lib.hyperdht_stream_write(self._handle, data, len(data))
         if rc < 0:
             raise RuntimeError(f"stream_write failed: {rc}")
+
+    def write_with_drain(
+        self, data: bytes, on_drain: Callable | None = None,
+    ) -> int:
+        """Write with drain callback for flow control.
+        Returns 0 on success (may be backpressured), negative on error.
+        on_drain fires when the transport is ready for more data."""
+        if not self._handle:
+            raise RuntimeError("Stream is closed")
+        if on_drain is None:
+            return _lib.hyperdht_stream_write(self._handle, data, len(data))
+
+        @DRAIN_CB
+        def cb(stream_ptr, ud):
+            on_drain()
+
+        self._callbacks.append(cb)
+        return _lib.hyperdht_stream_write_with_drain(
+            self._handle, data, len(data), cb, None)
 
     def close(self) -> None:
         """Close the stream."""
@@ -366,13 +386,23 @@ class HyperDHT:
         _uv.uv_loop_close(self._loop)
 
     def run(self, mode: str = "default") -> None:
-        """Run the libuv event loop."""
-        modes = {
-            "default": UV_RUN_DEFAULT,
-            "once": UV_RUN_ONCE,
-            "nowait": UV_RUN_NOWAIT,
-        }
-        _uv.uv_run(self._loop, modes.get(mode, UV_RUN_DEFAULT))
+        """Run the libuv event loop.
+
+        The default mode uses UV_RUN_ONCE in a Python loop so that
+        signals (Ctrl+C) are processed between iterations. Use
+        mode="blocking" for the old UV_RUN_DEFAULT behavior.
+        """
+        if mode == "blocking":
+            _uv.uv_run(self._loop, UV_RUN_DEFAULT)
+        elif mode == "once":
+            _uv.uv_run(self._loop, UV_RUN_ONCE)
+        elif mode == "nowait":
+            _uv.uv_run(self._loop, UV_RUN_NOWAIT)
+        else:
+            # Default: UV_RUN_ONCE loop — returns to Python between
+            # iterations so KeyboardInterrupt can be raised.
+            while _uv.uv_run(self._loop, UV_RUN_ONCE):
+                pass
 
     def suspend(self, log: Callable | None = None) -> None:
         """Suspend the DHT."""

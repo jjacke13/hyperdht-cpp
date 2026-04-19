@@ -42,7 +42,7 @@ class Server:
             if conn_ptr:
                 on_connection(Connection(conn_ptr.contents))
 
-        self._callbacks.append(cb)
+        self._callbacks.extend([cb, c_kp])
         rc = _lib.hyperdht_server_listen(
             self._handle, ctypes.byref(c_kp), cb, None)
         if rc != 0:

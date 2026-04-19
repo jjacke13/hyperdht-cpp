@@ -33,10 +33,10 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import os
 import socket
 import sys
+import weakref
 
 sys.path.insert(0, ".")
 
@@ -103,25 +103,29 @@ class Bridge:
 
     All I/O runs on the libuv event loop — TCP sockets are registered
     via uv_poll (hyperdht_poll_start), so there's zero polling latency.
-    The stream→TCP direction is handled by the stream's on_data callback.
-    The TCP→stream direction fires when libuv detects the fd is readable.
+    The stream->TCP direction is handled by the stream's on_data callback.
+    The TCP->stream direction fires when libuv detects the fd is readable.
     """
 
     def __init__(
         self, tcp_sock: socket.socket, stream, dht,
+        bridges: set[Bridge],
     ) -> None:
         self._tcp = tcp_sock
         self._stream = stream
         self._dht = dht
-        self._poll_handle = None
+        self._bridges = bridges
+        self._read_poll = None
+        self._write_poll = None
+        self._write_buf = bytearray()
         self._closed = False
         self._tcp.setblocking(False)
 
     def activate(self) -> None:
         """Start watching TCP for data. Call from on_open."""
-        if self._poll_handle or self._closed:
+        if self._read_poll or self._closed:
             return
-        self._poll_handle = self._dht.poll_start(
+        self._read_poll = self._dht.poll_start(
             self._tcp.fileno(), self._on_tcp_readable)
 
     def _on_tcp_readable(self, fd: int, events: int) -> None:
@@ -129,7 +133,7 @@ class Bridge:
         if not self._stream:
             return
         try:
-            data = self._tcp.recv(4096)
+            data = self._tcp.recv(65536)
         except BlockingIOError:
             return
         except OSError:
@@ -147,38 +151,84 @@ class Bridge:
 
     def write_to_tcp(self, data: bytes) -> None:
         """Called from stream's on_data — forward to TCP."""
+        if self._closed:
+            return
+
+        # If we already have buffered data, append and let the
+        # writable poll flush it in order.
+        if self._write_buf:
+            self._write_buf.extend(data)
+            return
+
+        # Try to send directly first (fast path).
         try:
-            self._tcp.sendall(data)
+            sent = self._tcp.send(data)
         except BlockingIOError:
-            # TCP send buffer full — retry with blocking send.
-            # Safe because we're on the event loop thread and the
-            # local TCP server is on the same machine (fast drain).
-            self._tcp.setblocking(True)
-            try:
-                self._tcp.sendall(data)
-            except OSError:
-                self.close()
-                return
-            finally:
-                self._tcp.setblocking(False)
+            sent = 0
         except OSError:
             self.close()
+            return
+
+        if sent == len(data):
+            return  # All sent, no buffering needed
+
+        # Partial send — buffer the rest and watch for writable.
+        self._write_buf.extend(data[sent:])
+        self._start_write_poll()
+
+    def _start_write_poll(self) -> None:
+        """Register POLL_WRITABLE to flush the write buffer."""
+        if self._write_poll or self._closed:
+            return
+        self._write_poll = self._dht.poll_start(
+            self._tcp.fileno(), self._on_tcp_writable,
+            readable=False, writable=True)
+
+    def _on_tcp_writable(self, fd: int, events: int) -> None:
+        """Called by libuv when the TCP socket can accept more data."""
+        if not self._write_buf:
+            self._stop_write_poll()
+            return
+
+        try:
+            sent = self._tcp.send(self._write_buf)
+        except BlockingIOError:
+            return
+        except OSError:
+            self.close()
+            return
+
+        del self._write_buf[:sent]
+
+        if not self._write_buf:
+            self._stop_write_poll()
+
+    def _stop_write_poll(self) -> None:
+        """Stop watching for writable."""
+        if self._write_poll:
+            self._dht.poll_stop(self._write_poll)
+            self._write_poll = None
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        if self._poll_handle:
-            self._dht.poll_stop(self._poll_handle)
-            self._poll_handle = None
+        self._bridges.discard(self)
+        if self._read_poll:
+            self._dht.poll_stop(self._read_poll)
+            self._read_poll = None
+        self._stop_write_poll()
+        self._write_buf.clear()
         try:
             self._tcp.close()
         except OSError:
             pass
-        try:
-            self._stream.close()
-        except RuntimeError:
-            pass
+        if self._stream:
+            try:
+                self._stream.close()
+            except RuntimeError:
+                pass
+            self._stream = None
 
 
 def main() -> None:
@@ -190,9 +240,10 @@ def main() -> None:
     test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         test_sock.connect((local_host, local_port))
-        test_sock.close()
     except OSError:
         print(f"Warning: nothing listening on {local_host}:{local_port} yet")
+    finally:
+        test_sock.close()
 
     # Keypair + connection string
     kp, connection_key = _make_keypair(args.seed, args.secure)
@@ -201,7 +252,7 @@ def main() -> None:
     dht = HyperDHT(use_public_bootstrap=True)
     dht.bind()
 
-    bridges: list[Bridge] = []
+    bridges: set[Bridge] = set()
 
     # Create server with optional firewall
     server = dht.create_server()
@@ -225,10 +276,12 @@ def main() -> None:
             tcp_sock.connect((local_host, local_port))
         except OSError as e:
             print(f"  Error: can't reach {local_host}:{local_port} -- {e}")
+            tcp_sock.close()
             return
 
-        bridge = Bridge(tcp_sock, None, dht)
-        bridges.append(bridge)
+        # Create bridge with stream=None initially, set after open_stream
+        bridge = Bridge(tcp_sock, None, dht, bridges)
+        bridges.add(bridge)
 
         def on_open() -> None:
             bridge.activate()
@@ -280,12 +333,15 @@ def main() -> None:
 
     # Event-driven: TCP sockets are registered with libuv via poll_start,
     # so dht.run() handles everything — DHT, streams, and TCP bridging.
+    # Uses UV_RUN_ONCE loop internally so Ctrl+C is handled properly.
     try:
         dht.run()
     except KeyboardInterrupt:
         pass
 
     print(f"\n  Shutting down ({connection_count} connections served)")
+    for bridge in list(bridges):
+        bridge.close()
     dht.destroy()
 
 

@@ -426,8 +426,15 @@ lib.hyperdht_stream_open.argtypes = [
 lib.hyperdht_stream_open.restype = ctypes.c_void_p
 
 lib.hyperdht_stream_write.argtypes = [
-    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
 lib.hyperdht_stream_write.restype = ctypes.c_int
+
+DRAIN_CB = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
+
+lib.hyperdht_stream_write_with_drain.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+    DRAIN_CB, ctypes.c_void_p]
+lib.hyperdht_stream_write_with_drain.restype = ctypes.c_int
 
 lib.hyperdht_stream_close.argtypes = [ctypes.c_void_p]
 lib.hyperdht_stream_close.restype = None
@@ -535,6 +542,9 @@ uv.uv_loop_init.restype = ctypes.c_int
 
 uv.uv_run.argtypes = [ctypes.c_void_p, ctypes.c_int]
 uv.uv_run.restype = ctypes.c_int
+
+uv.uv_stop.argtypes = [ctypes.c_void_p]
+uv.uv_stop.restype = None
 
 uv.uv_loop_close.argtypes = [ctypes.c_void_p]
 uv.uv_loop_close.restype = ctypes.c_int

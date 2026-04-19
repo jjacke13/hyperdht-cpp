@@ -34,12 +34,13 @@ Wire-compatible with JS `hyperdht@6.29.1`. Live-tested in both directions on the
 nix develop && mkdir -p build && cd build && cmake .. -G Ninja && ninja && ctest -L unit
 ```
 
-Without Nix: install `cmake`, `ninja`, `libsodium`, `libuv`, then the same cmake flow. See [examples/python/build.sh](examples/python/build.sh) for distro-specific dependency install commands.
+Without Nix: install `cmake`, `ninja`, `libsodium`, `libuv`, then the same cmake flow. Docker also works (`docker build -t hyperdht .`). See [BUILDING.md](docs/BUILDING.md) for full instructions (Linux, macOS, Docker, linking, troubleshooting).
 
 ## Documentation
 
 | | |
 |---|---|
+| [Build instructions](docs/BUILDING.md) | Linux, macOS, Docker, Nix — deps, compile, link, troubleshoot |
 | [C API reference](docs/C-API.md) | 76 functions, opaque-pointer pattern, callback-based async |
 | [C++ API reference](docs/CPP-API.md) | RAII wrappers, error codes, single-threaded event loop |
 | [Python examples](examples/python/) | Server, client, holesail tunnel, 22 wrapper tests |

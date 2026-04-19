@@ -149,6 +149,18 @@ class Bridge:
         """Called from stream's on_data — forward to TCP."""
         try:
             self._tcp.sendall(data)
+        except BlockingIOError:
+            # TCP send buffer full — retry with blocking send.
+            # Safe because we're on the event loop thread and the
+            # local TCP server is on the same machine (fast drain).
+            self._tcp.setblocking(True)
+            try:
+                self._tcp.sendall(data)
+            except OSError:
+                self.close()
+                return
+            finally:
+                self._tcp.setblocking(False)
         except OSError:
             self.close()
 

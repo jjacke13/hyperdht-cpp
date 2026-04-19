@@ -54,6 +54,22 @@ Tasks to verify / harden the implementation, organized by category and estimated
 - **aarch64 CI**
   - We've built on aarch64 NixOS manually. Add to CI when repo is pushed.
 
+- **Stream backpressure (drain callback)**
+  - `hyperdht_stream_write` returns 0 on backpressure but we don't expose
+    a drain callback to signal when the stream is ready for more data.
+    JS has `socket.on('drain', ...)` as a standard Node.js stream event.
+    Need: `hyperdht_stream_on_drain(stream, callback, userdata)` in the FFI.
+    Without it, holesail can't do proper pause/resume when streaming to
+    slow peers. Local TCP bridging uses a blocking sendall workaround.
+    Ref: holesail-nix commit 4563f71 patched the same issue in JS holesail.
+
+- **Nospoon coexistence**
+  - Running nospoon (JS HyperDHT VPN) on the same machine as holesail-py
+    prevents remote clients from connecting. Likely socket/port conflict
+    or NAT mapping collision when two DHT instances share the same public
+    IP. Needs a side-by-side comparison of JS `dht-rpc` socket binding
+    (SO_REUSEPORT, port selection) vs our `rpc.cpp`.
+
 - **Holesail connection latency vs JS**
   - Our holesail-py connects noticeably slower than JS holesail to the
     same server. uv_poll integration eliminated polling overhead but the

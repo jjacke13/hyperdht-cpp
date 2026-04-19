@@ -1408,3 +1408,62 @@ int hyperdht_ping(hyperdht_t* dht,
     });
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// File descriptor polling
+// ---------------------------------------------------------------------------
+
+struct hyperdht_poll_s {
+    uv_poll_t handle;
+    hyperdht_poll_cb cb;
+    void* userdata;
+    int fd;
+};
+
+static void on_poll(uv_poll_t* handle, int status, int events) {
+    auto* p = static_cast<hyperdht_poll_t*>(handle->data);
+    if (!p || !p->cb || status < 0) return;
+    int mapped = 0;
+    if (events & UV_READABLE) mapped |= HYPERDHT_POLL_READABLE;
+    if (events & UV_WRITABLE) mapped |= HYPERDHT_POLL_WRITABLE;
+    p->cb(p->fd, mapped, p->userdata);
+}
+
+hyperdht_poll_t* hyperdht_poll_start(hyperdht_t* dht,
+                                     int fd, int events,
+                                     hyperdht_poll_cb cb,
+                                     void* userdata) {
+    if (!dht || !dht->dht || fd < 0 || !cb) return nullptr;
+
+    auto* p = new (std::nothrow) hyperdht_poll_t{};
+    if (!p) return nullptr;
+
+    p->cb = cb;
+    p->userdata = userdata;
+    p->fd = fd;
+    p->handle.data = p;
+
+    if (uv_poll_init(dht->dht->loop(), &p->handle, fd) != 0) {
+        delete p;
+        return nullptr;
+    }
+
+    int uv_events = 0;
+    if (events & HYPERDHT_POLL_READABLE) uv_events |= UV_READABLE;
+    if (events & HYPERDHT_POLL_WRITABLE) uv_events |= UV_WRITABLE;
+
+    if (uv_poll_start(&p->handle, uv_events, on_poll) != 0) {
+        uv_close(reinterpret_cast<uv_handle_t*>(&p->handle),
+                 [](uv_handle_t* h) { delete static_cast<hyperdht_poll_t*>(h->data); });
+        return nullptr;
+    }
+
+    return p;
+}
+
+void hyperdht_poll_stop(hyperdht_poll_t* handle) {
+    if (!handle) return;
+    uv_poll_stop(&handle->handle);
+    uv_close(reinterpret_cast<uv_handle_t*>(&handle->handle),
+             [](uv_handle_t* h) { delete static_cast<hyperdht_poll_t*>(h->data); });
+}

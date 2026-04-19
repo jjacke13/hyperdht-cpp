@@ -20,6 +20,8 @@ from hyperdht._ffi import (
     MUTABLE_CB,
     PEER_CB,
     PING_CB,
+    POLL_CB,
+    POLL_READABLE,
     UV_RUN_DEFAULT,
     UV_RUN_NOWAIT,
     UV_RUN_ONCE,
@@ -939,6 +941,36 @@ class HyperDHT:
         rc = _lib.hyperdht_ping(self._handle, host.encode(), port, cb, None)
         if rc != 0:
             raise RuntimeError(f"ping failed: {rc}")
+
+    # -- FD polling (integrate external sockets into libuv) --
+
+    def poll_start(
+        self, fd: int, callback: Callable, readable: bool = True,
+        writable: bool = False,
+    ) -> ctypes.c_void_p:
+        """Watch a file descriptor on the event loop. Returns a poll handle.
+        Call poll_stop(handle) when done. The callback receives (fd, events)."""
+        events = 0
+        if readable:
+            events |= POLL_READABLE
+        if writable:
+            events |= POLL_WRITABLE
+
+        @POLL_CB
+        def cb(fd_val, ev, ud):
+            callback(fd_val, ev)
+
+        self._callbacks.append(cb)
+        handle = _lib.hyperdht_poll_start(self._handle, fd, events, cb, None)
+        if not handle:
+            raise RuntimeError("poll_start failed")
+        return handle
+
+    @staticmethod
+    def poll_stop(handle: ctypes.c_void_p) -> None:
+        """Stop watching a file descriptor."""
+        if handle:
+            _lib.hyperdht_poll_stop(handle)
 
     # -- Private helpers --
 

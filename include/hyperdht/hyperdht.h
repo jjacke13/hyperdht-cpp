@@ -897,6 +897,40 @@ HYPERDHT_API int hyperdht_ping(hyperdht_t* dht,
                                 const char* host, uint16_t port,
                                 hyperdht_ping_cb cb, void* userdata);
 
+/* =========================================================================
+ * File descriptor polling — integrate external sockets into the event loop
+ * ========================================================================= */
+
+typedef struct hyperdht_poll_s hyperdht_poll_t;
+
+#define HYPERDHT_POLL_READABLE 1
+#define HYPERDHT_POLL_WRITABLE 2
+
+/** Called when the file descriptor is ready. `events` is a bitmask of
+ *  HYPERDHT_POLL_READABLE / HYPERDHT_POLL_WRITABLE. */
+typedef void (*hyperdht_poll_cb)(int fd, int events, void* userdata);
+
+/**
+ * Start watching a file descriptor on the DHT's event loop. When the fd
+ * becomes readable/writable (per `events` bitmask), `cb` fires during
+ * `uv_run`. This lets external sockets (e.g. TCP) participate in the
+ * same event loop without polling.
+ *
+ * @param dht       DHT instance (provides the uv_loop)
+ * @param fd        file descriptor to watch
+ * @param events    bitmask: HYPERDHT_POLL_READABLE, HYPERDHT_POLL_WRITABLE
+ * @param cb        called when fd is ready
+ * @param userdata  passed to cb
+ * @return          poll handle, or NULL on failure
+ */
+HYPERDHT_API hyperdht_poll_t* hyperdht_poll_start(hyperdht_t* dht,
+                                                   int fd, int events,
+                                                   hyperdht_poll_cb cb,
+                                                   void* userdata);
+
+/** Stop watching and free the poll handle. Safe to call from inside cb. */
+HYPERDHT_API void hyperdht_poll_stop(hyperdht_poll_t* handle);
+
 #ifdef __cplusplus
 }
 #endif

@@ -510,6 +510,23 @@ lib.hyperdht_ping.argtypes = [
 lib.hyperdht_ping.restype = ctypes.c_int
 
 # ---------------------------------------------------------------------------
+# Function signatures — Poll (fd integration into event loop)
+# ---------------------------------------------------------------------------
+
+POLL_READABLE = 1
+POLL_WRITABLE = 2
+
+POLL_CB = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+
+lib.hyperdht_poll_start.argtypes = [
+    ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+    POLL_CB, ctypes.c_void_p]
+lib.hyperdht_poll_start.restype = ctypes.c_void_p
+
+lib.hyperdht_poll_stop.argtypes = [ctypes.c_void_p]
+lib.hyperdht_poll_stop.restype = None
+
+# ---------------------------------------------------------------------------
 # libuv
 # ---------------------------------------------------------------------------
 

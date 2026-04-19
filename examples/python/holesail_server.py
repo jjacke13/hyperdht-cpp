@@ -35,10 +35,8 @@ import argparse
 import base64
 import hashlib
 import os
-import selectors
 import socket
 import sys
-import time
 
 sys.path.insert(0, ".")
 
@@ -103,32 +101,31 @@ def _make_keypair(
 class Bridge:
     """Bidirectional bridge between a TCP socket and an encrypted stream.
 
-    All I/O happens on the main thread via a selectors poll loop.
+    All I/O runs on the libuv event loop — TCP sockets are registered
+    via uv_poll (hyperdht_poll_start), so there's zero polling latency.
     The stream→TCP direction is handled by the stream's on_data callback.
-    The TCP→stream direction is polled via the selector.
+    The TCP→stream direction fires when libuv detects the fd is readable.
     """
 
     def __init__(
-        self, tcp_sock: socket.socket, stream, selector: selectors.BaseSelector,
+        self, tcp_sock: socket.socket, stream, dht,
     ) -> None:
         self._tcp = tcp_sock
         self._stream = stream
-        self._selector = selector
+        self._dht = dht
+        self._poll_handle = None
         self._closed = False
-        self._active = False
-        # Don't register with selector yet — wait for on_open so the
-        # SecretStream header exchange completes before we try to write.
+        self._tcp.setblocking(False)
 
     def activate(self) -> None:
-        """Start polling TCP for data. Call from on_open."""
-        if self._active or self._closed:
+        """Start watching TCP for data. Call from on_open."""
+        if self._poll_handle or self._closed:
             return
-        self._active = True
-        self._selector.register(
-            self._tcp, selectors.EVENT_READ, self._on_tcp_readable)
+        self._poll_handle = self._dht.poll_start(
+            self._tcp.fileno(), self._on_tcp_readable)
 
-    def _on_tcp_readable(self) -> None:
-        """Called when the TCP socket has data (or EOF)."""
+    def _on_tcp_readable(self, fd: int, events: int) -> None:
+        """Called by libuv when the TCP socket has data."""
         if not self._stream:
             return
         try:
@@ -159,11 +156,9 @@ class Bridge:
         if self._closed:
             return
         self._closed = True
-        if self._active:
-            try:
-                self._selector.unregister(self._tcp)
-            except (KeyError, ValueError):
-                pass
+        if self._poll_handle:
+            self._dht.poll_stop(self._poll_handle)
+            self._poll_handle = None
         try:
             self._tcp.close()
         except OSError:
@@ -194,8 +189,6 @@ def main() -> None:
     dht = HyperDHT(use_public_bootstrap=True)
     dht.bind()
 
-    # Selector for polling TCP sockets alongside the libuv event loop
-    sel = selectors.DefaultSelector()
     bridges: list[Bridge] = []
 
     # Create server with optional firewall
@@ -222,7 +215,7 @@ def main() -> None:
             print(f"  Error: can't reach {local_host}:{local_port} -- {e}")
             return
 
-        bridge = Bridge(tcp_sock, None, sel)
+        bridge = Bridge(tcp_sock, None, dht)
         bridges.append(bridge)
 
         def on_open() -> None:
@@ -273,35 +266,14 @@ def main() -> None:
   Ctrl+C to stop
 """)
 
-    # Single-threaded event loop: poll both libuv and TCP sockets
-    last_put = time.monotonic()
-    put_seq = 2
+    # Event-driven: TCP sockets are registered with libuv via poll_start,
+    # so dht.run() handles everything — DHT, streams, and TCP bridging.
     try:
-        while True:
-            # Tick the libuv event loop (non-blocking)
-            dht.run(mode="nowait")
-
-            # Poll TCP sockets for readable data (short timeout)
-            # TODO: replace selectors with uv_poll integration for zero-latency
-            # TCP handling. Current polling adds ~1ms per DHT round-trip.
-            # Requires exposing uv_poll in the C FFI.
-            events = sel.select(timeout=0.001)
-            for key, _ in events:
-                callback = key.data
-                callback()
-
-            # Re-announce metadata every 50 minutes (JS parity)
-            now = time.monotonic()
-            if now - last_put >= 50 * 60:
-                dht.mutable_put(kp, metadata, seq=put_seq)
-                put_seq += 1
-                last_put = now
-
+        dht.run()
     except KeyboardInterrupt:
         pass
 
     print(f"\n  Shutting down ({connection_count} connections served)")
-    sel.close()
     dht.destroy()
 
 

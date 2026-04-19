@@ -15,11 +15,11 @@ pkgs.stdenv.mkDerivation {
   buildPhase = ''
     $CXX -std=c++20 -O2 server.cpp \
       -I${staticLib}/include \
-      -L${staticLib}/lib -lhyperdht \
+      -L${staticLib}/lib -lhyperdht -ludx \
       -lsodium -luv -o echo-server
     $CXX -std=c++20 -O2 client.cpp \
       -I${staticLib}/include \
-      -L${staticLib}/lib -lhyperdht \
+      -L${staticLib}/lib -lhyperdht -ludx \
       -lsodium -luv -o echo-client
   '';
 

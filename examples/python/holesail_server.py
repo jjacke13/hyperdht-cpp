@@ -115,21 +115,29 @@ class Bridge:
         self._stream = stream
         self._dht = dht
         self._bridges = bridges
-        self._read_poll = None
-        self._write_poll = None
+        self._poll_handle = None
         self._write_buf = bytearray()
+        self._watching_writable = False
         self._closed = False
         self._tcp.setblocking(False)
 
     def activate(self) -> None:
         """Start watching TCP for data. Call from on_open."""
-        if self._read_poll or self._closed:
+        if self._poll_handle or self._closed:
             return
-        self._read_poll = self._dht.poll_start(
-            self._tcp.fileno(), self._on_tcp_readable)
+        # Single poll handle — libuv forbids multiple polls on same fd.
+        # Start with readable only; add writable when backpressured.
+        self._poll_handle = self._dht.poll_start(
+            self._tcp.fileno(), self._on_poll)
 
-    def _on_tcp_readable(self, fd: int, events: int) -> None:
-        """Called by libuv when the TCP socket has data."""
+    def _on_poll(self, fd: int, events: int) -> None:
+        """Single callback for both readable and writable events."""
+        if events & 1:  # POLL_READABLE
+            self._handle_readable()
+        if events & 2:  # POLL_WRITABLE
+            self._handle_writable()
+
+    def _handle_readable(self) -> None:
         if not self._stream:
             return
         try:
@@ -148,6 +156,24 @@ class Bridge:
             self._stream.write(data)
         except RuntimeError:
             self.close()
+
+    def _handle_writable(self) -> None:
+        if not self._write_buf:
+            self._set_writable(False)
+            return
+
+        try:
+            sent = self._tcp.send(self._write_buf)
+        except BlockingIOError:
+            return
+        except OSError:
+            self.close()
+            return
+
+        del self._write_buf[:sent]
+
+        if not self._write_buf:
+            self._set_writable(False)
 
     def write_to_tcp(self, data: bytes) -> None:
         """Called from stream's on_data — forward to TCP."""
@@ -174,50 +200,30 @@ class Bridge:
 
         # Partial send — buffer the rest and watch for writable.
         self._write_buf.extend(data[sent:])
-        self._start_write_poll()
+        self._set_writable(True)
 
-    def _start_write_poll(self) -> None:
-        """Register POLL_WRITABLE to flush the write buffer."""
-        if self._write_poll or self._closed:
+    def _set_writable(self, enable: bool) -> None:
+        """Toggle writable event on the single poll handle."""
+        if enable == self._watching_writable:
             return
-        self._write_poll = self._dht.poll_start(
-            self._tcp.fileno(), self._on_tcp_writable,
-            readable=False, writable=True)
-
-    def _on_tcp_writable(self, fd: int, events: int) -> None:
-        """Called by libuv when the TCP socket can accept more data."""
-        if not self._write_buf:
-            self._stop_write_poll()
+        self._watching_writable = enable
+        if not self._poll_handle:
             return
-
-        try:
-            sent = self._tcp.send(self._write_buf)
-        except BlockingIOError:
-            return
-        except OSError:
-            self.close()
-            return
-
-        del self._write_buf[:sent]
-
-        if not self._write_buf:
-            self._stop_write_poll()
-
-    def _stop_write_poll(self) -> None:
-        """Stop watching for writable."""
-        if self._write_poll:
-            self._dht.poll_stop(self._write_poll)
-            self._write_poll = None
+        # Recreate poll with updated event flags — libuv doesn't
+        # support modifying events on an active poll, so stop+restart.
+        self._dht.poll_stop(self._poll_handle)
+        self._poll_handle = self._dht.poll_start(
+            self._tcp.fileno(), self._on_poll,
+            readable=True, writable=enable)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         self._bridges.discard(self)
-        if self._read_poll:
-            self._dht.poll_stop(self._read_poll)
-            self._read_poll = None
-        self._stop_write_poll()
+        if self._poll_handle:
+            self._dht.poll_stop(self._poll_handle)
+            self._poll_handle = None
         self._write_buf.clear()
         try:
             self._tcp.close()

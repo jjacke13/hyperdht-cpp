@@ -858,6 +858,23 @@ int hyperdht_stream_write(hyperdht_stream_t* stream,
     return stream->duplex->write(data, len, nullptr);
 }
 
+int hyperdht_stream_write_with_drain(hyperdht_stream_t* stream,
+                                      const uint8_t* data, size_t len,
+                                      hyperdht_drain_cb on_drain,
+                                      void* userdata) {
+    if (!stream || !stream->duplex || stream->closed || !data) return -1;
+    if (!stream->duplex->is_connected()) return -1;
+    if (!on_drain) {
+        return stream->duplex->write(data, len, nullptr);
+    }
+    return stream->duplex->write(data, len,
+        [stream, on_drain, userdata](int /*status*/) {
+            // Guard: stream may have been closed between write and drain.
+            if (stream->closed) return;
+            on_drain(stream, userdata);
+        });
+}
+
 void hyperdht_stream_close(hyperdht_stream_t* stream) {
     if (!stream || stream->closed || !stream->duplex) return;
     // Graceful close: `end()` sends write_end on the underlying UDX

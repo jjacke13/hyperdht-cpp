@@ -533,6 +533,12 @@ public:
     // Socket pool for route caching and socket reuse
     socket_pool::SocketPool* socket_pool() { return socket_pool_.get(); }
 
+    // §AUDIT-3: relay address cache (JS: _relayAddressesCache).
+    void cache_relay_addresses(const noise::PubKey& pk,
+                               const std::vector<compact::Ipv4Address>& relays);
+    std::vector<compact::Ipv4Address> get_cached_relay_addresses(
+        const noise::PubKey& pk) const;
+
     // --- Server API ---
 
     // Create a server instance. HyperDHT owns the returned pointer.
@@ -903,6 +909,13 @@ private:
     // validation once at bind() time across all available interfaces.
     std::unordered_map<std::string, bool> validated_host_cache_;
     std::vector<compact::Ipv4Address> validated_local_addresses_;
+
+    // §AUDIT-3: relay address cache (JS: _relayAddressesCache).
+    // Maps remote public key (hex) → vector of relay addresses from last
+    // successful findPeer. Session-lifetime, no TTL (JS: maxAge=0).
+    static constexpr size_t kMaxRelayAddressCache = 512;
+    std::unordered_map<std::string, std::vector<compact::Ipv4Address>>
+        relay_address_cache_;
 
     void ensure_bound();
     void do_connect(const noise::PubKey& remote_pk,

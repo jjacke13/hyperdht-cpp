@@ -6,48 +6,51 @@
 // JS FLOW MAP — how this file maps to the JavaScript reference
 // =========================================================================
 //
-// C++ function                       Line  JS file                   JS lines
-// ─────────────────────────────────── ────  ────────────────────────  ────────
-// client_raw_stream_firewall           62  connect.js               121-135
+// C++ function                       JS file                   JS lines
+// ─────────────────────────────────── ────────────────────────  ────────
+// client_raw_stream_firewall          connect.js               121-135
 //
-// HyperDHT::bind                     263  dht-rpc/index.js         157-159
-// HyperDHT::start_bootstrap_walk     445  dht-rpc/index.js         379-433
-// HyperDHT::refresh                  518  dht-rpc/index.js         435-438
-// HyperDHT::fire_network_change      574  dht-rpc/index.js         596-599
-// HyperDHT::create_raw_stream        724  hyperdht/index.js        460-462
-// HyperDHT::validate_local_addresses 765  hyperdht/index.js        135-184
-// HyperDHT::connect (entry)          835  hyperdht/index.js         80-82
+// HyperDHT::bind                     dht-rpc/index.js         157-159
+// HyperDHT::cache_relay_addresses    connect.js               464-466
+// HyperDHT::get_cached_relay_addrs   connect.js               323-324
+// HyperDHT::start_bootstrap_walk     dht-rpc/index.js         379-433
+// HyperDHT::refresh                  dht-rpc/index.js         435-438
+// HyperDHT::fire_network_change      dht-rpc/index.js         596-599
+// HyperDHT::create_raw_stream        hyperdht/index.js        460-462
+// HyperDHT::validate_local_addrs     hyperdht/index.js        135-184
+// HyperDHT::connect (entry)          hyperdht/index.js         80-82
 //
-// ConnState struct (file scope)      955  connect.js                57-93
-// do_connect                        1039  connect.js                32-115
-// ├─ rawStream + firewall                connect.js                73, 121-135
-// ├─ Step 1: findPeer                    connect.js               341-348
-// └─ Step 2: try_relay_fn                connect.js               336-338, 355-368
-//    └─ peer_handshake                   connect.js               409-449
-//       └─ on_handshake_success()        (static helper, see below)
+// ConnState struct (file scope)       connect.js                57-93
+// do_connect                          connect.js                32-115
+// ├─ rawStream + firewall             connect.js               73, 121-135
+// ├─ Route shortcut (§AUDIT-6)        connect.js               177-183
+// ├─ Cached relay warm-start (§3)     connect.js               323-324
+// └─ start_find_peer (§AUDIT-2)       connect.js               341-368
 //
-// on_handshake_success              1792  connect.js               405-503
-// ├─ Cached firewall replay              connect.js               493-496
-// ├─ BLIND RELAY start                   connect.js               489-491, 746-795
-// ├─ Direct connect (OPEN)               connect.js               212-221
-// ├─ No-holepunch-info fallback          connect.js               212-221
-// ├─ Passive wait (our fw OPEN)          connect.js               228-231
-// ├─ LAN shortcut (§6)                   connect.js               234-251
-// └─ holepunch_connect                   connect.js               258-316
+// fire_handshake                      connect.js               386-449
+// try_next_relay / check_exhaustion   connect.js               355-368
+// on_handshake_success                connect.js               405-503
+// ├─ Cached firewall replay           connect.js               493-496
+// ├─ BLIND RELAY start                connect.js               489-491, 746-795
+// ├─ Direct connect (OPEN)            connect.js               212-221
+// ├─ No-holepunch-info fallback       connect.js               212-221
+// ├─ Passive wait (our fw OPEN)       connect.js               228-231
+// ├─ LAN shortcut (§6)               connect.js               234-251
+// └─ holepunch_connect                connect.js               258-316
 //
-// start_relay_path                  2015  connect.js               746-795
-// ├─ dht.connect(relay_pk)               connect.js                762
-// ├─ SecretStream + Protomux setup       connect.js                764
-// ├─ BlindRelayClient.pair               connect.js                767
-// └─ Wire rawStream through relay        connect.js               778-784
+// start_relay_path                    connect.js               746-795
+// ├─ dht.connect(relay_pk)            connect.js                762
+// ├─ SecretStream + Protomux setup    connect.js                764
+// ├─ BlindRelayClient.pair            connect.js                767
+// └─ Wire rawStream through relay     connect.js               778-784
 //
-// HyperDHT::suspend(LogFn)          1634  hyperdht/index.js        106-118
-// HyperDHT::resume(LogFn)           1669  hyperdht/index.js         96-104
-// HyperDHT::destroy                 1699  hyperdht/index.js        122-133
-// HyperDHT::destroy(DestroyOptions) 1703  hyperdht/index.js  122 (force=true)
-// HyperDHT::bootstrapper (static)        dht-rpc/index.js         104-120
-// HyperDHT::to_array / add_node          dht-rpc/index.js         216-237
-// HyperDHT::remote_address               dht-rpc/index.js         201-214
+// HyperDHT::suspend(LogFn)           hyperdht/index.js        106-118
+// HyperDHT::resume(LogFn)            hyperdht/index.js         96-104
+// HyperDHT::destroy                  hyperdht/index.js        122-133
+// HyperDHT::destroy(DestroyOptions)  hyperdht/index.js  122 (force=true)
+// HyperDHT::bootstrapper (static)    dht-rpc/index.js         104-120
+// HyperDHT::to_array / add_node      dht-rpc/index.js         216-237
+// HyperDHT::remote_address           dht-rpc/index.js         201-214
 // =========================================================================
 
 #include "hyperdht/dht.hpp"
@@ -56,6 +59,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <deque>
 #include <cstdio>
 #include <stdexcept>
 
@@ -292,6 +296,12 @@ int HyperDHT::bind() {
     // periodic timer + diff, matching JS `udx.watchNetworkInterfaces()`.
     start_interface_watcher();
 
+    // §AUDIT-6: construct the socket pool for route caching. Peers
+    // that connected successfully get stored as routes — reconnects
+    // skip findPeer entirely. JS: connect.js:177 + socket-pool.js.
+    socket_pool_ = std::make_unique<socket_pool::SocketPool>(
+        loop_, socket_->udx_handle(), opts_.host);
+
     // §16: validate the machine's local interface addresses once at
     // bind time so the server-side handshake path (`share_local_address`)
     // has a cached list ready. JS runs this from `server._localAddresses`
@@ -347,6 +357,46 @@ std::array<uint8_t, 32> HyperDHT::hash(const uint8_t* data, size_t len) {
     std::array<uint8_t, 32> out{};
     crypto_generichash(out.data(), 32, data, len, nullptr, 0);
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// §AUDIT-3: Relay address cache
+// JS: _relayAddressesCache — hyperdht/index.js:55 (512-entry xache, no TTL)
+//     set: connect.js:464-466 (after successful connect)
+//     get: connect.js:323-324 (before findPeer on reconnect)
+// ---------------------------------------------------------------------------
+
+static std::string pk_to_hex(const noise::PubKey& pk) {
+    static const char hex_chars[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (uint8_t b : pk) {
+        out.push_back(hex_chars[b >> 4]);
+        out.push_back(hex_chars[b & 0x0f]);
+    }
+    return out;
+}
+
+void HyperDHT::cache_relay_addresses(
+    const noise::PubKey& pk,
+    const std::vector<compact::Ipv4Address>& relays) {
+    if (relays.empty()) return;
+    auto key = pk_to_hex(pk);
+    relay_address_cache_[key] = relays;
+    // Simple eviction: if over limit, erase first entry (effectively random
+    // for unordered_map). JS uses xache LRU but 512 is large enough that
+    // eviction policy doesn't matter in practice.
+    if (relay_address_cache_.size() > kMaxRelayAddressCache) {
+        relay_address_cache_.erase(relay_address_cache_.begin());
+    }
+}
+
+std::vector<compact::Ipv4Address> HyperDHT::get_cached_relay_addresses(
+    const noise::PubKey& pk) const {
+    auto key = pk_to_hex(pk);
+    auto it = relay_address_cache_.find(key);
+    if (it != relay_address_cache_.end()) return it->second;
+    return {};
 }
 
 // JS: DHT.bootstrapper — dht-rpc/index.js:104-120.
@@ -908,8 +958,12 @@ void HyperDHT::connect(const noise::PubKey& remote_public_key,
 //     .analysis/js/hyperdht/lib/connect.js:205-316 (holepunch)
 //     .analysis/js/hyperdht/lib/connect.js:746-795 (relayConnection)
 //
-// Structure (post-refactor):
-//   do_connect                 — setup, rawStream, findPeer, try_relay_fn
+// Structure (post-§AUDIT refactor):
+//   do_connect                 — setup, rawStream, route shortcut, cache,
+//                                start_find_peer (pipelined)
+//   ├─ fire_handshake          — per-relay PEER_HANDSHAKE (Semaphore(2))
+//   ├─ try_next_relay          — drain pending queue on failure
+//   ├─ check_exhaustion        — detect all-relays-exhausted (shared)
 //   └─ on_handshake_success    — post-handshake dispatch (6 paths)
 //      ├─ direct / OPEN        — no holepunch needed
 //      ├─ passive wait         — our firewall is OPEN, server probes us
@@ -921,9 +975,9 @@ void HyperDHT::connect(const noise::PubKey& remote_public_key,
 //   - No async/await: a ConnState shared_ptr is threaded through nested
 //     lambdas. JS's `isDone(c)` (connect.js:138-153) check becomes
 //     `state->completed`.
-//   - JS uses Semaphore(2) over an async iterator (connect.js:336-368).
-//     C++ implements a sequential retry loop (`try_relay_fn`) that fires
-//     two attempts up front but otherwise advances on failure.
+//   - §AUDIT-2: findPeer results are pipelined — handshakes fire as
+//     results stream in via on_reply, with Semaphore(2) concurrency
+//     limit. Replaces the old batch-then-retry approach.
 //   - `alive` weak_ptr sentinel replaces JS's `dht.destroyed` and
 //     `c.encryptedSocket.destroying` checks.
 //   - Client rawStream + firewall callback are created eagerly at connect()
@@ -944,12 +998,10 @@ struct ConnState {
     noise::PubKey remote_pk;
     noise::Keypair keypair;
     ConnectCallback on_done;
-    compact::Ipv4Address relay_addr;
-    std::vector<compact::Ipv4Address> relays;  // All relays from findPeer
-    int relay_idx = -1;  // Current retry index (counts down from end)
+    compact::Ipv4Address relay_addr;  // Relay used by the winning handshake
+    std::vector<compact::Ipv4Address> relays;  // All relays discovered
     peer_connect::HandshakeResult hs_result;
     std::shared_ptr<query::Query> query;
-    std::shared_ptr<std::function<void()>> try_relay_fn;  // Relay retry loop
     std::weak_ptr<bool> alive;  // Sentinel — expired if HyperDHT destroyed
     rpc::RpcSocket* socket = nullptr;  // Raw pointer, guarded by alive
     HyperDHT* dht = nullptr;  // Raw pointer, guarded by alive
@@ -957,6 +1009,13 @@ struct ConnState {
     uint32_t our_udx_id = 0;
     udx_stream_t* raw_stream = nullptr;  // Client rawStream (like JS)
     bool completed = false;
+
+    // §AUDIT-2: pipelining state (replaces relay_idx + try_relay_fn).
+    // Handshakes fire as findPeer results stream in, Semaphore(2).
+    int handshakes_in_flight = 0;
+    int handshakes_started = 0;
+    std::deque<compact::Ipv4Address> pending_relays;
+    bool query_done = false;  // True after on_done fires
 
     // Cached early firewall event — JS: c.serverSocket / c.serverAddress.
     // If the server's first UDX packet arrives BEFORE the handshake reply,
@@ -1009,6 +1068,21 @@ struct ConnState {
     void complete(int err, const ConnectResult& result = {}) {
         if (completed) return;  // Prevent double invocation (firewall + holepunch race)
         completed = true;
+
+        // §AUDIT-3: cache relay addresses after successful connect.
+        // JS: connect.js:464-466
+        if (err == 0 && dht && !relays.empty()) {
+            dht->cache_relay_addresses(remote_pk, relays);
+        }
+
+        // §AUDIT-6: store route after successful connect.
+        // JS: connect.js:474 — socketPool.routes.add(remotePublicKey, rawStream)
+        if (err == 0 && dht && dht->socket_pool() &&
+            result.udx_socket != nullptr) {
+            dht->socket_pool()->add_route(
+                remote_pk, result.udx_socket, result.peer_address);
+        }
+
         auto cb = std::move(on_done);
         on_done = nullptr;
         if (cb) cb(err, result);
@@ -1033,12 +1107,145 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
                               bool is_initiator,
                               noise::PubKey relay_pk,
                               blind_relay::Token relay_token);
+// §AUDIT-2: pipelining helpers
+static void fire_handshake(std::shared_ptr<ConnState> state,
+                            const compact::Ipv4Address& relay_addr);
+static void try_next_relay(std::shared_ptr<ConnState> state);
+static void check_exhaustion(std::shared_ptr<ConnState> state);
+static void start_find_peer(std::shared_ptr<ConnState> state);
+
+// ---------------------------------------------------------------------------
+// §AUDIT-2: fire_handshake — start a single PEER_HANDSHAKE through a relay.
+// Called as findPeer results stream in (pipelining) or from cached relays.
+// JS: connect.js:355-368 (connectThroughNode inside for-await).
+// ---------------------------------------------------------------------------
+static void fire_handshake(std::shared_ptr<ConnState> state,
+                            const compact::Ipv4Address& relay_addr) {
+    if (state->completed || state->alive.expired()) return;
+    state->handshakes_in_flight++;
+    state->handshakes_started++;
+
+    // Compute firewall + addresses4 for the handshake payload.
+    // JS: connect.js:386-394 (connectThroughNode)
+    uint32_t our_fw = peer_connect::FIREWALL_UNKNOWN;
+    std::vector<compact::Ipv4Address> our_addrs;
+
+    const auto& sampler = state->socket->nat_sampler();
+    if (!sampler.host().empty() &&
+        sampler.port() != 0 &&
+        !state->socket->is_firewalled() &&
+        sampler.port() == state->socket->port()) {
+        our_fw = peer_connect::FIREWALL_OPEN;
+        our_addrs.push_back(compact::Ipv4Address::from_string(
+            sampler.host(), sampler.port()));
+    }
+
+    // LAN addresses (§6 local_connection support).
+    if (state->local_connection) {
+        for (const auto& la : state->dht->validated_local_addresses()) {
+            our_addrs.push_back(la);
+        }
+    }
+
+    // Build relayThrough for the Noise payload (Phase E)
+    std::optional<peer_connect::RelayThroughInfo> relay_through_info;
+    if (state->relay_through.has_value()) {
+        peer_connect::RelayThroughInfo rt;
+        rt.version = 1;
+        rt.public_key = *state->relay_through;
+        rt.token = state->relay_token;
+        relay_through_info = rt;
+    }
+
+    DHT_LOG("  [connect] fire_handshake via %s:%u (%d in flight)\n",
+            relay_addr.host_string().c_str(), relay_addr.port,
+            state->handshakes_in_flight);
+
+    peer_connect::peer_handshake(*state->socket, relay_addr,
+        state->keypair, state->remote_pk, state->our_udx_id,
+        our_fw, our_addrs, relay_through_info,
+        [state, relay_addr](const peer_connect::HandshakeResult& hs) {
+            state->handshakes_in_flight--;
+            if (state->completed) return;  // First-success or destruction guard
+            if (state->alive.expired() || !hs.success) {
+                try_next_relay(state);
+                return;
+            }
+            state->relay_addr = relay_addr;
+            state->hs_result = hs;
+            on_handshake_success(state, hs);
+        });
+}
+
+// ---------------------------------------------------------------------------
+// §AUDIT-2: check_exhaustion — single shared helper for detecting all
+// relays exhausted. Called from both try_next_relay and on_done to avoid
+// a termination gap between the two call sites.
+// ---------------------------------------------------------------------------
+static void check_exhaustion(std::shared_ptr<ConnState> state) {
+    if (state->completed) return;
+    if (state->handshakes_in_flight > 0) return;  // Still in progress
+    if (!state->pending_relays.empty()) return;    // More to try
+    if (!state->query_done) return;                // Query still running
+    if (state->hs_result.success) return;          // Already succeeded
+    state->complete(ConnectError::PEER_CONNECTION_FAILED);
+}
+
+// ---------------------------------------------------------------------------
+// §AUDIT-2: try_next_relay — drain pending relay queue, Semaphore(2).
+// Called when a handshake fails and there are relays waiting.
+// ---------------------------------------------------------------------------
+static void try_next_relay(std::shared_ptr<ConnState> state) {
+    if (state->completed) return;
+    while (!state->pending_relays.empty() &&
+           state->handshakes_in_flight < 2) {
+        auto addr = state->pending_relays.front();
+        state->pending_relays.pop_front();
+        fire_handshake(state, addr);
+    }
+    check_exhaustion(state);
+}
+
+// ---------------------------------------------------------------------------
+// §AUDIT-2: start_find_peer — initiate the Kademlia findPeer query.
+// Extracted so the route-shortcut failure path can fall through to it.
+// ---------------------------------------------------------------------------
+static void start_find_peer(std::shared_ptr<ConnState> state) {
+    if (state->completed || state->alive.expired()) return;
+
+    state->query = dht_ops::find_peer(*state->socket, state->remote_pk,
+        // on_reply: fire handshake as results stream in (pipelining)
+        [state](const query::QueryReply& reply) {
+            if (state->completed) return;
+            if (!reply.value.has_value() || reply.value->empty()) return;
+            state->found = true;
+            state->relays.push_back(reply.from_addr);
+            if (state->handshakes_in_flight < 2) {
+                fire_handshake(state, reply.from_addr);
+            } else {
+                state->pending_relays.push_back(reply.from_addr);
+            }
+        },
+        // on_done: handle "nothing found" or let check_exhaustion detect
+        // all-failed. Both try_next_relay and on_done call check_exhaustion
+        // to prevent termination gaps regardless of interleaving.
+        [state](const std::vector<query::QueryReply>&) {
+            state->query.reset();
+            state->query_done = true;
+            if (state->completed) return;
+            if (!state->found && state->handshakes_started == 0) {
+                state->complete(ConnectError::PEER_NOT_FOUND);
+                return;
+            }
+            check_exhaustion(state);
+        });
+}
 
 // ---------------------------------------------------------------------------
 // do_connect — entry point for HyperDHT::connect().
 //
-// Orchestrates: findPeer → peer_handshake (with Semaphore(2) retry) →
-// on_handshake_success (post-handshake decision tree).
+// Orchestrates: route shortcut → cached relays → findPeer (pipelined) →
+// peer_handshake (Semaphore(2)) → on_handshake_success.
 // ---------------------------------------------------------------------------
 void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                            const noise::Keypair& keypair,
@@ -1168,113 +1375,57 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
         state->raw_stream = raw;
     }
 
-    // Step 1: findPeer — collect all relays that have the peer record.
-    // JS: findAndConnect tries connectThroughNode for each result.
-    // JS: connect.js:341-368 — for-await over findPeer query, semaphore(2)
-    state->query = dht_ops::find_peer(*socket_, remote_pk,
-        [state](const query::QueryReply& reply) {
-            if (reply.value.has_value() && !reply.value->empty()) {
-                state->found = true;
-                state->relays.push_back(reply.from_addr);
-            }
-        },
-        [state](const std::vector<query::QueryReply>&) {
-            state->query.reset();
-
-            if (state->alive.expired() || !state->found) {
-                state->complete(ConnectError::PEER_NOT_FOUND);
-                return;
-            }
-
-            // Step 2: try PEER_HANDSHAKE through relays, closest first.
-            // JS: connectThroughNode for each relay, Semaphore(2).
-            // Phase D: fire up to 2 initial attempts in parallel,
-            // then try remaining sequentially on failure.
-            state->relay_idx = static_cast<int>(state->relays.size()) - 1;
-            state->try_relay_fn = std::make_shared<std::function<void()>>();
-            *state->try_relay_fn = [state]() {
-                if (state->completed || state->alive.expired()) return;
-                if (state->relay_idx < 0) {
-                    // Copy state before reset — reset destroys this lambda
-                    // and its captured state, causing use-after-free
-                    auto st = state;
-                    st->try_relay_fn.reset();
-                    st->complete(ConnectError::PEER_CONNECTION_FAILED);
-                    return;
-                }
-
-                state->relay_addr = state->relays[state->relay_idx];
-                state->relay_idx--;
-
-                // Compute firewall + addresses4 for the handshake payload.
-                // JS: connect.js:386-394 (connectThroughNode)
-                //   const addr = c.dht.remoteAddress()
-                //   const localAddrs = c.lan ? localAddresses(serverSocket) : null
-                //   firewall = addr ? FIREWALL.OPEN : FIREWALL.UNKNOWN
-                //
-                // remoteAddress() returns non-null only when: host known,
-                // port known, not firewalled, NAT port == bound port.
-                uint32_t our_fw = peer_connect::FIREWALL_UNKNOWN;
-                std::vector<compact::Ipv4Address> our_addrs;
-
-                const auto& sampler = state->socket->nat_sampler();
-                if (!sampler.host().empty() &&
-                    sampler.port() != 0 &&
-                    !state->socket->is_firewalled() &&
-                    sampler.port() == state->socket->port()) {
-                    // Public / 1:1 NAT — advertise our public address
-                    our_fw = peer_connect::FIREWALL_OPEN;
-                    our_addrs.push_back(compact::Ipv4Address::from_string(
-                        sampler.host(), sampler.port()));
-                }
-
-                // Append validated LAN addresses (§6 local_connection support).
-                // JS: Holepuncher.localAddresses(dht.io.serverSocket) when c.lan
-                if (state->local_connection) {
-                    for (const auto& la : state->dht->validated_local_addresses()) {
-                        our_addrs.push_back(la);
-                    }
-                }
-
-                // Build relayThrough for the Noise payload (Phase E)
-                std::optional<peer_connect::RelayThroughInfo> relay_through_info;
-                if (state->relay_through.has_value()) {
-                    peer_connect::RelayThroughInfo rt;
-                    rt.version = 1;
-                    rt.public_key = *state->relay_through;
-                    rt.token = state->relay_token;
-                    relay_through_info = rt;
-                }
-
-                peer_connect::peer_handshake(*state->socket, state->relay_addr,
-                    state->keypair, state->remote_pk, state->our_udx_id,
-                    our_fw, our_addrs, relay_through_info,
-                    [state](const peer_connect::HandshakeResult& hs) {
-                        if (state->completed) return;
-                        if (state->alive.expired() || !hs.success) {
-                            if (state->try_relay_fn) (*state->try_relay_fn)();
-                            return;
-                        }
-                        // Guard: only the first successful handshake proceeds.
-                        // The parallel Semaphore(2) attempt fires a second
-                        // handshake that may also succeed. Without this guard,
-                        // it overwrites hs_result/raw_stream while holepunch #1
-                        // is in flight → mixed state (keys from hs2 + address
-                        // from hp1) → RTO because the server session at hp1's
-                        // address expects hs1's UDX IDs.
-                        if (state->hs_result.success) return;
-                        state->try_relay_fn.reset();  // Break cycle
+    // §AUDIT-6: Route shortcut — try cached socket+address before findPeer.
+    // JS: connect.js:177-183 — retryRoute before findAndConnect.
+    if (socket_pool_) {
+        auto* route = socket_pool_->get_route(remote_pk);
+        if (route) {
+            DHT_LOG("  [connect] route shortcut: trying cached route\n");
+            state->found = true;
+            // Try handshake through cached route. On failure, fall through
+            // to findPeer. We don't increment handshakes_in_flight because
+            // this path returns early (line below) — no pipelining runs
+            // concurrently. INVARIANT: the `return` below is load-bearing.
+            auto route_addr = route->address;
+            peer_connect::peer_handshake(*socket_, route_addr,
+                keypair, remote_pk, state->our_udx_id,
+                peer_connect::FIREWALL_UNKNOWN, {},
+                std::nullopt,
+                [state, route_addr](const peer_connect::HandshakeResult& hs) {
+                    if (state->completed || state->alive.expired()) return;
+                    if (hs.success) {
+                        state->relay_addr = route_addr;
                         state->hs_result = hs;
                         on_handshake_success(state, hs);
+                        return;
+                    }
+                    // Route failed — fall through to findPeer
+                    DHT_LOG("  [connect] route shortcut failed, starting findPeer\n");
+                    start_find_peer(state);
                 });
-            };
-            // Fire first attempt
-            (*state->try_relay_fn)();
-            // Fire second attempt in parallel (JS: Semaphore(2))
-            if (state->relay_idx >= 0 && !state->completed) {
-                (*state->try_relay_fn)();
+            return;  // Route attempt in progress — findPeer deferred
+        }
+    }
+
+    // §AUDIT-3: Pre-populate from relay address cache on reconnect.
+    // JS: connect.js:323-324 — use cached relays as initial set.
+    auto cached = get_cached_relay_addresses(remote_pk);
+    if (!cached.empty()) {
+        DHT_LOG("  [connect] relay cache hit: %zu cached relays\n",
+                cached.size());
+        state->found = true;
+        for (const auto& addr : cached) {
+            if (state->handshakes_in_flight < 2) {
+                fire_handshake(state, addr);
+            } else {
+                state->pending_relays.push_back(addr);
             }
-        });
+        }
+    }
+
+    // Step 1: findPeer with pipelining — handshakes fire as results
+    // stream in. JS: connect.js:350-362 (for-await + Semaphore(2)).
+    start_find_peer(state);
 }
 
 // ---------------------------------------------------------------------------

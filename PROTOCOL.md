@@ -1037,7 +1037,13 @@ Client → DHT → FIND_PEER(hash(serverPublicKey)) → closest nodes
 Closest node that knows server → returns relay info
 ```
 
-Up to 2 parallel queries via semaphore.
+Optimizations (implementation, not wire-level):
+- **Pipelining:** handshakes start as findPeer results stream in (not after
+  query completes). Up to 2 concurrent handshakes via Semaphore(2).
+- **Relay cache:** 512-entry session cache of relay addresses per remote key.
+  Reconnects skip the Kademlia walk.
+- **Route shortcut:** if a prior connection established a socket route,
+  try handshake through cached route before findPeer.
 
 ### 8.2 Phase 2: Relay Handshake (Noise IK)
 

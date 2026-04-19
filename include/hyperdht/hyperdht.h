@@ -510,6 +510,25 @@ HYPERDHT_API int hyperdht_stream_write(hyperdht_stream_t* stream,
                           const uint8_t* data, size_t len);
 
 /**
+ * Callback fired when UDX acknowledges the write (drain).
+ * Signals that the stream is ready for more data after backpressure.
+ */
+typedef void (*hyperdht_drain_cb)(hyperdht_stream_t* stream, void* userdata);
+
+/**
+ * Write data with a drain callback. Like hyperdht_stream_write but fires
+ * on_drain when the underlying UDX transport acknowledges the data.
+ * Use this for flow control: if write returns 0 (backpressure), wait for
+ * the drain callback before writing more.
+ *
+ * @return 0 on success, negative on error
+ */
+HYPERDHT_API int hyperdht_stream_write_with_drain(
+    hyperdht_stream_t* stream,
+    const uint8_t* data, size_t len,
+    hyperdht_drain_cb on_drain, void* userdata);
+
+/**
  * Close the stream. Sends end-of-stream and triggers on_close.
  */
 HYPERDHT_API void hyperdht_stream_close(hyperdht_stream_t* stream);

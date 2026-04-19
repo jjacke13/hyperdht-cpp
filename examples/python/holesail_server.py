@@ -282,7 +282,10 @@ def main() -> None:
             dht.run(mode="nowait")
 
             # Poll TCP sockets for readable data (short timeout)
-            events = sel.select(timeout=0.005)
+            # TODO: replace selectors with uv_poll integration for zero-latency
+            # TCP handling. Current polling adds ~1ms per DHT round-trip.
+            # Requires exposing uv_poll in the C FFI.
+            events = sel.select(timeout=0.001)
             for key, _ in events:
                 callback = key.data
                 callback()

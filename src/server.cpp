@@ -993,6 +993,12 @@ void Server::on_socket(server_connection::ServerConnection& conn,
         info.remote_udx_id = conn.remote_payload.udx->id;
     }
 
+    // JS: server.js:336-338 — destroy puncher on connection success
+    // to stop sending probes and free resources.
+    if (conn.puncher) {
+        conn.puncher.reset();
+    }
+
     DHT_LOG( "  [server] Connection from %s (udx: us=%u them=%u)\n",
             to_hex(conn.remote_public_key.data(), 8).c_str(),
             info.local_udx_id, info.remote_udx_id);

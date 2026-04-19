@@ -36,6 +36,7 @@ pkgs.python3Packages.buildPythonApplication {
 
       cat > $out/bin/holesail-py <<EOF
       #!/bin/sh
+      export PYTHONUNBUFFERED=1
       export LD_LIBRARY_PATH="${sharedLib}/lib:${pkgs.libuv}/lib\''${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
       export HYPERDHT_LIB="${sharedLib}/lib/libhyperdht.so"
       exec ${python}/bin/python3 $out/lib/holesail_server.py "\$@"

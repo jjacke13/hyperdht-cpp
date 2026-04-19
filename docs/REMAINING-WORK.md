@@ -54,6 +54,13 @@ Tasks to verify / harden the implementation, organized by category and estimated
 - **aarch64 CI**
   - We've built on aarch64 NixOS manually. Add to CI when repo is pushed.
 
+- **Holesail connection latency vs JS**
+  - Our holesail-py connects noticeably slower than JS holesail to the
+    same server. uv_poll integration eliminated polling overhead but the
+    gap remains. Needs profiling to identify where the extra latency is:
+    bootstrap walk speed, findPeer iterations, handshake relay selection,
+    Python ctypes callback overhead, or something else entirely.
+
 ---
 
 ## Going one step up: "app-level" production readiness

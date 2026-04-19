@@ -1,0 +1,122 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build pkg-config libsodium-dev libuv1-dev
+
+      - name: Build static
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHYPERDHT_BUILD_TESTS=OFF && ninja -C build
+
+      - name: Build shared
+        run: cmake -B build-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DHYPERDHT_BUILD_TESTS=OFF && ninja -C build-shared
+
+      - name: Build tests & run
+        run: |
+          cmake -B build-test -G Ninja -DCMAKE_BUILD_TYPE=Debug -DHYPERDHT_BUILD_TESTS=ON
+          ninja -C build-test
+          cd build-test && ctest -L unit --output-on-failure -j$(nproc)
+
+      - name: Package
+        run: |
+          mkdir -p dist/lib dist/include
+          cp build/libhyperdht.a dist/lib/
+          cp build-shared/libhyperdht.so dist/lib/
+          strip --strip-unneeded -o dist/lib/libhyperdht-stripped.a build/libhyperdht.a
+          strip --strip-unneeded -o dist/lib/libhyperdht-stripped.so build-shared/libhyperdht.so
+          cp -r include/hyperdht dist/include/
+          tar czf hyperdht-x86_64-linux.tar.gz -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperdht-x86_64-linux
+          path: hyperdht-x86_64-linux.tar.gz
+
+  build-linux-aarch64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: uraimo/run-on-arch-action@v2
+        with:
+          arch: aarch64
+          distro: ubuntu24.04
+          githubToken: ${{ github.token }}
+          install: |
+            apt-get update
+            apt-get install -y cmake ninja-build pkg-config g++ libsodium-dev libuv1-dev
+          run: |
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHYPERDHT_BUILD_TESTS=OFF
+            ninja -C build
+
+            cmake -B build-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DHYPERDHT_BUILD_TESTS=OFF
+            ninja -C build-shared
+
+            cmake -B build-test -G Ninja -DCMAKE_BUILD_TYPE=Debug -DHYPERDHT_BUILD_TESTS=ON
+            ninja -C build-test
+            cd build-test && ctest -L unit --output-on-failure -j$(nproc)
+            cd ..
+
+            mkdir -p dist/lib dist/include
+            cp build/libhyperdht.a dist/lib/
+            cp build-shared/libhyperdht.so dist/lib/
+            strip --strip-unneeded -o dist/lib/libhyperdht-stripped.a build/libhyperdht.a
+            strip --strip-unneeded -o dist/lib/libhyperdht-stripped.so build-shared/libhyperdht.so
+            cp -r include/hyperdht dist/include/
+            tar czf hyperdht-aarch64-linux.tar.gz -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperdht-aarch64-linux
+          path: hyperdht-aarch64-linux.tar.gz
+
+  build-macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install deps
+        run: brew install cmake ninja libsodium libuv pkg-config
+
+      - name: Build static
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHYPERDHT_BUILD_TESTS=OFF && ninja -C build
+
+      - name: Build shared
+        run: cmake -B build-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DHYPERDHT_BUILD_TESTS=OFF && ninja -C build-shared
+
+      - name: Build tests & run
+        run: |
+          cmake -B build-test -G Ninja -DCMAKE_BUILD_TYPE=Debug -DHYPERDHT_BUILD_TESTS=ON
+          ninja -C build-test
+          cd build-test && ctest -L unit --output-on-failure -j$(sysctl -n hw.ncpu)
+
+      - name: Package
+        run: |
+          mkdir -p dist/lib dist/include
+          cp build/libhyperdht.a dist/lib/
+          cp build-shared/libhyperdht.dylib dist/lib/
+          strip -x -o dist/lib/libhyperdht-stripped.a build/libhyperdht.a
+          strip -x -o dist/lib/libhyperdht-stripped.dylib build-shared/libhyperdht.dylib
+          cp -r include/hyperdht dist/include/
+          tar czf hyperdht-arm64-macos.tar.gz -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperdht-arm64-macos
+          path: hyperdht-arm64-macos.tar.gz
+

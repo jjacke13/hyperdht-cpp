@@ -649,6 +649,12 @@ class HyperDHT:
             if on_close:
                 on_close()
 
+        # Store callbacks on the DHT instance, not the Stream — the C
+        # library fires close_cb asynchronously after stream.close(), and
+        # the Stream object may be GC'd before that callback fires.
+        cbs = [open_cb, data_cb, close_cb]
+        self._callbacks.extend(cbs)
+
         handle = _lib.hyperdht_stream_open(
             self._handle, ctypes.byref(connection._c_conn),
             open_cb, data_cb, close_cb, None)

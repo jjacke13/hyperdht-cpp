@@ -24,6 +24,9 @@ let
     <strong>libhyperdht</strong> (C++) + Python.</p>
     <p>The connection is end-to-end encrypted (Noise IK + SecretStream)
     and traversed your NAT via holepunching.</p>
+    <p>It is the very first wire-compatibe implementation of hyperDHT in a language other than JS!</p>
+    <p>There is still more work to do and more tests to be run, but it works!!</p>
+    <p>You can find more info at: https://github.com/jjacke13/hyperdht-cpp </p>
     <p><code>holesail-py + hyperdht-cpp</code></p>
     </body>
     </html>

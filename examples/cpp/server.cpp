@@ -15,10 +15,16 @@
 #include <cstdio>
 #include <cstring>
 
+// Per-connection context: holds the stream pointer so callbacks can use it.
+struct EchoCtx {
+    hyperdht_stream_t* stream = nullptr;
+};
+
 static void on_data(const uint8_t* data, size_t len, void* ud) {
-    auto* stream = static_cast<hyperdht_stream_t*>(ud);
+    auto* ctx = static_cast<EchoCtx*>(ud);
+    if (!ctx || !ctx->stream) return;
     printf("  Received %zu bytes, echoing back\n", len);
-    hyperdht_stream_write(stream, data, len);
+    hyperdht_stream_write(ctx->stream, data, len);
 }
 
 static void on_open(void* ud) {
@@ -27,6 +33,8 @@ static void on_open(void* ud) {
 
 static void on_close(void* ud) {
     printf("  Stream closed\n");
+    auto* ctx = static_cast<EchoCtx*>(ud);
+    delete ctx;
 }
 
 static void on_connection(const hyperdht_connection_t* conn, void* ud) {
@@ -36,13 +44,13 @@ static void on_connection(const hyperdht_connection_t* conn, void* ud) {
     for (int i = 0; i < 8; i++) printf("%02x", conn->remote_public_key[i]);
     printf("...\n");
 
-    auto* stream = hyperdht_stream_open(dht, conn, on_open, on_data, on_close, nullptr);
+    // Allocate context first, pass as userdata, then store the stream handle.
+    auto* ctx = new EchoCtx;
+    auto* stream = hyperdht_stream_open(dht, conn, on_open, on_data, on_close, ctx);
     if (stream) {
-        // Store stream handle so on_data can echo back
-        // (reusing the userdata pointer on the data callback isn't possible
-        //  with the current API, so we use a static for this simple example)
-        static hyperdht_stream_t* last_stream = nullptr;
-        last_stream = stream;
+        ctx->stream = stream;
+    } else {
+        delete ctx;
     }
 }
 

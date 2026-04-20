@@ -50,4 +50,5 @@ These servers are running 24/7 for testing:
 
 | Machine | Public key |
 |---------|-----------|
-| TBD | TBD |
+| 1 | b7c5c4e909ad28e2071c48a09f330ec2735248a4e4d8759032a9b57b0f2e7aec |
+| 2 |                      TBD                                         |

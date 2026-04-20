@@ -88,8 +88,25 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 32; i++) printf("%02x", kp.public_key[i]);
     printf("\n\n");
 
+    // Log bootstrap + network events
+    hyperdht_on_bootstrapped(dht, [](void*) {
+        printf("[event] Bootstrapped — DHT is ready\n");
+        fflush(stdout);
+    }, nullptr);
+
+    hyperdht_on_network_change(dht, [](void*) {
+        printf("[event] Network change detected\n");
+        fflush(stdout);
+    }, nullptr);
+
     // Create server
     hyperdht_server_t* srv = hyperdht_server_create(dht);
+
+    hyperdht_server_on_listening(srv, [](void*) {
+        printf("[event] Server announced — accepting peers\n");
+        fflush(stdout);
+    }, nullptr);
+
     hyperdht_server_listen(srv, &kp, on_connection, dht);
 
     printf("Listening... (Ctrl+C to stop)\n\n");

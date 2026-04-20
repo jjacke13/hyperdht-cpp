@@ -25,8 +25,9 @@ in
 {
   inherit sourceFilter libudxPostUnpack;
 
-  mkHyperdht = { shared ? false }: pkgs.stdenv.mkDerivation {
-    pname = "hyperdht" + (if shared then "-shared" else "");
+  mkHyperdht = { shared ? false, debug ? false }: pkgs.stdenv.mkDerivation {
+    pname = "hyperdht" + (if shared then "-shared" else "")
+                       + (if debug then "-debug" else "");
     version = "0.1.0";
     src = sourceFilter;
     postUnpack = libudxPostUnpack;
@@ -36,7 +37,7 @@ in
 
     cmakeFlags = [
       "-DHYPERDHT_BUILD_TESTS=OFF"
-      "-DCMAKE_BUILD_TYPE=Release"
+      (if debug then "-DCMAKE_BUILD_TYPE=Debug" else "-DCMAKE_BUILD_TYPE=Release")
     ] ++ pkgs.lib.optional shared "-DBUILD_SHARED_LIBS=ON";
 
     meta = {

@@ -3,6 +3,9 @@
 # Usage:
 #   nix run .#echo-server
 #   nix run .#echo-server -- <64-hex-seed>
+#
+# For debug logging (DHT_LOG output):
+#   nix run .#echo-server-debug -- <seed>
 { pkgs, staticLib }:
 
 pkgs.stdenv.mkDerivation {

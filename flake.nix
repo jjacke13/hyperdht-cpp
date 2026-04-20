@@ -39,6 +39,11 @@
             staticLib = hyperdhtLib.mkHyperdht {};
           };
 
+          echo-server-debug = import ./nix/echo-server.nix {
+            inherit pkgs;
+            staticLib = hyperdhtLib.mkHyperdht { debug = true; };
+          };
+
           server-test = import ./nix/server-test.nix {
             inherit pkgs;
             inherit (hyperdhtLib) sourceFilter libudxPostUnpack;

@@ -10,7 +10,7 @@
 //   - C++ connects to JS at the port printed below with remote_id=1
 //   - JS echoes back any data received, then ends when remote ends
 
-const UDX = require('/home/jacke/Desktop/repos/nospoon/node_modules/udx-native')
+const UDX = require('udx-native')
 
 const remotePort = parseInt(process.argv[2], 10)
 if (!remotePort) {

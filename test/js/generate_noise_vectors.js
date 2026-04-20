@@ -12,11 +12,14 @@
 const sodium = require('sodium-universal')
 const b4a = require('b4a')
 
-// Load local Noise modules — using the CORRECT Ed25519 curve
-const curve = require('/home/jacke/Desktop/repos/hyperdht-cpp/.analysis/js/noise-curve-ed')
-const NoiseHandshake = require('/home/jacke/Desktop/repos/hyperdht-cpp/.analysis/js/noise-handshake/noise.js')
-const hmac = require('/home/jacke/Desktop/repos/hyperdht-cpp/.analysis/js/noise-handshake/hmac.js')
-const { hkdf, HASHLEN } = require('/home/jacke/Desktop/repos/hyperdht-cpp/.analysis/js/noise-handshake/hkdf.js')
+// Load local Noise modules — using the CORRECT Ed25519 curve.
+// These are in .analysis/js/ (gitignored reference copies from npm).
+const path = require('path')
+const ANALYSIS = path.join(__dirname, '..', '..', '.analysis', 'js')
+const curve = require(path.join(ANALYSIS, 'noise-curve-ed'))
+const NoiseHandshake = require(path.join(ANALYSIS, 'noise-handshake', 'noise.js'))
+const hmac = require(path.join(ANALYSIS, 'noise-handshake', 'hmac.js'))
+const { hkdf, HASHLEN } = require(path.join(ANALYSIS, 'noise-handshake', 'hkdf.js'))
 
 // Fixed seeds for deterministic keypairs
 const INITIATOR_SEED = b4a.alloc(32, 0x00) // All zeros

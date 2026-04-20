@@ -38,7 +38,8 @@ in
     cmakeFlags = [
       "-DHYPERDHT_BUILD_TESTS=OFF"
       (if debug then "-DCMAKE_BUILD_TYPE=Debug" else "-DCMAKE_BUILD_TYPE=Release")
-    ] ++ pkgs.lib.optional shared "-DBUILD_SHARED_LIBS=ON";
+    ] ++ pkgs.lib.optional shared "-DBUILD_SHARED_LIBS=ON"
+      ++ pkgs.lib.optional debug "-DHYPERDHT_DEBUG=ON";
 
     meta = {
       description = "C++ HyperDHT — wire-compatible with JS HyperDHT";

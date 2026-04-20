@@ -71,7 +71,13 @@ add_library(hyperdht
     src/server.cpp
     src/blind_relay.cpp
     src/dht.cpp
-    src/hyperdht_api.cpp
+    src/connect.cpp
+    src/dht_storage.cpp
+    src/dht_network.cpp
+    src/ffi_core.cpp
+    src/ffi_server.cpp
+    src/ffi_stream.cpp
+    src/ffi_storage.cpp
 )
 target_include_directories(hyperdht PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

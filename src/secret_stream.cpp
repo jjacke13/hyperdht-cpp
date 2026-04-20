@@ -705,6 +705,14 @@ void SecretStreamDuplex::handle_frame(std::vector<uint8_t> msg) {
     // keepalives OR on auth failure; we treat both as "no message to deliver".
     auto plain = crypto_.decrypt(msg.data(), msg.size());
     if (!plain.has_value()) return;
+
+    // JS buffers data that arrives before on_connect via Node.js Readable
+    // stream internals. We do the same explicitly: queue messages until
+    // the header exchange is complete, then replay in maybe_fire_connect().
+    if (!connected_) {
+        pending_messages_.push_back(std::move(*plain));
+        return;
+    }
     if (on_message_) on_message_(plain->data(), plain->size());
 }
 
@@ -713,6 +721,16 @@ void SecretStreamDuplex::maybe_fire_connect() {
     if (!header_sent_ || !header_received_) return;
     connected_ = true;
     if (on_connect_) on_connect_();
+
+    // Replay messages that arrived before the header exchange completed.
+    // JS does this implicitly via Node.js Readable buffer; we do it
+    // explicitly. Move the queue out first — on_message_ callbacks may
+    // trigger re-entrant writes that modify state.
+    auto pending = std::move(pending_messages_);
+    for (const auto& msg : pending) {
+        if (destroyed_ || !on_message_) break;
+        on_message_(msg.data(), msg.size());
+    }
 }
 
 // ---------------------------------------------------------------------------

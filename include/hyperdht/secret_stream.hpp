@@ -314,6 +314,11 @@ private:
     // Incoming frame parser state
     std::vector<uint8_t> recv_buf_;  // byte accumulator (up to one full frame)
 
+    // Messages received before on_connect fires (JS buffers these
+    // implicitly via Node.js Readable stream internals). Replayed
+    // in order from maybe_fire_connect() after on_connect_ fires.
+    std::vector<std::vector<uint8_t>> pending_messages_;
+
     // Unordered secretbox send/recv state (JS `_sendState`)
     bool send_state_ready_ = false;
     std::array<uint8_t, 32> secretbox_tx_key_{};

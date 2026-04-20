@@ -14,23 +14,44 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
-// Per-connection context: holds the stream pointer so callbacks can use it.
+// Per-connection context: holds the stream pointer and buffers data
+// that arrives before the SecretStream header exchange completes.
 struct EchoCtx {
     hyperdht_stream_t* stream = nullptr;
+    bool open = false;
+    std::vector<std::vector<uint8_t>> pending;
 };
 
 static void on_data(const uint8_t* data, size_t len, void* ud) {
     auto* ctx = static_cast<EchoCtx*>(ud);
     if (!ctx || !ctx->stream) return;
-    printf("  Received %zu bytes, echoing back\n", len);
+    printf("  Received %zu bytes", len);
+    if (!ctx->open) {
+        // Buffer until stream is open (SecretStream header not exchanged yet)
+        ctx->pending.emplace_back(data, data + len);
+        printf(" (buffered, stream not open yet)\n");
+    } else {
+        printf(", echoing back\n");
+        hyperdht_stream_write(ctx->stream, data, len);
+    }
     fflush(stdout);
-    hyperdht_stream_write(ctx->stream, data, len);
 }
 
 static void on_open(void* ud) {
+    auto* ctx = static_cast<EchoCtx*>(ud);
     printf("  Stream open — ready for data\n");
     fflush(stdout);
+    if (!ctx) return;
+    ctx->open = true;
+    // Flush buffered data
+    for (auto& buf : ctx->pending) {
+        printf("  Flushing %zu buffered bytes\n", buf.size());
+        fflush(stdout);
+        hyperdht_stream_write(ctx->stream, buf.data(), buf.size());
+    }
+    ctx->pending.clear();
 }
 
 static void on_close(void* ud) {

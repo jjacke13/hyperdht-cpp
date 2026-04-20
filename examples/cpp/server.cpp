@@ -24,15 +24,18 @@ static void on_data(const uint8_t* data, size_t len, void* ud) {
     auto* ctx = static_cast<EchoCtx*>(ud);
     if (!ctx || !ctx->stream) return;
     printf("  Received %zu bytes, echoing back\n", len);
+    fflush(stdout);
     hyperdht_stream_write(ctx->stream, data, len);
 }
 
 static void on_open(void* ud) {
     printf("  Stream open — ready for data\n");
+    fflush(stdout);
 }
 
 static void on_close(void* ud) {
     printf("  Stream closed\n");
+    fflush(stdout);
     auto* ctx = static_cast<EchoCtx*>(ud);
     delete ctx;
 }
@@ -43,6 +46,7 @@ static void on_connection(const hyperdht_connection_t* conn, void* ud) {
     printf("Connection from %s:%u  key=", conn->peer_host, conn->peer_port);
     for (int i = 0; i < 8; i++) printf("%02x", conn->remote_public_key[i]);
     printf("...\n");
+    fflush(stdout);
 
     // Allocate context first, pass as userdata, then store the stream handle.
     auto* ctx = new EchoCtx;

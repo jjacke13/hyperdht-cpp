@@ -54,11 +54,17 @@ Tasks to verify / harden the implementation, organized by category and estimated
 - **aarch64 CI**
   - We've built on aarch64 NixOS manually. Add to CI when repo is pushed.
 
-- **Stream backpressure (drain callback)**
-  - `hyperdht_stream_write` returns 0 on backpressure but we don't expose
-    a drain callback to signal when the stream is ready for more data.
-    JS has `socket.on('drain', ...)` as a standard Node.js stream event.
-    Need: `hyperdht_stream_on_drain(stream, callback, userdata)` in the FFI.
+- **Stream drain callback — DONE**
+  - `hyperdht_stream_write_with_drain()` added to C FFI + Python wrapper.
+
+- **Read-side backpressure (udx_stream_read_stop)**
+  - We never pause reading from UDX — every byte is consumed immediately.
+    JS does `rawStream.pause()` when the Readable buffer exceeds
+    `highWaterMark` (16KB), which calls `udx_stream_read_stop`.
+    Without this, a fast sender can grow our internal buffers.
+    The pre-connect message queue has a 64-message cap as defense-in-depth,
+    but the general data path has no read-side flow control.
+    Need: expose pause/resume on SecretStreamDuplex, wire to UDX read stop.
     Without it, holesail can't do proper pause/resume when streaming to
     slow peers. Local TCP bridging uses a blocking sendall workaround.
     Ref: holesail-nix commit 4563f71 patched the same issue in JS holesail.

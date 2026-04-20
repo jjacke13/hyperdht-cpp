@@ -711,6 +711,14 @@ void SecretStreamDuplex::handle_frame(std::vector<uint8_t> msg) {
     // the header exchange is complete, then replay in maybe_fire_connect().
     if (!connected_) {
         pending_messages_.push_back(std::move(*plain));
+        // Cap: prevent unbounded growth from a malicious peer flooding
+        // data before the header exchange completes. The window is
+        // normally sub-RTT (1-2 messages), so 64 is very generous.
+        // JS mitigates this via Node.js Readable highWaterMark backpressure.
+        // Long-term fix: read-side backpressure (udx_stream_read_stop).
+        if (pending_messages_.size() > 64) {
+            destroy(-7);
+        }
         return;
     }
     if (on_message_) on_message_(plain->data(), plain->size());

@@ -457,6 +457,14 @@ int uv_prepare_stop(uv_prepare_t* handle);
 int uv_async_init(uv_loop_t* loop, uv_async_t* handle, uv_async_cb cb);
 int uv_async_send(uv_async_t* handle);
 
+/* Poll event flags */
+enum uv_poll_event {
+  UV_READABLE = 1,
+  UV_WRITABLE = 2,
+  UV_DISCONNECT = 4,
+  UV_PRIORITIZED = 8,
+};
+
 /* --- Poll (stub) --- */
 int uv_poll_init(uv_loop_t* loop, uv_poll_t* handle, int fd);
 int uv_poll_start(uv_poll_t* handle, int events, uv_poll_cb cb);

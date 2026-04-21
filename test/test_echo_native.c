@@ -115,8 +115,41 @@ int main(int argc, char** argv) {
     state.timeout->data = &state;
     uv_timer_start(state.timeout, on_timeout, 30000, 0);
 
-    // UV_RUN_ONCE loop — same as Android/Kotlin
-    while (uv_run(&loop, UV_RUN_ONCE) != 0) {}
+    // Walk the closing_handles list and the handle_queue before each
+    // uv_run to catch zeroed/freed handles BEFORE the crash.
+    int tick = 0;
+    int connected_tick = 0;
+    while (1) {
+        tick++;
+        // Check closing_handles linked list for zeroed entries
+        {
+            uv_handle_t* h = loop.closing_handles;
+            int i = 0;
+            while (h) {
+                // If the handle's queue prev/next are zeroed, it's freed memory
+                void** q = (void**)((char*)h + 32); // handle_queue offset on 64-bit
+                if (q[0] == NULL && q[1] == NULL && i > 0) {
+                    printf("  !!! CANARY tick=%d: closing_handles[%d]=%p has zeroed queue!\n",
+                           tick, i, (void*)h);
+                    printf("      handle type=%d flags=%x loop=%p\n",
+                           h->type, h->flags, (void*)h->loop);
+                    fflush(stdout);
+                }
+                h = h->next_closing;
+                i++;
+                if (i > 1000) { printf("  !!! closing_handles list corrupted (>1000)\n"); break; }
+            }
+        }
+        if (state.connected && !connected_tick) {
+            connected_tick = tick;
+            printf("  [tick=%d] connected!\n", tick);
+        }
+        if (tick >= connected_tick + 1 && connected_tick > 0 && tick <= connected_tick + 20)
+            printf("  [tick=%d] uv_run...\n", tick);
+
+        int rc = uv_run(&loop, UV_RUN_ONCE);
+        if (rc == 0) break;
+    }
 
     hyperdht_free(dht);
     uv_loop_close(&loop);

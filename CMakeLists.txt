@@ -57,9 +57,11 @@ target_include_directories(udx
 )
 target_link_libraries(udx PUBLIC ${UV_TARGET})
 
-# Android NDK's Bionic libc needs explicit arpa/inet.h for ntohl in libudx
+# Android NDK's Bionic: IN6_IS_ADDR_V4MAPPED uses ntohl without including
+# the header that declares it. Force-include both headers.
 if(ANDROID)
-    target_compile_options(udx PRIVATE "-include" "arpa/inet.h")
+    target_compile_options(udx PRIVATE "-include" "netinet/in.h" "-include" "arpa/inet.h")
+    target_compile_options(udx PRIVATE "-Wno-implicit-function-declaration")
 endif()
 
 # === Library ===

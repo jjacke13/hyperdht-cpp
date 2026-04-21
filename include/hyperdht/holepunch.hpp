@@ -421,7 +421,9 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        uint32_t local_firewall,
                        const std::vector<compact::Ipv4Address>& local_addresses,
                        OnHolepunchCallback on_done,
-                       bool fast_open = true);
+                       bool fast_open = true,
+                       udx_socket_t** pool_handle_out = nullptr,
+                       std::shared_ptr<void>* pool_keepalive_out = nullptr);
 
 // ---------------------------------------------------------------------------
 // Utility functions (JS: Holepuncher.localAddresses, Holepuncher.matchAddress)

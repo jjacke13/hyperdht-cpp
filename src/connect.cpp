@@ -72,6 +72,14 @@ struct ConnState {
     // cache the firewall info here and replay it after hs_result is set.
     udx_socket_t* cached_fw_socket = nullptr;
     compact::Ipv4Address cached_fw_address;
+    // Keepalive for the pool socket used by the holepunch probes. Set when
+    // the puncher is started so the rawStream firewall callback can pass it
+    // through to socket_keepalive in ConnectResult. Without this, the pool
+    // socket can be freed while the UDX stream still references it — a
+    // use-after-free that Android's scudo allocator exposes (zeroed memory
+    // → SIGSEGV in uv_run) but glibc hides (stale data still readable).
+    udx_socket_t* pool_socket_handle = nullptr;
+    std::shared_ptr<void> pool_socket_keepalive;
     // Passive wait timer (OPEN firewall path) — RAII
     std::unique_ptr<async_utils::UvTimer> passive_timer;
     // §6 ConnectOptions snapshot (copied, not referenced — opts may
@@ -401,6 +409,8 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
             result.remote_public_key = st->hs_result.remote_public_key;
             result.peer_address = real_addr;
             result.udx_socket = sock;
+            if (sock == st->pool_socket_handle)
+                result.socket_keepalive = st->pool_socket_keepalive;
             result.local_udx_id = st->our_udx_id;
             if (st->hs_result.remote_payload.udx.has_value()) {
                 result.remote_udx_id = st->hs_result.remote_payload.udx->id;
@@ -511,6 +521,8 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
         result.remote_public_key = hs.remote_public_key;
         result.peer_address = state->cached_fw_address;
         result.udx_socket = state->cached_fw_socket;
+        if (state->cached_fw_socket == state->pool_socket_handle)
+            result.socket_keepalive = state->pool_socket_keepalive;
         result.local_udx_id = state->our_udx_id;
         if (hs.remote_payload.udx.has_value()) {
             result.remote_udx_id = hs.remote_payload.udx->id;
@@ -708,7 +720,9 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
             state->take_raw_stream(result);
             state->complete(0, result);
         },
-        state->fast_open);  // §6 opts.fast_open
+        state->fast_open,
+        &state->pool_socket_handle,
+        &state->pool_socket_keepalive);
 }
 
 // ---------------------------------------------------------------------------

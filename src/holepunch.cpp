@@ -1158,7 +1158,9 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        uint32_t local_firewall,
                        const std::vector<compact::Ipv4Address>& local_addresses,
                        OnHolepunchCallback on_done,
-                       bool fast_open) {
+                       bool fast_open,
+                       udx_socket_t** pool_handle_out,
+                       std::shared_ptr<void>* pool_keepalive_out) {
 
     // Derive holepunchSecret from handshake hash
     // holepunchSecret = BLAKE2b-256(NS_PEER_HOLEPUNCH, key=handshake_hash)
@@ -1177,6 +1179,13 @@ void holepunch_connect(rpc::RpcSocket& socket,
     // Create pool socket (JS: dht._socketPool.acquire())
     state->pool = std::make_shared<PoolSocket>(socket.loop(), socket.udx_handle());
     state->pool->bind();
+
+    // Expose pool socket to caller so the rawStream firewall callback can
+    // set socket_keepalive when the server replies via the pool socket.
+    if (pool_handle_out)
+        *pool_handle_out = state->pool->socket_handle();
+    if (pool_keepalive_out)
+        *pool_keepalive_out = state->pool;
 
     // Create puncher EARLY — matching JS connect.js:258.
     // JS creates the Holepuncher (which acquires a pool socket) BEFORE

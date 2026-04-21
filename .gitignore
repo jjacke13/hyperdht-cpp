@@ -5,3 +5,12 @@ compile_commands.json
 __pycache__/
 node_modules/
 CLAUDE.md
+
+# Android / Gradle
+.gradle/
+.idea/
+local.properties
+*.apk
+examples/android/app/build/
+examples/android/build/
+examples/android/app/src/main/jniLibs/

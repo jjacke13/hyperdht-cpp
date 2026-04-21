@@ -73,6 +73,40 @@
             '';
           };
 
+          # Android / Kotlin development (JNI bridge + NDK)
+          android = let
+            # Android SDK requires unfree license acceptance
+            androidPkgs = import nixpkgs {
+              inherit system;
+              config.android_sdk.accept_license = true;
+              config.allowUnfree = true;
+            };
+            androidComposition = androidPkgs.androidenv.composeAndroidPackages {
+              platformVersions = [ "34" ];
+              ndkVersions = [ "26.3.11579264" ];
+              buildToolsVersions = [ "34.0.0" ];
+              includeNDK = true;
+            };
+            androidSdk = androidComposition.androidsdk;
+          in pkgs.mkShell {
+            nativeBuildInputs = [
+              pkgs.cmake pkgs.ninja pkgs.pkg-config
+              pkgs.gcc14 pkgs.jdk21 pkgs.kotlin pkgs.gradle
+              androidSdk
+            ];
+            buildInputs = [ pkgs.libsodium pkgs.libuv ];
+            ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
+            ANDROID_NDK_HOME = "${androidSdk}/libexec/android-sdk/ndk/26.3.11579264";
+            JAVA_HOME = "${pkgs.jdk21}";
+            shellHook = ''
+              echo "hyperdht-cpp Android dev shell"
+              echo "  JDK:    $(java -version 2>&1 | head -1)"
+              echo "  Kotlin: $(kotlin -version 2>&1)"
+              echo "  NDK:    $ANDROID_NDK_HOME"
+              echo "  SDK:    $ANDROID_HOME"
+            '';
+          };
+
           # Python demo (shared lib + python3)
           python = pkgs.mkShell {
             buildInputs = [

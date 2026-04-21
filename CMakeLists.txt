@@ -40,6 +40,11 @@ target_include_directories(udx
 )
 target_link_libraries(udx PUBLIC PkgConfig::UV)
 
+# Android NDK's Bionic libc needs explicit arpa/inet.h for ntohl in libudx
+if(ANDROID)
+    target_compile_options(udx PRIVATE "-include" "arpa/inet.h")
+endif()
+
 # === Library ===
 
 add_library(hyperdht

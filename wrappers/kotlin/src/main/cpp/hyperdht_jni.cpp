@@ -90,7 +90,7 @@ Java_com_hyperdht_Native_loopClose(JNIEnv*, jobject, jlong ptr) {
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_hyperdht_Native_asyncCreate(JNIEnv*, jobject, jlong loopPtr) {
-    auto* async = new uv_async_t;
+    auto* async = new uv_async_t{};
     uv_async_init((uv_loop_t*)loopPtr, async, [](uv_async_t*) {});
     return (jlong)async;
 }

@@ -71,14 +71,14 @@ Java_com_hyperdht_Native_loopCreate(JNIEnv*, jobject) {
 }
 
 static int g_loop_tick = 0;
+static bool g_connected = false;
 extern "C" JNIEXPORT jint JNICALL
 Java_com_hyperdht_Native_loopRunOnce(JNIEnv*, jobject, jlong ptr) {
     int tick = ++g_loop_tick;
-    if (tick <= 5 || tick % 100 == 0)
-        LOGT("uv_run tick=%d", tick);
+    bool verbose = (tick <= 5 || tick % 100 == 0 || g_connected);
+    if (verbose) LOGT("uv_run tick=%d", tick);
     int rc = uv_run((uv_loop_t*)ptr, UV_RUN_ONCE);
-    if (tick <= 5 || tick % 100 == 0)
-        LOGT("uv_run tick=%d done rc=%d", tick, rc);
+    if (verbose) LOGT("uv_run tick=%d done rc=%d", tick, rc);
     return rc;
 }
 
@@ -462,6 +462,7 @@ static void jni_connect_stream_cb(int error,
             ctx->dht, conn,
             jni_stream_open_cb, jni_stream_data_cb, jni_stream_close_cb, sctx);
         LOGT("stream_open returned %p", stream);
+        g_connected = true;
 
         if (stream) {
             streamHandle = (jlong)stream;

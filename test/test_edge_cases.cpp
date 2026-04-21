@@ -203,8 +203,8 @@ TEST(EdgeCase, FullBucketEviction) {
     our_id.fill(0x80);
     routing::RoutingTable table(our_id);
 
-    // Fill a bucket with 20 nodes (k=20)
-    for (int i = 0; i < 20; i++) {
+    // Fill a bucket with K nodes
+    for (size_t i = 0; i < routing::K; i++) {
         routing::Node node;
         node.id.fill(0x00);
         node.id[31] = static_cast<uint8_t>(i + 1);  // Same bucket (close IDs)
@@ -213,9 +213,9 @@ TEST(EdgeCase, FullBucketEviction) {
         table.add(node);
     }
 
-    EXPECT_EQ(table.size(), 20u);
+    EXPECT_EQ(table.size(), routing::K);
 
-    // Adding a 21st node to the same bucket — should be ignored or evict
+    // Adding one more node to the same bucket — should be ignored or evict
     routing::Node extra;
     extra.id.fill(0x00);
     extra.id[31] = 0xFF;
@@ -224,7 +224,7 @@ TEST(EdgeCase, FullBucketEviction) {
     table.add(extra);
 
     // Table should not exceed k per bucket
-    EXPECT_LE(table.size(), 21u);  // May or may not add depending on eviction policy
+    EXPECT_LE(table.size(), routing::K + 1u);  // May or may not add depending on eviction policy
 }
 
 TEST(EdgeCase, ClosestWithEmptyTable) {

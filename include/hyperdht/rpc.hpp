@@ -30,7 +30,11 @@ namespace rpc {
 // Constants
 // ---------------------------------------------------------------------------
 
+#ifdef HYPERDHT_EMBEDDED
+constexpr int DEFAULT_MAX_WINDOW = 16;  // Reduced for embedded
+#else
 constexpr int DEFAULT_MAX_WINDOW = 80;
+#endif
 constexpr int DEFAULT_RETRIES = 3;
 constexpr uint64_t DEFAULT_TIMEOUT_MS = 1000;
 constexpr uint64_t DRAIN_INTERVAL_MS = 750;

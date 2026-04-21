@@ -17,7 +17,11 @@ namespace routing {
 
 constexpr size_t ID_LEN = 32;           // 256-bit node ID
 constexpr size_t ID_BITS = ID_LEN * 8;  // 256
+#ifdef HYPERDHT_EMBEDDED
+constexpr size_t K = 10;                // Reduced bucket size for embedded
+#else
 constexpr size_t K = 20;                // Bucket size
+#endif
 
 using NodeId = std::array<uint8_t, ID_LEN>;
 

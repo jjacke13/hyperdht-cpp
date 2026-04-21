@@ -7,9 +7,13 @@
       url = "github:holepunchto/libudx/0420f6267110e919d3fcefb8d5de4385912eb353";
       flake = false;
     };
+    nixpkgs-esp-dev = {
+      url = "github:mirrexagon/nixpkgs-esp-dev";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, libudx }:
+  outputs = { self, nixpkgs, libudx, nixpkgs-esp-dev }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
       pkgsFor = system: nixpkgs.legacyPackages.${system};
@@ -123,6 +127,28 @@
               echo ""
               echo "  cd examples/python"
               echo "  python3 holesail_server.py --live 8080"
+            '';
+          };
+
+          # ESP32 development (ESP-IDF + Xtensa toolchain)
+          esp32 = let
+            espPkgs = import nixpkgs {
+              inherit system;
+              overlays = [ nixpkgs-esp-dev.overlays.default ];
+              config.permittedInsecurePackages = [
+                "python3.13-ecdsa-0.19.1"
+              ];
+            };
+          in espPkgs.mkShell {
+            buildInputs = [ espPkgs.esp-idf-xtensa ];
+            shellHook = ''
+              echo "hyperdht-cpp ESP32 dev shell"
+              echo "  ESP-IDF: $IDF_PATH"
+              echo "  Target:  esp32s3"
+              echo ""
+              echo "  cd examples/esp32"
+              echo "  idf.py set-target esp32s3"
+              echo "  idf.py build"
             '';
           };
         }

@@ -148,6 +148,10 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release -DLIBUV_BUILD_TESTS=OFF \
             -DCMAKE_INSTALL_PREFIX=/tmp/libuv-android
           ninja -C /tmp/libuv-build install
+          ls /tmp/libuv-android/lib/
+          # Find the static lib name (libuv.a or libuv_a.a)
+          UV_LIB=$(find /tmp/libuv-android/lib -name "*.a" | head -1)
+          echo "UV_LIB=$UV_LIB" >> $GITHUB_ENV
 
       - name: Build hyperdht for Android arm64-v8a
         run: |
@@ -161,7 +165,7 @@ jobs:
             -DSODIUM_INCLUDE_DIR=$SODIUM_PREFIX/include \
             -DSODIUM_LIBRARY=$SODIUM_PREFIX/lib/libsodium.a \
             -DUV_INCLUDE_DIR=/tmp/libuv-android/include \
-            -DUV_LIBRARY=/tmp/libuv-android/lib/libuv_a.a
+            -DUV_LIBRARY=$UV_LIB
           ninja -C build-android
 
       - name: Build JNI bridge
@@ -172,9 +176,8 @@ jobs:
             -I /tmp/libuv-android/include \
             -I $JAVA_HOME/include -I $JAVA_HOME/include/linux \
             wrappers/kotlin/src/main/cpp/hyperdht_jni.cpp \
-            -L build-android -lhyperdht -ludx \
-            -L $SODIUM_PREFIX/lib -lsodium \
-            -L /tmp/libuv-android/lib -luv_a \
+            build-android/libhyperdht.a build-android/libudx.a \
+            $SODIUM_PREFIX/lib/libsodium.a $UV_LIB \
             -llog \
             -o build-android/libhyperdht_jni.so
 

@@ -184,11 +184,14 @@ jobs:
 
       - name: Build native echo test (no JNI, pure C++)
         run: |
-          NDK_CXX=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++
-          $NDK_CXX -O2 -Wall \
+          NDK=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+          $NDK/aarch64-linux-android26-clang -O2 -Wall -c \
             -I include -I deps/libudx/include \
             -I /tmp/libuv-android/include \
-            -x c++ test/test_echo_native.c \
+            test/test_echo_native.c \
+            -o build-android/test_echo_native.o
+          $NDK/aarch64-linux-android26-clang++ -O2 \
+            build-android/test_echo_native.o \
             build-android/libhyperdht.a build-android/libudx.a \
             $SODIUM_PREFIX/lib/libsodium.a $UV_LIB \
             -static-libstdc++ -lm -ldl \

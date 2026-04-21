@@ -13,6 +13,8 @@
 #include <uv.h>
 
 #include <cstdio>
+#include <android/log.h>
+#define LOGT(...) __android_log_print(ANDROID_LOG_DEBUG, "HyperDHT-JNI", __VA_ARGS__)
 #include <cstring>
 #include <pthread.h>
 
@@ -68,9 +70,16 @@ Java_com_hyperdht_Native_loopCreate(JNIEnv*, jobject) {
     return (jlong)loop;
 }
 
+static int g_loop_tick = 0;
 extern "C" JNIEXPORT jint JNICALL
 Java_com_hyperdht_Native_loopRunOnce(JNIEnv*, jobject, jlong ptr) {
-    return uv_run((uv_loop_t*)ptr, UV_RUN_ONCE);
+    int tick = ++g_loop_tick;
+    if (tick <= 5 || tick % 100 == 0)
+        LOGT("uv_run tick=%d", tick);
+    int rc = uv_run((uv_loop_t*)ptr, UV_RUN_ONCE);
+    if (tick <= 5 || tick % 100 == 0)
+        LOGT("uv_run tick=%d done rc=%d", tick, rc);
+    return rc;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -437,6 +446,10 @@ static void jni_connect_stream_cb(int error,
     JNIEnv* env = get_env();
     jlong streamHandle = 0;
 
+    LOGT("connect_stream_cb: error=%d conn=%p raw_stream=%p udx_socket=%p",
+         error, conn, conn ? conn->raw_stream : nullptr,
+         conn ? conn->udx_socket : nullptr);
+
     if (error == 0 && conn) {
         // Open stream NOW — conn is only valid during this callback
         auto* sctx = new StreamCtx;
@@ -444,9 +457,11 @@ static void jni_connect_stream_cb(int error,
         sctx->onData  = ctx->onData;
         sctx->onClose = ctx->onClose;
 
+        LOGT("calling stream_open dht=%p", ctx->dht);
         auto* stream = hyperdht_stream_open(
             ctx->dht, conn,
             jni_stream_open_cb, jni_stream_data_cb, jni_stream_close_cb, sctx);
+        LOGT("stream_open returned %p", stream);
 
         if (stream) {
             streamHandle = (jlong)stream;

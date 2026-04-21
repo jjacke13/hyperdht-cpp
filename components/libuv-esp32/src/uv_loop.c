@@ -249,15 +249,17 @@ static void uv__io_poll(uv_loop_t* loop, uint64_t timeout_ms) {
   if (maxfd < 0 && timeout_ms == 0)
     return;  /* Nothing to wait on and no timeout */
 
-  struct timeval tv;
-  struct timeval* tvp = NULL;
-  if (timeout_ms != (uint64_t)-1) {
-    tv.tv_sec = (long)(timeout_ms / 1000);
-    tv.tv_usec = (long)((timeout_ms % 1000) * 1000);
-    tvp = &tv;
-  }
+  /* Cap timeout at 1 second — never block forever.
+   * Real libuv can block indefinitely, but on FreeRTOS we need
+   * to yield to the watchdog and let other tasks run. */
+  if (timeout_ms == (uint64_t)-1 || timeout_ms > 1000)
+    timeout_ms = 1000;
 
-  int n = select(maxfd + 1, &readfds, &writefds, NULL, tvp);
+  struct timeval tv;
+  tv.tv_sec = (long)(timeout_ms / 1000);
+  tv.tv_usec = (long)((timeout_ms % 1000) * 1000);
+
+  int n = select(maxfd + 1, &readfds, &writefds, NULL, &tv);
 
   /* Update time after blocking */
   loop->time = uv__get_time_ms();

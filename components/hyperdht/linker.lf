@@ -1,0 +1,6 @@
+# Force all hyperdht code to flash (not IRAM).
+# IRAM is only 16KB on ESP32-S3 — FreeRTOS needs it for interrupts.
+[mapping:hyperdht]
+archive: lib__idf_hyperdht.a
+entries:
+    * (noflash_text -> flash_text)

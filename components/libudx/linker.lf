@@ -1,0 +1,5 @@
+# Force all libudx code to flash (not IRAM).
+[mapping:libudx]
+archive: lib__idf_libudx.a
+entries:
+    * (noflash_text -> flash_text)

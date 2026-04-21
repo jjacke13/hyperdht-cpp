@@ -364,14 +364,15 @@ std::unique_ptr<HyperDHT> HyperDHT::bootstrapper(
     const std::string& host,
     DhtOptions opts) {
 
-    if (port == 0) throw std::invalid_argument("Port is required");
-    if (host.empty()) throw std::invalid_argument("Host is required");
-    if (host == "0.0.0.0" || host == "::") throw std::invalid_argument("Invalid host");
+    if (port == 0 || host.empty() ||
+        host == "0.0.0.0" || host == "::") {
+        return nullptr;  // Invalid arguments
+    }
     // IPv4 sanity: uv_ip4_addr parses the dotted-quad form. Anything it
     // rejects (IPv6, hostname, garbage) trips the check.
     struct sockaddr_in probe{};
     if (uv_ip4_addr(host.c_str(), port, &probe) != 0) {
-        throw std::invalid_argument("Host must be an IPv4 address");
+        return nullptr;  // Host must be an IPv4 address
     }
 
     opts.port = port;

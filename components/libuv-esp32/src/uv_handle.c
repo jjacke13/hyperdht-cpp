@@ -91,39 +91,35 @@ int uv_fileno(const uv_handle_t* handle, uv_os_fd_t* fd) {
 }
 
 int uv_send_buffer_size(uv_handle_t* handle, int* value) {
-  int fd;
   uv_os_fd_t os_fd;
-
   if (uv_fileno(handle, &os_fd) != 0)
     return UV_EBADF;
-  fd = (int)os_fd;
+  int fd = (int)os_fd;
 
   if (*value == 0) {
+    /* Query: try getsockopt, fall back to a reasonable default */
     socklen_t len = sizeof(*value);
     if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, value, &len) != 0)
-      return uv__translate_errno(errno);
+      *value = 65536;  /* lwIP doesn't always support SO_SNDBUF query */
   } else {
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, value, sizeof(*value)) != 0)
-      return uv__translate_errno(errno);
+    /* Set: try setsockopt, ignore failure (lwIP manages its own buffers) */
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, value, sizeof(*value));
   }
   return 0;
 }
 
 int uv_recv_buffer_size(uv_handle_t* handle, int* value) {
-  int fd;
   uv_os_fd_t os_fd;
-
   if (uv_fileno(handle, &os_fd) != 0)
     return UV_EBADF;
-  fd = (int)os_fd;
+  int fd = (int)os_fd;
 
   if (*value == 0) {
     socklen_t len = sizeof(*value);
     if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, value, &len) != 0)
-      return uv__translate_errno(errno);
+      *value = 65536;
   } else {
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, value, sizeof(*value)) != 0)
-      return uv__translate_errno(errno);
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, value, sizeof(*value));
   }
   return 0;
 }

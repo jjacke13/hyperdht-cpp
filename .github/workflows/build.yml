@@ -133,6 +133,7 @@ jobs:
           cd /tmp/libsodium
           ./autogen.sh
           export ANDROID_NDK_HOME=$ANDROID_NDK
+          export NDK_PLATFORM=android-26
           dist-build/android-armv8-a.sh
           ls -la libsodium-android-armv8-a+crypto/lib/
           echo "SODIUM_PREFIX=/tmp/libsodium/libsodium-android-armv8-a+crypto" >> $GITHUB_ENV

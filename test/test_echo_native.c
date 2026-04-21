@@ -6,6 +6,8 @@
 #include <hyperdht/hyperdht.h>
 #include <uv.h>
 
+#define LOG(...) do { fprintf(stderr, __VA_ARGS__); fflush(stderr); } while(0)
+
 typedef struct {
     hyperdht_t* dht;
     hyperdht_stream_t* stream;
@@ -14,7 +16,11 @@ typedef struct {
     int closed;
     uv_timer_t* timeout;
     const char* test_msg;
+    int connect_tick;
 } State;
+
+static State* g_state = NULL;
+static int g_tick = 0;
 
 static void teardown(State* s) {
     s->closed = 1;
@@ -28,20 +34,20 @@ static void teardown(State* s) {
 
 static void on_close(void* ud) {
     State* s = (State*)ud;
-    printf("  Stream CLOSED\n");
+    LOG("  Stream CLOSED (tick=%d)\n", g_tick);
     teardown(s);
 }
 
 static void on_timeout(uv_timer_t* t) {
     State* s = (State*)t->data;
-    printf("  TIMEOUT — tearing down\n");
+    LOG("  TIMEOUT — tearing down\n");
     if (s->stream) hyperdht_stream_close(s->stream);
     else teardown(s);
 }
 
 static void on_data(const uint8_t* data, size_t len, void* ud) {
     State* s = (State*)ud;
-    printf("  ECHO (%zu bytes): %.*s\n", len, (int)len, data);
+    LOG("  ECHO (%zu bytes): %.*s\n", len, (int)len, data);
     if (len == strlen(s->test_msg) && memcmp(data, s->test_msg, len) == 0)
         s->echo_ok = 1;
     hyperdht_stream_close(s->stream);
@@ -49,32 +55,33 @@ static void on_data(const uint8_t* data, size_t len, void* ud) {
 
 static void on_open(void* ud) {
     State* s = (State*)ud;
-    printf("  Stream OPEN\n");
+    LOG("  Stream OPEN (tick=%d)\n", g_tick);
     int rc = hyperdht_stream_write(s->stream,
         (const uint8_t*)s->test_msg, strlen(s->test_msg));
-    printf("  Sent %zu bytes (rc=%d)\n", strlen(s->test_msg), rc);
+    LOG("  Sent %zu bytes (rc=%d)\n", strlen(s->test_msg), rc);
 }
 
 static void on_connect(int error, const hyperdht_connection_t* conn, void* ud) {
     State* s = (State*)ud;
-    printf("  connect: error=%d conn=%p\n", error, (void*)conn);
+    LOG("  connect cb: error=%d conn=%p (tick=%d)\n", error, (void*)conn, g_tick);
     if (error != 0 || !conn) {
-        printf("  CONNECT FAILED (error=%d)\n", error);
-        hyperdht_destroy(s->dht, NULL, NULL);
+        LOG("  CONNECT FAILED (error=%d)\n", error);
+        teardown(s);
         return;
     }
     s->connected = 1;
-    printf("  Connected! peer=%s:%u raw=%s\n",
+    s->connect_tick = g_tick;
+    LOG("  Connected! peer=%s:%u raw=%p sock=%p\n",
            conn->peer_host, conn->peer_port,
-           conn->raw_stream ? "yes" : "no");
+           conn->raw_stream, conn->udx_socket);
 
     s->stream = hyperdht_stream_open(s->dht, conn,
         on_open, on_data, on_close, ud);
     if (!s->stream) {
-        printf("  stream_open FAILED\n");
-        hyperdht_destroy(s->dht, NULL, NULL);
+        LOG("  stream_open FAILED\n");
+        teardown(s);
     } else {
-        printf("  stream_open OK (%p)\n", (void*)s->stream);
+        LOG("  stream_open OK (%p)\n", (void*)s->stream);
     }
 }
 
@@ -98,15 +105,16 @@ int main(int argc, char** argv) {
     hyperdht_opts_t opts = {0};
     opts.use_public_bootstrap = 1;
     hyperdht_t* dht = hyperdht_create(&loop, &opts);
-    if (!dht) { fprintf(stderr, "create failed\n"); return 1; }
+    if (!dht) { LOG("create failed\n"); return 1; }
     hyperdht_bind(dht, 0);
-    printf("  Bound to port %u\n", hyperdht_port(dht));
+    LOG("  Bound to port %u\n", hyperdht_port(dht));
 
     State state = {0};
     state.dht = dht;
     state.test_msg = "hello from native Android test";
+    g_state = &state;
 
-    printf("  Connecting...\n");
+    LOG("  Connecting...\n");
     hyperdht_connect(dht, server_pk, on_connect, &state);
 
     // Timeout
@@ -115,38 +123,15 @@ int main(int argc, char** argv) {
     state.timeout->data = &state;
     uv_timer_start(state.timeout, on_timeout, 30000, 0);
 
-    // Walk the closing_handles list and the handle_queue before each
-    // uv_run to catch zeroed/freed handles BEFORE the crash.
-    int tick = 0;
-    int connected_tick = 0;
+    // UV_RUN_ONCE loop
     while (1) {
-        tick++;
-        // Check closing_handles linked list for zeroed entries
-        {
-            uv_handle_t* h = loop.closing_handles;
-            int i = 0;
-            while (h) {
-                // If the handle's queue prev/next are zeroed, it's freed memory
-                void** q = (void**)((char*)h + 32); // handle_queue offset on 64-bit
-                if (q[0] == NULL && q[1] == NULL && i > 0) {
-                    printf("  !!! CANARY tick=%d: closing_handles[%d]=%p has zeroed queue!\n",
-                           tick, i, (void*)h);
-                    printf("      handle type=%d flags=%x loop=%p\n",
-                           h->type, h->flags, (void*)h->loop);
-                    fflush(stdout);
-                }
-                h = h->next_closing;
-                i++;
-                if (i > 1000) { printf("  !!! closing_handles list corrupted (>1000)\n"); break; }
-            }
+        g_tick++;
+        // Log ticks around connect time
+        if (state.connect_tick > 0 &&
+            g_tick >= state.connect_tick &&
+            g_tick <= state.connect_tick + 25) {
+            LOG("  [tick=%d]\n", g_tick);
         }
-        if (state.connected && !connected_tick) {
-            connected_tick = tick;
-            printf("  [tick=%d] connected!\n", tick);
-        }
-        if (tick >= connected_tick + 1 && connected_tick > 0 && tick <= connected_tick + 20)
-            printf("  [tick=%d] uv_run...\n", tick);
-
         int rc = uv_run(&loop, UV_RUN_ONCE);
         if (rc == 0) break;
     }
@@ -154,6 +139,6 @@ int main(int argc, char** argv) {
     hyperdht_free(dht);
     uv_loop_close(&loop);
 
-    printf("\n  Result: connected=%d echo=%d\n", state.connected, state.echo_ok);
+    LOG("\n  Result: connected=%d echo=%d\n", state.connected, state.echo_ok);
     return state.echo_ok ? 0 : 1;
 }

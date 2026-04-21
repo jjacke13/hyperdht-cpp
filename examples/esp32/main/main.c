@@ -1,4 +1,4 @@
-/* HyperDHT on ESP32-S3 — bootstrap test. */
+/* HyperDHT on ESP32-S3 — connect to echo server. */
 
 #include <stdio.h>
 #include <string.h>
@@ -17,6 +17,18 @@
 #define TAG "dht"
 #define WIFI_CONNECTED_BIT BIT0
 static EventGroupHandle_t s_wifi_event_group;
+
+static const uint8_t SERVER_PK[32] = {
+    0xb7, 0xc5, 0xc4, 0xe9, 0x09, 0xad, 0x28, 0xe2,
+    0x07, 0x1c, 0x48, 0xa0, 0x9f, 0x33, 0x0e, 0xc2,
+    0x73, 0x52, 0x48, 0xa4, 0xe4, 0xd8, 0x75, 0x90,
+    0x32, 0xa9, 0xb5, 0x7b, 0x0f, 0x2e, 0x7a, 0xec
+};
+
+static hyperdht_t* g_dht = NULL;
+static hyperdht_stream_t* g_stream = NULL;
+
+/* --- WiFi --- */
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data) {
@@ -53,22 +65,57 @@ static void wifi_init_sta(void) {
     ESP_LOGI(TAG, "connecting to WiFi: %s", CONFIG_WIFI_SSID);
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
         WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
-    if (bits & WIFI_CONNECTED_BIT)
-        ESP_LOGI(TAG, "WiFi connected");
-    else
-        ESP_LOGE(TAG, "WiFi connection FAILED");
+    if (!(bits & WIFI_CONNECTED_BIT))
+        ESP_LOGE(TAG, "WiFi FAILED");
 }
+
+/* --- Stream callbacks --- */
+
+static void on_stream_open(void* userdata) {
+    (void)userdata;
+    ESP_LOGI(TAG, "stream OPEN — sending hello");
+    const char* msg = "hello from ESP32-S3!";
+    hyperdht_stream_write(g_stream, (const uint8_t*)msg, strlen(msg));
+}
+
+static void on_stream_data(const uint8_t* data, size_t len, void* userdata) {
+    ESP_LOGI(TAG, "ECHO received (%zu bytes): %.*s", len, (int)len, (const char*)data);
+}
+
+static void on_stream_close(void* userdata) {
+    ESP_LOGI(TAG, "stream CLOSED");
+}
+
+/* --- Connect callback --- */
+
+static void on_connect(int error, const hyperdht_connection_t* conn, void* userdata) {
+    if (error != 0) {
+        ESP_LOGE(TAG, "connect FAILED: %d", error);
+        return;
+    }
+
+    ESP_LOGI(TAG, "CONNECTED to %s:%u", conn->peer_host, conn->peer_port);
+
+    g_stream = hyperdht_stream_open(
+        g_dht, conn, on_stream_open, on_stream_data, on_stream_close, NULL);
+
+    if (!g_stream)
+        ESP_LOGE(TAG, "stream_open failed!");
+}
+
+/* --- Bootstrap callback --- */
 
 static void on_bootstrapped(void* userdata) {
     hyperdht_t* dht = (hyperdht_t*)userdata;
-    ESP_LOGI(TAG, "*** BOOTSTRAPPED on port %u ***", hyperdht_port(dht));
-    ESP_LOGI(TAG, "  online:     %d", hyperdht_is_online(dht));
-    ESP_LOGI(TAG, "  free heap:  %zu KB",
-             heap_caps_get_free_size(MALLOC_CAP_DEFAULT) / 1024);
+    ESP_LOGI(TAG, "BOOTSTRAPPED on port %u — connecting to server...",
+             hyperdht_port(dht));
+    hyperdht_connect(dht, SERVER_PK, on_connect, NULL);
 }
 
+/* --- Main --- */
+
 void app_main(void) {
-    ESP_LOGI(TAG, "HyperDHT ESP32-S3 bootstrap test");
+    ESP_LOGI(TAG, "HyperDHT ESP32-S3 — echo test");
     ESP_LOGI(TAG, "  free heap: %zu KB",
              heap_caps_get_free_size(MALLOC_CAP_DEFAULT) / 1024);
 
@@ -90,34 +137,19 @@ void app_main(void) {
     opts.use_public_bootstrap = 1;
 
     ESP_LOGI(TAG, "creating DHT node...");
-    hyperdht_t* dht = hyperdht_create(&loop, &opts);
-    if (!dht) {
-        ESP_LOGE(TAG, "hyperdht_create failed!");
+    g_dht = hyperdht_create(&loop, &opts);
+    if (!g_dht) {
+        ESP_LOGE(TAG, "create failed!");
         return;
     }
 
-    int rc = hyperdht_bind(dht, 0);
-    ESP_LOGI(TAG, "bind rc=%d, port=%u", rc, hyperdht_port(dht));
-    hyperdht_on_bootstrapped(dht, on_bootstrapped, dht);
+    hyperdht_bind(g_dht, 0);
+    ESP_LOGI(TAG, "bound on port %u", hyperdht_port(g_dht));
+    hyperdht_on_bootstrapped(g_dht, on_bootstrapped, g_dht);
 
-    ESP_LOGI(TAG, "running event loop (v2) — active_handles=%u",
-             loop.active_handles);
-    int iter = 0;
-    int alive;
-    do {
-        alive = uv_run(&loop, UV_RUN_ONCE);
-        if (++iter % 100 == 1)
-            ESP_LOGI(TAG, "iter %d, alive=%d, handles=%u, time=%llu",
-                     iter, alive, loop.active_handles,
-                     (unsigned long long)uv_now(&loop));
-        vTaskDelay(1);
-    } while (alive);
-
-    ESP_LOGI(TAG, "cleaning up...");
-    hyperdht_destroy(dht, NULL, NULL);
+    ESP_LOGI(TAG, "running...");
     while (uv_run(&loop, UV_RUN_ONCE))
         vTaskDelay(1);
-    hyperdht_free(dht);
-    uv_loop_close(&loop);
+
     ESP_LOGI(TAG, "done");
 }

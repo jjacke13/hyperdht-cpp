@@ -16,16 +16,27 @@ typedef struct {
     const char* test_msg;
 } State;
 
-static void on_close(void* ud) {
-    State* s = (State*)ud;
+static void teardown(State* s) {
     s->closed = 1;
-    printf("  Stream CLOSED\n");
     if (s->timeout) {
         uv_timer_stop(s->timeout);
         uv_close((uv_handle_t*)s->timeout, NULL);
         s->timeout = NULL;
     }
     hyperdht_destroy(s->dht, NULL, NULL);
+}
+
+static void on_close(void* ud) {
+    State* s = (State*)ud;
+    printf("  Stream CLOSED\n");
+    teardown(s);
+}
+
+static void on_timeout(uv_timer_t* t) {
+    State* s = (State*)t->data;
+    printf("  TIMEOUT — tearing down\n");
+    if (s->stream) hyperdht_stream_close(s->stream);
+    else teardown(s);
 }
 
 static void on_data(const uint8_t* data, size_t len, void* ud) {
@@ -102,7 +113,7 @@ int main(int argc, char** argv) {
     state.timeout = (uv_timer_t*)malloc(sizeof(uv_timer_t));
     uv_timer_init(&loop, state.timeout);
     state.timeout->data = &state;
-    uv_timer_start(state.timeout, (uv_timer_cb)on_close, 30000, 0);
+    uv_timer_start(state.timeout, on_timeout, 30000, 0);
 
     // UV_RUN_ONCE loop — same as Android/Kotlin
     while (uv_run(&loop, UV_RUN_ONCE) != 0) {}

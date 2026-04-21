@@ -155,7 +155,7 @@ public:
     }
 
     void close();
-    udx_socket_t* socket_handle() { return &socket_; }
+    udx_socket_t* socket_handle() { return socket_; }
     bool is_closing() const { return closing_; }
 
 private:
@@ -168,7 +168,9 @@ private:
     };
 
     uv_loop_t* loop_;
-    udx_socket_t socket_{};
+    udx_socket_t* socket_;  // Heap-allocated — freed in uv_close callback,
+                            // NOT with PoolSocket. Prevents use-after-free
+                            // when GrapheneOS/scudo unmaps freed pages.
     bool bound_ = false;
     bool closing_ = false;
 

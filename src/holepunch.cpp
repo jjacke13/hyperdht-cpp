@@ -719,9 +719,9 @@ void Holepuncher::on_punch_timer(uv_timer_t* timer) {
 // ---------------------------------------------------------------------------
 
 PoolSocket::PoolSocket(uv_loop_t* loop, udx_t* udx)
-    : loop_(loop) {
-    udx_socket_init(udx, &socket_, nullptr);
-    socket_.data = this;
+    : loop_(loop), socket_(new udx_socket_t{}) {
+    udx_socket_init(udx, socket_, nullptr);
+    socket_->data = this;
     next_tid_ = static_cast<uint16_t>(randombytes_uniform(0xFFFF));
 }
 
@@ -732,10 +732,10 @@ PoolSocket::~PoolSocket() {
 int PoolSocket::bind() {
     struct sockaddr_in addr{};
     uv_ip4_addr("0.0.0.0", 0, &addr);
-    int rc = udx_socket_bind(&socket_, reinterpret_cast<const struct sockaddr*>(&addr), 0);
+    int rc = udx_socket_bind(socket_, reinterpret_cast<const struct sockaddr*>(&addr), 0);
     if (rc == 0) {
         bound_ = true;
-        udx_socket_recv_start(&socket_, on_recv);
+        udx_socket_recv_start(socket_, on_recv);
     }
     return rc;
 }
@@ -833,7 +833,7 @@ void PoolSocket::request(const messages::Request& req,
     DHT_LOG("  [pool] Sending request (tid=%u, cmd=%u, %zu bytes) to %s:%u\n",
             inf->tid, msg.command, ctx->buf.size(),
             req.to.addr.host_string().c_str(), req.to.addr.port);
-    int rc = udx_socket_send(&ctx->req, &socket_, &uv_buf, 1,
+    int rc = udx_socket_send(&ctx->req, socket_, &uv_buf, 1,
                     reinterpret_cast<const struct sockaddr*>(&dest),
                     [](udx_socket_send_t* r, int status) {
                         if (status < 0) {
@@ -879,7 +879,7 @@ void PoolSocket::send_probe(const Ipv4Address& to) {
     uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(&ctx->buf), 1);
     struct sockaddr_in dest{};
     uv_ip4_addr(to.host_string().c_str(), to.port, &dest);
-    udx_socket_send(&ctx->req, &socket_, &uv_buf, 1,
+    udx_socket_send(&ctx->req, socket_, &uv_buf, 1,
                     reinterpret_cast<const struct sockaddr*>(&dest),
                     [](udx_socket_send_t* r, int) {
                         delete static_cast<SendCtx*>(r->data);
@@ -897,7 +897,7 @@ void PoolSocket::send_probe_ttl(const Ipv4Address& to, int ttl) {
     uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(&ctx->buf), 1);
     struct sockaddr_in dest{};
     uv_ip4_addr(to.host_string().c_str(), to.port, &dest);
-    udx_socket_send_ttl(&ctx->req, &socket_, &uv_buf, 1,
+    udx_socket_send_ttl(&ctx->req, socket_, &uv_buf, 1,
                         reinterpret_cast<const struct sockaddr*>(&dest), ttl,
                         [](udx_socket_send_t* r, int) {
                             delete static_cast<SendCtx*>(r->data);
@@ -907,7 +907,7 @@ void PoolSocket::send_probe_ttl(const Ipv4Address& to, int ttl) {
 void PoolSocket::close() {
     if (closing_) return;
     closing_ = true;
-    socket_.data = nullptr;
+    socket_->data = nullptr;
     // Clean up inflight
     for (auto* inf : inflight_) {
         if (inf->timer && !uv_is_closing(reinterpret_cast<uv_handle_t*>(inf->timer))) {
@@ -918,8 +918,12 @@ void PoolSocket::close() {
         delete inf;
     }
     inflight_.clear();
-    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&socket_))) {
-        uv_close(reinterpret_cast<uv_handle_t*>(&socket_), nullptr);
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(socket_))) {
+        // Socket is heap-allocated — free it in the close callback so it
+        // survives until libuv has finished processing (QUEUE_REMOVE etc.)
+        uv_close(reinterpret_cast<uv_handle_t*>(socket_),
+                 [](uv_handle_t* h) { delete reinterpret_cast<udx_socket_t*>(h); });
+        socket_ = nullptr;
     }
 }
 

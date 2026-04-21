@@ -48,6 +48,7 @@ internal object Native {
 
     // --- Connect ---
     external fun connect(handle: Long, publicKey: ByteArray, callback: ConnectCallback): Int
+    external fun connectionFree(ptr: Long)  // free copied connection struct
     external fun connectEx(
         handle: Long, publicKey: ByteArray,
         keypairPk: ByteArray?, keypairSk: ByteArray?,

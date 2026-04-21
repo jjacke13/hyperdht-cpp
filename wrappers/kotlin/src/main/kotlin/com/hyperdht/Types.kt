@@ -35,14 +35,22 @@ data class DhtOptions(
     val host: String? = null,
 )
 
-/** Connection info from a successful connect or incoming peer. */
+/**
+ * Connection info from a successful connect or incoming peer.
+ * The ptr is a heap-allocated copy — must be freed with free().
+ */
 data class ConnectionInfo(
     internal val ptr: Long,
     val remotePublicKey: ByteArray,
     val peerHost: String,
     val peerPort: Int,
     val isInitiator: Boolean,
-)
+) {
+    /** Free the native connection struct. Call after openStream(). */
+    fun free() {
+        if (ptr != 0L) Native.connectionFree(ptr)
+    }
+}
 
 /** Network address. */
 data class Address(val host: String, val port: Int)

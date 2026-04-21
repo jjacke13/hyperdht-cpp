@@ -209,9 +209,18 @@ static void jni_connect_cb(int error, const hyperdht_connection_t* conn, void* u
     auto* ctx = static_cast<ConnectCtx*>(ud);
     JNIEnv* env = get_env();
 
+    // CRITICAL: conn points to temporary memory that is freed after this
+    // callback returns. We must copy it so Kotlin can use it later in
+    // openStream(). The copy is freed by Kotlin via a destroy call.
+    hyperdht_connection_t* copy = nullptr;
+    if (error == 0 && conn) {
+        copy = new hyperdht_connection_t;
+        *copy = *conn;
+    }
+
     jclass cls = env->GetObjectClass(ctx->callback);
     jmethodID mid = env->GetMethodID(cls, "onResult", "(IJ)V");
-    env->CallVoidMethod(ctx->callback, mid, (jint)error, (jlong)conn);
+    env->CallVoidMethod(ctx->callback, mid, (jint)error, (jlong)copy);
     check_exception(env);
 
     env->DeleteGlobalRef(ctx->callback);
@@ -229,6 +238,12 @@ Java_com_hyperdht_Native_connect(
     ctx->callback = env->NewGlobalRef(jcallback);
 
     return hyperdht_connect((hyperdht_t*)h, pk, jni_connect_cb, ctx);
+}
+
+// Free a copied connection struct (allocated in jni_connect_cb / jni_connection_cb)
+extern "C" JNIEXPORT void JNICALL
+Java_com_hyperdht_Native_connectionFree(JNIEnv*, jobject, jlong ptr) {
+    delete (hyperdht_connection_t*)ptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -409,9 +424,15 @@ struct ServerCtx {
 static void jni_connection_cb(const hyperdht_connection_t* conn, void* ud) {
     auto* ctx = static_cast<ServerCtx*>(ud);
     JNIEnv* env = get_env();
+
+    // Copy — conn is temporary, freed after callback returns
+    auto* copy = new hyperdht_connection_t;
+    *copy = *conn;
+
     jclass cls = env->GetObjectClass(ctx->callback);
     jmethodID mid = env->GetMethodID(cls, "onConnection", "(J)V");
-    env->CallVoidMethod(ctx->callback, mid, (jlong)conn);
+    env->CallVoidMethod(ctx->callback, mid, (jlong)copy);
+    check_exception(env);
 }
 
 extern "C" JNIEXPORT jlong JNICALL

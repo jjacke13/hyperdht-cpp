@@ -1,94 +1,86 @@
 package com.hyperdht
 
 import kotlinx.coroutines.*
-import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.Closeable
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 /**
  * HyperDHT node — connect to peers, listen for connections, store data.
  *
- * Usage:
- * ```kotlin
- * val dht = HyperDHT(usePublicBootstrap = true)
- * dht.start()
- *
- * val conn = dht.connect(serverPublicKey)
- * val stream = dht.openStream(conn)
- * stream.awaitOpen()
- * stream.write("hello".toByteArray())
- *
- * dht.close()
- * ```
+ * Threading model: ALL native calls execute on a single dedicated thread
+ * via loopExecutor.execute(). The uv_run loop yields periodically to let
+ * queued tasks run on the same thread. This ensures libuv's single-thread
+ * requirement is always met.
  */
 class HyperDHT(
     private val options: DhtOptions = DhtOptions(),
 ) : Closeable {
 
-    private val loopHandle: Long = Native.loopCreate()
-    private val handle: Long
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val loopExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "hyperdht-loop").apply { isDaemon = true }
+    }
+    private val loopDispatcher = loopExecutor.asCoroutineDispatcher()
+    private val scope = CoroutineScope(loopDispatcher + SupervisorJob())
+
+    private var loopHandle: Long = 0L
+    private var handle: Long = 0L
     private var loopJob: Job? = null
     @Volatile private var destroyed = false
 
-    // Callback ref management: one-shot callbacks remove themselves;
-    // persistent callbacks (events) are cleaned up in close().
     private val cbIdGen = AtomicLong(0)
     private val persistentRefs = ConcurrentHashMap<Long, Any>()
 
     init {
-        handle = Native.create(
-            loopHandle, options.port, options.ephemeral,
-            options.usePublicBootstrap, options.connectionKeepAlive,
-            options.seed, options.host,
-        )
-        check(handle != 0L) { "Failed to create HyperDHT instance" }
-        Native.bind(handle, options.port)
+        // ALL native calls on the loop thread
+        runBlocking(loopDispatcher) {
+            loopHandle = Native.loopCreate()
+            handle = Native.create(
+                loopHandle, options.port, options.ephemeral,
+                options.usePublicBootstrap, options.connectionKeepAlive,
+                options.seed, options.host,
+            )
+            check(handle != 0L) { "Failed to create HyperDHT instance" }
+            Native.bind(handle, options.port)
+        }
     }
 
-    /** DHT UDP port. */
     val port: Int get() = Native.port(handle)
-
-    /** Default keypair. */
-    val defaultKeyPair: KeyPair
-        get() {
-            val pk = ByteArray(32)
-            val sk = ByteArray(64)
-            // TODO: add Native.defaultKeypair(handle, pk, sk) JNI function
-            return KeyPair(pk, sk)
-        }
 
     // --- Lifecycle ---
 
-    /** Start the libuv event loop on a background thread. */
     fun start(): Job {
         check(loopJob == null) { "Already started" }
         loopJob = scope.launch {
             while (isActive && !destroyed) {
                 Native.loopRunOnce(loopHandle)
+                // Yield lets other tasks queued on this thread execute
+                // (connect, write, etc.) before the next uv_run iteration
                 yield()
             }
         }
         return loopJob!!
     }
 
-    /** Stop the event loop and destroy the DHT instance. */
     override fun close() {
         if (destroyed) return
         destroyed = true
-        scope.cancel()
-        // Wait for the loop job to finish so we don't race with uv_run
-        runBlocking { loopJob?.join() }
-        Native.destroy(handle)
-        // Drain remaining close callbacks
-        while (Native.loopRunOnce(loopHandle) != 0) {}
-        Native.free(handle)
-        Native.loopClose(loopHandle)
+        runBlocking(loopDispatcher) {
+            loopJob?.cancelAndJoin()
+            Native.destroy(handle)
+            while (Native.loopRunOnce(loopHandle) != 0) {}
+            Native.free(handle)
+            Native.loopClose(loopHandle)
+        }
+        loopExecutor.shutdown()
         persistentRefs.clear()
     }
+
+    // --- Helper: run a native call on the loop thread ---
+
+    private suspend fun <T> onLoop(block: () -> T): T =
+        withContext(loopDispatcher) { block() }
 
     // --- State ---
 
@@ -120,53 +112,55 @@ class HyperDHT(
             aborts = Native.relayStatsAborts(handle),
         )
 
-    // --- Events (persistent callbacks — stored until close) ---
+    // --- Events ---
 
-    suspend fun awaitBootstrapped(): Unit = suspendCancellableCoroutine { cont ->
-        if (isBootstrapped) { cont.resume(Unit); return@suspendCancellableCoroutine }
+    suspend fun awaitBootstrapped() {
+        if (isBootstrapped) return
+        val deferred = CompletableDeferred<Unit>()
         val id = cbIdGen.incrementAndGet()
         val cb = Runnable {
             persistentRefs.remove(id)
-            if (cont.isActive) cont.resume(Unit)
+            deferred.complete(Unit)
         }
         persistentRefs[id] = cb
-        Native.onBootstrapped(handle, cb)
+        onLoop { Native.onBootstrapped(handle, cb) }
+        deferred.await()
     }
 
     fun onNetworkChange(callback: () -> Unit) {
         val id = cbIdGen.incrementAndGet()
         val cb = Runnable { callback() }
         persistentRefs[id] = cb
-        Native.onNetworkChange(handle, cb)
-    }
-
-    fun onNetworkUpdate(callback: () -> Unit) {
-        val id = cbIdGen.incrementAndGet()
-        val cb = Runnable { callback() }
-        persistentRefs[id] = cb
-        Native.onNetworkUpdate(handle, cb)
+        loopExecutor.execute { Native.onNetworkChange(handle, cb) }
     }
 
     // --- Connect ---
 
-    /** Connect to a remote peer. Suspends until connection is established. */
+    /**
+     * Connect to a remote peer. Suspends until connection is established.
+     *
+     * Native.connect() is posted to the loop thread. The callback fires
+     * during uv_run on that same thread, completing the deferred.
+     */
     suspend fun connect(remotePublicKey: ByteArray): ConnectionInfo {
         require(remotePublicKey.size == 32) { "Public key must be 32 bytes" }
-        return suspendCancellableCoroutine { cont ->
-            val cb = ConnectCallback { error, connPtr ->
-                if (!cont.isActive) return@ConnectCallback
-                if (error != 0) cont.resumeWithException(DhtException(error))
-                else cont.resume(ConnectionInfo(
-                    ptr = connPtr,
-                    remotePublicKey = remotePublicKey,
-                    peerHost = "",
-                    peerPort = 0,
-                    isInitiator = true,
-                ))
-            }
-            // One-shot: JNI GlobalRef prevents GC, freed in jni_connect_cb
-            Native.connect(handle, remotePublicKey, cb)
+        val deferred = CompletableDeferred<ConnectionInfo>()
+
+        val cb = ConnectCallback { error, connPtr ->
+            if (error != 0) deferred.completeExceptionally(DhtException(error))
+            else deferred.complete(ConnectionInfo(
+                ptr = connPtr,
+                remotePublicKey = remotePublicKey,
+                peerHost = "",
+                peerPort = 0,
+                isInitiator = true,
+            ))
         }
+
+        // Post the native call to the loop thread
+        onLoop { Native.connect(handle, remotePublicKey, cb) }
+
+        return deferred.await()
     }
 
     // --- Server ---
@@ -175,44 +169,43 @@ class HyperDHT(
 
     // --- Stream ---
 
-    fun openStream(connection: ConnectionInfo): Stream =
-        Stream.open(handle, connection.ptr)
+    suspend fun openStream(connection: ConnectionInfo): Stream =
+        onLoop { Stream.open(handle, connection.ptr) }
 
     // --- Storage ---
 
-    suspend fun immutablePut(value: ByteArray): Unit =
-        suspendCancellableCoroutine { cont ->
-            val cb = DoneCallback { error ->
-                if (!cont.isActive) return@DoneCallback
-                if (error != 0) cont.resumeWithException(DhtException(error))
-                else cont.resume(Unit)
-            }
-            Native.immutablePut(handle, value, cb)
+    suspend fun immutablePut(value: ByteArray) {
+        val deferred = CompletableDeferred<Unit>()
+        val cb = DoneCallback { error ->
+            if (error != 0) deferred.completeExceptionally(DhtException(error))
+            else deferred.complete(Unit)
         }
+        onLoop { Native.immutablePut(handle, value, cb) }
+        deferred.await()
+    }
 
     suspend fun immutableGet(target: ByteArray): ByteArray? {
         require(target.size == 32) { "Target must be 32 bytes" }
+        val deferred = CompletableDeferred<ByteArray?>()
         var result: ByteArray? = null
-        suspendCancellableCoroutine { cont ->
-            val valCb = ValueCallback { value -> result = value }
-            val doneCb = DoneCallback { _ ->
-                if (cont.isActive) cont.resume(Unit)
-            }
-            Native.immutableGet(handle, target, valCb, doneCb)
-        }
-        return result
+        val valCb = ValueCallback { value -> result = value }
+        val doneCb = DoneCallback { _ -> deferred.complete(result) }
+        onLoop { Native.immutableGet(handle, target, valCb, doneCb) }
+        return deferred.await()
     }
 
-    suspend fun mutablePut(keyPair: KeyPair, value: ByteArray, seq: Long): Unit =
-        suspendCancellableCoroutine { cont ->
-            val cb = DoneCallback { error ->
-                if (!cont.isActive) return@DoneCallback
-                if (error != 0) cont.resumeWithException(DhtException(error))
-                else cont.resume(Unit)
-            }
+    suspend fun mutablePut(keyPair: KeyPair, value: ByteArray, seq: Long) {
+        val deferred = CompletableDeferred<Unit>()
+        val cb = DoneCallback { error ->
+            if (error != 0) deferred.completeExceptionally(DhtException(error))
+            else deferred.complete(Unit)
+        }
+        onLoop {
             Native.mutablePut(handle, keyPair.publicKey, keyPair.secretKey,
                 value, seq, cb)
         }
+        deferred.await()
+    }
 
     // --- Utilities ---
 
@@ -222,19 +215,18 @@ class HyperDHT(
         return out
     }
 
-    fun addNode(host: String, port: Int) {
+    suspend fun addNode(host: String, port: Int) = onLoop {
         val rc = Native.addNode(handle, host, port)
         if (rc != 0) throw DhtException(rc, "addNode failed: $rc")
     }
 
-    suspend fun ping(host: String, port: Int): Boolean =
-        suspendCancellableCoroutine { cont ->
-            val cb = PingCallback { success ->
-                if (cont.isActive) cont.resume(success)
-            }
-            Native.ping(handle, host, port, cb)
-        }
+    suspend fun ping(host: String, port: Int): Boolean {
+        val deferred = CompletableDeferred<Boolean>()
+        val cb = PingCallback { success -> deferred.complete(success) }
+        onLoop { Native.ping(handle, host, port, cb) }
+        return deferred.await()
+    }
 
-    fun suspend() = Native.suspend(handle)
-    fun resume() = Native.resume(handle)
+    fun suspend() = loopExecutor.execute { Native.suspend(handle) }
+    fun resume() = loopExecutor.execute { Native.resume(handle) }
 }

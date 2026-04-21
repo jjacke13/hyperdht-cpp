@@ -182,14 +182,28 @@ jobs:
             -llog \
             -o build-android/libhyperdht_jni.so
 
+      - name: Build native echo test (no JNI, pure C++)
+        run: |
+          NDK_CC=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang
+          $NDK_CC -O2 -Wall \
+            -I include -I deps/libudx/include \
+            -I /tmp/libuv-android/include \
+            test/test_echo_native.c \
+            build-android/libhyperdht.a build-android/libudx.a \
+            $SODIUM_PREFIX/lib/libsodium.a $UV_LIB \
+            -static-libstdc++ -lc++ -lm -ldl \
+            -o build-android/test_echo_native
+          file build-android/test_echo_native
+
       - name: Package
         run: |
-          mkdir -p dist/lib dist/include
+          mkdir -p dist/lib dist/include dist/bin
           cp build-android/libhyperdht.a dist/lib/
           cp build-android/libudx.a dist/lib/
           cp build-android/libhyperdht_jni.so dist/lib/ || true
           cp $SODIUM_PREFIX/lib/libsodium.a dist/lib/
           cp $UV_LIB dist/lib/
+          cp build-android/test_echo_native dist/bin/ || true
           cp -r include/hyperdht dist/include/
           cp -r wrappers/kotlin/src/main/kotlin dist/kotlin
           tar czf hyperdht-android-arm64.tar.gz -C dist .

@@ -10,26 +10,26 @@ import kotlin.coroutines.resume
 class Server internal constructor(
     private val handle: Long,
     private val dhtHandle: Long,
+    private val postToLoop: (Runnable) -> Unit,
 ) {
     private var listening = false
 
-    /** Listen for connections. Returns a Flow that emits ConnectionInfo. */
-    fun listen(keyPair: KeyPair): Flow<ConnectionInfo> = callbackFlow {
+    /**
+     * Listen for connections. Returns a Flow that emits ready-to-use Streams.
+     *
+     * The stream is opened inside the C connection callback while the
+     * connection struct is still valid. This is critical — the struct
+     * contains pointers that are freed after the callback returns.
+     */
+    fun listen(keyPair: KeyPair): Flow<Stream> = callbackFlow {
         check(!listening) { "Already listening" }
         listening = true
 
         val rc = Native.serverListen(handle, keyPair.publicKey, keyPair.secretKey,
             ConnectionCallback { connPtr ->
-                // TODO: extract remotePublicKey/host/port from connPtr via
-                // JNI accessor functions. For now, pass the pointer for
-                // stream opening.
-                trySend(ConnectionInfo(
-                    ptr = connPtr,
-                    remotePublicKey = ByteArray(32), // filled by JNI in future
-                    peerHost = "",
-                    peerPort = 0,
-                    isInitiator = false,
-                ))
+                // connPtr is valid ONLY during this callback — open stream NOW
+                val stream = Stream.open(dhtHandle, connPtr, postToLoop)
+                trySend(stream)
             })
         if (rc != 0) throw DhtException(rc, "server_listen failed: $rc")
 
@@ -74,7 +74,4 @@ class Server internal constructor(
             if (cont.isActive) cont.resume(Unit)
         })
     }
-
-    fun openStream(connection: ConnectionInfo): Stream =
-        Stream.open(dhtHandle, connection.ptr)
 }

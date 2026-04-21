@@ -15,6 +15,11 @@ internal object Native {
     external fun loopRunOnce(loopPtr: Long): Int
     external fun loopClose(loopPtr: Long)
 
+    // --- Async wakeup (thread-safe uv_run kick) ---
+    external fun asyncCreate(loopPtr: Long): Long
+    external fun asyncSend(asyncPtr: Long)
+    external fun asyncClose(asyncPtr: Long)
+
     // --- Keypair ---
     external fun keypairGenerate(pk: ByteArray, sk: ByteArray)
     external fun keypairFromSeed(seed: ByteArray, pk: ByteArray, sk: ByteArray)
@@ -48,7 +53,12 @@ internal object Native {
 
     // --- Connect ---
     external fun connect(handle: Long, publicKey: ByteArray, callback: ConnectCallback): Int
-    external fun connectionFree(ptr: Long)  // free copied connection struct
+    external fun connectAndOpenStream(
+        handle: Long, publicKey: ByteArray,
+        onOpen: Runnable, onData: DataCallback, onClose: Runnable,
+        callback: ConnectCallback,
+    ): Int
+    external fun connectionFree(ptr: Long)  // legacy — no longer used
     external fun connectEx(
         handle: Long, publicKey: ByteArray,
         keypairPk: ByteArray?, keypairSk: ByteArray?,

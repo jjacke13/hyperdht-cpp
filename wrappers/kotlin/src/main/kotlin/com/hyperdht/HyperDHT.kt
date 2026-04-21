@@ -26,6 +26,7 @@ class HyperDHT(
 
     private var loopHandle: Long = 0L
     private var handle: Long = 0L
+    private var asyncHandle: Long = 0L
     private var loopJob: Job? = null
     @Volatile private var destroyed = false
 
@@ -42,8 +43,19 @@ class HyperDHT(
                 options.seed, options.host,
             )
             check(handle != 0L) { "Failed to create HyperDHT instance" }
+            asyncHandle = Native.asyncCreate(loopHandle)
             Native.bind(handle, options.port)
         }
+    }
+
+    /**
+     * Post a task to the loop thread and wake up uv_run immediately.
+     * Thread-safe — may be called from any thread (UI, IO, etc.).
+     */
+    internal fun postToLoop(block: Runnable) {
+        if (destroyed) return  // async handle already closed
+        loopExecutor.execute(block)
+        Native.asyncSend(asyncHandle)
     }
 
     val port: Int get() = Native.port(handle)
@@ -68,6 +80,7 @@ class HyperDHT(
         destroyed = true
         runBlocking(loopDispatcher) {
             loopJob?.cancelAndJoin()
+            Native.asyncClose(asyncHandle)
             Native.destroy(handle)
             while (Native.loopRunOnce(loopHandle) != 0) {}
             Native.free(handle)
@@ -137,40 +150,42 @@ class HyperDHT(
     // --- Connect ---
 
     /**
-     * Connect to a remote peer. Suspends until connection is established.
+     * Connect to a remote peer and open an encrypted stream.
      *
-     * Native.connect() is posted to the loop thread. The callback fires
-     * during uv_run on that same thread, completing the deferred.
+     * The stream is opened atomically inside the C connect callback,
+     * while the connection struct is still valid. This avoids the
+     * dangling-pointer crash that occurs when stream_open is called
+     * after the callback returns.
      */
-    suspend fun connect(remotePublicKey: ByteArray): ConnectionInfo {
+    suspend fun connect(remotePublicKey: ByteArray): Stream {
         require(remotePublicKey.size == 32) { "Public key must be 32 bytes" }
-        val deferred = CompletableDeferred<ConnectionInfo>()
+        val deferred = CompletableDeferred<Stream>()
 
-        val cb = ConnectCallback { error, connPtr ->
+        val stream = Stream.createPending(handle, ::postToLoop)
+        val onOpen = Runnable { stream.fireOpen() }
+        val onData = DataCallback { data -> stream.fireData(data) }
+        val onClose = Runnable { stream.fireClose() }
+        stream.retainCallbacks(onOpen, onData, onClose)
+
+        val cb = ConnectCallback { error, streamHandle ->
             if (error != 0) deferred.completeExceptionally(DhtException(error))
-            else deferred.complete(ConnectionInfo(
-                ptr = connPtr,
-                remotePublicKey = remotePublicKey,
-                peerHost = "",
-                peerPort = 0,
-                isInitiator = true,
-            ))
+            else {
+                stream.setHandle(streamHandle)
+                deferred.complete(stream)
+            }
         }
 
-        // Post the native call to the loop thread
-        onLoop { Native.connect(handle, remotePublicKey, cb) }
+        onLoop {
+            Native.connectAndOpenStream(
+                handle, remotePublicKey, onOpen, onData, onClose, cb)
+        }
 
         return deferred.await()
     }
 
     // --- Server ---
 
-    fun createServer(): Server = Server(Native.serverCreate(handle), handle)
-
-    // --- Stream ---
-
-    suspend fun openStream(connection: ConnectionInfo): Stream =
-        onLoop { Stream.open(handle, connection.ptr) }
+    fun createServer(): Server = Server(Native.serverCreate(handle), handle, ::postToLoop)
 
     // --- Storage ---
 

@@ -13,9 +13,14 @@
 #include <uv.h>
 
 #include <cstdio>
+#include <cstring>
+
+#ifdef HYPERDHT_JNI_DEBUG
 #include <android/log.h>
 #define LOGT(...) __android_log_print(ANDROID_LOG_DEBUG, "HyperDHT-JNI", __VA_ARGS__)
-#include <cstring>
+#else
+#define LOGT(...) ((void)0)
+#endif
 #include <pthread.h>
 
 static JavaVM* g_jvm = nullptr;
@@ -70,15 +75,22 @@ Java_com_hyperdht_Native_loopCreate(JNIEnv*, jobject) {
     return (jlong)loop;
 }
 
+#ifdef HYPERDHT_JNI_DEBUG
 static int g_loop_tick = 0;
 static bool g_connected = false;
+#endif
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_hyperdht_Native_loopRunOnce(JNIEnv*, jobject, jlong ptr) {
+#ifdef HYPERDHT_JNI_DEBUG
     int tick = ++g_loop_tick;
     bool verbose = (tick <= 5 || tick % 100 == 0 || g_connected);
     if (verbose) LOGT("uv_run tick=%d", tick);
+#endif
     int rc = uv_run((uv_loop_t*)ptr, UV_RUN_ONCE);
+#ifdef HYPERDHT_JNI_DEBUG
     if (verbose) LOGT("uv_run tick=%d done rc=%d", tick, rc);
+#endif
     return rc;
 }
 
@@ -462,7 +474,9 @@ static void jni_connect_stream_cb(int error,
             ctx->dht, conn,
             jni_stream_open_cb, jni_stream_data_cb, jni_stream_close_cb, sctx);
         LOGT("stream_open returned %p", stream);
+#ifdef HYPERDHT_JNI_DEBUG
         g_connected = true;
+#endif
 
         if (stream) {
             streamHandle = (jlong)stream;

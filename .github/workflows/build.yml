@@ -198,6 +198,40 @@ jobs:
             -o build-android/test_echo_native
           file build-android/test_echo_native
 
+      - name: Build ASAN native echo test
+        run: |
+          NDK=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+          # Rebuild all static libs with ASAN
+          cmake -B build-android-asan -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
+            -DHYPERDHT_BUILD_TESTS=OFF \
+            -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON \
+            -DSODIUM_INCLUDE_DIR=$SODIUM_PREFIX/include \
+            -DSODIUM_LIBRARY=$SODIUM_PREFIX/lib/libsodium.a \
+            -DUV_INCLUDE_DIR=/tmp/libuv-android/include \
+            -DUV_LIBRARY=$UV_LIB
+          ninja -C build-android-asan
+          # Compile test with ASAN
+          $NDK/aarch64-linux-android26-clang \
+            -fsanitize=address -fno-omit-frame-pointer -O1 -g -Wall -c \
+            -I include -I deps/libudx/include \
+            -I /tmp/libuv-android/include \
+            test/test_echo_native.c \
+            -o build-android-asan/test_echo_native.o
+          $NDK/aarch64-linux-android26-clang++ \
+            -fsanitize=address -fno-omit-frame-pointer -O1 -g \
+            build-android-asan/test_echo_native.o \
+            build-android-asan/libhyperdht.a build-android-asan/libudx.a \
+            $SODIUM_PREFIX/lib/libsodium.a $UV_LIB \
+            -static-libstdc++ -lm -ldl \
+            -o build-android-asan/test_echo_native_asan
+          file build-android-asan/test_echo_native_asan
+
       - name: Package
         run: |
           mkdir -p dist/lib dist/include dist/bin
@@ -207,6 +241,7 @@ jobs:
           cp $SODIUM_PREFIX/lib/libsodium.a dist/lib/
           cp $UV_LIB dist/lib/
           cp build-android/test_echo_native dist/bin/ || true
+          cp build-android-asan/test_echo_native_asan dist/bin/ || true
           cp -r include/hyperdht dist/include/
           cp -r wrappers/kotlin/src/main/kotlin dist/kotlin
           tar czf hyperdht-android-arm64.tar.gz -C dist .

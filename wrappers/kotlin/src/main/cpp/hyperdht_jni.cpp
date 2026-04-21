@@ -81,6 +81,33 @@ Java_com_hyperdht_Native_loopClose(JNIEnv*, jobject, jlong ptr) {
 }
 
 // ---------------------------------------------------------------------------
+// Async wakeup — thread-safe uv_run kick
+//
+// uv_async_send() is the ONE libuv function safe to call from any thread.
+// The Kotlin wrapper posts tasks to the loop executor then sends this to
+// unblock uv_run(UV_RUN_ONCE) so the queued task executes promptly.
+// ---------------------------------------------------------------------------
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_hyperdht_Native_asyncCreate(JNIEnv*, jobject, jlong loopPtr) {
+    auto* async = new uv_async_t;
+    uv_async_init((uv_loop_t*)loopPtr, async, [](uv_async_t*) {});
+    return (jlong)async;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hyperdht_Native_asyncSend(JNIEnv*, jobject, jlong asyncPtr) {
+    uv_async_send((uv_async_t*)asyncPtr);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hyperdht_Native_asyncClose(JNIEnv*, jobject, jlong asyncPtr) {
+    auto* async = (uv_async_t*)asyncPtr;
+    uv_close(reinterpret_cast<uv_handle_t*>(async),
+             [](uv_handle_t* h) { delete reinterpret_cast<uv_async_t*>(h); });
+}
+
+// ---------------------------------------------------------------------------
 // Keypair
 // ---------------------------------------------------------------------------
 

@@ -57,11 +57,11 @@ target_include_directories(udx
 )
 target_link_libraries(udx PUBLIC ${UV_TARGET})
 
-# Android NDK's Bionic: IN6_IS_ADDR_V4MAPPED uses ntohl without including
-# the header that declares it. Force-include both headers.
+# Android NDK's Bionic: IN6_IS_ADDR_V4MAPPED macro uses ntohl without
+# the header that declares it. Suppress the implicit declaration warning.
+# ntohl is always available at link time on Bionic.
 if(ANDROID)
-    target_compile_options(udx PRIVATE "-include" "netinet/in.h" "-include" "arpa/inet.h")
-    target_compile_options(udx PRIVATE "-Wno-implicit-function-declaration")
+    target_compile_options(udx PRIVATE -Wno-implicit-function-declaration)
 endif()
 
 # === Library ===

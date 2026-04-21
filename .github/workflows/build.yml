@@ -125,26 +125,53 @@ jobs:
           submodules: recursive
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build autoconf automake libtool
 
-      - name: Build for Android arm64-v8a
+      - name: Cross-compile libsodium for Android
+        run: |
+          git clone --depth 1 --branch stable https://github.com/jedisct1/libsodium.git /tmp/libsodium
+          cd /tmp/libsodium
+          export ANDROID_NDK_HOME=$ANDROID_NDK
+          dist-build/android-aarch64.sh
+          echo "SODIUM_PREFIX=/tmp/libsodium/libsodium-android-armv8-a+crypto" >> $GITHUB_ENV
+
+      - name: Cross-compile libuv for Android
+        run: |
+          git clone --depth 1 --branch v1.51.0 https://github.com/libuv/libuv.git /tmp/libuv
+          cmake -B /tmp/libuv-build -S /tmp/libuv -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release -DLIBUV_BUILD_TESTS=OFF \
+            -DCMAKE_INSTALL_PREFIX=/tmp/libuv-android
+          ninja -C /tmp/libuv-build install
+
+      - name: Build hyperdht for Android arm64-v8a
         run: |
           cmake -B build-android -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release \
-            -DHYPERDHT_BUILD_TESTS=OFF
+            -DHYPERDHT_BUILD_TESTS=OFF \
+            -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON \
+            -DSODIUM_INCLUDE_DIR=$SODIUM_PREFIX/include \
+            -DSODIUM_LIBRARY=$SODIUM_PREFIX/lib/libsodium.a \
+            -DUV_INCLUDE_DIR=/tmp/libuv-android/include \
+            -DUV_LIBRARY=/tmp/libuv-android/lib/libuv_a.a
           ninja -C build-android
 
       - name: Build JNI bridge
         run: |
-          $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++ \
-            -std=c++20 -O2 -shared -fPIC \
+          NDK_CC=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++
+          $NDK_CC -std=c++20 -O2 -shared -fPIC \
             -I include -I deps/libudx/include \
+            -I /tmp/libuv-android/include \
             -I $JAVA_HOME/include -I $JAVA_HOME/include/linux \
             wrappers/kotlin/src/main/cpp/hyperdht_jni.cpp \
             -L build-android -lhyperdht -ludx \
+            -L $SODIUM_PREFIX/lib -lsodium \
+            -L /tmp/libuv-android/lib -luv_a \
+            -llog \
             -o build-android/libhyperdht_jni.so
 
       - name: Package
@@ -153,6 +180,8 @@ jobs:
           cp build-android/libhyperdht.a dist/lib/
           cp build-android/libudx.a dist/lib/
           cp build-android/libhyperdht_jni.so dist/lib/ || true
+          cp $SODIUM_PREFIX/lib/libsodium.a dist/lib/
+          cp /tmp/libuv-android/lib/libuv_a.a dist/lib/
           cp -r include/hyperdht dist/include/
           cp -r wrappers/kotlin/src/main/kotlin dist/kotlin
           tar czf hyperdht-android-arm64.tar.gz -C dist .

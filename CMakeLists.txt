@@ -15,9 +15,26 @@ option(HYPERDHT_DEBUG "Enable debug logging to stderr" OFF)
 
 # === Dependencies ===
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium)
-pkg_check_modules(UV REQUIRED IMPORTED_TARGET libuv)
+# Support two modes: pkg-config (desktop) or explicit paths (Android cross-compile)
+if(NOT CMAKE_DISABLE_FIND_PACKAGE_PkgConfig AND NOT SODIUM_LIBRARY)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium)
+    pkg_check_modules(UV REQUIRED IMPORTED_TARGET libuv)
+    set(SODIUM_TARGET PkgConfig::SODIUM)
+    set(UV_TARGET PkgConfig::UV)
+else()
+    # Android / manual: SODIUM_INCLUDE_DIR, SODIUM_LIBRARY, UV_INCLUDE_DIR, UV_LIBRARY
+    add_library(sodium_ext STATIC IMPORTED)
+    set_target_properties(sodium_ext PROPERTIES
+        IMPORTED_LOCATION "${SODIUM_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${SODIUM_INCLUDE_DIR}")
+    add_library(uv_ext STATIC IMPORTED)
+    set_target_properties(uv_ext PROPERTIES
+        IMPORTED_LOCATION "${UV_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${UV_INCLUDE_DIR}")
+    set(SODIUM_TARGET sodium_ext)
+    set(UV_TARGET uv_ext)
+endif()
 
 # libudx — C library from git submodule
 # libudx is always static (internal dependency, compiled into libhyperdht)
@@ -38,7 +55,7 @@ target_include_directories(udx
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE deps/libudx/src
 )
-target_link_libraries(udx PUBLIC PkgConfig::UV)
+target_link_libraries(udx PUBLIC ${UV_TARGET})
 
 # Android NDK's Bionic libc needs explicit arpa/inet.h for ntohl in libudx
 if(ANDROID)
@@ -90,7 +107,7 @@ target_include_directories(hyperdht PUBLIC
 )
 target_link_libraries(hyperdht PUBLIC
     udx
-    PkgConfig::SODIUM
+    ${SODIUM_TARGET}
     PkgConfig::UV
 )
 if(HYPERDHT_DEBUG)

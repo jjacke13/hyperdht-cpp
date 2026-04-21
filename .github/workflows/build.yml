@@ -172,6 +172,7 @@ jobs:
         run: |
           NDK_CC=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++
           $NDK_CC -std=c++20 -O2 -shared -fPIC \
+            -static-libstdc++ \
             -I include -I deps/libudx/include \
             -I /tmp/libuv-android/include \
             -I $JAVA_HOME/include -I $JAVA_HOME/include/linux \

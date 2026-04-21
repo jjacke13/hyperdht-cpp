@@ -232,6 +232,34 @@ jobs:
             -o build-android-asan/test_echo_native_asan
           file build-android-asan/test_echo_native_asan
 
+      - name: Build O0 native echo test (optimization bug check)
+        run: |
+          NDK=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+          cmake -B build-android-o0 -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DHYPERDHT_BUILD_TESTS=OFF \
+            -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON \
+            -DSODIUM_INCLUDE_DIR=$SODIUM_PREFIX/include \
+            -DSODIUM_LIBRARY=$SODIUM_PREFIX/lib/libsodium.a \
+            -DUV_INCLUDE_DIR=/tmp/libuv-android/include \
+            -DUV_LIBRARY=$UV_LIB
+          ninja -C build-android-o0
+          $NDK/aarch64-linux-android26-clang -O0 -g -Wall -c \
+            -I include -I deps/libudx/include \
+            -I /tmp/libuv-android/include \
+            test/test_echo_native.c \
+            -o build-android-o0/test_echo_native.o
+          $NDK/aarch64-linux-android26-clang++ -O0 -g \
+            build-android-o0/test_echo_native.o \
+            build-android-o0/libhyperdht.a build-android-o0/libudx.a \
+            $SODIUM_PREFIX/lib/libsodium.a $UV_LIB \
+            -static-libstdc++ -lm -ldl \
+            -o build-android-o0/test_echo_native_o0
+          file build-android-o0/test_echo_native_o0
+
       - name: Package
         run: |
           mkdir -p dist/lib dist/include dist/bin
@@ -242,6 +270,7 @@ jobs:
           cp $UV_LIB dist/lib/
           cp build-android/test_echo_native dist/bin/ || true
           cp build-android-asan/test_echo_native_asan dist/bin/ || true
+          cp build-android-o0/test_echo_native_o0 dist/bin/ || true
           cp -r include/hyperdht dist/include/
           cp -r wrappers/kotlin/src/main/kotlin dist/kotlin
           tar czf hyperdht-android-arm64.tar.gz -C dist .

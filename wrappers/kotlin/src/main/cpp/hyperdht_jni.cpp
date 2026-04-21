@@ -12,17 +12,44 @@
 #include <hyperdht/hyperdht.h>
 #include <uv.h>
 
+#include <cstdio>
 #include <cstring>
+#include <pthread.h>
 
 static JavaVM* g_jvm = nullptr;
 
-// Get JNIEnv for the current thread (works from libuv callbacks)
+// Thread-local JNI attach state. The libuv event loop thread is long-lived;
+// we attach once and detach via pthread_key destructor on thread exit.
+static pthread_key_t g_jni_key;
+static pthread_once_t g_jni_key_once = PTHREAD_ONCE_INIT;
+
+static void detach_thread(void*) {
+    if (g_jvm) g_jvm->DetachCurrentThread();
+}
+
+static void make_key() {
+    pthread_key_create(&g_jni_key, detach_thread);
+}
+
+// Get JNIEnv for the current thread. Attaches if needed; auto-detaches
+// when the thread exits via the pthread_key destructor.
 static JNIEnv* get_env() {
     JNIEnv* env = nullptr;
-    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
-        g_jvm->AttachCurrentThread((void**)&env, nullptr);
-    }
+    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_OK) return env;
+    pthread_once(&g_jni_key_once, make_key);
+    g_jvm->AttachCurrentThread((void**)&env, nullptr);
+    pthread_setspecific(g_jni_key, env);  // triggers detach_thread on exit
     return env;
+}
+
+// Check for JNI exception after a Call*Method. Clears and logs it.
+static bool check_exception(JNIEnv* env) {
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        return true;
+    }
+    return false;
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
@@ -185,6 +212,7 @@ static void jni_connect_cb(int error, const hyperdht_connection_t* conn, void* u
     jclass cls = env->GetObjectClass(ctx->callback);
     jmethodID mid = env->GetMethodID(cls, "onResult", "(IJ)V");
     env->CallVoidMethod(ctx->callback, mid, (jint)error, (jlong)conn);
+    check_exception(env);
 
     env->DeleteGlobalRef(ctx->callback);
     delete ctx;
@@ -213,7 +241,9 @@ static void jni_event_cb(void* ud) {
     jclass cls = env->GetObjectClass(*ref);
     jmethodID mid = env->GetMethodID(cls, "run", "()V");
     env->CallVoidMethod(*ref, mid);
-    // Note: don't delete — event callbacks fire multiple times
+    check_exception(env);
+    // Note: don't delete — event callbacks fire multiple times.
+    // Freed when DHT is destroyed (caller must release GlobalRefs).
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -264,6 +294,7 @@ static void jni_stream_open_cb(void* ud) {
     jclass cls = env->GetObjectClass(ctx->onOpen);
     jmethodID mid = env->GetMethodID(cls, "run", "()V");
     env->CallVoidMethod(ctx->onOpen, mid);
+    check_exception(env);
 }
 
 static void jni_stream_data_cb(const uint8_t* data, size_t len, void* ud) {
@@ -276,6 +307,7 @@ static void jni_stream_data_cb(const uint8_t* data, size_t len, void* ud) {
     jclass cls = env->GetObjectClass(ctx->onData);
     jmethodID mid = env->GetMethodID(cls, "onData", "([B)V");
     env->CallVoidMethod(ctx->onData, mid, jdata);
+    check_exception(env);
     env->DeleteLocalRef(jdata);
 }
 
@@ -286,8 +318,8 @@ static void jni_stream_close_cb(void* ud) {
     jclass cls = env->GetObjectClass(ctx->onClose);
     jmethodID mid = env->GetMethodID(cls, "run", "()V");
     env->CallVoidMethod(ctx->onClose, mid);
+    check_exception(env);
 
-    // Clean up global refs
     env->DeleteGlobalRef(ctx->onOpen);
     env->DeleteGlobalRef(ctx->onData);
     env->DeleteGlobalRef(ctx->onClose);

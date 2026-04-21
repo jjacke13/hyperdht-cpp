@@ -1,8 +1,8 @@
 package com.hyperdht
 
-import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 
@@ -13,23 +13,25 @@ class Stream internal constructor(
     private val connPtr: Long,
 ) {
     private var closed = false
+    @Volatile private var opened = false
+    private var openContinuation: kotlinx.coroutines.CancellableContinuation<Unit>? = null
+
+    // Eagerly created channel — no data loss before collection.
+    private val dataChannel = Channel<ByteArray>(Channel.UNLIMITED)
 
     /** True when the SecretStream header exchange is complete. */
     val isOpen: Boolean get() = handle != 0L && Native.streamIsOpen(handle)
 
     /** Suspend until the stream is open (header exchange complete). */
     suspend fun awaitOpen(): Unit = suspendCancellableCoroutine { cont ->
-        // If already open, resume immediately
-        if (isOpen) { cont.resume(Unit); return@suspendCancellableCoroutine }
-        // Otherwise wait for on_open — wired during open()
-        openContinuation = cont
+        synchronized(this) {
+            if (opened) { cont.resume(Unit); return@suspendCancellableCoroutine }
+            openContinuation = cont
+        }
     }
 
     /** Incoming data as a Flow. Collect to receive stream data. */
-    val data: Flow<ByteArray> = callbackFlow {
-        dataChannel = this
-        awaitClose { dataChannel = null }
-    }
+    val data: Flow<ByteArray> = dataChannel.receiveAsFlow()
 
     /** Write data to the encrypted stream. */
     fun write(data: ByteArray): Int {
@@ -41,39 +43,41 @@ class Stream internal constructor(
     fun close() {
         if (closed) return
         closed = true
+        dataChannel.close()
         if (handle != 0L) {
             Native.streamClose(handle)
             handle = 0L
         }
     }
 
-    // Internal: wired by HyperDHT.openStream()
-    internal var openContinuation: kotlinx.coroutines.CancellableContinuation<Unit>? = null
-    internal var dataChannel: kotlinx.coroutines.channels.SendChannel<ByteArray>? = null
-    internal var onCloseCallback: (() -> Unit)? = null
-
+    // Called from JNI on the libuv thread
     internal fun fireOpen() {
-        openContinuation?.resume(Unit)
-        openContinuation = null
+        synchronized(this) {
+            opened = true
+            openContinuation?.resume(Unit)
+            openContinuation = null
+        }
     }
 
     internal fun fireData(bytes: ByteArray) {
-        dataChannel?.trySend(bytes)
+        dataChannel.trySend(bytes)
     }
 
     internal fun fireClose() {
         closed = true
         handle = 0L
-        dataChannel?.close()
+        dataChannel.close()
         onCloseCallback?.invoke()
     }
 
+    internal var onCloseCallback: (() -> Unit)? = null
+
+    // prevent GC of callback objects passed to JNI
+    @Suppress("unused")
+    private var _refs: Array<Any>? = null
+
     companion object {
-        /** Open a stream over a connection. Called by HyperDHT.openStream(). */
-        internal fun open(
-            dhtHandle: Long,
-            connPtr: Long,
-        ): Stream {
+        internal fun open(dhtHandle: Long, connPtr: Long): Stream {
             val stream = Stream(0L, dhtHandle, connPtr)
 
             val onOpen = Runnable { stream.fireOpen() }
@@ -83,15 +87,9 @@ class Stream internal constructor(
             val handle = Native.streamOpen(dhtHandle, connPtr, onOpen, onData, onClose)
             check(handle != 0L) { "Failed to open stream" }
             stream.handle = handle
-
-            // Keep callback refs alive (prevent GC)
             stream._refs = arrayOf(onOpen, onData, onClose)
 
             return stream
         }
     }
-
-    // prevent GC of callback objects passed to JNI
-    @Suppress("unused")
-    private var _refs: Array<Any>? = null
 }

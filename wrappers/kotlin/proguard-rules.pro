@@ -1,0 +1,13 @@
+# Keep JNI callback interfaces — called from native code via JNI
+-keep class com.hyperdht.Native { *; }
+-keep class com.hyperdht.ConnectCallback { *; }
+-keep class com.hyperdht.ConnectionCallback { *; }
+-keep class com.hyperdht.FirewallCallback { *; }
+-keep class com.hyperdht.FirewallAsyncCallback { *; }
+-keep class com.hyperdht.DataCallback { *; }
+-keep class com.hyperdht.ValueCallback { *; }
+-keep class com.hyperdht.MutableValueCallback { *; }
+-keep class com.hyperdht.DoneCallback { *; }
+-keep class com.hyperdht.PeerCallback { *; }
+-keep class com.hyperdht.PingCallback { *; }
+-keep class com.hyperdht.PollCallback { *; }

@@ -388,6 +388,92 @@ Java_com_hyperdht_Native_streamIsOpen(JNIEnv*, jobject, jlong h) {
 }
 
 // ---------------------------------------------------------------------------
+// Connect + open stream (atomic — avoids dangling connection pointer)
+//
+// hyperdht_connection_t contains raw_stream / udx_socket pointers that are
+// freed after the connect callback returns.  Opening the stream INSIDE the
+// callback is the only safe window.  This function does exactly that.
+// ---------------------------------------------------------------------------
+
+struct ConnectStreamCtx {
+    hyperdht_t* dht;
+    jobject resultCb;  // ConnectCallback — reused: onResult(error, streamHandle)
+    jobject onOpen;    // Runnable
+    jobject onData;    // DataCallback
+    jobject onClose;   // Runnable
+};
+
+static void jni_connect_stream_cb(int error,
+                                   const hyperdht_connection_t* conn,
+                                   void* ud) {
+    auto* ctx = static_cast<ConnectStreamCtx*>(ud);
+    JNIEnv* env = get_env();
+    jlong streamHandle = 0;
+
+    if (error == 0 && conn) {
+        // Open stream NOW — conn is only valid during this callback
+        auto* sctx = new StreamCtx;
+        sctx->onOpen  = ctx->onOpen;
+        sctx->onData  = ctx->onData;
+        sctx->onClose = ctx->onClose;
+
+        auto* stream = hyperdht_stream_open(
+            ctx->dht, conn,
+            jni_stream_open_cb, jni_stream_data_cb, jni_stream_close_cb, sctx);
+
+        if (stream) {
+            streamHandle = (jlong)stream;
+        } else {
+            env->DeleteGlobalRef(sctx->onOpen);
+            env->DeleteGlobalRef(sctx->onData);
+            env->DeleteGlobalRef(sctx->onClose);
+            delete sctx;
+            error = -1;
+        }
+    } else {
+        // Connect failed — release stream callback refs
+        env->DeleteGlobalRef(ctx->onOpen);
+        env->DeleteGlobalRef(ctx->onData);
+        env->DeleteGlobalRef(ctx->onClose);
+    }
+
+    jclass cls = env->GetObjectClass(ctx->resultCb);
+    jmethodID mid = env->GetMethodID(cls, "onResult", "(IJ)V");
+    env->CallVoidMethod(ctx->resultCb, mid, (jint)error, streamHandle);
+    check_exception(env);
+
+    env->DeleteGlobalRef(ctx->resultCb);
+    delete ctx;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_hyperdht_Native_connectAndOpenStream(
+    JNIEnv* env, jobject, jlong h, jbyteArray jpk,
+    jobject jOnOpen, jobject jOnData, jobject jOnClose,
+    jobject jResultCb)
+{
+    uint8_t pk[32];
+    env->GetByteArrayRegion(jpk, 0, 32, (jbyte*)pk);
+
+    auto* ctx = new ConnectStreamCtx;
+    ctx->dht      = (hyperdht_t*)h;
+    ctx->resultCb = env->NewGlobalRef(jResultCb);
+    ctx->onOpen   = env->NewGlobalRef(jOnOpen);
+    ctx->onData   = env->NewGlobalRef(jOnData);
+    ctx->onClose  = env->NewGlobalRef(jOnClose);
+
+    int rc = hyperdht_connect(ctx->dht, pk, jni_connect_stream_cb, ctx);
+    if (rc != 0) {
+        env->DeleteGlobalRef(ctx->resultCb);
+        env->DeleteGlobalRef(ctx->onOpen);
+        env->DeleteGlobalRef(ctx->onData);
+        env->DeleteGlobalRef(ctx->onClose);
+        delete ctx;
+    }
+    return rc;
+}
+
+// ---------------------------------------------------------------------------
 // Misc
 // ---------------------------------------------------------------------------
 
@@ -425,13 +511,13 @@ static void jni_connection_cb(const hyperdht_connection_t* conn, void* ud) {
     auto* ctx = static_cast<ServerCtx*>(ud);
     JNIEnv* env = get_env();
 
-    // Copy — conn is temporary, freed after callback returns
-    auto* copy = new hyperdht_connection_t;
-    *copy = *conn;
-
+    // Pass ORIGINAL pointer — valid only during this callback.
+    // Kotlin MUST open the stream before returning from onConnection.
+    // (Do NOT copy: the struct contains raw_stream / udx_socket pointers
+    // that become dangling after the callback returns.)
     jclass cls = env->GetObjectClass(ctx->callback);
     jmethodID mid = env->GetMethodID(cls, "onConnection", "(J)V");
-    env->CallVoidMethod(ctx->callback, mid, (jlong)copy);
+    env->CallVoidMethod(ctx->callback, mid, (jlong)conn);
     check_exception(env);
 }
 

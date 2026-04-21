@@ -108,7 +108,7 @@ target_include_directories(hyperdht PUBLIC
 target_link_libraries(hyperdht PUBLIC
     udx
     ${SODIUM_TARGET}
-    PkgConfig::UV
+    ${UV_TARGET}
 )
 if(HYPERDHT_DEBUG)
     target_compile_definitions(hyperdht PUBLIC HYPERDHT_DEBUG=1)

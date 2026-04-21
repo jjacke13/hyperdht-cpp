@@ -131,8 +131,10 @@ jobs:
         run: |
           git clone --depth 1 --branch stable https://github.com/jedisct1/libsodium.git /tmp/libsodium
           cd /tmp/libsodium
+          ./autogen.sh
           export ANDROID_NDK_HOME=$ANDROID_NDK
           dist-build/android-armv8-a.sh
+          ls -la libsodium-android-armv8-a+crypto/lib/
           echo "SODIUM_PREFIX=/tmp/libsodium/libsodium-android-armv8-a+crypto" >> $GITHUB_ENV
 
       - name: Cross-compile libuv for Android

@@ -40,10 +40,16 @@ struct KeyHash {
     size_t operator()(const TargetKey& k) const {
         // FNV-1a over all 32 bytes (keys are already hashed, but full coverage
         // avoids collisions when only trailing bytes differ)
-        size_t h = 14695981039346656037ULL;  // FNV offset basis
+        // FNV-1a: use 64-bit or 32-bit constants based on platform
+        size_t h = (sizeof(size_t) == 8)
+            ? static_cast<size_t>(14695981039346656037ULL)   // FNV-1a 64-bit offset
+            : static_cast<size_t>(2166136261U);              // FNV-1a 32-bit offset
+        const size_t prime = (sizeof(size_t) == 8)
+            ? static_cast<size_t>(1099511628211ULL)          // FNV-1a 64-bit prime
+            : static_cast<size_t>(16777619U);                // FNV-1a 32-bit prime
         for (auto b : k) {
             h ^= static_cast<size_t>(b);
-            h *= 1099511628211ULL;  // FNV prime
+            h *= prime;
         }
         return h;
     }

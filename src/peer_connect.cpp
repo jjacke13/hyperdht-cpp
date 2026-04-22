@@ -39,7 +39,10 @@ static std::array<uint8_t, 32> compute_prologue() {
     return result;
 }
 
-static const auto PROLOGUE = compute_prologue();
+static const std::array<uint8_t, 32>& prologue() {
+    static const auto value = compute_prologue();
+    return value;
+}
 
 // ---------------------------------------------------------------------------
 // NoisePayload encoding — the inner payload that travels inside the
@@ -317,7 +320,7 @@ void peer_handshake(rpc::RpcSocket& socket,
 
     // Create Noise IK initiator with real prologue
     auto noise_ik = std::make_shared<noise::NoiseIK>(true, our_keypair,
-                                                      PROLOGUE.data(), PROLOGUE.size(),
+                                                      prologue().data(), prologue().size(),
                                                       &remote_pubkey);
 
     // Build noisePayload for msg1
@@ -407,7 +410,7 @@ void peer_handshake(rpc::RpcSocket& socket,
                     OnHandshakeCallback on_done) {
     // Create Noise IK initiator with real prologue
     auto noise_ik = std::make_shared<noise::NoiseIK>(true, our_keypair,
-                                                      PROLOGUE.data(), PROLOGUE.size(),
+                                                      prologue().data(), prologue().size(),
                                                       &remote_pubkey);
 
     // Build noisePayload for msg1

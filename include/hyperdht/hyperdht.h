@@ -538,6 +538,26 @@ HYPERDHT_API void hyperdht_stream_close(hyperdht_stream_t* stream);
  */
 HYPERDHT_API int hyperdht_stream_is_open(const hyperdht_stream_t* stream);
 
+/**
+ * Connect and open a stream atomically. Combines hyperdht_connect +
+ * hyperdht_stream_open so the stream is opened inside the connect
+ * callback while the connection struct is still alive. Avoids the
+ * dangling-pointer race that occurs when stream_open is called after
+ * the connect callback returns.
+ */
+typedef void (*hyperdht_connect_stream_cb)(int error,
+                                            hyperdht_stream_t* stream,
+                                            void* userdata);
+
+HYPERDHT_API int hyperdht_connect_and_open_stream(
+    hyperdht_t* dht,
+    const uint8_t remote_pk[32],
+    hyperdht_connect_stream_cb on_connect,
+    hyperdht_close_cb on_open,
+    hyperdht_data_cb on_data,
+    hyperdht_close_cb on_close,
+    void* userdata);
+
 /* =========================================================================
  * Phase C: Extended API (2026-04-14)
  * ========================================================================= */

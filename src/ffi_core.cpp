@@ -242,3 +242,52 @@ int hyperdht_connect_ex(hyperdht_t* dht,
 
     return 0;
 }
+
+int hyperdht_connect_and_open_stream(
+    hyperdht_t* dht,
+    const uint8_t remote_pk[32],
+    hyperdht_connect_stream_cb on_connect,
+    hyperdht_close_cb on_open,
+    hyperdht_data_cb on_data,
+    hyperdht_close_cb on_close,
+    void* userdata) {
+
+    if (!dht || !dht->dht || !remote_pk || !on_connect) return -1;
+
+    hyperdht::noise::PubKey pk{};
+    memcpy(pk.data(), remote_pk, 32);
+
+    hyperdht::ConnectOptions cpp_opts;
+    dht->dht->connect(pk, cpp_opts,
+        [dht, on_connect, on_open, on_data, on_close, userdata](
+            int error, const hyperdht::ConnectResult& result) {
+
+            if (error != 0) {
+                on_connect(error, nullptr, userdata);
+                return;
+            }
+
+            hyperdht_connection_t conn{};
+            fill_connection(&conn, result.tx_key, result.rx_key,
+                            result.handshake_hash, result.remote_public_key,
+                            result.peer_address, result.remote_udx_id,
+                            result.local_udx_id, true);
+            conn.raw_stream = result.raw_stream;
+            conn.udx_socket = result.udx_socket;
+            conn._internal = result.socket_keepalive
+                ? new std::shared_ptr<void>(result.socket_keepalive)
+                : nullptr;
+
+            // Open stream NOW — conn is still alive on the stack
+            hyperdht_stream_t* stream = hyperdht_stream_open(
+                dht, &conn, on_open, on_data, on_close, userdata);
+
+            if (conn._internal) {
+                delete static_cast<std::shared_ptr<void>*>(conn._internal);
+            }
+
+            on_connect(stream ? 0 : -1, stream, userdata);
+        });
+
+    return 0;
+}

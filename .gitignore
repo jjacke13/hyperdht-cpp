@@ -14,3 +14,8 @@ local.properties
 examples/android/app/build/
 examples/android/build/
 examples/android/app/src/main/jniLibs/
+
+# ESP-IDF
+managed_components/
+sdkconfig
+sdkconfig.old

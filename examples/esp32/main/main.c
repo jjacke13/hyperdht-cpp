@@ -1,4 +1,4 @@
-/* HyperDHT on ESP32-S3 — connect to echo server. */
+/* HyperDHT on ESP32-S3 — echo test with atomic connect+stream. */
 
 #include <stdio.h>
 #include <string.h>
@@ -79,43 +79,49 @@ static void on_stream_open(void* userdata) {
 }
 
 static void on_stream_data(const uint8_t* data, size_t len, void* userdata) {
-    ESP_LOGI(TAG, "ECHO received (%zu bytes): %.*s", len, (int)len, (const char*)data);
+    (void)userdata;
+    ESP_LOGI(TAG, "ECHO (%zu bytes): %.*s", len, (int)len, (const char*)data);
+    ESP_LOGI(TAG, "closing stream...");
+    hyperdht_stream_close(g_stream);
 }
 
 static void on_stream_close(void* userdata) {
+    (void)userdata;
     ESP_LOGI(TAG, "stream CLOSED");
 }
 
-/* --- Connect callback --- */
+/* --- Atomic connect+stream callback --- */
 
-static void on_connect(int error, const hyperdht_connection_t* conn, void* userdata) {
-    if (error != 0) {
-        ESP_LOGE(TAG, "connect FAILED: %d", error);
+static void on_connect_stream(int error, hyperdht_stream_t* stream,
+                               void* userdata) {
+    (void)userdata;
+    if (error != 0 || !stream) {
+        ESP_LOGE(TAG, "connect+stream FAILED: %d", error);
         return;
     }
-
-    ESP_LOGI(TAG, "CONNECTED to %s:%u", conn->peer_host, conn->peer_port);
-
-    g_stream = hyperdht_stream_open(
-        g_dht, conn, on_stream_open, on_stream_data, on_stream_close, NULL);
-
-    if (!g_stream)
-        ESP_LOGE(TAG, "stream_open failed!");
+    g_stream = stream;
+    ESP_LOGI(TAG, "CONNECTED — stream opened atomically");
 }
 
 /* --- Bootstrap callback --- */
 
 static void on_bootstrapped(void* userdata) {
-    hyperdht_t* dht = (hyperdht_t*)userdata;
-    ESP_LOGI(TAG, "BOOTSTRAPPED on port %u — connecting to server...",
-             hyperdht_port(dht));
-    hyperdht_connect(dht, SERVER_PK, on_connect, NULL);
+    (void)userdata;
+    ESP_LOGI(TAG, "BOOTSTRAPPED on port %u — connecting...",
+             hyperdht_port(g_dht));
+    hyperdht_connect_and_open_stream(
+        g_dht, SERVER_PK,
+        on_connect_stream,
+        on_stream_open,
+        on_stream_data,
+        on_stream_close,
+        NULL);
 }
 
 /* --- Main --- */
 
 void app_main(void) {
-    ESP_LOGI(TAG, "HyperDHT ESP32-S3 — echo test");
+    ESP_LOGI(TAG, "HyperDHT ESP32-S3 — echo test (atomic stream)");
     ESP_LOGI(TAG, "  free heap: %zu KB",
              heap_caps_get_free_size(MALLOC_CAP_DEFAULT) / 1024);
 

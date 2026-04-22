@@ -1,0 +1,3 @@
+dependencies:
+  espressif/libsodium:
+    version: "^1.0.20"

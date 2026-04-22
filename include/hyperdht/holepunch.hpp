@@ -219,7 +219,11 @@ struct PunchStats {
 };
 
 // Holepunch strategy constants
+#ifdef HYPERDHT_EMBEDDED
+constexpr int BIRTHDAY_SOCKETS = 8;    // lwIP max ~10 sockets total
+#else
 constexpr int BIRTHDAY_SOCKETS = 256;
+#endif
 constexpr int HOLEPUNCH_TTL = 5;
 constexpr int DEFAULT_TTL = 64;
 constexpr int MAX_REOPENS = 3;

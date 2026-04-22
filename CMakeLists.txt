@@ -12,6 +12,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # === Options ===
 option(HYPERDHT_DEBUG "Enable debug logging to stderr" OFF)
+option(HYPERDHT_EMBEDDED "Reduce sizing constants for embedded targets (ESP32)" OFF)
 
 # === Dependencies ===
 
@@ -114,6 +115,9 @@ target_link_libraries(hyperdht PUBLIC
 )
 if(HYPERDHT_DEBUG)
     target_compile_definitions(hyperdht PUBLIC HYPERDHT_DEBUG=1)
+endif()
+if(HYPERDHT_EMBEDDED)
+    target_compile_definitions(hyperdht PUBLIC HYPERDHT_EMBEDDED=1)
 endif()
 
 # Position-independent code (needed for shared lib and when static is linked into a .so)

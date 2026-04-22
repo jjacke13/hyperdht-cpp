@@ -206,11 +206,12 @@ surface.
 - **ESP-IDF component wrapper** — wrap the library as a reusable
   ESP-IDF component with a CMakeLists.txt registering the component
   against the IDF build system. Pair with an `HYPERDHT_EMBEDDED=ON`
-  CMake option that trims memory-heavy features for the ESP32-S3
-  target (8MB PSRAM): shrink the routing table (256 → 64 buckets),
-  shrink the congestion window (80 → 16 inflight), strip the
-  mutable/immutable storage codecs (device is client-only), and
-  lower default buffer sizes. Estimated ~50 lines.
+  CMake option that reduces resource sizing for constrained devices
+  (ESP32-S3, 8MB PSRAM): shrink the routing table bucket size
+  (k=20 → k=10), shrink the congestion window (80 → 16 inflight),
+  reduce birthday holepunch sockets (256 → 8), and lower default
+  UDX buffer sizes. Full protocol support — no features stripped.
+  Estimated ~50 lines.
 
 ### 9. Documentation
 
@@ -259,22 +260,26 @@ backend since lwIP's `poll()` works via `select()` internally.
 
 **Memory budget (ESP32-S3, 8MB PSRAM):**
 
-| Component | Full node | Client-only |
+| Component | Desktop (full) | Embedded (`HYPERDHT_EMBEDDED=ON`) |
 |---|---|---|
-| Routing table (k=20, 256 buckets) | ~400KB | ~100KB (k=5) |
+| Routing table (k=20, 256 buckets) | ~400KB | ~200KB (k=10, 256 buckets) |
 | Crypto state per connection | ~2KB | ~2KB |
 | UDX buffers per stream | ~64KB | ~16KB |
-| Code (.text) + libsodium | ~300KB | ~250KB |
-| **Total** | **~800KB** | **~400KB** |
+| Code (.text) + libsodium | ~300KB | ~300KB |
+| **Total** | **~800KB** | **~500KB** |
 
-A stripped connect-only profile fits in ~400KB — well within the
-8MB PSRAM budget. Even 2MB PSRAM devices are viable.
+Full protocol support (connect, listen, announce, storage) fits
+in ~500KB — well within the 8MB PSRAM budget. Even 2MB PSRAM
+devices are viable. The device is a full peer: it can serve
+connections (sensors, GPIO, camera), announce itself, and
+participate in DHT storage.
 
 **Compile-time trim knob (`HYPERDHT_EMBEDDED=ON`):**
-- Routing table: 256 → 64 buckets, k=20 → k=5
+- Routing table: k=20 → k=10 (256 buckets unchanged — tied to ID bit length)
 - Congestion window: 80 → 16 inflight
-- Strip mutable/immutable storage codecs (client-only)
+- Birthday holepunch sockets: 256 → 8 (lwIP socket limit)
 - Lower default UDX buffer sizes
+- No features stripped — full protocol support
 
 **Integration pattern (mimiclaw-tested):**
 

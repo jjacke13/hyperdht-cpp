@@ -1,0 +1,18 @@
+menu "HyperDHT Echo Server"
+
+    config WIFI_SSID
+        string "WiFi SSID"
+        default "myssid"
+
+    config WIFI_PASSWORD
+        string "WiFi Password"
+        default "mypassword"
+
+    config SERVER_SEED
+        string "Server seed (64 hex chars, empty = random)"
+        default ""
+        help
+            Deterministic keypair seed. Leave empty for random
+            (public key printed on boot).
+
+endmenu

@@ -177,6 +177,13 @@ static void uv__udp_recv(uv_udp_t* handle) {
 
   /* Read up to 8 datagrams per iteration (avoid starving timers) */
   for (int i = 0; i < 8; i++) {
+    /* Re-check: recv_cb may have been nulled by a previous callback
+     * (e.g. stream close triggered by processing a packet) */
+    if (!handle->recv_cb || !handle->alloc_cb)
+      break;
+    if (handle->io_watcher.fd < 0)
+      break;
+
     uv_buf_t buf;
     handle->alloc_cb((uv_handle_t*)handle, 65536, &buf);
     if (buf.base == NULL || buf.len == 0)
@@ -189,21 +196,24 @@ static void uv__udp_recv(uv_udp_t* handle) {
                              (struct sockaddr*)&addr, &addrlen);
     if (nread < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        /* No more data — deliver empty read to free the buffer */
-        handle->recv_cb(handle, 0, &buf, NULL, 0);
+        if (handle->recv_cb)
+          handle->recv_cb(handle, 0, &buf, NULL, 0);
         break;
       }
-      handle->recv_cb(handle, uv__translate_errno(errno), &buf, NULL, 0);
+      if (handle->recv_cb)
+        handle->recv_cb(handle, uv__translate_errno(errno), &buf, NULL, 0);
       break;
     }
 
     if (nread == 0) {
-      handle->recv_cb(handle, 0, &buf, NULL, 0);
+      if (handle->recv_cb)
+        handle->recv_cb(handle, 0, &buf, NULL, 0);
       break;
     }
 
     buf.len = (size_t)nread;
-    handle->recv_cb(handle, nread, &buf, (struct sockaddr*)&addr, 0);
+    if (handle->recv_cb)
+      handle->recv_cb(handle, nread, &buf, (struct sockaddr*)&addr, 0);
   }
 }
 
@@ -273,7 +283,13 @@ static void uv__io_poll(uv_loop_t* loop, uint64_t timeout_ms) {
     (void)r;
   }
 
-  /* Dispatch UDP I/O */
+  /* Dispatch UDP I/O.
+   * Snapshot active handles first — callbacks may close handles and
+   * modify the handle_queue, invalidating a live iterator. */
+  uv_udp_t* ready[UV_ESP32_MAX_FDS];
+  int ready_events[UV_ESP32_MAX_FDS];
+  int nready = 0;
+
   for (q = uv__queue_head(&loop->handle_queue);
        q != &loop->handle_queue;
        q = uv__queue_next(q)) {
@@ -285,10 +301,25 @@ static void uv__io_poll(uv_loop_t* loop, uint64_t timeout_ms) {
     int fd = udp->io_watcher.fd;
     if (fd < 0) continue;
 
-    if (FD_ISSET(fd, &readfds))
-      uv__udp_recv(udp);
-    if (FD_ISSET(fd, &writefds))
-      uv__flush_udp_sends(udp);
+    int events = 0;
+    if (FD_ISSET(fd, &readfds)) events |= 0x01;
+    if (FD_ISSET(fd, &writefds)) events |= 0x04;
+    if (events && nready < UV_ESP32_MAX_FDS) {
+      ready[nready] = udp;
+      ready_events[nready] = events;
+      nready++;
+    }
+  }
+
+  for (int i = 0; i < nready; i++) {
+    uv_udp_t* udp = ready[i];
+    /* Re-check: handle may have been closed by a previous callback */
+    if (udp->io_watcher.fd < 0) continue;
+    if (((uv_handle_t*)udp)->flags & (UV_HANDLE_CLOSING | UV_HANDLE_CLOSED))
+      continue;
+
+    if (ready_events[i] & 0x01) uv__udp_recv(udp);
+    if (ready_events[i] & 0x04) uv__flush_udp_sends(udp);
   }
 }
 
@@ -298,6 +329,16 @@ static void uv__run_closing(uv_loop_t* loop) {
   while (loop->closing_handles != NULL) {
     uv_handle_t* h = loop->closing_handles;
     loop->closing_handles = h->next_closing;
+
+    /* Close the fd NOW — deferred from uv_close() so pending
+     * send/recv operations could complete first. */
+    if (h->type == UV_UDP) {
+      uv_udp_t* udp = (uv_udp_t*)h;
+      if (udp->io_watcher.fd >= 0) {
+        close(udp->io_watcher.fd);
+        udp->io_watcher.fd = -1;
+      }
+    }
 
     h->flags |= UV_HANDLE_CLOSED;
     h->flags &= ~UV_HANDLE_CLOSING;

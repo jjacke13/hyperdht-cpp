@@ -49,10 +49,9 @@ void uv_close(uv_handle_t* handle, uv_close_cb close_cb) {
     case UV_UDP: {
       uv_udp_t* udp = (uv_udp_t*)handle;
       uv_udp_recv_stop(udp);
-      if (udp->io_watcher.fd >= 0) {
-        close(udp->io_watcher.fd);
-        udp->io_watcher.fd = -1;
-      }
+      /* Do NOT close the fd here — defer to the close callback.
+       * libudx may still have pending send/recv operations referencing
+       * this fd. Real libuv also defers fd close to uv__finish_close. */
       break;
     }
     case UV_ASYNC:

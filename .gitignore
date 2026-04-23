@@ -17,5 +17,6 @@ examples/android/app/src/main/jniLibs/
 
 # ESP-IDF
 managed_components/
+dependencies.lock
 sdkconfig
 sdkconfig.old

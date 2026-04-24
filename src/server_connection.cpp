@@ -38,6 +38,9 @@ namespace server_connection {
 
 ServerConnection::~ServerConnection() {
     if (raw_stream) {
+        // Null the RawStreamCtx pointer so the on_close callback doesn't
+        // dereference a dangling Server* after the Server is destroyed.
+        raw_stream->data = nullptr;
         udx_stream_destroy(raw_stream);
         // The finalize callback (set during init) will delete the memory
         raw_stream = nullptr;

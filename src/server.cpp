@@ -544,9 +544,19 @@ void Server::on_handshake_result(
     auto* raw = new udx_stream_t;
     auto* raw_ctx = new RawStreamCtx{this};
     udx_stream_init(socket_.udx_handle(), raw, conn.local_udx_id,
-                    [](udx_stream_t*, int) {},
+                    [](udx_stream_t* s, int) {
+                        // on_close: trigger reactive session cleanup.
+                        // JS: server.js:299-303 rawStream.on('close', ...)
+                        // If the stream closes without a connection (relay
+                        // died, client gone), clear the session immediately
+                        // instead of waiting for the 10s timer.
+                        auto* ctx = static_cast<RawStreamCtx*>(s->data);
+                        if (ctx && ctx->server && !ctx->server->is_closed()) {
+                            ctx->server->on_raw_stream_close(s->local_id);
+                        }
+                    },
                     [](udx_stream_t* s) {
-                        // RAII: context freed in on_close regardless of callback path
+                        // finalize: free context and stream memory
                         if (s->data) {
                             delete static_cast<RawStreamCtx*>(s->data);
                             s->data = nullptr;
@@ -610,7 +620,7 @@ void Server::on_handshake_result(
         auto* dht_ptr = dht_;
         auto* self = this;
         dht_->connect(relay_pk,
-            [self, dht_ptr, relay_is_initiator, relay_tok, relay_raw,
+            [self, dht_ptr, hp_id, relay_is_initiator, relay_tok, relay_raw,
              relay_hs_tx, relay_hs_rx, relay_hs_hash, relay_hs_rpk,
              relay_local_udx_id, relay_remote_udx_id,
              relay_keep_alive = relay_keep_alive](
@@ -618,6 +628,7 @@ void Server::on_handshake_result(
             if (self->closed_ || !relay_result.success || err != 0) {
                 DHT_LOG("  [server] Relay connect failed: %d\n", err);
                 if (dht_ptr) dht_ptr->relay_stats().aborts++;
+                if (!self->closed_) self->clear_session(hp_id);
                 return;
             }
 
@@ -681,7 +692,7 @@ void Server::on_handshake_result(
             // JS: server.js:649 — hs.relayClient.pair(isInitiator, token, hs.rawStream)
             relay_client->pair(
                 relay_is_initiator, relay_tok, relay_local_udx_id,
-                [self, dht_ptr, relay_raw, relay_duplex, relay_mux, relay_client,
+                [self, dht_ptr, hp_id, relay_raw, relay_duplex, relay_mux, relay_client,
                  relay_hs_tx, relay_hs_rx, relay_hs_hash, relay_hs_rpk,
                  relay_local_udx_id, relay_remote_udx_id](uint32_t remote_id) {
                     if (self->closed_) return;
@@ -703,7 +714,12 @@ void Server::on_handshake_result(
                                            reinterpret_cast<const struct sockaddr*>(relay_addr));
                     }
 
-                    // Emit connection via on_socket
+                    // Clean up session BEFORE emitting connection —
+                    // prevents the 10s timer from destroying the stream
+                    // the caller is about to use.
+                    self->clear_session(hp_id);
+
+                    // Emit connection
                     // JS: server.js:670-672
                     char host[INET_ADDRSTRLEN];
                     uv_ip4_name(relay_addr, host, sizeof(host));
@@ -725,10 +741,11 @@ void Server::on_handshake_result(
                         self->on_connection_(info);
                     }
                 },
-                [self, dht_ptr](int err) {
+                [self, dht_ptr, hp_id](int err) {
                     if (self->closed_) return;
                     DHT_LOG("  [server] Relay pairing failed: %d\n", err);
                     if (dht_ptr) dht_ptr->relay_stats().aborts++;
+                    self->clear_session(hp_id);
                 });
         });
     }
@@ -901,16 +918,30 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
             });
             conn.puncher->set_local_firewall(our_fw);
 
-            // A7: Wire puncher→onsocket so probe success triggers connection
+            // A7: Wire puncher→onsocket so probe success triggers connection.
             // JS: server.js:438 — `hs.puncher.onconnect = hs.onsocket`
+            // Must clean up session from all maps BEFORE calling on_socket,
+            // matching the on_raw_stream_firewall path (line 1062-1073).
             uint32_t session_id = hp_msg.id;
             conn.puncher->on_connect([this, session_id](const holepunch::HolepunchResult& hp) {
                 if (closed_) return;
                 auto it = connections_.find(session_id);
                 if (it == connections_.end()) return;
+
+                // Take ownership and clean up before calling on_socket
+                auto conn_ptr = std::move(it->second);
+                for (auto dit = handshake_dedup_.begin(); dit != handshake_dedup_.end(); ++dit) {
+                    if (dit->second == session_id) { handshake_dedup_.erase(dit); break; }
+                }
+                if (conn_ptr->raw_stream) {
+                    pending_punch_streams_.erase(conn_ptr->raw_stream->local_id);
+                }
+                session_timers_.erase(session_id);
+                connections_.erase(it);
+
                 DHT_LOG("  [server] Puncher detected connection from %s:%u\n",
                         hp.address.host_string().c_str(), hp.address.port);
-                on_socket(*it->second, hp.address, hp.socket);
+                on_socket(*conn_ptr, hp.address, hp.socket);
             });
         }
         conn.puncher->set_remote_firewall(reply.remote_firewall);
@@ -1016,11 +1047,16 @@ void Server::clear_session(uint32_t hp_id) {
     auto it = connections_.find(hp_id);
     if (it == connections_.end()) return;
 
-    DHT_LOG("  [server] Session timeout id=%u\n", hp_id);
+    DHT_LOG("  [server] Session cleanup id=%u\n", hp_id);
 
     // Remove dedup entry
     for (auto dit = handshake_dedup_.begin(); dit != handshake_dedup_.end(); ++dit) {
         if (dit->second == hp_id) { handshake_dedup_.erase(dit); break; }
+    }
+    // Remove pending_punch_streams entry for this session's rawStream.
+    // Without this, each timed-out session leaks an orphaned entry.
+    if (it->second && it->second->raw_stream) {
+        pending_punch_streams_.erase(it->second->raw_stream->local_id);
     }
     // Erase session timer (UvTimer RAII handles stop + close).
     // Safe whether the timer fired this call or is being cancelled early.
@@ -1071,6 +1107,33 @@ void Server::on_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket,
     // Connect with the REAL address and the socket that received the probe
     // JS: hs.onsocket(socket, port, host) — uses the exact socket
     on_socket(*conn_ptr, real_addr, socket);
+}
+
+// ---------------------------------------------------------------------------
+// rawStream on_close — reactive session cleanup when the stream closes
+// without a successful connection.
+//
+// JS: server.js:299-303 — `hs.rawStream.on('close', onrawstreamclose)`
+//     where onrawstreamclose calls `this._clearLater(hs, id, k)`.
+//
+// Re-entrance safe: if clear_session already ran (timer path), it erased
+// the pending_punch_streams_ entry, so this is a no-op.
+// ---------------------------------------------------------------------------
+
+void Server::on_raw_stream_close(uint32_t local_id) {
+    auto pit = pending_punch_streams_.find(local_id);
+    if (pit == pending_punch_streams_.end()) return;
+    auto hp_id = pit->second;
+    pending_punch_streams_.erase(pit);
+
+    // Null the raw_stream pointer so ~ServerConnection doesn't call
+    // udx_stream_destroy on a stream libuv is already closing.
+    auto cit = connections_.find(hp_id);
+    if (cit != connections_.end() && cit->second) {
+        cit->second->raw_stream = nullptr;
+    }
+
+    clear_session(hp_id);
 }
 
 }  // namespace server

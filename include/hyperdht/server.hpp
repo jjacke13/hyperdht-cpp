@@ -280,6 +280,10 @@ public:
     // Called by rawStream firewall callback (static C function needs access)
     void on_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket,
                                const struct sockaddr* from);
+    // Called by rawStream on_close callback — reactive cleanup when the
+    // stream closes without a successful connection (relay died, client
+    // gone, etc.). JS: server.js:299-303 rawStream.on('close', ...)
+    void on_raw_stream_close(uint32_t local_id);
 private:
 
     // Per-session cleanup — uses configurable handshake_clear_wait

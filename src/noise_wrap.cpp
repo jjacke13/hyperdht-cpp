@@ -313,7 +313,7 @@ NoiseIK::NoiseIK(bool initiator, const Keypair& static_kp,
 
     // Initialize symmetric state with protocol name
     size_t pn_len = std::strlen(PROTOCOL_NAME);
-    // Protocol name fits in HASHLEN (35 < 64), so pad with zeros
+    // Protocol name fits in HASHLEN (37 < 64), so pad with zeros
     symmetric_.digest.fill(0);
     std::memcpy(symmetric_.digest.data(), PROTOCOL_NAME, pn_len);
     symmetric_.chaining_key = symmetric_.digest;

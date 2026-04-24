@@ -107,6 +107,8 @@ void RpcHandlers::handle(const messages::Request& req) {
     } else {
         DHT_LOG( "  [handlers] ext cmd=%u from %s:%u\n",
                 req.command, req.from.addr.host_string().c_str(), req.from.addr.port);
+
+        // Connection-layer commands pass through regardless of ephemeral state.
         switch (req.command) {
             case messages::CMD_PEER_HANDSHAKE:
                 if (router_) {
@@ -117,7 +119,7 @@ void RpcHandlers::handle(const messages::Request& req) {
                             socket_.udp_send(buf, req.to.addr);
                         });
                 }
-                break;
+                return;
             case messages::CMD_PEER_HOLEPUNCH:
                 if (router_) {
                     router_->handle_peer_holepunch(req,
@@ -127,7 +129,19 @@ void RpcHandlers::handle(const messages::Request& req) {
                             socket_.udp_send(buf, req.to.addr);
                         });
                 }
+                return;
+            default:
                 break;
+        }
+
+        // Storage commands gated behind persistent state.
+        // JS: hyperdht/index.js:404 — `if (this._persistent === null) return false`
+        // Announce signatures include our node ID; accepting them while ephemeral
+        // (random ID) would produce signatures that become invalid when the ID
+        // changes at the persistent transition.
+        if (socket_.is_ephemeral()) return;
+
+        switch (req.command) {
             case messages::CMD_FIND_PEER:     handle_find_peer(req); break;
             case messages::CMD_LOOKUP:        handle_lookup(req); break;
             case messages::CMD_ANNOUNCE:      handle_announce(req); break;
@@ -146,13 +160,19 @@ void RpcHandlers::handle(const messages::Request& req) {
 //
 // JS: .analysis/js/dht-rpc/lib/io.js:485-518 (_sendReply — assembles
 //     response with id/token/closerNodes/error/value flags)
+//
+// ID is only included when NOT ephemeral. JS:
+//   `const id = this._io.ephemeral === false && socket === this._io.serverSocket`
+// Our single-socket implementation simplifies to: `!ephemeral`.
 // ---------------------------------------------------------------------------
 
 messages::Response RpcHandlers::make_query_response(const messages::Request& req) {
     messages::Response resp;
     resp.tid = req.tid;
     resp.from.addr = req.from.addr;
-    resp.id = socket_.table().id();
+    if (!socket_.is_ephemeral()) {
+        resp.id = socket_.table().id();
+    }
     resp.token = socket_.token_store().create(req.from.addr.host_string());
 
     if (req.target.has_value()) {
@@ -231,7 +251,9 @@ void RpcHandlers::handle_down_hint(const messages::Request& req) {
         messages::Response resp;
         resp.tid = req.tid;
         resp.from.addr = req.from.addr;
-        resp.id = socket_.table().id();
+        if (!socket_.is_ephemeral()) {
+            resp.id = socket_.table().id();
+        }
         socket_.reply(resp);
     };
 
@@ -318,7 +340,9 @@ void RpcHandlers::on_delayed_ping_fire(uv_timer_t* timer) {
         messages::Response resp;
         resp.tid = dr->tid;
         resp.from.addr = dr->from;
-        resp.id = dr->owner->socket_.table().id();
+        if (!dr->owner->socket_.is_ephemeral()) {
+            resp.id = dr->owner->socket_.table().id();
+        }
         dr->owner->socket_.reply(resp);
 
         // Remove from pending list (swap-and-pop)
@@ -464,7 +488,9 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
         messages::Response resp;
         resp.tid = req.tid;
         resp.from.addr = req.from.addr;
-        resp.id = socket_.table().id();
+        if (!socket_.is_ephemeral()) {
+            resp.id = socket_.table().id();
+        }
         socket_.reply(resp);
         return;
     }
@@ -509,7 +535,9 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
     messages::Response resp;
     resp.tid = req.tid;
     resp.from.addr = req.from.addr;
-    resp.id = socket_.table().id();
+    if (!socket_.is_ephemeral()) {
+        resp.id = socket_.table().id();
+    }
 
     socket_.reply(resp);
 }
@@ -565,7 +593,9 @@ void RpcHandlers::handle_unannounce(const messages::Request& req) {
     messages::Response resp;
     resp.tid = req.tid;
     resp.from.addr = req.from.addr;
-    resp.id = socket_.table().id();
+    if (!socket_.is_ephemeral()) {
+        resp.id = socket_.table().id();
+    }
 
     socket_.reply(resp);
 }

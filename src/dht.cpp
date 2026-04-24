@@ -100,15 +100,14 @@ HyperDHT::HyperDHT(uv_loop_t* loop, DhtOptions opts)
                 "seed ignored (keypair takes priority)\n");
     }
 
-    // Create RPC socket with our public key as node ID.
-    // Both NodeId and PubKey are 32-byte arrays — assert the invariant
-    // so any future divergence fails at compile time.
-    static_assert(sizeof(routing::NodeId) == sizeof(noise::PubKey),
-                  "NodeId must be the same size as PubKey");
+    // Create RPC socket with a random node ID.
+    // JS: `this.table = new Table(randomBytes(32))` — dht-rpc/index.js:37.
+    // The random ID is a placeholder used only for internal XOR distance
+    // calculations while ephemeral. When the node transitions to persistent,
+    // the routing table is rebuilt with the real address-based ID
+    // (BLAKE2b(host:port)) — see RpcSocket::check_persistent().
     routing::NodeId our_id{};
-    std::copy(opts_.default_keypair.public_key.begin(),
-              opts_.default_keypair.public_key.end(),
-              our_id.begin());
+    randombytes_buf(our_id.data(), our_id.size());
 
     socket_ = std::make_unique<rpc::RpcSocket>(loop_, our_id);
 

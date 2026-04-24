@@ -140,6 +140,14 @@ public:
     // Total number of nodes in the table
     size_t size() const { return size_; }
 
+    // Rebuild the table with a new local ID. All existing nodes are
+    // re-inserted into new bucket positions (XOR distances change).
+    // Nodes that don't fit (bucket full) are silently dropped.
+    // The on_full callback is suppressed during migration to avoid
+    // triggering ping-and-swap for nodes being copied over.
+    // JS: dht-rpc/index.js:854-864 (ephemeral → persistent transition)
+    void rebuild_with_id(const NodeId& new_id);
+
     // Set callback for bucket-full events
     void on_full(OnFullCallback cb) { on_full_ = std::move(cb); }
 

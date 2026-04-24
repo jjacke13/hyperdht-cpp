@@ -31,6 +31,18 @@ static std::string to_hex(const uint8_t* data, size_t len) {
     return out;
 }
 
+// Transition a socket from ephemeral to persistent by feeding the NAT sampler
+// 3 consistent loopback samples. Must be called after bind().
+static void make_persistent(RpcSocket& socket) {
+    auto our_addr = Ipv4Address::from_string("127.0.0.1", socket.port());
+    for (int i = 1; i <= 3; i++) {
+        auto from = Ipv4Address::from_string(
+            "10.0.0." + std::to_string(i), 49737);
+        socket.nat_sampler().add(our_addr, from);
+    }
+    socket.force_check_persistent();
+}
+
 // ---------------------------------------------------------------------------
 // Test: loopback query between two C++ nodes
 // ---------------------------------------------------------------------------
@@ -44,6 +56,7 @@ TEST(Query, LoopbackFindNode) {
     server_id.fill(0x11);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
     RpcHandlers handlers(server);
     handlers.install();
 
@@ -129,6 +142,7 @@ TEST(Query, DestroyFromOnReplyEndsWalk) {
     server_id.fill(0x11);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
     RpcHandlers handlers(server);
     handlers.install();
 
@@ -313,6 +327,7 @@ TEST(Query, ClosestNodesMirrorsClosestReplies) {
     server_id.fill(0x33);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
     RpcHandlers handlers(server);
     handlers.install();
 
@@ -511,6 +526,7 @@ TEST(Query, TableRetryAfterExternalSeedFlood) {
     live_id.fill(0x99);
     RpcSocket live_server(&loop, live_id);
     live_server.bind(0);
+    make_persistent(live_server);
     RpcHandlers live_handlers(live_server);
     live_handlers.install();
 

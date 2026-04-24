@@ -18,6 +18,24 @@ using namespace hyperdht::compact;
 using namespace hyperdht::routing;
 
 // ---------------------------------------------------------------------------
+// Helper: transition an RpcSocket from ephemeral to persistent.
+// Feeds the NAT sampler 3 consistent loopback samples so firewall =
+// CONSISTENT, then calls force_check_persistent() which flips ephemeral_
+// to false and rebuilds the routing table with an address-based ID.
+// Must be called AFTER bind().
+// ---------------------------------------------------------------------------
+
+static void make_persistent(RpcSocket& socket) {
+    auto our_addr = Ipv4Address::from_string("127.0.0.1", socket.port());
+    for (int i = 1; i <= 3; i++) {
+        auto from = Ipv4Address::from_string(
+            "10.0.0." + std::to_string(i), 49737);
+        socket.nat_sampler().add(our_addr, from);
+    }
+    socket.force_check_persistent();
+}
+
+// ---------------------------------------------------------------------------
 // Test: handlers respond to self-sent requests (loopback)
 // ---------------------------------------------------------------------------
 
@@ -53,9 +71,13 @@ TEST(RpcHandlers, PingReply) {
     server_id.fill(0x11);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
 
     RpcHandlers handlers(server);
     handlers.install();
+
+    // Capture the actual table ID (address-based after persistent transition)
+    auto expected_id = server.table().id();
 
     NodeId client_id{};
     client_id.fill(0x22);
@@ -72,13 +94,12 @@ TEST(RpcHandlers, PingReply) {
     req.internal = true;
 
     client.request(req,
-        [&ctx, &server_id](const Response& resp) {
+        [&ctx, &expected_id](const Response& resp) {
             ctx.response_received = true;
             ctx.has_id = resp.id.has_value();
             ctx.has_token = resp.token.has_value();
             if (ctx.has_id) {
-                // Verify server returned its own ID
-                EXPECT_EQ(*resp.id, server_id);
+                EXPECT_EQ(*resp.id, expected_id);
             }
             loopback_cleanup(&ctx);
         },
@@ -111,6 +132,7 @@ TEST(RpcHandlers, FindNodeReply) {
     server_id.fill(0x11);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
 
     // Add some nodes to the server's routing table
     for (int i = 1; i <= 5; i++) {
@@ -321,6 +343,7 @@ TEST(RpcHandlers, AnnounceValidSignatureAccepted) {
     server_id.fill(0x11);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
     RpcHandlers handlers(server);
     handlers.install();
 
@@ -368,6 +391,7 @@ TEST(RpcHandlers, AnnTtlMsPropagatesToStoredEntry) {
     server_id.fill(0x11);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
 
     // Pick a distinctive non-default value. The hardcoded fallback is
     // 20 minutes (announce::DEFAULT_TTL_MS); if the plumbing regressed
@@ -423,6 +447,7 @@ TEST(RpcHandlers, AnnounceTamperedSignatureRejected) {
     server_id.fill(0x11);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
     RpcHandlers handlers(server);
     handlers.install();
 
@@ -462,6 +487,7 @@ TEST(RpcHandlers, AnnounceWrongNamespaceRejected) {
     server_id.fill(0x11);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
     RpcHandlers handlers(server);
     handlers.install();
 
@@ -501,6 +527,7 @@ TEST(RpcHandlers, AnnounceNoSignatureRejected) {
     server_id.fill(0x11);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
     RpcHandlers handlers(server);
     handlers.install();
 
@@ -537,6 +564,7 @@ TEST(RpcHandlers, UnannounceValidSignatureAccepted) {
     server_id.fill(0x11);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
     RpcHandlers handlers(server);
     handlers.install();
 
@@ -674,6 +702,7 @@ struct TestEnv {
         server_id.fill(0x11);
         server = std::make_unique<RpcSocket>(&loop, server_id);
         server->bind(0);
+        make_persistent(*server);
         handlers = std::make_unique<RpcHandlers>(*server);
         handlers->install();
         client_id.fill(0x22);
@@ -905,6 +934,7 @@ TEST(DelayedPing, ServerRepliesAfterDelay) {
     server_id.fill(0x11);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
 
     RpcHandlers handlers(server);
     handlers.install();
@@ -988,6 +1018,7 @@ TEST(DelayedPing, ServerDropsDelayAboveItsMax) {
     server_id.fill(0x44);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
     // Server allows up to 50 ms; client will request 500 ms → server drops.
     server.set_max_ping_delay_ms(50);
 
@@ -1155,6 +1186,9 @@ TEST(PingAndSwap, KeepsOldestWhenItResponds) {
     oldest_id.fill(0x55);
     RpcSocket oldest_sock(&loop, oldest_id);
     oldest_sock.bind(0);
+    make_persistent(oldest_sock);
+    // After persistent transition, the table ID is address-based
+    auto actual_oldest_id = oldest_sock.table().id();
     RpcHandlers oldest_handlers(oldest_sock);
     oldest_handlers.install();
 
@@ -1166,12 +1200,12 @@ TEST(PingAndSwap, KeepsOldestWhenItResponds) {
     client.set_bootstrapped(true);
 
     // Find a bucket index that puts the oldest node in the right spot.
-    // We'll use the bucket determined by bucket_index(local, oldest_id).
-    size_t bkt = hyperdht::routing::bucket_index(local_id, oldest_id);
+    // Use the address-based ID (what validateId expects).
+    size_t bkt = hyperdht::routing::bucket_index(local_id, actual_oldest_id);
 
     // Inject the *real* oldest socket at rank 1 (oldest added).
     Node real_old{};
-    real_old.id = oldest_id;
+    real_old.id = actual_oldest_id;
     real_old.host = "127.0.0.1";
     real_old.port = oldest_sock.port();
     real_old.added = 1;
@@ -1195,8 +1229,8 @@ TEST(PingAndSwap, KeepsOldestWhenItResponds) {
     // Candidate new node.
     Node new_node{};
     new_node.id = node_id_in_bucket(local_id, bkt, /*rank=*/201);
-    // Avoid collision with the oldest_id's last byte
-    if (new_node.id == oldest_id) new_node.id[31] ^= 0x01;
+    // Avoid collision with the oldest node's actual ID
+    if (new_node.id == actual_oldest_id) new_node.id[31] ^= 0x01;
     new_node.host = "127.0.0.1";
     new_node.port = 9999;
     new_node.added = client.tick();
@@ -1223,7 +1257,7 @@ TEST(PingAndSwap, KeepsOldestWhenItResponds) {
     uv_run(&loop, UV_RUN_DEFAULT);
     EXPECT_TRUE(wd.done);
 
-    EXPECT_TRUE(client.table().has(oldest_id))
+    EXPECT_TRUE(client.table().has(actual_oldest_id))
         << "Oldest (responded) should have been kept";
     EXPECT_FALSE(client.table().has(new_node.id))
         << "New node should NOT have been swapped in";
@@ -1382,6 +1416,7 @@ TEST(DownHint, EvictsTargetWhenItTimesOut) {
     server_id.fill(0xA1);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
 
     RpcHandlers handlers(server);
     handlers.install();
@@ -1461,6 +1496,7 @@ TEST(DownHint, IgnoresMalformedValue) {
     server_id.fill(0xB1);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
 
     RpcHandlers handlers(server);
     handlers.install();
@@ -1516,6 +1552,7 @@ TEST(DownHint, UnknownTargetRepliesButDoesNothing) {
     server_id.fill(0xC1);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
 
     RpcHandlers handlers(server);
     handlers.install();
@@ -1680,6 +1717,7 @@ TEST(Session, DestroyCancelsInflightRequests) {
     server_id.fill(0x10);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
 
     NodeId client_id{};
     client_id.fill(0x11);
@@ -1749,6 +1787,7 @@ TEST(Session, DestructorCancelsPending) {
     server_id.fill(0x20);
     RpcSocket server(&loop, server_id);
     server.bind(0);
+    make_persistent(server);
 
     NodeId client_id{};
     client_id.fill(0x21);

@@ -570,9 +570,16 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
         uv_ip4_name(addr, host, sizeof(host));
         req.from.addr = compact::Ipv4Address::from_string(host, ntohs(addr->sin_port));
 
-        // Observe the peer in the routing table (JS: _addNodeFromNetwork).
+        // Validate and observe the peer in the routing table.
+        // JS: io.js:392 `from.id = validateId(id, from)` — recomputes
+        // peer.id(host, port) and rejects mismatches. Prevents a malicious
+        // node from claiming an arbitrary position in our routing table.
         if (req.id.has_value()) {
-            add_node_from_network(*req.id, req.from.addr);
+            auto expected = compute_peer_id(req.from.addr);
+            if (*req.id == expected) {
+                add_node_from_network(expected, req.from.addr);
+            }
+            // else: ID mismatch — treat as no-ID (don't add to table)
         }
 
         if (on_request_) {
@@ -587,9 +594,17 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
             remote_host, ntohs(addr->sin_port));
         nat_sampler_.add(resp.from.addr, remote_addr);
 
-        // Observe the responding peer (JS: _addNodeFromNetwork on response).
+        // Validate and observe the responding peer.
+        // JS: io.js:619 `from.id = validateId(id, from)` — same validation
+        // as requests. Clear resp.id on mismatch so the query layer
+        // (which reads resp.id to set reply.from_id) sees clean data.
         if (resp.id.has_value()) {
-            add_node_from_network(*resp.id, remote_addr);
+            auto expected = compute_peer_id(remote_addr);
+            if (*resp.id == expected) {
+                add_node_from_network(expected, remote_addr);
+            } else {
+                resp.id = std::nullopt;
+            }
         }
 
         auto* inflight = find_inflight(resp.tid);
@@ -838,6 +853,17 @@ void RpcSocket::check_persistent() {
     if (fw == 2 /* FIREWALL_CONSISTENT */ || fw == 1 /* FIREWALL_OPEN */) {
         ephemeral_ = false;
         firewalled_ = (fw != 1);
+
+        // Rebuild routing table with address-based ID.
+        // JS: index.js:831 — `const id = peer.id(natSampler.host, natSampler.port)`
+        // JS: index.js:854-864 — create new Table(id), copy nodes, re-bootstrap.
+        auto our_addr = compact::Ipv4Address::from_string(
+            current_host, nat_sampler_.port());
+        auto new_id = compute_peer_id(our_addr);
+        if (new_id != table_.id()) {
+            table_.rebuild_with_id(new_id);
+        }
+
         if (on_persistent_) on_persistent_();
     }
 }

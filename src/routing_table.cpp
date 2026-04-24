@@ -214,5 +214,40 @@ const Node* RoutingTable::random() const {
     return nullptr;  // Should never reach here
 }
 
+void RoutingTable::rebuild_with_id(const NodeId& new_id) {
+    // 1. Snapshot all current nodes
+    std::vector<Node> all_nodes;
+    all_nodes.reserve(size_);
+    for (auto& bucket : buckets_) {
+        for (const auto& node : bucket.nodes()) {
+            all_nodes.push_back(node);
+        }
+    }
+
+    // 2. Clear all buckets
+    for (auto& bucket : buckets_) {
+        bucket.nodes_mut().clear();
+    }
+    size_ = 0;
+
+    // 3. Set new ID
+    id_ = new_id;
+
+    // 4. Temporarily suppress on_full to avoid ping-and-swap during
+    //    migration. JS creates a new Table() without a 'row' listener
+    //    and installs it after copying nodes (index.js:864).
+    auto saved_on_full = std::move(on_full_);
+    on_full_ = nullptr;
+
+    // 5. Re-add nodes — bucket assignments change due to new XOR distances.
+    //    Self-exclusion (node.id == id_) is handled by add().
+    for (const auto& node : all_nodes) {
+        add(node);
+    }
+
+    // 6. Restore on_full callback
+    on_full_ = std::move(saved_on_full);
+}
+
 }  // namespace routing
 }  // namespace hyperdht

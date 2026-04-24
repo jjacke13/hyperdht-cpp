@@ -218,6 +218,13 @@ void HyperDHT::fire_network_update() {
 void HyperDHT::fire_persistent() {
     if (destroyed_) return;
     DHT_LOG("  [dht] persistent: node has transitioned ephemeral -> persistent\n");
+
+    // JS: index.js:867 — re-bootstrap after ID change so the routing table
+    // is populated with nodes close to our new address-based ID.
+    if (socket_->is_bootstrapped()) {
+        refresh();
+    }
+
     if (on_persistent_) {
         on_persistent_();
     }

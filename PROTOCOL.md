@@ -330,9 +330,29 @@ Bit  Value  Field
 
 ### 3.6 Routing ID
 
+The routing ID determines a node's position in the Kademlia keyspace.
+
+**Derivation** (address-based, used when persistent):
 ```
-id = BLAKE2b(publicIP_4bytes + publicPort_2bytes_LE)  → 32 bytes
+id = BLAKE2b-256(host_4bytes + port_2bytes_LE)  → 32 bytes
 ```
+Where `host_4bytes` is the IPv4 octets (e.g. `[88, 99, 3, 86]`) and `port_2bytes_LE`
+is the port in little-endian. This is the compact IPv4 encoding (§1.7), hashed.
+
+**Initial ID** (ephemeral phase): `randomBytes(32)`. Never sent on the wire — used
+only for internal XOR distance calculations in the routing table.
+
+**ID in messages**: Only included when `ephemeral === false`. The flag bit (bit 0) in
+the request/response flags byte controls presence. When ephemeral, the flag is unset
+and the 32-byte ID field is omitted entirely.
+
+**Validation on receive** (`validateId`): When a message includes an ID, the receiver
+recomputes `BLAKE2b(from_host:from_port)` from the UDP source address and compares it
+to the wire ID. If they don't match, the ID is discarded (`from.id = null`). This
+prevents a node from claiming an arbitrary position in the keyspace.
+
+**Source**: `dht-rpc/lib/peer.js:20-25` (derivation), `dht-rpc/lib/io.js:627-630`
+(validation), `dht-rpc/lib/io.js:488,521` (suppression)
 
 ### 3.7 Token System
 
@@ -434,12 +454,49 @@ Result: `{ firewall: OPEN|CONSISTENT|RANDOM|UNKNOWN, host, port }`
 
 ### 3.12 Persistent vs Ephemeral Mode
 
-**Ephemeral** (default): Node ID not included in messages. Used by clients and
-nodes behind NAT.
+Nodes start **ephemeral** and may transition to **persistent** once their
+external address is verified as stable. The transition is one-way under normal
+operation (persistent → ephemeral only on suspension in adaptive mode).
 
-**Persistent**: Node ID included in all messages. Stable long-term identity.
-Entered explicitly (`ephemeral: false`) or adaptively after ~20 minutes of
-stable external address.
+**Ephemeral** (default):
+- Routing table ID: random 32 bytes (placeholder for XOR distance calculations)
+- ID NOT included in any request or response message (flag bit 0 unset)
+- Remote nodes with `from.id === null` are sampled for NAT but NOT added to
+  routing tables (JS: `_addNodeFromNetwork`, line 488)
+- **Storage commands blocked**: FIND_PEER, LOOKUP, ANNOUNCE, UNANNOUNCE,
+  MUTABLE/IMMUTABLE_GET/PUT are silently dropped. Only internal commands (PING,
+  PING_NAT, FIND_NODE, DOWN_HINT, DELAYED_PING) and connection-layer commands
+  (PEER_HANDSHAKE, PEER_HOLEPUNCH) are processed.
+  JS: `if (this._persistent === null) return false` (hyperdht/index.js:404)
+
+**Persistent transition** (`_updateNetworkState`, dht-rpc/index.js:801-875):
+1. After `STABLE_TICKS` (240 × 5s = ~20 min) of stable network, or immediately
+   if `opts.ephemeral === false`
+2. Check firewall probe: if firewalled, remain ephemeral
+3. Set `firewalled = false`, `ephemeral = false`
+4. Compute address-based ID: `id = BLAKE2b(compact_ipv4(host, port))`
+5. **Rebuild routing table**: create new table with the address-based ID,
+   copy all existing nodes (skip self, drop those that don't fit in new
+   bucket layout). Suppress bucket-full callbacks during migration.
+6. Re-install `on('row', ...)` listener for ping-and-swap eviction
+7. If already bootstrapped: trigger `refresh()` (re-bootstrap walk with
+   new ID so the table fills with nodes close to our new position)
+8. Emit `'persistent'` event
+
+**Persistent**:
+- Routing table ID: `BLAKE2b(publicHost:publicPort)` — address-based
+- ID included in all messages (flag bit 0 set, 32-byte field present)
+- Storage commands accepted and processed
+- Announce signatures bind to this ID: `signable = NS + BLAKE2b(target || nodeId || token || peer || refresh)`
+  — the `nodeId` in the signature is the receiving node's routing ID. Client
+  obtains it from the response, server uses its own `table.id`. Both must
+  match for the signature to verify.
+
+**Why storage commands are gated**: Announce signatures include the server's
+node ID. If the server accepted announces while ephemeral (with a random ID),
+those signatures would become invalid when the ID changes at the persistent
+transition. By blocking storage commands until the ID is finalized, the
+signature binding is always consistent.
 
 ### 3.13 Timing Constants
 
@@ -637,8 +694,11 @@ Produces 5 × 32-byte keys. `NS_PEER_HANDSHAKE` is the Noise prologue.
 ### 5.1 Protocol
 
 ```
-Noise_IK_25519_ChaChaPoly_BLAKE2b
+Noise_IK_Ed25519_ChaChaPoly_BLAKE2b
 ```
+
+Constructed from: `"Noise" + "_" + pattern + "_" + DH_ALG + "_" + CIPHER_ALG + "_" + "BLAKE2b"`.
+`DH_ALG` is `"Ed25519"` (from `noise-curve-ed/index.js:10`), NOT `"25519"`.
 
 - **Pattern**: IK (initiator knows responder's static public key)
 - **DH**: Ed25519 (NOT standard X25519 — see 5.5)
@@ -665,12 +725,21 @@ Mixed into initial hash state before any handshake tokens.
 
 ### 5.4 State Machine
 
-**Initialization**:
+**Initialization** (noise-handshake/noise.js:126-132):
 ```
-chainingKey = BLAKE2b-512("Noise_IK_25519_ChaChaPoly_BLAKE2b")  → 64 bytes
-digest = BLAKE2b-512(chainingKey || prologue)
+protocol = "Noise_IK_Ed25519_ChaChaPoly_BLAKE2b"  (37 bytes)
+
+// Standard Noise: if len(protocol) <= HASHLEN, zero-pad; else hash.
+// 37 <= 64, so zero-pad:
+digest = protocol || 0x00 × (64 - 37)             → 64 bytes (zero-padded)
+chainingKey = copy(digest)                         → 64 bytes (same value)
+digest = BLAKE2b-512(digest || prologue)           → 64 bytes (via mixHash)
 key = null, nonce = 0
 ```
+
+Note: the protocol string is NOT hashed — it is zero-padded to HASHLEN (64 bytes)
+and used directly as the initial digest. This follows the standard Noise Framework
+specification for protocol strings shorter than the hash output length.
 
 **Message 1 (initiator → responder)**:
 ```

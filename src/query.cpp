@@ -292,15 +292,20 @@ void Query::on_visit_response(const PendingNode& node, const messages::Response&
         errors_++;
     }
 
-    // Build query reply
+    // Build query reply.
+    // JS: from.id comes solely from the wire (validated by io.js:619
+    // validateId), not from the frontier's pre-computed ID. Zero-init
+    // so replies without a validated resp.id get from_id = all-zeros,
+    // which the push_closest gate below filters out (matching JS
+    // query.js:270 `m.from.id !== null`).
     QueryReply reply;
-    reply.from_id = node.id;
+    reply.from_id = {};
     reply.from_addr = node.addr;
     reply.token = resp.token;
     reply.value = resp.value;
     reply.closer_nodes = resp.closer_nodes;
 
-    // Update ID from response if available
+    // Set ID from validated response (already cleaned by rpc.cpp validateId)
     if (resp.id.has_value()) {
         std::copy(resp.id->begin(), resp.id->end(), reply.from_id.begin());
     }

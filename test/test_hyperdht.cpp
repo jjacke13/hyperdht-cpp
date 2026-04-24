@@ -13,9 +13,21 @@
 #include "hyperdht/announce_sig.hpp"
 #include "hyperdht/dht.hpp"
 #include "hyperdht/hyperdht.h"
+#include "hyperdht/rpc.hpp"
 #include "hyperdht/secret_stream.hpp"
 
 using namespace hyperdht;
+
+// Transition an RpcSocket from ephemeral to persistent.
+static void make_persistent(rpc::RpcSocket& socket) {
+    auto our_addr = compact::Ipv4Address::from_string("127.0.0.1", socket.port());
+    for (int i = 1; i <= 3; i++) {
+        auto from = compact::Ipv4Address::from_string(
+            "10.0.0." + std::to_string(i), 49737);
+        socket.nat_sampler().add(our_addr, from);
+    }
+    socket.force_check_persistent();
+}
 
 TEST(HyperDHT, CreateAndDestroy) {
     uv_loop_t loop;
@@ -1403,6 +1415,7 @@ TEST(HyperDHT, BootstrapWalkAgainstLoopbackServer) {
     bootstrap_id.fill(0xBB);
     rpc::RpcSocket bootstrap_server(&loop, bootstrap_id);
     ASSERT_EQ(bootstrap_server.bind(0, "127.0.0.1"), 0);
+    make_persistent(bootstrap_server);
     rpc::RpcHandlers bootstrap_handlers(bootstrap_server);
     bootstrap_handlers.install();
 
@@ -1464,6 +1477,7 @@ TEST(HyperDHT, OnBootstrappedFiresImmediatelyIfAlreadyDone) {
     bootstrap_id.fill(0xCC);
     rpc::RpcSocket bootstrap_server(&loop, bootstrap_id);
     ASSERT_EQ(bootstrap_server.bind(0, "127.0.0.1"), 0);
+    make_persistent(bootstrap_server);
     rpc::RpcHandlers bootstrap_handlers(bootstrap_server);
     bootstrap_handlers.install();
 

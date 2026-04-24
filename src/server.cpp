@@ -43,9 +43,10 @@
 //   ├─ puncher->punch()               908  server.js                576
 //   └─ probe echo listener (add_*)         server.js  (always-on echo handler)
 //
-// Server::on_socket                   954  server.js                305-342
-// Server::clear_session               993  server.js                450-462
-// Server::on_raw_stream_firewall     1017  server.js                282-291
+// Server::on_socket                        server.js                305-342
+// Server::clear_session                    server.js                450-462
+// Server::on_raw_stream_firewall           server.js                282-291
+// Server::on_raw_stream_close              server.js                299-303
 //
 // =========================================================================
 //
@@ -56,15 +57,24 @@
 //     from the map is sufficient cleanup.
 //   - Handshake dedup uses `handshake_dedup_` map<noise_hex, hp_id>
 //     vs JS `_connects` Map<noise_hex, Promise<hs>>.
-//   - rawStream firewall ctx (`RawStreamCtx*`) stored in stream->data; freed
-//     by the stream's on_close callback (RAII — guaranteed regardless of which
-//     libudx callback path fires first).
+//   - rawStream has two libudx callbacks:
+//       on_close:    triggers reactive session cleanup via on_raw_stream_close()
+//                    (matches JS rawStream.on('close', → _clearLater))
+//       on_finalize: frees RawStreamCtx and the stream struct itself
+//     ~ServerConnection nulls raw_stream->data before udx_stream_destroy
+//     so on_close won't dereference a dangling Server* during teardown.
+//   - Session cleanup happens from 4 paths (all funnel through clear_session):
+//       1. Session timer fires (10s timeout)
+//       2. rawStream on_close (stream died without connection)
+//       3. Puncher on_connect (holepunch succeeded)
+//       4. rawStream firewall (client's UDX packet arrived directly)
+//     All paths clean connections_, handshake_dedup_, pending_punch_streams_,
+//     and session_timers_. Relay success/failure paths also call clear_session.
 //   - Holepunch state lives in unique_ptr<ServerConnection> in
 //     `connections_` (no JS-style sparse array of `_holepunches`).
 //   - Probe echo is a single global listener installed on first holepunch via
 //     `add_probe_listener` (multi-listener API), tracked in `probe_listener_id_`
-//     and removed on close(). Previously overwrote a single slot per session,
-//     which silently clobbered concurrent holepunch sessions.
+//     and removed on close().
 
 #include "hyperdht/server.hpp"
 

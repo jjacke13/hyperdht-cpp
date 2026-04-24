@@ -1,4 +1,5 @@
-/* HyperDHT on ESP32-S3 — echo test with atomic connect+stream. */
+/* HyperDHT echo client on ESP32-S3.
+ * Connects to an echo server and sends "hello from ESP32-S3!" */
 
 #include <stdio.h>
 #include <string.h>
@@ -27,8 +28,6 @@ static const uint8_t SERVER_PK[32] = {
 
 static hyperdht_t* g_dht = NULL;
 static hyperdht_stream_t* g_stream = NULL;
-
-/* --- WiFi --- */
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data) {
@@ -69,8 +68,6 @@ static void wifi_init_sta(void) {
         ESP_LOGE(TAG, "WiFi FAILED");
 }
 
-/* --- Stream callbacks --- */
-
 static void on_stream_open(void* userdata) {
     (void)userdata;
     ESP_LOGI(TAG, "stream OPEN — sending hello");
@@ -90,20 +87,17 @@ static void on_stream_close(void* userdata) {
     ESP_LOGI(TAG, "stream CLOSED");
 }
 
-/* --- Atomic connect+stream callback --- */
-
 static void on_connect_stream(int error, hyperdht_stream_t* stream,
                                void* userdata) {
     (void)userdata;
     if (error != 0 || !stream) {
-        ESP_LOGE(TAG, "connect+stream FAILED: %d", error);
+        ESP_LOGE(TAG, "connect FAILED: %s (%d)",
+                 hyperdht_connect_strerror(error), error);
         return;
     }
     g_stream = stream;
     ESP_LOGI(TAG, "CONNECTED — stream opened atomically");
 }
-
-/* --- Bootstrap callback --- */
 
 static void on_bootstrapped(void* userdata) {
     (void)userdata;
@@ -111,17 +105,12 @@ static void on_bootstrapped(void* userdata) {
              hyperdht_port(g_dht));
     hyperdht_connect_and_open_stream(
         g_dht, SERVER_PK,
-        on_connect_stream,
-        on_stream_open,
-        on_stream_data,
-        on_stream_close,
+        on_connect_stream, on_stream_open, on_stream_data, on_stream_close,
         NULL);
 }
 
-/* --- Main --- */
-
 void app_main(void) {
-    ESP_LOGI(TAG, "HyperDHT ESP32-S3 — echo test (atomic stream)");
+    ESP_LOGI(TAG, "HyperDHT ESP32-S3 — echo client");
     ESP_LOGI(TAG, "  free heap: %zu KB",
              heap_caps_get_free_size(MALLOC_CAP_DEFAULT) / 1024);
 
@@ -142,20 +131,14 @@ void app_main(void) {
     hyperdht_opts_default(&opts);
     opts.use_public_bootstrap = 1;
 
-    ESP_LOGI(TAG, "creating DHT node...");
     g_dht = hyperdht_create(&loop, &opts);
-    if (!g_dht) {
-        ESP_LOGE(TAG, "create failed!");
-        return;
-    }
+    if (!g_dht) { ESP_LOGE(TAG, "create failed!"); return; }
 
     hyperdht_bind(g_dht, 0);
-    ESP_LOGI(TAG, "bound on port %u", hyperdht_port(g_dht));
-    hyperdht_on_bootstrapped(g_dht, on_bootstrapped, g_dht);
+    hyperdht_on_bootstrapped(g_dht, on_bootstrapped, NULL);
 
     ESP_LOGI(TAG, "running...");
     while (uv_run(&loop, UV_RUN_ONCE))
         vTaskDelay(1);
-
     ESP_LOGI(TAG, "done");
 }

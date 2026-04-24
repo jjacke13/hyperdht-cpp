@@ -23,10 +23,10 @@ Wire-compatible with JS `hyperdht@6.29.1`. Live-tested in both directions on the
 
 | | |
 |---|---|
-| **Tests** | 569 unit + 6 live, ASAN/UBSan clean |
+| **Tests** | 566 unit + 6 live, ASAN/UBSan clean |
 | **API parity** | Full -- see [JS-PARITY-GAPS.md](docs/JS-PARITY-GAPS.md) |
-| **Languages** | C++ / C / Python (Kotlin, Swift, Go, Rust planned) |
-| **Platforms** | Linux, macOS, Windows (ESP32 planned -- see [REMAINING-WORK.md](docs/REMAINING-WORK.md#11-esp32--embedded-porting)) |
+| **Languages** | C++ / C / Python / Kotlin (Swift, Go, Rust planned) |
+| **Platforms** | Linux, macOS, Windows, ESP32, Android |
 
 ## Build
 
@@ -44,6 +44,8 @@ Without Nix: install `cmake`, `ninja`, `libsodium`, `libuv`, then the same cmake
 | [C API reference](docs/C-API.md) | 76 functions, opaque-pointer pattern, callback-based async |
 | [C++ API reference](docs/CPP-API.md) | RAII wrappers, error codes, single-threaded event loop |
 | [Python examples](examples/python/) | Server, client, holesail tunnel, 22 wrapper tests |
+| [ESP32 guide](examples/esp32/) | Build, flash, run HyperDHT on ESP32-S3 (echo server + client) |
+| [Android example](examples/android/) | Kotlin/JNI wrapper with echo test app |
 | [Wire protocol spec](PROTOCOL.md) | Reverse-engineered from JS, 12 sections |
 | [JS name mapping](docs/JS-MAPPING.md) | Side-by-side: `createServer` -> `create_server` -> `hyperdht_server_create` |
 | [Remaining work](docs/REMAINING-WORK.md) | Verification tasks, production readiness, ESP32 porting plan |

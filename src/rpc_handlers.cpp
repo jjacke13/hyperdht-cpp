@@ -6,6 +6,18 @@
 //     .analysis/js/hyperdht/lib/persistent.js:16-257 (Persistent class —
 //                                                     all HyperDHT cmds)
 //
+// Two protocol-parity behaviors implemented here:
+//
+//   1. ID suppression: responses only include our routing table ID when
+//      NOT ephemeral. JS: io.js:488 `ephemeral === false && socket ===
+//      serverSocket`. Our single-socket impl simplifies to `!ephemeral`.
+//
+//   2. Storage command gating: FIND_PEER, LOOKUP, ANNOUNCE, UNANNOUNCE,
+//      MUTABLE/IMMUTABLE_GET/PUT are dropped when ephemeral. JS:
+//      hyperdht/index.js:404 `if (this._persistent === null) return false`.
+//      Connection-layer commands (PEER_HANDSHAKE, PEER_HOLEPUNCH) pass
+//      through regardless.
+//
 // C++ diffs from JS:
 //   - JS Persistent has separate caches for `bumps`, `refreshes`,
 //     `mutables`, `immutables` (record-cache + xache packages).

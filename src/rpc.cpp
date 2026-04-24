@@ -1,6 +1,6 @@
 // DHT RPC socket implementation — UDP send/receive over a UDX socket,
 // TID-based response matching, retries/timeouts, per-peer adaptive RTT,
-// congestion control, and NAT probe detection.
+// congestion control, NAT probe detection, and ID validation.
 //
 // JS: .analysis/js/dht-rpc/index.js:32-1003 (DHT class)
 //     .analysis/js/dht-rpc/lib/io.js:15-349  (IO class — wire send/recv)
@@ -829,6 +829,13 @@ void RpcSocket::background_tick() {
 // simplified: we trust the NAT sampler's classification rather than
 // running a separate PING_NAT firewall probe (JS:916-963 _checkIfFirewalled
 // requires the dual-socket setup we don't have).
+//
+// On success (CONSISTENT or OPEN firewall):
+//   1. Flip ephemeral_ to false
+//   2. Rebuild routing table with address-based ID: BLAKE2b(host:port)
+//      (JS: index.js:831-864 — new Table(peer.id(host, port)), copy nodes)
+//   3. Fire on_persistent_ callback → HyperDHT::fire_persistent() triggers
+//      refresh() to re-bootstrap with the new ID
 //
 // Idempotency: once `ephemeral_` has flipped to false, this is a no-op.
 // The production background tick already guards the call with

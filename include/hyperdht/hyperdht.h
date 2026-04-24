@@ -579,6 +579,9 @@ HYPERDHT_API int hyperdht_connect_and_open_stream(
 #define HYPERDHT_ERR_RELAY_FAILED       (-7)
 #define HYPERDHT_ERR_CANCELLED          (-8)
 
+/** Return a human-readable name for a connect error code. */
+HYPERDHT_API const char* hyperdht_connect_strerror(int error);
+
 /* --- C2: DHT state --- */
 
 HYPERDHT_API int hyperdht_is_online(const hyperdht_t* dht);

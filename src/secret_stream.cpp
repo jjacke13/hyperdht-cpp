@@ -362,6 +362,12 @@ SecretStreamDuplex::~SecretStreamDuplex() {
     // bails out before touching `owner`.
     *alive_ = false;
 
+    // Stop timers if destroy() wasn't called first. The timers use async
+    // uv_close — their on_timer_close callback frees the timer handle
+    // on the next uv_run iteration. We null timer->data so the callback
+    // doesn't dereference the now-dead SecretStream.
+    crypto_.stop_timers();
+
     // Detach from the raw stream so any pending UDX read/close callback
     // also sees a null `data` pointer.
     if (raw_stream_) {

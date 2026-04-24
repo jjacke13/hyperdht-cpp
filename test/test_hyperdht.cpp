@@ -588,16 +588,11 @@ TEST(HyperDHT, BootstrapperRejectsInvalidInputs) {
     uv_loop_t loop;
     uv_loop_init(&loop);
 
-    EXPECT_THROW(HyperDHT::bootstrapper(&loop, 0, "127.0.0.1"),
-                 std::invalid_argument);
-    EXPECT_THROW(HyperDHT::bootstrapper(&loop, 49737, ""),
-                 std::invalid_argument);
-    EXPECT_THROW(HyperDHT::bootstrapper(&loop, 49737, "0.0.0.0"),
-                 std::invalid_argument);
-    EXPECT_THROW(HyperDHT::bootstrapper(&loop, 49737, "::"),
-                 std::invalid_argument);
-    EXPECT_THROW(HyperDHT::bootstrapper(&loop, 49737, "not.an.ip"),
-                 std::invalid_argument);
+    EXPECT_EQ(HyperDHT::bootstrapper(&loop, 0, "127.0.0.1"), nullptr);
+    EXPECT_EQ(HyperDHT::bootstrapper(&loop, 49737, ""), nullptr);
+    EXPECT_EQ(HyperDHT::bootstrapper(&loop, 49737, "0.0.0.0"), nullptr);
+    EXPECT_EQ(HyperDHT::bootstrapper(&loop, 49737, "::"), nullptr);
+    EXPECT_EQ(HyperDHT::bootstrapper(&loop, 49737, "not.an.ip"), nullptr);
 
     uv_loop_close(&loop);
 }

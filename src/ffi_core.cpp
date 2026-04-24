@@ -1,6 +1,21 @@
 // FFI core: query cancel/free, keypair, DHT lifecycle, connect.
 #include "ffi_internal.hpp"
 
+const char* hyperdht_connect_strerror(int error) {
+    switch (error) {
+        case  0: return "success";
+        case -1: return "DHT destroyed during connect";
+        case -2: return "peer not found";
+        case -3: return "peer connection failed (all relay handshakes failed)";
+        case -4: return "no connectable addresses from server";
+        case -5: return "holepunch failed";
+        case -6: return "holepunch timeout";
+        case -7: return "blind relay pairing failed";
+        case -8: return "cancelled";
+        default: return "unknown error";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Query cancellation (shared by all *_ex variants)
 // ---------------------------------------------------------------------------

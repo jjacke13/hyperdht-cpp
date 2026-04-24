@@ -156,10 +156,11 @@ inline void stream_fire_close(hyperdht_stream_s* s) {
     if (s->closed) return;
     s->closed = true;
     if (s->on_close) s->on_close(s->userdata);
-    // Free the Duplex first — its destructor detaches from raw_stream
-    // and wipes key material. The raw UDX stream is deleted by libudx
-    // itself once its close callback fires (the `delete s;` lambda we
-    // passed to `udx_stream_init` in `create_raw_stream`).
+    // destroy() stops the UDX stream (udx_stream_destroy) and timers
+    // BEFORE we delete the duplex. Without this, the UDX stream keeps
+    // receiving data and calls on_udx_read with data=nullptr → crash.
+    // destroy() is idempotent (checks destroyed_ flag).
+    if (s->duplex) s->duplex->destroy(0);
     delete s->duplex;
     s->duplex = nullptr;
     delete s;

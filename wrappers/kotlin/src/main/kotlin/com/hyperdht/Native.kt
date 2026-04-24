@@ -129,6 +129,7 @@ internal object Native {
     ): Int
 
     // --- Misc ---
+    external fun connectStrerror(error: Int): String
     external fun hash(data: ByteArray, out: ByteArray)
     external fun addNode(handle: Long, host: String, port: Int): Int
     external fun ping(handle: Long, host: String, port: Int, callback: PingCallback): Int

@@ -534,6 +534,14 @@ Java_com_hyperdht_Native_connectAndOpenStream(
 // Misc
 // ---------------------------------------------------------------------------
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_hyperdht_Native_connectStrerror(
+    JNIEnv* env, jobject, jint error)
+{
+    const char* msg = hyperdht_connect_strerror(error);
+    return env->NewStringUTF(msg);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_hash(
     JNIEnv* env, jobject, jbyteArray jdata, jbyteArray jout)

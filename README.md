@@ -24,7 +24,7 @@ Wire-compatible with JS `hyperdht@6.29.1`. Live-tested in both directions on the
 | | |
 |---|---|
 | **Tests** | 566 unit + 6 live, ASAN/UBSan clean |
-| **API parity** | Full -- see [JS-PARITY-GAPS.md](docs/JS-PARITY-GAPS.md) |
+| **API parity** | Full -- wire-compatible with JS `hyperdht@6.29.1` ([audit](docs/archive/JS-PARITY-GAPS.md)) |
 | **Languages** | C++ / C / Python / Kotlin (Swift, Go, Rust planned) |
 | **Platforms** | Linux, macOS, Windows, ESP32, Android |
 
@@ -62,7 +62,7 @@ node3.hyperdht.org:49737
 
 ## Contributing
 
-[JS-PARITY-GAPS.md](docs/JS-PARITY-GAPS.md) tracks protocol parity. [REMAINING-WORK.md](docs/REMAINING-WORK.md) tracks hardening and production polish. Every network-behaviour change must be live-tested against a JS peer before landing.
+[REMAINING-WORK.md](docs/REMAINING-WORK.md) tracks hardening and production polish. JS protocol parity is complete ([audit](docs/archive/JS-PARITY-GAPS.md)). Every network-behaviour change must be live-tested against a JS peer before landing.
 
 ## License
 

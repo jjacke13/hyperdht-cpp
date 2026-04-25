@@ -67,7 +67,7 @@ Live testing against more JS peers revealed dozens of behavioral gaps -- things 
 
 ### Weeks 2-3 (2026-04-05 to 2026-04-14)
 
-Systematic audit of every C++ file against the JS source. Added JS flow maps (exact C++ line -> JS file:line citations) to 16 source files. Tracked gaps in [JS-PARITY-GAPS.md](../docs/JS-PARITY-GAPS.md).
+Systematic audit of every C++ file against the JS source. Added JS flow maps (exact C++ line -> JS file:line citations) to 16 source files. Tracked gaps in [JS-PARITY-GAPS.md](../docs/archive/JS-PARITY-GAPS.md).
 
 **What we found and fixed:**
 

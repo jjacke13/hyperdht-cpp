@@ -16,24 +16,34 @@
 
 static hyperdht_t* g_dht = nullptr;
 
+struct ClientCtx {
+    hyperdht_stream_t* stream = nullptr;
+};
+
 static void on_data(const uint8_t* data, size_t len, void* ud) {
     printf("Received: %.*s\n", (int)len, data);
+    fflush(stdout);
 }
 
 static void on_open(void* ud) {
-    auto* stream = static_cast<hyperdht_stream_t*>(ud);
+    auto* ctx = static_cast<ClientCtx*>(ud);
     printf("Stream open — sending hello\n");
+    fflush(stdout);
     const char* msg = "hello from C++";
-    hyperdht_stream_write(stream, (const uint8_t*)msg, strlen(msg));
+    hyperdht_stream_write(ctx->stream, (const uint8_t*)msg, strlen(msg));
 }
 
 static void on_close(void* ud) {
     printf("Stream closed\n");
+    fflush(stdout);
+    delete static_cast<ClientCtx*>(ud);
 }
 
 static void on_connect(int error, const hyperdht_connection_t* conn, void* ud) {
     if (error != 0) {
-        fprintf(stderr, "Connect failed: %d\n", error);
+        fprintf(stderr, "Connect failed: %s (%d)\n",
+                hyperdht_connect_strerror(error), error);
+        fflush(stderr);
         hyperdht_destroy(g_dht, nullptr, nullptr);
         return;
     }
@@ -42,11 +52,16 @@ static void on_connect(int error, const hyperdht_connection_t* conn, void* ud) {
     printf("  Remote key: ");
     for (int i = 0; i < 8; i++) printf("%02x", conn->remote_public_key[i]);
     printf("...\n");
+    fflush(stdout);
 
-    auto* stream = hyperdht_stream_open(g_dht, conn, on_open, on_data, on_close, nullptr);
+    auto* ctx = new ClientCtx;
+    auto* stream = hyperdht_stream_open(g_dht, conn, on_open, on_data, on_close, ctx);
     if (stream) {
-        // Pass stream to on_open so it can write
-        // (reuse the on_open userdata for the stream handle)
+        ctx->stream = stream;
+    } else {
+        printf("stream_open failed!\n");
+        fflush(stdout);
+        delete ctx;
     }
 }
 

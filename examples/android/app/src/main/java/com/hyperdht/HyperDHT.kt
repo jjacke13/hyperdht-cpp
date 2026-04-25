@@ -5,6 +5,8 @@ import java.io.Closeable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * HyperDHT node — connect to peers, listen for connections, store data.
@@ -32,6 +34,13 @@ class HyperDHT(
 
     private val cbIdGen = AtomicLong(0)
     private val persistentRefs = ConcurrentHashMap<Long, Any>()
+    internal val activeStreams: MutableSet<Stream> = ConcurrentHashMap.newKeySet()
+
+    // Fixed keys for single-slot event callbacks (avoids unbounded map growth).
+    // Each event type overwrites the same key instead of incrementing cbIdGen.
+    private companion object {
+        const val KEY_NETWORK_CHANGE = -1L
+    }
 
     init {
         // ALL native calls on the loop thread
@@ -77,22 +86,52 @@ class HyperDHT(
     override fun close() {
         if (destroyed) return
         destroyed = true
-        runBlocking(loopDispatcher) {
-            loopJob?.cancelAndJoin()
-            Native.asyncClose(asyncHandle)
-            Native.destroy(handle)
-            while (Native.loopRunOnce(loopHandle) != 0) {}
-            Native.free(handle)
-            Native.loopClose(loopHandle)
+        try {
+            runBlocking(loopDispatcher) {
+                withTimeout(5000L) {
+                    loopJob?.cancelAndJoin()
+                    // Invalidate all active streams before destroying native resources
+                    for (stream in activeStreams) {
+                        stream.markClosed()
+                    }
+                    activeStreams.clear()
+                    Native.asyncClose(asyncHandle)
+                    Native.destroy(handle)
+                    // Drain pending close callbacks with bounded iterations
+                    var remaining = 500
+                    while (Native.loopRunOnce(loopHandle) != 0 && remaining-- > 0) {}
+                    Native.free(handle)
+                    Native.loopClose(loopHandle)
+                }
+            }
+        } catch (_: Exception) {
+            // Timeout or cancellation — force cleanup to prevent ANR
+            for (stream in activeStreams) {
+                stream.markClosed()
+            }
+            activeStreams.clear()
         }
-        loopExecutor.shutdown()
+        loopExecutor.shutdownNow()
         persistentRefs.clear()
     }
 
-    // --- Helper: run a native call on the loop thread ---
+    // --- Helper: run a native call on the loop thread + wake the loop ---
 
     private suspend fun <T> onLoop(block: () -> T): T =
-        withContext(loopDispatcher) { block() }
+        suspendCancellableCoroutine { cont ->
+            try {
+                loopExecutor.execute {
+                    try {
+                        cont.resume(block())
+                    } catch (e: Throwable) {
+                        cont.resumeWithException(e)
+                    }
+                }
+                if (!destroyed) Native.asyncSend(asyncHandle)
+            } catch (e: java.util.concurrent.RejectedExecutionException) {
+                cont.resumeWithException(e)
+            }
+        }
 
     // --- State ---
 
@@ -140,9 +179,8 @@ class HyperDHT(
     }
 
     fun onNetworkChange(callback: () -> Unit) {
-        val id = cbIdGen.incrementAndGet()
         val cb = Runnable { callback() }
-        persistentRefs[id] = cb
+        persistentRefs[KEY_NETWORK_CHANGE] = cb
         loopExecutor.execute { Native.onNetworkChange(handle, cb) }
     }
 
@@ -163,13 +201,17 @@ class HyperDHT(
         val stream = Stream.createPending(handle, ::postToLoop)
         val onOpen = Runnable { stream.fireOpen() }
         val onData = DataCallback { data -> stream.fireData(data) }
-        val onClose = Runnable { stream.fireClose() }
+        val onClose = Runnable {
+            stream.fireClose()
+            activeStreams.remove(stream)
+        }
         stream.retainCallbacks(onOpen, onData, onClose)
 
         val cb = ConnectCallback { error, streamHandle ->
             if (error != 0) deferred.completeExceptionally(DhtException(error))
             else {
                 stream.setHandle(streamHandle)
+                activeStreams.add(stream)
                 deferred.complete(stream)
             }
         }
@@ -184,7 +226,7 @@ class HyperDHT(
 
     // --- Server ---
 
-    fun createServer(): Server = Server(Native.serverCreate(handle), handle, ::postToLoop)
+    fun createServer(): Server = Server(Native.serverCreate(handle), handle, ::postToLoop, activeStreams)
 
     // --- Storage ---
 

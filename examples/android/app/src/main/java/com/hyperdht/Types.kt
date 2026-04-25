@@ -18,11 +18,24 @@ object Errors {
     const val HOLEPUNCH_FAILED = -5
     const val HOLEPUNCH_TIMEOUT = -6
     const val RELAY_FAILED = -7
-    const val CANCELLED = -10
+    const val CANCELLED = -8
+
+    fun describe(code: Int): String = when (code) {
+        OK -> "success"
+        DESTROYED -> "DHT destroyed"
+        PEER_NOT_FOUND -> "peer not found on DHT"
+        CONNECTION_FAILED -> "all relay handshakes failed"
+        NO_ADDRESSES -> "no addresses available"
+        HOLEPUNCH_FAILED -> "holepunch failed"
+        HOLEPUNCH_TIMEOUT -> "holepunch timeout"
+        RELAY_FAILED -> "relay connection failed"
+        CANCELLED -> "cancelled"
+        else -> "unknown error ($code)"
+    }
 }
 
-/** HyperDHT error with numeric code. */
-class DhtException(val code: Int, message: String = "HyperDHT error: $code") :
+/** HyperDHT error with numeric code and human-readable message. */
+class DhtException(val code: Int, message: String = Errors.describe(code)) :
     Exception(message)
 
 /** DHT node options. */

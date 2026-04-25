@@ -11,8 +11,10 @@ class Server internal constructor(
     private val handle: Long,
     private val dhtHandle: Long,
     private val postToLoop: (Runnable) -> Unit,
+    private val activeStreams: MutableSet<Stream>,
 ) {
     private var listening = false
+    @Volatile private var closed = false
 
     /**
      * Listen for connections. Returns a Flow that emits ready-to-use Streams.
@@ -29,6 +31,8 @@ class Server internal constructor(
             ConnectionCallback { connPtr ->
                 // connPtr is valid ONLY during this callback — open stream NOW
                 val stream = Stream.open(dhtHandle, connPtr, postToLoop)
+                stream.onCloseCallback = { activeStreams.remove(stream) }
+                activeStreams.add(stream)
                 trySend(stream)
             })
         if (rc != 0) throw DhtException(rc, "server_listen failed: $rc")
@@ -45,15 +49,23 @@ class Server internal constructor(
 
     /** Close the server (unannounce from DHT). */
     suspend fun close(): Unit = suspendCancellableCoroutine { cont ->
-        Native.serverClose(handle, Runnable {
-            if (cont.isActive) cont.resume(Unit)
+        if (closed) { cont.resume(Unit); return@suspendCancellableCoroutine }
+        closed = true
+        postToLoop(Runnable {
+            Native.serverClose(handle, Runnable {
+                if (cont.isActive) cont.resume(Unit)
+            })
         })
     }
 
     /** Force-close without unannouncing. */
     suspend fun closeForce(): Unit = suspendCancellableCoroutine { cont ->
-        Native.serverCloseForce(handle, Runnable {
-            if (cont.isActive) cont.resume(Unit)
+        if (closed) { cont.resume(Unit); return@suspendCancellableCoroutine }
+        closed = true
+        postToLoop(Runnable {
+            Native.serverCloseForce(handle, Runnable {
+                if (cont.isActive) cont.resume(Unit)
+            })
         })
     }
 

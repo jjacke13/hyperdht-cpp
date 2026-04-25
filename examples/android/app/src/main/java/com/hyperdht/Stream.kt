@@ -89,6 +89,21 @@ class Stream internal constructor(
         onCloseCallback?.invoke()
     }
 
+    /**
+     * Mark this stream as closed without calling native close.
+     * Used during HyperDHT.close() when the C layer handles cleanup.
+     */
+    internal fun markClosed() {
+        synchronized(this) {
+            if (closed) return
+            closed = true
+            handle = 0L
+            openContinuation?.cancel()
+            openContinuation = null
+        }
+        dataChannel.close()
+    }
+
     internal var onCloseCallback: (() -> Unit)? = null
 
     // prevent GC of callback objects passed to JNI

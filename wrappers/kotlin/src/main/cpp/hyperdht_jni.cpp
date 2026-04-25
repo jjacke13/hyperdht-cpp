@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
 
 #ifdef HYPERDHT_JNI_DEBUG
 #include <android/log.h>
@@ -569,8 +570,13 @@ Java_com_hyperdht_Native_addNode(
 // ---------------------------------------------------------------------------
 
 struct ServerCtx {
-    jobject callback;  // ConnectionCallback global ref
+    jobject callback;        // ConnectionCallback global ref
+    jobject* firewallPtr;    // Heap-allocated firewall global ref (sync or async), or nullptr
 };
+
+// Map server handle → ServerCtx for cleanup on serverClose.
+// Accessed only from the JNI call thread (all calls dispatch through loopExecutor).
+static std::unordered_map<jlong, ServerCtx*> g_server_ctx;
 
 static void jni_connection_cb(const hyperdht_connection_t* conn, void* ud) {
     auto* ctx = static_cast<ServerCtx*>(ud);
@@ -588,7 +594,13 @@ static void jni_connection_cb(const hyperdht_connection_t* conn, void* ud) {
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_hyperdht_Native_serverCreate(JNIEnv*, jobject, jlong h) {
-    return (jlong)hyperdht_server_create((hyperdht_t*)h);
+    auto sh = (jlong)hyperdht_server_create((hyperdht_t*)h);
+    // Pre-create ServerCtx so setFirewall can be called before serverListen
+    auto* ctx = new ServerCtx;
+    ctx->callback = nullptr;
+    ctx->firewallPtr = nullptr;
+    g_server_ctx[sh] = ctx;
+    return sh;
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -600,7 +612,18 @@ Java_com_hyperdht_Native_serverListen(
     env->GetByteArrayRegion(jpk, 0, 32, (jbyte*)kp.public_key);
     env->GetByteArrayRegion(jsk, 0, 64, (jbyte*)kp.secret_key);
 
-    auto* ctx = new ServerCtx;
+    // Reuse existing ctx (created in serverCreate) or create new one
+    auto it = g_server_ctx.find(sh);
+    ServerCtx* ctx;
+    if (it != g_server_ctx.end()) {
+        ctx = it->second;
+        // Release previous connection callback if re-listening
+        if (ctx->callback) env->DeleteGlobalRef(ctx->callback);
+    } else {
+        ctx = new ServerCtx;
+        ctx->firewallPtr = nullptr;
+        g_server_ctx[sh] = ctx;
+    }
     ctx->callback = env->NewGlobalRef(jcallback);
 
     return hyperdht_server_listen((hyperdht_server_t*)sh, &kp, jni_connection_cb, ctx);
@@ -608,6 +631,19 @@ Java_com_hyperdht_Native_serverListen(
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_serverClose(JNIEnv* env, jobject, jlong sh, jobject jcb) {
+    // Release ServerCtx resources (connection callback + firewall refs)
+    auto it = g_server_ctx.find(sh);
+    if (it != g_server_ctx.end()) {
+        auto* sctx = it->second;
+        env->DeleteGlobalRef(sctx->callback);
+        if (sctx->firewallPtr) {
+            env->DeleteGlobalRef(*(sctx->firewallPtr));
+            delete sctx->firewallPtr;
+        }
+        delete sctx;
+        g_server_ctx.erase(it);
+    }
+
     if (jcb) {
         auto* ref = new jobject(env->NewGlobalRef(jcb));
         hyperdht_server_close((hyperdht_server_t*)sh,
@@ -627,6 +663,19 @@ Java_com_hyperdht_Native_serverClose(JNIEnv* env, jobject, jlong sh, jobject jcb
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_serverCloseForce(JNIEnv* env, jobject, jlong sh, jobject jcb) {
+    // Same ServerCtx cleanup as serverClose
+    auto it = g_server_ctx.find(sh);
+    if (it != g_server_ctx.end()) {
+        auto* sctx = it->second;
+        env->DeleteGlobalRef(sctx->callback);
+        if (sctx->firewallPtr) {
+            env->DeleteGlobalRef(*(sctx->firewallPtr));
+            delete sctx->firewallPtr;
+        }
+        delete sctx;
+        g_server_ctx.erase(it);
+    }
+
     if (jcb) {
         auto* ref = new jobject(env->NewGlobalRef(jcb));
         hyperdht_server_close_force((hyperdht_server_t*)sh,
@@ -667,15 +716,42 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_serverSetFirewall(
     JNIEnv* env, jobject, jlong sh, jobject jcb)
 {
+    // Release previous firewall ref if any
+    auto it = g_server_ctx.find(sh);
+    if (it != g_server_ctx.end() && it->second->firewallPtr) {
+        env->DeleteGlobalRef(*(it->second->firewallPtr));
+        delete it->second->firewallPtr;
+        it->second->firewallPtr = nullptr;
+    }
+
     auto* ref = new jobject(env->NewGlobalRef(jcb));
     hyperdht_server_set_firewall((hyperdht_server_t*)sh, jni_firewall_cb, ref);
+
+    // Track for cleanup
+    if (it != g_server_ctx.end()) {
+        it->second->firewallPtr = ref;
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_serverSetFirewallAsync(
     JNIEnv* env, jobject, jlong sh, jobject jcb)
 {
+    // Release previous firewall ref if any
+    auto it = g_server_ctx.find(sh);
+    if (it != g_server_ctx.end() && it->second->firewallPtr) {
+        env->DeleteGlobalRef(*(it->second->firewallPtr));
+        delete it->second->firewallPtr;
+        it->second->firewallPtr = nullptr;
+    }
+
     auto* ref = new jobject(env->NewGlobalRef(jcb));
+
+    // Track for cleanup
+    if (it != g_server_ctx.end()) {
+        it->second->firewallPtr = ref;
+    }
+
     hyperdht_server_set_firewall_async((hyperdht_server_t*)sh,
         [](const uint8_t pk[32], const char* host, uint16_t port,
            hyperdht_firewall_done_t* done, void* ud) {

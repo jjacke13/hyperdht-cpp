@@ -116,6 +116,7 @@ private:
         RpcHandlers* owner;         // Null after destruction to prevent use-after-free
         uint16_t tid;
         compact::Ipv4Address from;
+        bool from_server = false;   // Which socket received the original request
     };
     std::vector<DelayedReply*> pending_delayed_;
 

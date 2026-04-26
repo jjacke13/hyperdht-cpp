@@ -88,6 +88,11 @@ struct Request {
     std::optional<std::array<uint8_t, 32>> target;   // FLAG_HAS_TARGET
     std::optional<std::vector<uint8_t>> value;        // FLAG_HAS_VALUE
     bool internal = false;                             // FLAG_INTERNAL
+
+    // Transport-layer field (not wire-encoded): true if this request was
+    // received on the server socket. Used for ID suppression in replies —
+    // JS only includes the node ID when `!ephemeral && socket === serverSocket`.
+    bool from_server = false;
 };
 
 // ---------------------------------------------------------------------------

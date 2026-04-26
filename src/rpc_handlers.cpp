@@ -182,7 +182,8 @@ messages::Response RpcHandlers::make_query_response(const messages::Request& req
     messages::Response resp;
     resp.tid = req.tid;
     resp.from.addr = req.from.addr;
-    if (!socket_.is_ephemeral()) {
+    // JS: io.js:488 — includes ID only when `!ephemeral && socket === serverSocket`
+    if (!socket_.is_ephemeral() && req.from_server) {
         resp.id = socket_.table().id();
     }
     resp.token = socket_.token_store().create(req.from.addr.host_string());
@@ -263,7 +264,7 @@ void RpcHandlers::handle_down_hint(const messages::Request& req) {
         messages::Response resp;
         resp.tid = req.tid;
         resp.from.addr = req.from.addr;
-        if (!socket_.is_ephemeral()) {
+        if (!socket_.is_ephemeral() && req.from_server) {
             resp.id = socket_.table().id();
         }
         socket_.reply(resp);
@@ -334,6 +335,7 @@ void RpcHandlers::handle_delayed_ping(const messages::Request& req) {
     dr->owner = this;
     dr->tid = req.tid;
     dr->from = req.from.addr;
+    dr->from_server = req.from_server;
 
     uv_timer_init(socket_.loop(), &dr->timer);
     dr->timer.data = dr;
@@ -352,7 +354,7 @@ void RpcHandlers::on_delayed_ping_fire(uv_timer_t* timer) {
         messages::Response resp;
         resp.tid = dr->tid;
         resp.from.addr = dr->from;
-        if (!dr->owner->socket_.is_ephemeral()) {
+        if (!dr->owner->socket_.is_ephemeral() && dr->from_server) {
             resp.id = dr->owner->socket_.table().id();
         }
         dr->owner->socket_.reply(resp);
@@ -500,7 +502,7 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
         messages::Response resp;
         resp.tid = req.tid;
         resp.from.addr = req.from.addr;
-        if (!socket_.is_ephemeral()) {
+        if (!socket_.is_ephemeral() && req.from_server) {
             resp.id = socket_.table().id();
         }
         socket_.reply(resp);
@@ -547,7 +549,7 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
     messages::Response resp;
     resp.tid = req.tid;
     resp.from.addr = req.from.addr;
-    if (!socket_.is_ephemeral()) {
+    if (!socket_.is_ephemeral() && req.from_server) {
         resp.id = socket_.table().id();
     }
 
@@ -605,7 +607,7 @@ void RpcHandlers::handle_unannounce(const messages::Request& req) {
     messages::Response resp;
     resp.tid = req.tid;
     resp.from.addr = req.from.addr;
-    if (!socket_.is_ephemeral()) {
+    if (!socket_.is_ephemeral() && req.from_server) {
         resp.id = socket_.table().id();
     }
 

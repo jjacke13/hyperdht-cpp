@@ -10,9 +10,9 @@
 // C++ diffs from JS:
 //   - JS splits responsibilities across DHT (lifecycle, ticking) + IO
 //     (sockets, congestion, requests). C++ collapses both into RpcSocket.
-//   - Single UDP socket vs JS's two (clientSocket + serverSocket). The
-//     PING_NAT firewall probe (JS DHT::_checkIfFirewalled) is therefore
-//     not implemented here.
+//   - Dual sockets (client_socket_ + server_socket_) matching JS
+//     io.js clientSocket/serverSocket. Firewall probe (_checkIfFirewalled)
+//     sends PING_NAT from client asking remote to reply to server port.
 //   - bind() takes an explicit `host` param vs JS's default `0.0.0.0`.
 //   - Per-peer RTT stored in `peer_rtt_` map (EMA via record_rtt) vs
 //     JS using the `adaptive-timeout` package.
@@ -130,8 +130,10 @@ RpcSocket::RpcSocket(uv_loop_t* loop, const routing::NodeId& local_id)
     : loop_(loop), table_(local_id) {
 
     udx_init(loop_, &udx_, nullptr);
-    udx_socket_init(&udx_, &socket_, nullptr);
-    socket_.data = this;
+    udx_socket_init(&udx_, &client_socket_, nullptr);
+    udx_socket_init(&udx_, &server_socket_, nullptr);
+    client_socket_.data = this;
+    server_socket_.data = this;
 
     // Drain timer (heap-allocated to outlive RpcSocket on close)
     drain_timer_ = new uv_timer_t;
@@ -156,38 +158,57 @@ RpcSocket::RpcSocket(uv_loop_t* loop, const routing::NodeId& local_id)
 }
 
 RpcSocket::~RpcSocket() {
-    assert(!socket_bound_ || closing_);
+    assert((!client_bound_ && !server_bound_) || closing_);
     // Safety: if destroyed without close(), detach timers so callbacks don't use 'this'
     if (drain_timer_) drain_timer_->data = nullptr;
     if (bg_timer_) bg_timer_->data = nullptr;
+    if (probe_timer_) probe_timer_->data = nullptr;
 }
 
-// JS: io.js:224-228 (bind) + io.js:230-295 (_bindSockets — JS binds two
-//     sockets here, server + client. C++ binds just one.)
+// JS: io.js:224-228 (bind) + io.js:230-295 (_bindSockets — JS binds
+//     serverSocket to user port, clientSocket to random port.)
 int RpcSocket::bind(uint16_t port, const std::string& host) {
-    struct sockaddr_in addr{};
-    // uv_ip4_addr rejects malformed IPv4 strings; pass through the caller's
-    // host (JS default "0.0.0.0", but apps may want to bind a specific
-    // interface for multi-homed hosts or dev/testing isolation).
-    if (uv_ip4_addr(host.c_str(), port, &addr) != 0) return UV_EINVAL;
-    int rc = udx_socket_bind(&socket_, reinterpret_cast<const struct sockaddr*>(&addr), 0);
-    if (rc == 0) {
-        socket_bound_ = true;
-        udx_socket_recv_start(&socket_, on_recv);
+    // Server socket: user-specified port (or 0 for OS-assigned)
+    struct sockaddr_in server_addr{};
+    if (uv_ip4_addr(host.c_str(), port, &server_addr) != 0) return UV_EINVAL;
+    int rc = udx_socket_bind(&server_socket_,
+                             reinterpret_cast<const struct sockaddr*>(&server_addr), 0);
+    if (rc != 0) return rc;
+    server_bound_ = true;
 
-        // Start drain timer
-        uv_timer_start(drain_timer_, on_drain_tick, DRAIN_INTERVAL_MS, DRAIN_INTERVAL_MS);
-
-        // Start background tick timer
-        uv_timer_start(bg_timer_, on_bg_tick, BG_TICK_MS, BG_TICK_MS);
+    // Client socket: always random port (ephemeral outbound)
+    struct sockaddr_in client_addr{};
+    if (uv_ip4_addr(host.c_str(), 0, &client_addr) != 0) {
+        udx_socket_close(&server_socket_);
+        server_bound_ = false;
+        return UV_EINVAL;
     }
-    return rc;
+    rc = udx_socket_bind(&client_socket_,
+                         reinterpret_cast<const struct sockaddr*>(&client_addr), 0);
+    if (rc != 0) {
+        udx_socket_close(&server_socket_);
+        server_bound_ = false;
+        return rc;
+    }
+    client_bound_ = true;
+
+    // Both sockets receive messages
+    udx_socket_recv_start(&client_socket_, on_recv_client);
+    udx_socket_recv_start(&server_socket_, on_recv_server);
+
+    // Start drain timer
+    uv_timer_start(drain_timer_, on_drain_tick, DRAIN_INTERVAL_MS, DRAIN_INTERVAL_MS);
+
+    // Start background tick timer
+    uv_timer_start(bg_timer_, on_bg_tick, BG_TICK_MS, BG_TICK_MS);
+    return 0;
 }
 
 uint16_t RpcSocket::port() const {
+    // Return server socket port — the persistent/advertised port
     struct sockaddr_in addr{};
     int len = sizeof(addr);
-    udx_socket_getsockname(const_cast<udx_socket_t*>(&socket_),
+    udx_socket_getsockname(const_cast<udx_socket_t*>(&server_socket_),
                            reinterpret_cast<struct sockaddr*>(&addr), &len);
     return ntohs(addr.sin_port);
 }
@@ -245,6 +266,12 @@ struct SendContext {
 };
 
 void RpcSocket::udp_send(const std::vector<uint8_t>& buf, const compact::Ipv4Address& to) {
+    udp_send_on(buf, to, active_socket());
+}
+
+void RpcSocket::udp_send_on(const std::vector<uint8_t>& buf,
+                            const compact::Ipv4Address& to,
+                            udx_socket_t* socket) {
     auto* ctx = new SendContext;
     ctx->buf = buf;
     ctx->req.data = ctx;
@@ -255,7 +282,7 @@ void RpcSocket::udp_send(const std::vector<uint8_t>& buf, const compact::Ipv4Add
     struct sockaddr_in dest{};
     uv_ip4_addr(to.host_string().c_str(), to.port, &dest);
 
-    udx_socket_send(&ctx->req, &socket_, &uv_buf, 1,
+    udx_socket_send(&ctx->req, socket, &uv_buf, 1,
                     reinterpret_cast<const struct sockaddr*>(&dest),
                     [](udx_socket_send_t* req, int) {
                         delete static_cast<SendContext*>(req->data);
@@ -381,7 +408,11 @@ uint16_t RpcSocket::delayed_ping(const compact::Ipv4Address& to,
 void RpcSocket::reply(const messages::Response& resp) {
     if (closing_) return;
     auto buf = messages::encode_response(resp);
-    udp_send(buf, resp.from.addr);
+    // Replies always go from server_socket_ when persistent — the ID in
+    // the response is computed from the server socket's address, so the
+    // receiver's validateId must see that source port. When ephemeral,
+    // active_socket() returns client_socket_ (no ID in response anyway).
+    udp_send_on(buf, resp.from.addr, active_socket());
 }
 
 void RpcSocket::stop_tick() {
@@ -432,7 +463,20 @@ void RpcSocket::close() {
     }
     pending_.clear();
 
-    udx_socket_close(&socket_);
+    // Cancel firewall probe if running
+    if (firewall_probe_running_) {
+        firewall_probe_running_ = false;
+        if (probe_timer_) uv_timer_stop(probe_timer_);
+    }
+    if (probe_timer_) {
+        probe_timer_->data = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(probe_timer_), free_timer);
+        probe_timer_ = nullptr;
+    }
+
+    // Close both sockets
+    if (client_bound_) udx_socket_close(&client_socket_);
+    if (server_bound_) udx_socket_close(&server_socket_);
 }
 
 // ---------------------------------------------------------------------------
@@ -489,14 +533,33 @@ void RpcSocket::on_request_timeout(uv_timer_t* timer) {
 //     RESPONSE_ID dispatch, RTT recording, congestion.recv, inflight pop)
 // ---------------------------------------------------------------------------
 
-void RpcSocket::on_recv(udx_socket_t* socket, ssize_t nread, const uv_buf_t* buf,
-                        const struct sockaddr* addr) {
+void RpcSocket::on_recv_client(udx_socket_t* socket, ssize_t nread, const uv_buf_t* buf,
+                               const struct sockaddr* addr) {
     if (nread <= 0 || addr == nullptr) return;
-
     auto* self = static_cast<RpcSocket*>(socket->data);
     auto* addr_in = reinterpret_cast<const struct sockaddr_in*>(addr);
     self->handle_message(reinterpret_cast<const uint8_t*>(buf->base),
-                         static_cast<size_t>(nread), addr_in);
+                         static_cast<size_t>(nread), addr_in, false);
+}
+
+void RpcSocket::on_recv_server(udx_socket_t* socket, ssize_t nread, const uv_buf_t* buf,
+                               const struct sockaddr* addr) {
+    if (nread <= 0 || addr == nullptr) return;
+    auto* self = static_cast<RpcSocket*>(socket->data);
+    auto* addr_in = reinterpret_cast<const struct sockaddr_in*>(addr);
+
+    // During firewall probe: track which hosts reached the server socket
+    if (self->firewall_probe_running_) {
+        char host[INET_ADDRSTRLEN];
+        uv_ip4_name(addr_in, host, sizeof(host));
+        self->probe_replied_hosts_.insert(host);
+        if (self->probe_replied_hosts_.size() >= self->probe_threshold()) {
+            self->finish_firewall_probe();
+        }
+    }
+
+    self->handle_message(reinterpret_cast<const uint8_t*>(buf->base),
+                         static_cast<size_t>(nread), addr_in, true);
 }
 
 // Register a new holepunch probe listener. Returns an ID for later removal.
@@ -529,7 +592,7 @@ void RpcSocket::send_probe_ttl(const compact::Ipv4Address& to, int ttl) {
     struct sockaddr_in dest{};
     uv_ip4_addr(to.host_string().c_str(), to.port, &dest);
 
-    udx_socket_send_ttl(&ctx->req, &socket_, &uv_buf, 1,
+    udx_socket_send_ttl(&ctx->req, active_socket(), &uv_buf, 1,
                         reinterpret_cast<const struct sockaddr*>(&dest),
                         ttl,
                         [](udx_socket_send_t* req, int) {
@@ -541,8 +604,13 @@ void RpcSocket::send_probe_ttl(const compact::Ipv4Address& to, int ttl) {
 // (`buffer.byteLength < 2`). C++ uses 1-byte 0x00 as a holepunch probe
 // (matching DHT::onmessage at index.js:153 which only forwards >1 byte
 // payloads to io.js — leaving 1-byte for holepunch detection).
+//
+// `from_server` indicates which socket received this message. Used for
+// ID suppression logic: JS only includes the node ID in responses when
+// `!ephemeral && socket === serverSocket` (io.js:488).
 void RpcSocket::handle_message(const uint8_t* data, size_t len,
-                               const struct sockaddr_in* addr) {
+                               const struct sockaddr_in* addr,
+                               bool from_server) {
     if (closing_) return;
 
     // Holepunch probe: single byte 0x00
@@ -570,6 +638,7 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
         char host[INET_ADDRSTRLEN];
         uv_ip4_name(addr, host, sizeof(host));
         req.from.addr = compact::Ipv4Address::from_string(host, ntohs(addr->sin_port));
+        req.from_server = from_server;
 
         // Validate and observe the peer in the routing table.
         // JS: io.js:392 `from.id = validateId(id, from)` — recomputes
@@ -826,25 +895,18 @@ void RpcSocket::background_tick() {
     }
 }
 
-// JS: dht-rpc/index.js:801-875 (_updateNetworkState). Our version is
-// simplified: we trust the NAT sampler's classification rather than
-// running a separate PING_NAT firewall probe (JS:916-963 _checkIfFirewalled
-// requires the dual-socket setup we don't have).
+// JS: dht-rpc/index.js:801-875 (_updateNetworkState).
 //
-// On success (CONSISTENT or OPEN firewall):
-//   1. Flip ephemeral_ to false
-//   2. Rebuild routing table with address-based ID: BLAKE2b(host:port)
-//      (JS: index.js:831-864 — new Table(peer.id(host, port)), copy nodes)
-//   3. Fire on_persistent_ callback → HyperDHT::fire_persistent() triggers
-//      refresh() to re-bootstrap with the new ID
+// Now matches JS: when NAT sampler says CONSISTENT, we run a firewall
+// probe (PING_NAT from client_socket_, replies expected on server_socket_)
+// before committing to the persistent transition. This correctly detects
+// port-restricted cone NATs that map consistently but block unsolicited
+// inbound — JS: _checkIfFirewalled (index.js:916-963).
 //
 // Idempotency: once `ephemeral_` has flipped to false, this is a no-op.
-// The production background tick already guards the call with
-// `if (ephemeral_ && --stable_ticks_ <= 0)`, but `force_check_persistent()`
-// is publicly callable and the JS parity semantic is "emit once".
-// Re-entering after the flip would fire `on_persistent_` a second time.
 void RpcSocket::check_persistent() {
     if (!ephemeral_) return;
+    if (firewall_probe_running_) return;  // probe already in flight
 
     auto current_host = nat_sampler_.host();
 
@@ -858,28 +920,139 @@ void RpcSocket::check_persistent() {
     stable_ticks_ = STABLE_TICKS_MORE;
     last_nat_host_ = current_host;
 
-    // If NAT sampler has determined we're consistent or open → become persistent
     uint32_t fw = nat_sampler_.firewall();
     const char* fw_str = fw == 0 ? "UNKNOWN" : fw == 1 ? "OPEN" :
                          fw == 2 ? "CONSISTENT" : fw == 3 ? "RANDOM" : "?";
     DHT_LOG("  [rpc] check_persistent: host=%s:%u firewall=%s (%u)\n",
             current_host.c_str(), nat_sampler_.port(), fw_str, fw);
-    if (fw == 2 /* FIREWALL_CONSISTENT */ || fw == 1 /* FIREWALL_OPEN */) {
-        ephemeral_ = false;
-        firewalled_ = (fw != 1);
 
-        // Rebuild routing table with address-based ID.
-        // JS: index.js:831 — `const id = peer.id(natSampler.host, natSampler.port)`
-        // JS: index.js:854-864 — create new Table(id), copy nodes, re-bootstrap.
-        auto our_addr = compact::Ipv4Address::from_string(
-            current_host, nat_sampler_.port());
-        auto new_id = compute_peer_id(our_addr);
-        if (new_id != table_.id()) {
-            table_.rebuild_with_id(new_id);
-        }
-
-        if (on_persistent_) on_persistent_();
+    if (fw == 2 /* CONSISTENT */ || fw == 1 /* OPEN */) {
+        // Don't transition immediately — run firewall probe first.
+        // JS: index.js:821 — `const firewalled = this.firewalled && (await this._checkIfFirewalled(natSampler))`
+        start_firewall_probe();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Firewall probe — verify server socket is reachable before going persistent
+//
+// JS: dht-rpc/index.js:916-963 (_checkIfFirewalled)
+// Sends PING_NAT from client_socket_ asking remote nodes to reply to
+// server_socket_'s port. If replies arrive on server_socket_, the port
+// is reachable from the network → not firewalled → go persistent.
+// ---------------------------------------------------------------------------
+
+void RpcSocket::start_firewall_probe() {
+    if (firewall_probe_running_ || closing_) return;
+    firewall_probe_running_ = true;
+    probe_replied_hosts_.clear();
+
+    auto nodes = collect_probe_nodes(5);
+    probe_expected_ = nodes.size();
+    if (nodes.empty()) {
+        DHT_LOG("  [rpc] firewall probe: no nodes to probe\n");
+        firewall_probe_running_ = false;
+        return;
+    }
+
+    // Encode server socket port as PING_NAT value (uint16le)
+    struct sockaddr_in saddr{};
+    int slen = sizeof(saddr);
+    udx_socket_getsockname(&server_socket_,
+                           reinterpret_cast<struct sockaddr*>(&saddr), &slen);
+    uint16_t server_port = ntohs(saddr.sin_port);
+
+    std::vector<uint8_t> value = {
+        static_cast<uint8_t>(server_port & 0xFF),
+        static_cast<uint8_t>((server_port >> 8) & 0xFF)
+    };
+
+    DHT_LOG("  [rpc] firewall probe: sending PING_NAT to %zu nodes, server_port=%u\n",
+            nodes.size(), server_port);
+
+    // Send PING_NAT from client_socket_ to each node.
+    // The remote's PING_NAT handler (rpc_handlers.cpp) reads the port from
+    // value and replies to (our_host, server_port) instead of (our_host, client_port).
+    for (const auto& node : nodes) {
+        messages::Request req;
+        req.internal = true;
+        req.command = messages::CMD_PING_NAT;
+        req.value = value;
+        auto buf = messages::encode_request(req);
+        auto addr = compact::Ipv4Address::from_string(node.host, node.port);
+        udp_send_on(buf, addr, &client_socket_);
+    }
+
+    // 5 second timeout
+    if (!probe_timer_) {
+        probe_timer_ = new uv_timer_t;
+        uv_timer_init(loop_, probe_timer_);
+        probe_timer_->data = this;
+    }
+    uv_timer_start(probe_timer_, [](uv_timer_t* t) {
+        auto* self = static_cast<RpcSocket*>(t->data);
+        if (self) self->finish_firewall_probe();
+    }, 5000, 0);
+}
+
+void RpcSocket::finish_firewall_probe() {
+    if (!firewall_probe_running_) return;
+    firewall_probe_running_ = false;
+    if (probe_timer_) uv_timer_stop(probe_timer_);
+
+    size_t threshold = probe_threshold();
+    bool is_firewalled = probe_replied_hosts_.size() < threshold;
+
+    DHT_LOG("  [rpc] firewall probe: %zu/%zu replied, threshold=%zu → %s\n",
+            probe_replied_hosts_.size(), probe_expected_, threshold,
+            is_firewalled ? "FIREWALLED" : "NOT FIREWALLED");
+
+    if (is_firewalled) {
+        firewalled_ = true;
+        // Stay ephemeral — retry on next stable_ticks_ cycle
+        return;
+    }
+
+    // Not firewalled — proceed with persistent transition
+    do_persistent_transition();
+}
+
+std::vector<routing::Node> RpcSocket::collect_probe_nodes(size_t max) {
+    std::vector<routing::Node> out;
+    for (size_t i = 0; i < 256 && out.size() < max; i++) {
+        for (const auto& n : table_.bucket(i).nodes()) {
+            out.push_back(n);
+            if (out.size() >= max) return out;
+        }
+    }
+    return out;
+}
+
+// The actual ephemeral → persistent transition logic, extracted so both
+// the firewall probe callback and force_check_persistent() can use it.
+//
+// JS: index.js:824 — `this.firewalled = this.io.firewalled = false`
+// After the firewall probe succeeds (or we're forced persistent),
+// firewalled_ flips to false and all traffic switches to server_socket_.
+void RpcSocket::do_persistent_transition() {
+    if (!ephemeral_) return;
+
+    ephemeral_ = false;
+    firewalled_ = false;  // Probe passed (or forced) → server socket is reachable
+
+    auto current_host = nat_sampler_.host();
+
+    // Rebuild routing table with address-based ID.
+    // JS: index.js:831 — `const id = peer.id(natSampler.host, natSampler.port)`
+    // JS: index.js:854-864 — create new Table(id), copy nodes, re-bootstrap.
+    auto our_addr = compact::Ipv4Address::from_string(
+        current_host, nat_sampler_.port());
+    auto new_id = compute_peer_id(our_addr);
+    if (new_id != table_.id()) {
+        table_.rebuild_with_id(new_id);
+    }
+
+    if (on_persistent_) on_persistent_();
 }
 
 // ---------------------------------------------------------------------------

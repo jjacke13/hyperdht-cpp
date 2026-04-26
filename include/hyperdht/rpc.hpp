@@ -11,6 +11,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <udx.h>
@@ -116,7 +117,13 @@ struct InflightRequest {
 };
 
 // ---------------------------------------------------------------------------
-// RpcSocket — single UDP socket for DHT communication
+// RpcSocket — dual UDP socket for DHT communication
+//
+// JS parity: dht-rpc/lib/io.js uses two sockets:
+//   clientSocket — ephemeral outbound, random port (used while firewalled)
+//   serverSocket — persistent, user-specified port (used after transition)
+// _checkIfFirewalled() probes whether the server socket is reachable
+// from the network before committing to the persistent transition.
 // ---------------------------------------------------------------------------
 
 class RpcSocket {
@@ -212,7 +219,12 @@ public:
 
     // Access the underlying UDX handles (for stream connect through same socket)
     udx_t* udx_handle() { return &udx_; }
-    udx_socket_t* socket_handle() { return &socket_; }
+    // Always returns server socket — UDX streams use the persistent port.
+    // Matches JS: index.js:139 where dht.socket returns serverSocket.
+    udx_socket_t* socket_handle() { return &server_socket_; }
+
+    // Returns the currently active socket (client while firewalled, server after)
+    udx_socket_t* active_socket() { return firewalled_ ? &client_socket_ : &server_socket_; }
 
     // Close the socket and stop all timers
     void close();
@@ -247,13 +259,14 @@ public:
     // Reset the refresh timer (called by query engine when queries are active)
     void reset_refresh_timer() { refresh_ticks_ = REFRESH_TICKS; }
 
-    // Force an immediate ephemeral → persistent re-evaluation. Exposed
-    // so tests can drive the `on_persistent_` callback deterministically
-    // without waiting for `STABLE_TICKS_INIT` to elapse; production code
-    // reaches this path through the background tick countdown. Safe to
-    // call repeatedly: the target `check_persistent()` is idempotent —
-    // once `ephemeral_` has flipped to false, further calls are no-ops.
-    void force_check_persistent() { check_persistent(); }
+    // Force an immediate ephemeral → persistent transition, bypassing
+    // the firewall probe. Exposed for tests that need deterministic
+    // behavior without waiting for STABLE_TICKS_INIT or network probes.
+    // Production code reaches the persistent transition through the
+    // background tick → check_persistent() → firewall probe path.
+    void force_check_persistent() {
+        do_persistent_transition();
+    }
 
     // Directly fire the `on_health_change_` callback. Test-only hook used
     // to verify §15 network-update wiring without driving four background
@@ -322,8 +335,10 @@ public:
 private:
     uv_loop_t* loop_;
     udx_t udx_;
-    udx_socket_t socket_;
-    bool socket_bound_ = false;
+    udx_socket_t client_socket_;   // Ephemeral outbound (random port)
+    udx_socket_t server_socket_;   // Persistent (user-specified or 0)
+    bool client_bound_ = false;
+    bool server_bound_ = false;
     bool closing_ = false;
 
     routing::RoutingTable table_;
@@ -406,15 +421,33 @@ private:
     // Background tick: health, refresh, ephemeral/persistent
     void background_tick();
     void check_persistent();
+    void do_persistent_transition();
+
+    // Firewall probe — verifies server socket is reachable before persistent transition
+    // JS: dht-rpc/index.js:916-963 (_checkIfFirewalled)
+    bool firewall_probe_running_ = false;
+    std::unordered_set<std::string> probe_replied_hosts_;
+    size_t probe_expected_ = 0;
+    uv_timer_t* probe_timer_ = nullptr;
+    void start_firewall_probe();
+    void finish_firewall_probe();
+    // JS threshold: count >= 3 when 5 nodes probed, >= 1 when fewer
+    size_t probe_threshold() const { return probe_expected_ >= 5 ? 3 : 1; }
+    std::vector<routing::Node> collect_probe_nodes(size_t max);
+    void udp_send_on(const std::vector<uint8_t>& buf,
+                     const compact::Ipv4Address& to,
+                     udx_socket_t* socket);
 
     // Adaptive timeout: record RTT sample
     void record_rtt(const compact::Ipv4Address& peer, uint64_t rtt_ms);
 
-    // UDP receive callback
-    static void on_recv(udx_socket_t* socket, ssize_t nread, const uv_buf_t* buf,
-                        const struct sockaddr* addr);
+    // UDP receive callbacks — one per socket
+    static void on_recv_client(udx_socket_t* socket, ssize_t nread, const uv_buf_t* buf,
+                               const struct sockaddr* addr);
+    static void on_recv_server(udx_socket_t* socket, ssize_t nread, const uv_buf_t* buf,
+                               const struct sockaddr* addr);
     void handle_message(const uint8_t* data, size_t len,
-                        const struct sockaddr_in* addr);
+                        const struct sockaddr_in* addr, bool from_server);
 };
 
 // ---------------------------------------------------------------------------

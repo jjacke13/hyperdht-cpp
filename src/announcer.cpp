@@ -141,8 +141,13 @@ void Announcer::notify_online() {
         return;
     }
     DHT_LOG("  [announcer] notify_online: triggering update cycle "
-            "(reset has_reannounced_)\n");
+            "(reset has_reannounced_ + clear active_relays_)\n");
     has_reannounced_ = false;
+    // Clear stale relay entries so the next cycle rebuilds them with
+    // fresh peer_addr from the current active_socket() (e.g. after
+    // the persistent transition switches from client to server socket).
+    active_relays_.clear();
+    relays_.clear();
     update();
 }
 

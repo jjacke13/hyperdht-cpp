@@ -627,14 +627,27 @@ void Server::on_handshake_result(
 
         // Connect to the relay node — same pattern as client side.
         // JS: server.js:643 — hs.relaySocket = this.dht.connect(publicKey)
+        //
+        // Liveness: dht_->connect runs `findPeer` + multiple async
+        // round-trips, and the `pair` continuation below adds another.
+        // The Server may be closed (or destroyed via ~HyperDHT, which
+        // drops servers_ unique_ptrs) before any of those fire. Capture
+        // a weak_ptr<bool> sentinel and bail before dereferencing the
+        // raw `this` pointer. Mirrors the firewall_async_ path above.
         auto* dht_ptr = dht_;
         auto* self = this;
+        std::weak_ptr<bool> weak_alive = alive_;
         dht_->connect(relay_pk,
-            [self, dht_ptr, hp_id, relay_is_initiator, relay_tok, relay_raw,
+            [self, dht_ptr, weak_alive, hp_id, relay_is_initiator, relay_tok, relay_raw,
              relay_hs_tx, relay_hs_rx, relay_hs_hash, relay_hs_rpk,
              relay_local_udx_id, relay_remote_udx_id,
              relay_keep_alive = relay_keep_alive](
                 int err, const ConnectResult& relay_result) {
+            // If the Server is gone, the parent HyperDHT may also be in
+            // destruction (servers_ is owned by HyperDHT). Skip stats /
+            // clear_session — both would dereference dangling memory.
+            auto alive = weak_alive.lock();
+            if (!alive || !*alive) return;
             if (self->closed_ || !relay_result.success || err != 0) {
                 DHT_LOG("  [server] Relay connect failed: %d\n", err);
                 if (dht_ptr) dht_ptr->relay_stats().aborts++;
@@ -700,11 +713,17 @@ void Server::on_handshake_result(
 
             // Pair through the relay
             // JS: server.js:649 — hs.relayClient.pair(isInitiator, token, hs.rawStream)
+            //
+            // Liveness: same hazard as the outer connect — pair waits on
+            // an async exchange with the relay node. Recheck `weak_alive`
+            // before touching `self->...`.
             relay_client->pair(
                 relay_is_initiator, relay_tok, relay_local_udx_id,
-                [self, dht_ptr, hp_id, relay_raw, relay_duplex, relay_mux, relay_client,
+                [self, dht_ptr, weak_alive, hp_id, relay_raw, relay_duplex, relay_mux, relay_client,
                  relay_hs_tx, relay_hs_rx, relay_hs_hash, relay_hs_rpk,
                  relay_local_udx_id, relay_remote_udx_id](uint32_t remote_id) {
+                    auto alive = weak_alive.lock();
+                    if (!alive || !*alive) return;
                     if (self->closed_) return;
 
                     DHT_LOG("  [server] Relay pairing succeeded! remote_id=%u\n", remote_id);
@@ -751,7 +770,9 @@ void Server::on_handshake_result(
                         self->on_connection_(info);
                     }
                 },
-                [self, dht_ptr, hp_id](int err) {
+                [self, dht_ptr, weak_alive, hp_id](int err) {
+                    auto alive = weak_alive.lock();
+                    if (!alive || !*alive) return;
                     if (self->closed_) return;
                     DHT_LOG("  [server] Relay pairing failed: %d\n", err);
                     if (dht_ptr) dht_ptr->relay_stats().aborts++;

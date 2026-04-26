@@ -108,3 +108,32 @@ TEST(LruCache, OverwriteRefreshesTimestamp) {
     cache.gc(4000, 2000);
     EXPECT_NE(cache.get("a"), nullptr) << "Refreshed entry should survive GC";
 }
+
+// Regression: gc() must walk the entire list, not stop at the first
+// un-expired tail entry. `get()` promotes by moving an entry to the
+// front WITHOUT updating `created_at`, so list-tail order is LRU
+// access order, not chronological created_at order. After a `get()`,
+// an old (truly-expired) entry can sit at the front while a younger
+// (un-expired) entry sits at the back. An early `break` at the back
+// would leak the expired entry indefinitely.
+TEST(LruCache, GcWalksFullListAfterGetPromotion) {
+    LruCache<std::string, int> cache(100);
+    cache.put("old", 1, 1000);
+    cache.put("fresh", 2, 5000);
+
+    // Promote "old" to the front — list is now [old(1000), fresh(5000)]
+    // (front-to-back). The back is now "fresh", which is un-expired.
+    ASSERT_NE(cache.get("old"), nullptr);
+
+    // GC at time=4000 with 2s TTL.
+    // - "old" (created_at=1000, age=3000) IS expired.
+    // - "fresh" (created_at=5000) is fresh.
+    // A buggy gc that stops at the first un-expired tail entry would
+    // see "fresh" at the back, break, and leave "old" forever.
+    cache.gc(4000, 2000);
+    EXPECT_EQ(cache.get("old"), nullptr)
+        << "Expired entry must be evicted even when it's not at the list tail";
+    EXPECT_NE(cache.get("fresh"), nullptr)
+        << "Un-expired entry must survive";
+    EXPECT_EQ(cache.size(), 1u);
+}

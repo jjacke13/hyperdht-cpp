@@ -1013,6 +1013,18 @@ void RpcSocket::finish_firewall_probe() {
         return;
     }
 
+    // JS: index.js:954 — verify the external port matches our local server
+    // socket port (no NAT port remapping). If the NAT remaps, other nodes
+    // can't predict which external port to reach us at.
+    uint16_t local_server_port = port();  // server_socket_ port
+    uint16_t external_port = nat_sampler_.port();
+    if (external_port != 0 && external_port != local_server_port) {
+        DHT_LOG("  [rpc] firewall probe: port remapped (local=%u external=%u) → FIREWALLED\n",
+                local_server_port, external_port);
+        firewalled_ = true;
+        return;
+    }
+
     // Not firewalled — proceed with persistent transition
     do_persistent_transition();
 }

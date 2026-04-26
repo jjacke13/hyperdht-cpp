@@ -539,6 +539,55 @@ HYPERDHT_API void hyperdht_stream_close(hyperdht_stream_t* stream);
 HYPERDHT_API int hyperdht_stream_is_open(const hyperdht_stream_t* stream);
 
 /**
+ * Unordered, unreliable encrypted datagrams over the same SecretStream
+ * keys as the reliable stream. Mirrors `SecretStreamDuplex::send_udp`
+ * and `on_udp_message` (see `secret_stream.hpp`). The transport is
+ * UDX's `send`/`recv` channel — bypasses the reliable byte stream, so
+ * messages may be dropped, duplicated, or arrive out of order. Each
+ * call writes one secretbox-sealed envelope; payloads should fit in a
+ * single UDP datagram (~1200 bytes after framing overhead).
+ *
+ * Receive-side ordering: `cb` may fire only after the caller has
+ * installed it AND the underlying handshake is done (i.e. `on_open`
+ * has fired). Datagrams that arrive before either condition is met
+ * are dropped silently.
+ */
+typedef void (*hyperdht_udp_msg_cb)(const uint8_t* data,
+                                    size_t len,
+                                    void* userdata);
+
+/**
+ * Install / replace the UDP-message receive callback. Pass `cb=NULL`
+ * to detach. Returns 0 on success, negative on error.
+ *
+ * Must be called from the loop thread (same thread that owns the DHT).
+ */
+HYPERDHT_API int hyperdht_stream_set_on_udp_message(
+    hyperdht_stream_t* stream,
+    hyperdht_udp_msg_cb cb,
+    void* userdata);
+
+/**
+ * Send an unordered encrypted datagram. Returns 0 on submission
+ * success, negative on error (closed stream, send-state not ready,
+ * UDX backpressure). Equivalent to JS `stream.send(buf)`.
+ */
+HYPERDHT_API int hyperdht_stream_send_udp(
+    hyperdht_stream_t* stream,
+    const uint8_t* data,
+    size_t len);
+
+/**
+ * Fire-and-forget variant — never blocks, drops on send-buffer
+ * pressure rather than reporting it. Equivalent to JS
+ * `stream.trySend(buf)`. Returns 0 on submission success.
+ */
+HYPERDHT_API int hyperdht_stream_try_send_udp(
+    hyperdht_stream_t* stream,
+    const uint8_t* data,
+    size_t len);
+
+/**
  * Connect and open a stream atomically. Combines hyperdht_connect +
  * hyperdht_stream_open so the stream is opened inside the connect
  * callback while the connection struct is still alive. Avoids the

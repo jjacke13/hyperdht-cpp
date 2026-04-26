@@ -87,6 +87,13 @@ struct hyperdht_stream_s {
     hyperdht_close_cb on_close = nullptr;
     void* userdata = nullptr;
 
+    // Unordered/encrypted datagram receive slot. Filled lazily via
+    // `hyperdht_stream_set_on_udp_message`; the duplex callback is
+    // always installed at construction time and silently drops
+    // messages that arrive while `on_udp_message` is null.
+    hyperdht_udp_msg_cb on_udp_message = nullptr;
+    void* udp_userdata = nullptr;
+
     bool closed = false;
 
     // Keeps the holepunch pool socket alive for the UDX stream's lifetime.

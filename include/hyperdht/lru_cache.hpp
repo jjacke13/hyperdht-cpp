@@ -62,16 +62,23 @@ public:
         map_.erase(it);
     }
 
-    // Evict entries older than max_age_ms. Walk from oldest (back).
+    // Evict entries older than max_age_ms.
+    //
+    // We must walk the whole list, not stop at the first un-expired
+    // tail entry: `get()` splices accessed entries to the front
+    // without touching `created_at`, so list order tracks LRU access
+    // time, not insertion / refresh time. After a few `get()`s an
+    // expired entry can sit anywhere in the middle of the list with
+    // a fresher entry behind it, and an early `break` on the back
+    // would leak it indefinitely.
     void gc(uint64_t now_ms, uint64_t max_age_ms) {
-        while (!entries_.empty()) {
-            auto& oldest = entries_.back();
-            if (now_ms >= oldest.created_at &&
-                (now_ms - oldest.created_at) > max_age_ms) {
-                map_.erase(oldest.key);
-                entries_.pop_back();
+        for (auto it = entries_.begin(); it != entries_.end(); ) {
+            if (now_ms >= it->created_at &&
+                (now_ms - it->created_at) > max_age_ms) {
+                map_.erase(it->key);
+                it = entries_.erase(it);
             } else {
-                break;  // Entries are ordered by insertion — once we hit a fresh one, stop
+                ++it;
             }
         }
     }

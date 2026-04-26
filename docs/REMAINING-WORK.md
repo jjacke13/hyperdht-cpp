@@ -2,7 +2,7 @@
 
 Tasks to verify / harden the implementation, organized by category and estimated effort.
 
-**Last updated: 2026-04-16** (after Phase E + reviewer-fix round 2)
+**Last updated: 2026-04-26** (after merging PRs #1-#3 from lukeburns)
 
 ---
 
@@ -12,8 +12,9 @@ Tasks to verify / harden the implementation, organized by category and estimated
 
 - **Memory leak check under valgrind/ASAN full suite**
   - Run `ctest` under valgrind with leak detection
-  - Already have ASAN build in `build-asan/`. Known: teardown leaks in
-    libuv loop internals (not our code). Verify no leaks in hot path.
+  - Already have ASAN build in `build-asan/`. Known: 10600 bytes leaked
+    in `test_server` teardown (pre-existing libuv/libudx internals, not
+    our code). Verify no leaks in hot path.
 
 - **Documentation pass on `CLAUDE.md`**
   - Update phase status table (phases A-E all done)
@@ -22,16 +23,11 @@ Tasks to verify / harden the implementation, organized by category and estimated
   - Note the UvTimer RAII pattern
   - Note the multi-listener probe callback pattern
 
-- **Python FFI smoke test**
-  - `wrappers/python/` exists; verify the C FFI actually works end-to-end
-  - Import, create DHT, connect, echo round-trip — same as test_echo_fixture
-    but through Python
-
 ### Medium effort (~1 hour each)
 
 - **Fuzzing run**
-  - `fuzz/` directory has fuzz harnesses for compact, handshake_msg,
-    holepunch_msg, noise_payload
+  - `fuzz/` directory has 5 harnesses (compact, handshake_msg,
+    holepunch_msg, messages, noise_payload)
   - Run each for 30 minutes under libFuzzer, report coverage
   - Fix any crashes found
 
@@ -51,12 +47,6 @@ Tasks to verify / harden the implementation, organized by category and estimated
   - Open a connection, exchange data every 5 minutes, run for 12+ hours
   - Verify NAT pinhole keepalive, SecretStream keepalive, no drift
 
-- **aarch64 CI**
-  - We've built on aarch64 NixOS manually. Add to CI when repo is pushed.
-
-- **Stream drain callback — DONE**
-  - `hyperdht_stream_write_with_drain()` added to C FFI + Python wrapper.
-
 - **Read-side backpressure (udx_stream_read_stop)**
   - We never pause reading from UDX — every byte is consumed immediately.
     JS does `rawStream.pause()` when the Readable buffer exceeds
@@ -65,9 +55,6 @@ Tasks to verify / harden the implementation, organized by category and estimated
     The pre-connect message queue has a 64-message cap as defense-in-depth,
     but the general data path has no read-side flow control.
     Need: expose pause/resume on SecretStreamDuplex, wire to UDX read stop.
-    Without it, holesail can't do proper pause/resume when streaming to
-    slow peers. Local TCP bridging uses a blocking sendall workaround.
-    Ref: holesail-nix commit 4563f71 patched the same issue in JS holesail.
 
 - **Nospoon coexistence**
   - Running nospoon (JS HyperDHT VPN) on the same machine as holesail-py
@@ -150,173 +137,62 @@ PEER_HANDSHAKE and exhaust memory (each handshake allocates session state).
 
 - **Stable public headers** — move the consumer-facing subset of `include/hyperdht/`
   to `include/hyperdht/public/` with ABI guarantees
-- **pkg-config** — already have `hyperdht.pc.in`; verify install path
 - **NixOS module** — ship a `module.nix` so downstream can `imports = [ hyperdht ];`
 - **Docker image** — Alpine-based, statically linked, ~5MB
 - **Debian/RPM packages** — via nix2deb or fpm
 
-### 8. Language bindings (beyond C FFI)
+### 8. C FFI remaining exposures
 
-The C FFI surface (76 fns as of commit 41ff514) is now considered
-production-ready for mobile/cross-language consumers: no known UAFs,
-explicit `_free` contracts on owned handles, idempotent cancel,
-ABI-pinned struct layouts, async firewall completion that survives
-the callback frame.
+The C FFI surface (84 fns as of 2026-04-26) is production-ready for
+mobile/cross-language consumers. Recent additions:
 
-#### 8.0. C FFI — remaining exposures
+- **PR #3** (lukeburns): `hyperdht_stream_send_udp`,
+  `hyperdht_stream_try_send_udp`, `hyperdht_stream_set_on_udp_message`
+  — unordered encrypted datagrams. Also fixed `NS_SEND` namespace
+  constant (was wrong, broke C++ ↔ JS datagram interop).
 
-Audit 2026-04-17 against the C++ public surface found a handful of
-C++ methods still not exposed through the C FFI. None block any
-current consumer (Python wrapper works end-to-end with what's
-available today), but a true feature-parity C FFI would cover them.
+Still not exposed:
 
 | C++ method | Priority | Why it matters |
 |------------|----------|----------------|
-| `HyperDHT::pool()` → connection pool | MEDIUM | Multi-peer apps (nospoon swarm, mobile messaging) want connection dedup. Currently every `connect()` is independent — repeated connects to the same peer build repeated sessions. |
-| `HyperDHT::listening()` snapshot | LOW | Enumerate active servers. Wrappers can track their own list instead, but an accessor is cheap. |
-| `HyperDHT::lookup_and_unannounce()` combined op | LOW | JS `dht.lookupAndUnannounce()`. Caller can do lookup + unannounce separately today. |
-| `HyperDHT::BOOTSTRAP()` getter | TRIVIAL | Returns the 3 canonical seed nodes as a const list. Currently `HYPERDHT_BOOTSTRAP_*` is a constant-based workaround — a proper getter would be ~5 lines. |
+| `HyperDHT::pool()` → connection pool | MEDIUM | Multi-peer apps want connection dedup. Currently every `connect()` is independent. |
+| `HyperDHT::listening()` snapshot | LOW | Enumerate active servers. Wrappers can track their own list. |
+| `HyperDHT::lookup_and_unannounce()` | LOW | Caller can do lookup + unannounce separately today. |
 
-Explicitly **NOT** planned for the C FFI (implementation details or
-documented non-goals):
+Explicitly **NOT** planned for the C FFI:
 
 | C++ method | Why excluded |
 |------------|--------------|
-| `HyperDHT::bootstrapper()` static factory | For running a public bootstrap node — niche server-side use case; not a mobile/app concern. |
-| `HyperDHT::connect_raw_stream()` static | Advanced multi-stream piggyback — leaks libudx primitives into the C FFI. |
-| `HyperDHT::validate_local_addresses()` | JS itself comments this is "semi terrible"; a 500ms echo probe per interface. Rarely needed. |
-| `HyperDHT::create_raw_stream()` | Returns a raw `udx_stream_t*` — exposes libudx through the boundary; wrappers should stay above that layer. |
-| `rpc::Session` | Batched request cancellation. `hyperdht_query_cancel()` covers the common case (one query at a time); Session is for query-heavy internal code paths. |
+| `HyperDHT::bootstrapper()` | Niche server-side use case. |
+| `HyperDHT::connect_raw_stream()` | Leaks libudx primitives into the C FFI. |
+| `HyperDHT::validate_local_addresses()` | JS itself comments this is "semi terrible". |
+| `HyperDHT::create_raw_stream()` | Exposes libudx through the boundary. |
+| `rpc::Session` | `hyperdht_query_cancel()` covers the common case. |
 
-What remains is building idiomatic wrappers on top of the current
-surface.
+### 9. Language bindings
 
-- **Python** — ✅ DONE (commit f6cc594). Full parity: 76 FFI
-  functions exposed, 4 modules (_ffi, _bindings, _server, __init__),
-  22 tests, holesail server live-tested. Remaining: async/await
-  support, PEP 517 packaging.
-- **Go** — cgo wrapper with goroutine-friendly callbacks
-- **Rust** — `hyperdht-sys` crate + safe `hyperdht` wrapper
-- **Swift/Kotlin** — for mobile use (mimiclaw, future iOS/Android
-  apps). The C FFI was explicitly designed with these consumers in
-  mind: `HYPERDHT_PK_SIZE` / `HYPERDHT_HOST_STRIDE` constants, flat
-  `char*` out-buffers, explicit struct padding (`_pad0`), completion-
-  callback-style async firewall, and `_ex` query cancellation all
-  target Swift C-interop / JNI idioms directly.
-- **ESP-IDF component wrapper** — wrap the library as a reusable
-  ESP-IDF component with a CMakeLists.txt registering the component
-  against the IDF build system. Pair with an `HYPERDHT_EMBEDDED=ON`
-  CMake option that reduces resource sizing for constrained devices
-  (ESP32-S3, 8MB PSRAM): shrink the routing table bucket size
-  (k=20 → k=10), shrink the congestion window (80 → 16 inflight),
-  reduce birthday holepunch sockets (256 → 8), and lower default
-  UDX buffer sizes. Full protocol support — no features stripped.
-  Estimated ~50 lines.
+- **Python** — Done (commit f6cc594). 84 FFI functions, 4 modules, 22
+  tests, holesail live-tested. Remaining: async/await support, PEP 517.
+- **Kotlin/Android** — Done. JNI wrapper (`wrappers/kotlin/`), example
+  app (`examples/android/`), CI builds arm64 .so. Fixed: JNI global ref
+  leaks, threading, lifecycle (commit e821a7c).
+- **Go** — cgo wrapper with goroutine-friendly callbacks (no consumer yet)
+- **Rust** — `hyperdht-sys` crate + safe `hyperdht` wrapper (no consumer yet)
+- **Swift** — for iOS targets; C FFI was designed with Swift C-interop in mind
 
-### 9. Documentation
+### 10. Documentation
 
 - **User guide** — getting started, common patterns, common pitfalls
 - **API reference** — Doxygen for C++ + public C headers
 - **Protocol spec** — already have PROTOCOL.md; cross-link from code
 - **Migration guide** — for existing JS HyperDHT users
 
-### 10. Real-world deployment validation
+### 11. Real-world deployment validation
 
 - **Run a public node** — announce on the public DHT, serve real nospoon traffic
 - **Multi-region test** — clients in US, EU, Asia connecting through each other
 - **Mobile network test** — 4G/5G NAT behavior, esp. carrier-grade NAT
 - **IPv6 validation** — protocol has IPv6 fields (`addresses6`); we don't exercise them
-
-### 11. ESP32 / embedded porting
-
-**Goal:** run hyperdht-cpp on ESP32-S3 (and any FreeRTOS + lwIP device)
-so that $5 microcontrollers become first-class peers on the HyperDHT
-network — no cloud broker, no relay server.
-
-**The one blocker: libuv doesn't run on FreeRTOS.** No existing port
-exists. The libuv maintainers rejected an ESP-IDF PR ([#4132](https://github.com/libuv/libuv/discussions/4132))
-to avoid ifdef soup. Everything else (libsodium, our C++ code, libudx)
-is portable.
-
-**Approach: `libuv-esp32` shim component (~500 lines)**
-
-A standalone ESP-IDF component implementing only the libuv subset that
-libudx calls. libudx and hyperdht-cpp compile unmodified.
-
-| libuv function | ESP-IDF equivalent |
-|---|---|
-| `uv_loop_init` / `uv_run` / `uv_loop_close` | `select()` loop in a FreeRTOS task |
-| `uv_udp_init` / `uv_udp_bind` / `uv_udp_send` / `uv_udp_recv_start` | `lwip_socket`, `lwip_sendto`, `lwip_recvfrom` |
-| `uv_timer_init` / `uv_timer_start` / `uv_timer_stop` | `xTimerCreate` or `esp_timer` |
-| `uv_hrtime` | `esp_timer_get_time() * 1000` (us → ns) |
-| `uv_async_send` | self-pipe or `xTaskNotify` to wake the select loop |
-| `uv_interface_addresses` | `esp_netif_get_ip_info()` |
-
-NOT needed: filesystem, processes, pipes, TTY, signals, thread pool.
-
-libuv already has a `posix-poll.c` backend (used by QNX, Haiku) that
-uses `poll()` instead of `epoll` — this is the template for the FreeRTOS
-backend since lwIP's `poll()` works via `select()` internally.
-
-**Memory budget (ESP32-S3, 8MB PSRAM):**
-
-| Component | Desktop (full) | Embedded (`HYPERDHT_EMBEDDED=ON`) |
-|---|---|---|
-| Routing table (k=20, 256 buckets) | ~400KB | ~200KB (k=10, 256 buckets) |
-| Crypto state per connection | ~2KB | ~2KB |
-| UDX buffers per stream | ~64KB | ~16KB |
-| Code (.text) + libsodium | ~300KB | ~300KB |
-| **Total** | **~800KB** | **~500KB** |
-
-Full protocol support (connect, listen, announce, storage) fits
-in ~500KB — well within the 8MB PSRAM budget. Even 2MB PSRAM
-devices are viable. The device is a full peer: it can serve
-connections (sensors, GPIO, camera), announce itself, and
-participate in DHT storage.
-
-**Compile-time trim knob (`HYPERDHT_EMBEDDED=ON`):**
-- Routing table: k=20 → k=10 (256 buckets unchanged — tied to ID bit length)
-- Congestion window: 80 → 16 inflight
-- Birthday holepunch sockets: 256 → 8 (lwIP socket limit)
-- Lower default UDX buffer sizes
-- No features stripped — full protocol support
-
-**Integration pattern (mimiclaw-tested):**
-
-mimiclaw already uses FreeRTOS tasks + queues + lwIP (via
-`esp_http_client`). HyperDHT would run as one more task:
-
-```c
-xTaskCreatePinnedToCore(hyperdht_task, "dht", 8192, NULL, 5, NULL, 1);
-
-void hyperdht_task(void* arg) {
-    uv_loop_t loop;
-    uv_loop_init(&loop);
-    hyperdht_t* dht = hyperdht_create(&loop, &opts);
-    hyperdht_bind(dht, 0);
-    uv_run(&loop, UV_RUN_DEFAULT);  // blocks on this core
-}
-```
-
-Messages flow through the existing message bus (`xQueue`) — same
-pattern as the telegram/feishu bot tasks.
-
-**What this enables:**
-- **Device-to-device P2P** — two ESP32s find each other on the
-  internet via DHT, holepunch through NAT, encrypted channel.
-  No server, no MQTT broker.
-- **Phone → ESP32 direct** — mobile app (Kotlin/Swift wrapper)
-  connects to ESP32 from anywhere. No port forwarding.
-- **ESP32 as holesail server** — plug into any network, expose a
-  local service (serial, camera, GPIO) over HyperDHT.
-- **P2P firmware updates** — one device announces new firmware on
-  DHT, others discover and download. No OTA server.
-- **Mesh of cheap sensors** — self-organizing, no infrastructure
-  beyond the 3 public bootstrap nodes.
-
-**Effort estimate:** ~1 week for the libuv-esp32 shim + build
-integration + basic testing on real hardware. The protocol code,
-crypto, and C FFI layer are untouched.
 
 ---
 
@@ -329,8 +205,11 @@ making the library *shippable*, not making it correct.
 
 Goal: a known consumer exercising the library in production.
 
-**Blocking:** nothing — Python wrapper is done (commit f6cc594),
-holesail live-tested end-to-end with JS client (2026-04-17).
+**Active consumer:** Luke Burns (nospoon) is already using the library
+and contributing back fixes:
+- PR #1: server UAF in blind-relay callback chain
+- PR #2: LRU cache gc() leaked entries after get() promotion
+- PR #3: datagram C FFI + NS_SEND constant fix
 
 **Must have:**
 - 30-min soak test (open a connection, exchange data every 5min,
@@ -338,7 +217,7 @@ holesail live-tested end-to-end with JS client (2026-04-17).
 - CLAUDE.md documentation pass (update phase table, note the new
   RAII patterns added since)
 
-**Tag v0.1.0.** nospoon integrates, reports real-world issues.
+**Tag v0.1.0.**
 
 ### Phase 2 — v1.0 public release
 
@@ -351,36 +230,32 @@ holesail live-tested end-to-end with JS client (2026-04-17).
 
 **Strong should-have:**
 - Fuzzing CI (runs on every push, not ad-hoc)
-- aarch64 CI (we build on aarch64 NixOS manually today)
 - Clean-machine NAT-to-NAT live test (rules out nospoon interference)
 - Full ASAN test suite pass (no hot-path leaks; pre-existing libudx
   teardown leaks documented as acceptable)
 
 **Nice to have:**
-- Rate limiting / DoS protection (§5)
+- Rate limiting / DoS protection (section 5)
 - Static analysis CI (clang-tidy, cppcheck)
-- Noise implementation crypto audit (§6)
-- IPv6 validation (§10)
+- Noise implementation crypto audit (section 6)
+- IPv6 validation (section 11)
 
 ### Phase 3 — language + platform expansion
 
 Parallel to v1.0, driven by downstream consumer needs:
 
-- **Kotlin / Swift wrappers** for mimiclaw / iOS / Android targets —
-  the C FFI was designed for these consumers specifically, but no
-  wrappers exist yet.
-- **ESP32 porting** via `libuv-esp32` shim + `HYPERDHT_EMBEDDED=ON`
-  trim — see §11 for full technical plan.
+- **Swift wrapper** for iOS targets — the C FFI was designed for
+  Swift C-interop, but no wrapper exists yet.
 - **Go / Rust wrappers** (lower priority — no active consumer).
-- **Public bootstrap node deployment** (§10 real-world validation).
+- **Public bootstrap node deployment** (section 11 real-world validation).
 
 ### What it takes to NOT ship
 
-- ❌ Don't ship if ASAN reports a hot-path leak (every test run, not
+- Don't ship if ASAN reports a hot-path leak (every test run, not
   just teardown).
-- ❌ Don't ship if the fuzzer finds a new decoder crash.
-- ❌ Don't ship if the soak test shows memory growth over 30 min.
-- ❌ Don't ship if a live test against JS regresses.
+- Don't ship if the fuzzer finds a new decoder crash.
+- Don't ship if the soak test shows memory growth over 30 min.
+- Don't ship if a live test against JS regresses.
 
 None of these are true today — the tree is in a shippable state
 modulo the Phase 1 items above.

@@ -21,6 +21,7 @@
 //   - Background tick at 5s matches JS index.js:18 (TICK_INTERVAL).
 
 #include "hyperdht/rpc.hpp"
+#include "hyperdht/debug.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -848,6 +849,8 @@ void RpcSocket::check_persistent() {
     auto current_host = nat_sampler_.host();
 
     if (current_host.empty() || nat_sampler_.port() == 0) {
+        DHT_LOG("  [rpc] check_persistent: no address yet (host=%s port=%u)\n",
+                current_host.c_str(), nat_sampler_.port());
         stable_ticks_ = STABLE_TICKS_MORE;
         return;
     }
@@ -857,6 +860,10 @@ void RpcSocket::check_persistent() {
 
     // If NAT sampler has determined we're consistent or open → become persistent
     uint32_t fw = nat_sampler_.firewall();
+    const char* fw_str = fw == 0 ? "UNKNOWN" : fw == 1 ? "OPEN" :
+                         fw == 2 ? "CONSISTENT" : fw == 3 ? "RANDOM" : "?";
+    DHT_LOG("  [rpc] check_persistent: host=%s:%u firewall=%s (%u)\n",
+            current_host.c_str(), nat_sampler_.port(), fw_str, fw);
     if (fw == 2 /* FIREWALL_CONSISTENT */ || fw == 1 /* FIREWALL_OPEN */) {
         ephemeral_ = false;
         firewalled_ = (fw != 1);

@@ -134,6 +134,15 @@ hyperdht_stream_t* hyperdht_stream_open(
     s->duplex->on_message([s](const uint8_t* data, size_t len) {
         if (s->on_data) s->on_data(data, len, s->userdata);
     });
+    s->duplex->on_udp_message([s](const uint8_t* data, size_t len) {
+        // Drops are intentional when no callback is installed yet —
+        // mirrors the reliable-stream behaviour and keeps install
+        // semantics asymmetric (set-once vs constructor) flexible.
+        if (s->closed) return;
+        if (s->on_udp_message) {
+            s->on_udp_message(data, len, s->udp_userdata);
+        }
+    });
     s->duplex->on_end([s]() {
         // Peer signalled half-close; begin our own teardown so on_close
         // fires for the user. `end()` is idempotent.
@@ -183,6 +192,27 @@ void hyperdht_stream_close(hyperdht_stream_t* stream) {
 int hyperdht_stream_is_open(const hyperdht_stream_t* stream) {
     if (!stream || !stream->duplex) return 0;
     return stream->duplex->is_connected() ? 1 : 0;
+}
+
+int hyperdht_stream_set_on_udp_message(hyperdht_stream_t* stream,
+                                        hyperdht_udp_msg_cb cb,
+                                        void* userdata) {
+    if (!stream) return -1;
+    stream->on_udp_message = cb;
+    stream->udp_userdata = userdata;
+    return 0;
+}
+
+int hyperdht_stream_send_udp(hyperdht_stream_t* stream,
+                              const uint8_t* data, size_t len) {
+    if (!stream || stream->closed || !stream->duplex || !data) return -1;
+    return stream->duplex->send_udp(data, len);
+}
+
+int hyperdht_stream_try_send_udp(hyperdht_stream_t* stream,
+                                  const uint8_t* data, size_t len) {
+    if (!stream || stream->closed || !stream->duplex || !data) return -1;
+    return stream->duplex->try_send_udp(data, len);
 }
 
 // ---------------------------------------------------------------------------

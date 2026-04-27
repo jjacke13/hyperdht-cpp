@@ -13,6 +13,7 @@ internal object Native {
     // --- libuv loop ---
     external fun loopCreate(): Long
     external fun loopRunOnce(loopPtr: Long): Int
+    external fun loopRunNowait(loopPtr: Long): Int
     external fun loopClose(loopPtr: Long)
 
     // --- Async wakeup (thread-safe uv_run kick) ---

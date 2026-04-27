@@ -57,11 +57,17 @@ class Stream internal constructor(
     /**
      * Close the stream gracefully. Thread-safe — posts to the loop
      * thread (fire-and-forget, does not wait for close to complete).
+     *
+     * The dataChannel is NOT closed here — it stays open so that
+     * in-flight data arriving on the libuv thread (via fireData)
+     * is not silently dropped by trySend on a closed channel.
+     * The channel is closed later by fireClose() when the native
+     * on_close callback fires, guaranteeing correct ordering:
+     * all data callbacks complete before the channel shuts down.
      */
     fun close() {
         if (closed) return
         closed = true
-        dataChannel.close()
         if (handle != 0L) {
             val h = handle
             handle = 0L

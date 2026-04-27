@@ -95,6 +95,11 @@ Java_com_hyperdht_Native_loopRunOnce(JNIEnv*, jobject, jlong ptr) {
     return rc;
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_hyperdht_Native_loopRunNowait(JNIEnv*, jobject, jlong ptr) {
+    return uv_run((uv_loop_t*)ptr, UV_RUN_NOWAIT);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_loopClose(JNIEnv*, jobject, jlong ptr) {
     auto* loop = (uv_loop_t*)ptr;

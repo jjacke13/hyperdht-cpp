@@ -1,13 +1,10 @@
 package com.hyperdht
 
-import android.util.Log
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
-
-private const val TAG = "HyperDHT-Stream"
 
 /**
  * Encrypted read/write stream over an established connection.
@@ -34,11 +31,9 @@ class Stream internal constructor(
 
     /** Suspend until the stream is open (header exchange complete). */
     suspend fun awaitOpen(): Unit = suspendCancellableCoroutine { cont ->
-        Log.d(TAG, "awaitOpen: opened=$opened handle=$handle")
         synchronized(this) {
-            if (opened) { Log.d(TAG, "awaitOpen: already open"); cont.resume(Unit); return@suspendCancellableCoroutine }
+            if (opened) { cont.resume(Unit); return@suspendCancellableCoroutine }
             openContinuation = cont
-            Log.d(TAG, "awaitOpen: suspending")
         }
     }
 
@@ -51,11 +46,9 @@ class Stream internal constructor(
      */
     suspend fun write(data: ByteArray): Int {
         check(!closed) { "Stream is closed" }
-        Log.d(TAG, "write: ${data.size} bytes, handle=$handle")
         return suspendCancellableCoroutine { cont ->
             postToLoop(Runnable {
                 val rc = if (handle != 0L) Native.streamWrite(handle, data) else -1
-                Log.d(TAG, "write: native rc=$rc")
                 cont.resume(rc)
             })
         }
@@ -84,28 +77,22 @@ class Stream internal constructor(
 
     // Called from JNI on the libuv thread
     internal fun fireOpen() {
-        Log.d(TAG, "fireOpen: opened=$opened handle=$handle")
         synchronized(this) {
             opened = true
             openContinuation?.resume(Unit)
             openContinuation = null
         }
-        Log.d(TAG, "fireOpen: done")
     }
 
     internal fun fireData(bytes: ByteArray) {
-        Log.d(TAG, "fireData: ${bytes.size} bytes, closed=$closed, handle=$handle")
-        val result = dataChannel.trySend(bytes)
-        Log.d(TAG, "fireData: trySend success=${result.isSuccess} failure=${result.isFailure} closed=${result.isClosed}")
+        dataChannel.trySend(bytes)
     }
 
     internal fun fireClose() {
-        Log.d(TAG, "fireClose: closed=$closed handle=$handle")
         closed = true
         handle = 0L
         dataChannel.close()
         onCloseCallback?.invoke()
-        Log.d(TAG, "fireClose: done")
     }
 
     /**

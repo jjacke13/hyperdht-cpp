@@ -1,5 +1,6 @@
 package com.hyperdht
 
+import android.util.Log
 import kotlinx.coroutines.*
 import java.io.Closeable
 import java.util.concurrent.ConcurrentHashMap
@@ -7,6 +8,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+
+private const val TAG = "HyperDHT"
 
 /**
  * HyperDHT node — connect to peers, listen for connections, store data.
@@ -214,10 +217,12 @@ class HyperDHT(
         stream.retainCallbacks(onOpen, onData, onClose)
 
         val cb = ConnectCallback { error, streamHandle ->
+            Log.d(TAG, "connectCallback: error=$error streamHandle=$streamHandle")
             if (error != 0) deferred.completeExceptionally(DhtException(error))
             else {
                 stream.setHandle(streamHandle)
                 activeStreams.add(stream)
+                Log.d(TAG, "connectCallback: stream ready, completing deferred")
                 deferred.complete(stream)
             }
         }

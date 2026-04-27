@@ -2,12 +2,15 @@ package com.hyperdht.example
 
 import android.app.Activity
 import android.os.Bundle
+import android.util.Log
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import com.hyperdht.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
+
+private const val TAG = "EchoTest"
 
 /**
  * HyperDHT P2P echo test — connects to a remote C++ echo server over
@@ -63,20 +66,26 @@ class MainActivity : Activity() {
                 log("Connecting to ${serverKeyHex.take(16)}...")
 
                 val stream = dht!!.connect(serverKey)
+                Log.d(TAG, "connect() returned, stream handle set")
                 log("Connected! Waiting for stream open...")
 
                 stream.awaitOpen()
+                Log.d(TAG, "awaitOpen() returned")
                 log("Stream open! Sending...")
 
                 val message = messageInput.text.toString()
-                stream.write(message.toByteArray())
-                log("Sent: $message")
+                val writeRc = stream.write(message.toByteArray())
+                Log.d(TAG, "write() returned rc=$writeRc")
+                log("Sent: $message (rc=$writeRc)")
 
                 statusText.text = "Waiting for echo..."
+                Log.d(TAG, "waiting for stream.data.first() with 10s timeout")
 
                 val echo = withTimeoutOrNull(10000) {
                     stream.data.first()
                 }
+
+                Log.d(TAG, "echo result: ${echo?.size ?: "null"} bytes")
 
                 if (echo != null) {
                     val echoStr = String(echo)
@@ -84,6 +93,7 @@ class MainActivity : Activity() {
                     statusText.text = if (echoStr == message) "Echo OK!" else "Echo mismatch!"
                 } else {
                     log("Timeout waiting for echo")
+                    Log.w(TAG, "TIMEOUT: no data received in 10s. stream.isOpen=${stream.isOpen}")
                     statusText.text = "Timeout"
                 }
 

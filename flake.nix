@@ -78,6 +78,8 @@
           };
 
           # Android / Kotlin development (JNI bridge + NDK)
+          # Uses buildFHSEnv so Gradle-downloaded binaries (aapt2, etc.)
+          # work on NixOS without patching.
           android = let
             # Android SDK requires unfree license acceptance
             androidPkgs = import nixpkgs {
@@ -92,22 +94,28 @@
               includeNDK = true;
             };
             androidSdk = androidComposition.androidsdk;
+            fhs = pkgs.buildFHSEnv {
+              name = "android-fhs";
+              targetPkgs = p: [
+                p.cmake p.ninja p.pkg-config p.gcc14
+                p.jdk21 p.kotlin p.gradle
+                androidSdk
+                p.libsodium p.libuv
+                # Runtime deps for Gradle-downloaded binaries (aapt2, etc.)
+                p.glibc p.zlib p.stdenv.cc.cc.lib
+              ];
+              profile = ''
+                export ANDROID_HOME="${androidSdk}/libexec/android-sdk"
+                export ANDROID_NDK_HOME="${androidSdk}/libexec/android-sdk/ndk/26.3.11579264"
+                export JAVA_HOME="${pkgs.jdk21}"
+              '';
+            };
           in pkgs.mkShell {
-            nativeBuildInputs = [
-              pkgs.cmake pkgs.ninja pkgs.pkg-config
-              pkgs.gcc14 pkgs.jdk21 pkgs.kotlin pkgs.gradle
-              androidSdk
-            ];
-            buildInputs = [ pkgs.libsodium pkgs.libuv ];
-            ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
-            ANDROID_NDK_HOME = "${androidSdk}/libexec/android-sdk/ndk/26.3.11579264";
-            JAVA_HOME = "${pkgs.jdk21}";
+            nativeBuildInputs = [ fhs ];
             shellHook = ''
-              echo "hyperdht-cpp Android dev shell"
-              echo "  JDK:    $(java -version 2>&1 | head -1)"
-              echo "  Kotlin: $(kotlin -version 2>&1)"
-              echo "  NDK:    $ANDROID_NDK_HOME"
-              echo "  SDK:    $ANDROID_HOME"
+              echo "hyperdht-cpp Android dev shell (FHS)"
+              echo "  Run: android-fhs"
+              echo "  Then: cd examples/android && gradle assembleDebug"
             '';
           };
 

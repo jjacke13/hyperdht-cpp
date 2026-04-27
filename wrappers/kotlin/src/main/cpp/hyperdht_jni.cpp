@@ -359,15 +359,18 @@ struct StreamCtx {
 
 static void jni_stream_open_cb(void* ud) {
     auto* ctx = static_cast<StreamCtx*>(ud);
+    LOGT("stream_open_cb fired ctx=%p", ctx);
     JNIEnv* env = get_env();
     jclass cls = env->GetObjectClass(ctx->onOpen);
     jmethodID mid = env->GetMethodID(cls, "run", "()V");
     env->CallVoidMethod(ctx->onOpen, mid);
     check_exception(env);
+    LOGT("stream_open_cb done");
 }
 
 static void jni_stream_data_cb(const uint8_t* data, size_t len, void* ud) {
     auto* ctx = static_cast<StreamCtx*>(ud);
+    LOGT("stream_data_cb fired ctx=%p len=%zu", ctx, len);
     JNIEnv* env = get_env();
 
     jbyteArray jdata = env->NewByteArray((jsize)len);
@@ -378,10 +381,12 @@ static void jni_stream_data_cb(const uint8_t* data, size_t len, void* ud) {
     env->CallVoidMethod(ctx->onData, mid, jdata);
     check_exception(env);
     env->DeleteLocalRef(jdata);
+    LOGT("stream_data_cb done");
 }
 
 static void jni_stream_close_cb(void* ud) {
     auto* ctx = static_cast<StreamCtx*>(ud);
+    LOGT("stream_close_cb fired ctx=%p", ctx);
     JNIEnv* env = get_env();
 
     jclass cls = env->GetObjectClass(ctx->onClose);
@@ -393,6 +398,7 @@ static void jni_stream_close_cb(void* ud) {
     env->DeleteGlobalRef(ctx->onData);
     env->DeleteGlobalRef(ctx->onClose);
     delete ctx;
+    LOGT("stream_close_cb done");
 }
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -425,8 +431,10 @@ Java_com_hyperdht_Native_streamWrite(
 {
     jsize len = env->GetArrayLength(jdata);
     jbyte* data = env->GetByteArrayElements(jdata, nullptr);
+    LOGT("streamWrite h=%p len=%d", (void*)h, (int)len);
     int rc = hyperdht_stream_write(
         (hyperdht_stream_t*)h, (const uint8_t*)data, (size_t)len);
+    LOGT("streamWrite rc=%d", rc);
     env->ReleaseByteArrayElements(jdata, data, JNI_ABORT);
     return rc;
 }

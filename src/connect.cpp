@@ -571,6 +571,9 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
     // Check for direct connect (OPEN firewall)
     holepunch::HolepunchResult hp_result;
     if (holepunch::try_direct_connect(hs, hp_result)) {
+        DHT_LOG("  [connect] *** DIRECT CONNECT (server OPEN) → %s:%u "
+                "(no holepunch, no pool socket) ***\n",
+                hp_result.address.host_string().c_str(), hp_result.address.port);
         ConnectResult result;
         result.success = true;
         result.tx_key = hs.tx_key;
@@ -592,6 +595,9 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
     if (!hs.remote_payload.holepunch.has_value() ||
         hs.remote_payload.holepunch->relays.empty()) {
         if (!hs.remote_payload.addresses4.empty()) {
+            DHT_LOG("  [connect] *** NO HOLEPUNCH INFO → direct connect to %s:%u ***\n",
+                    hs.remote_payload.addresses4[0].host_string().c_str(),
+                    hs.remote_payload.addresses4[0].port);
             ConnectResult result;
             result.success = true;
             result.tx_key = hs.tx_key;

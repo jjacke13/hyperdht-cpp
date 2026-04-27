@@ -46,9 +46,9 @@ node ../js/server.js
 
 ## Live servers
 
-These servers are running 24/7 for testing:
+These echo servers are running 24/7 for testing:
 
 | Machine | Public key |
 |---------|-----------|
-| 1 | b7c5c4e909ad28e2071c48a09f330ec2735248a4e4d8759032a9b57b0f2e7aec |
-| 2 |                      TBD                                         |
+| VPS (x86_64) with public ip | `b7c5c4e909ad28e2071c48a09f330ec2735248a4e4d8759032a9b57b0f2e7aec` |
+| ESP32-S3 (Oh yeah!) | `25fb5b5427530ae59d13ad54e778cefde687f1e5517a01f0cdbf3b5b1d0040a4` |

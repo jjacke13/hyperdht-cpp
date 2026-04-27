@@ -92,6 +92,18 @@ class HyperDHT(
         return loopJob!!
     }
 
+    /**
+     * Shut down the DHT node and release all native resources.
+     *
+     * **WARNING — BLOCKS THE CALLING THREAD** for up to 5 seconds while
+     * libuv close callbacks drain. Never call from the Android UI thread
+     * (Dispatchers.Main) — it will freeze the screen and may trigger an
+     * ANR. Use `Dispatchers.IO` or a background thread:
+     *
+     * ```kotlin
+     * withContext(Dispatchers.IO) { dht.close() }
+     * ```
+     */
     override fun close() {
         if (destroyed) return
         destroyed = true

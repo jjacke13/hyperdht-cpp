@@ -267,6 +267,12 @@ HYPERDHT_API int hyperdht_is_destroyed(const hyperdht_t* dht);
  * After calling this, you MUST:
  *   1. Call uv_run() to drain pending close callbacks
  *   2. Call hyperdht_free() to release memory
+ *
+ * BLOCKING: This function and the subsequent uv_run() drain may block
+ * for several seconds while libuv close callbacks complete. On mobile
+ * platforms (Android/iOS), never call this from the UI/main thread —
+ * it will freeze the screen. Use a background thread or dispatch queue.
+ *
  * @param cb      optional callback when destruction starts
  * @param userdata passed to cb
  */

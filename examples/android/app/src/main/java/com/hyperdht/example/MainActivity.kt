@@ -108,8 +108,17 @@ class MainActivity : Activity() {
                 statusText.text = "Error: ${e.message}"
             } finally {
                 connectButton.isEnabled = true
-                try { dht?.close() } catch (_: Exception) {}
+                // Close on a background thread — runBlocking in dht.close()
+                // blocks the calling thread, which freezes the UI if called
+                // from Dispatchers.Main.
+                val d = dht
                 dht = null
+                if (d != null) {
+                    @Suppress("OPT_IN_USAGE")
+                    GlobalScope.launch(Dispatchers.IO) {
+                        try { d.close() } catch (_: Exception) {}
+                    }
+                }
             }
         }
     }

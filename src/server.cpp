@@ -397,6 +397,17 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     // holepunch. Without a HyperDHT back-pointer we can't reach the
     // cached validated list and the LAN advertisement silently no-ops.
     auto our_addrs = socket_.nat_sampler().addresses();
+    // After persistent transition, the NAT sampler still has addresses
+    // with client_socket_'s port (from pre-transition traffic). Replace
+    // with server_socket_'s port — that's the port we're now reachable
+    // on and the one the firewall is opened for.
+    if (!socket_.is_firewalled()) {
+        uint16_t server_port = socket_.port();
+        for (auto& addr : our_addrs) {
+            addr = compact::Ipv4Address::from_string(
+                addr.host_string(), server_port);
+        }
+    }
     if (share_local_address && dht_ != nullptr) {
         // Copy the vector by value (not by `const&`) so the append loop
         // cannot observe a mid-flight modification if the cache is

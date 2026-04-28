@@ -26,7 +26,7 @@ Wire-compatible with JS `hyperdht@6.29.1`. Live-tested in both directions on the
 | **Tests** | 566 unit + 6 live, ASAN/UBSan clean |
 | **API parity** | Full -- wire-compatible with JS `hyperdht@6.29.1` ([audit](docs/archive/JS-PARITY-GAPS.md)) |
 | **Languages** | C++ / C / Python / Kotlin (Swift, Go, Rust planned) |
-| **Platforms** | Linux, macOS, Windows, ESP32, Android |
+| **Platforms** | Linux, macOS, ESP32, Android |
 
 ## Build
 

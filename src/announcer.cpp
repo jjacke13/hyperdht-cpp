@@ -148,6 +148,14 @@ void Announcer::notify_online() {
     // the persistent transition switches from client to server socket).
     active_relays_.clear();
     relays_.clear();
+    // Cancel any in-flight query from the pre-transition cycle so
+    // update() isn't blocked by the updating_ guard. Without this,
+    // the old query continues committing with stale peer_addr (wrong
+    // socket port) and the new cycle never starts.
+    if (current_query_) {
+        current_query_.reset();
+    }
+    updating_ = false;
     update();
 }
 

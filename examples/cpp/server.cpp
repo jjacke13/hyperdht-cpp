@@ -2,8 +2,9 @@
  * Persistent HyperDHT server — accepts connections and echoes data.
  *
  * Usage:
- *   ./server                          # random keypair
- *   ./server <64-char-hex-seed>       # deterministic identity
+ *   ./server                          # random keypair, random port
+ *   ./server <64-char-hex-seed>       # deterministic identity, random port
+ *   ./server <seed> <port>            # deterministic identity, fixed port
  *
  * Build:
  *   g++ -std=c++20 -O2 server.cpp -I../../include -L../../build -lhyperdht -lsodium -luv -o server
@@ -87,14 +88,21 @@ int main(int argc, char** argv) {
     hyperdht_opts_default(&opts);
     opts.use_public_bootstrap = 1;
 
-    // Deterministic seed from CLI arg
-    if (argc > 1 && strlen(argv[1]) == 64) {
-        for (int i = 0; i < 32; i++) {
-            unsigned byte;
-            sscanf(argv[1] + i * 2, "%02x", &byte);
-            opts.seed[i] = (uint8_t)byte;
+    // Parse CLI args: each arg is either a 64-char hex seed or a port number
+    uint16_t port = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strlen(argv[i]) == 64) {
+            // 64 hex chars = seed
+            for (int j = 0; j < 32; j++) {
+                unsigned byte;
+                sscanf(argv[i] + j * 2, "%02x", &byte);
+                opts.seed[j] = (uint8_t)byte;
+            }
+            opts.seed_is_set = 1;
+        } else {
+            // Numeric = port
+            port = (uint16_t)atoi(argv[i]);
         }
-        opts.seed_is_set = 1;
     }
 
     hyperdht_t* dht = hyperdht_create(&loop, &opts);
@@ -103,7 +111,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    hyperdht_bind(dht, 0);
+    hyperdht_bind(dht, port);
     printf("DHT port: %u\n", hyperdht_port(dht));
 
     // Print public key

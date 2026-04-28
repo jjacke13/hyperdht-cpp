@@ -130,11 +130,8 @@ hyperdht_t* hyperdht_create(uv_loop_t* loop, const hyperdht_opts_t* opts) {
 
 int hyperdht_bind(hyperdht_t* dht, uint16_t port) {
     if (!dht || !dht->dht) return -1;
-    // Port 0 uses the port from DhtOptions (or ephemeral)
-    // Non-zero port overrides DhtOptions
     if (port != 0) {
-        // TODO: forward port to bind — currently HyperDHT::bind() uses opts_.port
-        // For now, this is a known limitation: port must be set via opts at creation
+        dht->dht->set_port(port);
     }
     return dht->dht->bind();
 }

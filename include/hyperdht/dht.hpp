@@ -760,6 +760,7 @@ public:
     router::Router& router() { return router_; }
     const noise::Keypair& default_keypair() const { return opts_.default_keypair; }
     uint16_t port() const { return socket_ ? socket_->port() : 0; }
+    void set_port(uint16_t p) { opts_.port = p; }
     bool is_bound() const { return bound_; }
 
     // JS: dht-rpc/index.js:233-237 `toArray({limit})` — snapshot the

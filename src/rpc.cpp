@@ -1013,14 +1013,23 @@ void RpcSocket::finish_firewall_probe() {
         return;
     }
 
-    // JS: index.js:954 — verify the external port matches our local server
-    // socket port (no NAT port remapping). If the NAT remaps, other nodes
-    // can't predict which external port to reach us at.
-    uint16_t local_server_port = port();  // server_socket_ port
-    uint16_t external_port = nat_sampler_.port();
-    if (external_port != 0 && external_port != local_server_port) {
-        DHT_LOG("  [rpc] firewall probe: port remapped (local=%u external=%u) → FIREWALLED\n",
-                local_server_port, external_port);
+    // Port-preservation check: verify the NAT isn't remapping ports.
+    //
+    // nat_sampler_.port() tracks client_socket_'s external port (from the
+    // `to` field in responses). Compare it with client_socket_'s LOCAL
+    // port: if the NAT preserves ports for client_socket_, it preserves
+    // them for server_socket_ too (same NAT device). The old check
+    // compared client external vs server local — always mismatched on
+    // dual-socket because they're different sockets with different ports.
+    struct sockaddr_in client_addr{};
+    int client_len = sizeof(client_addr);
+    udx_socket_getsockname(&client_socket_,
+                           reinterpret_cast<struct sockaddr*>(&client_addr), &client_len);
+    uint16_t client_local = ntohs(client_addr.sin_port);
+    uint16_t client_external = nat_sampler_.port();
+    if (client_external != 0 && client_external != client_local) {
+        DHT_LOG("  [rpc] firewall probe: port remapped (client local=%u external=%u) → FIREWALLED\n",
+                client_local, client_external);
         firewalled_ = true;
         return;
     }

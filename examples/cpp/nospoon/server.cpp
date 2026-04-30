@@ -85,12 +85,16 @@ void setup_peer_stream(ServerCtx& ctx, const server::ConnectionInfo& info) {
     hs.public_key = ctx.keypair.public_key;
     hs.is_initiator = false;
 
-    // Connect raw stream
+    // Connect raw stream — use holepunch socket if available,
+    // fall back to the main RPC socket (same as ffi_stream.cpp)
     if (info.peer_address.port != 0 && info.raw_stream) {
         struct sockaddr_in dest{};
         uv_ip4_addr(info.peer_address.host_string().c_str(),
                      info.peer_address.port, &dest);
-        udx_stream_connect(info.raw_stream, info.udx_socket,
+        udx_socket_t* sock = info.udx_socket
+            ? info.udx_socket
+            : ctx.dht->socket().socket_handle();
+        udx_stream_connect(info.raw_stream, sock,
                            info.remote_udx_id,
                            reinterpret_cast<const struct sockaddr*>(&dest));
     }
@@ -184,9 +188,10 @@ int run_server(const Config& config) {
         kp = noise::generate_keypair();
     }
 
-    // Build DHT
+    // Build DHT — use the seed-derived keypair as the default identity
     DhtOptions opts;
     opts.bootstrap = HyperDHT::default_bootstrap_nodes();
+    opts.default_keypair = kp;
     HyperDHT dht(&loop, opts);
     dht.bind();
 

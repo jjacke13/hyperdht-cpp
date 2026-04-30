@@ -2,7 +2,8 @@
  * HyperDHT client — connects to a server, sends a message, prints the echo.
  *
  * Usage:
- *   ./client <64-char-hex-public-key>
+ *   ./client <remote-pubkey>              # random identity
+ *   ./client <remote-pubkey> <our-seed>   # deterministic identity
  *
  * Build:
  *   g++ -std=c++20 -O2 client.cpp -I../../include -L../../build -lhyperdht -lsodium -luv -o client
@@ -85,6 +86,17 @@ int main(int argc, char** argv) {
     hyperdht_opts_t opts;
     hyperdht_opts_default(&opts);
     opts.use_public_bootstrap = 1;
+
+    // Optional seed for deterministic identity
+    if (argc > 2 && strlen(argv[2]) == 64) {
+        for (int i = 0; i < 32; i++) {
+            unsigned byte;
+            sscanf(argv[2] + i * 2, "%02x", &byte);
+            opts.seed[i] = (uint8_t)byte;
+        }
+        opts.seed_is_set = 1;
+        printf("Using seed: %.16s...\n", argv[2]);
+    }
 
     g_dht = hyperdht_create(&loop, &opts);
     if (!g_dht) {

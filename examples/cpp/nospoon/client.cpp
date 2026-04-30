@@ -185,9 +185,10 @@ int run_client(const Config& config) {
         return 1;
     }
 
-    // Build DHT
+    // Build DHT — use the seed-derived keypair as the default identity
     DhtOptions opts;
     opts.bootstrap = HyperDHT::default_bootstrap_nodes();
+    opts.default_keypair = kp;
     HyperDHT dht(&loop, opts);
     dht.bind();
 

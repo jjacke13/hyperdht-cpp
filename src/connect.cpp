@@ -650,15 +650,34 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
     }
 
     // --- §6: localConnection LAN shortcut ------------------
-    // JS: connect.js:234-251 — same-NAT shortcut. See file header for details.
+    // JS: connect.js:234-251 — same-NAT shortcut.
+    //
+    // Two triggers:
+    //   A) Same public IP: our NAT sampler host matches the server's
+    //      first address (both behind the same NAT with public IPs).
+    //   B) Subnet match: the server advertises a private address on
+    //      the same subnet as one of our local interfaces (server has
+    //      no public IP yet, e.g. fw=UNKNOWN, but is on our LAN).
     {
         const bool relayed = !hs.remote_payload.addresses4.empty() &&
             (hs.remote_payload.addresses4[0] != state->relay_addr);
 
-        if (state->local_connection && relayed &&
+        // Check A: same public IP
+        bool same_nat = state->local_connection && relayed &&
             !state->socket->nat_sampler().host().empty() &&
             state->socket->nat_sampler().host() ==
-                hs.remote_payload.addresses4[0].host_string()) {
+                hs.remote_payload.addresses4[0].host_string();
+
+        // Check B: server has a private address on our subnet
+        bool same_subnet = false;
+        if (state->local_connection && relayed && !same_nat) {
+            auto my_local = holepunch::local_addresses(0);
+            auto subnet_match = holepunch::match_address(
+                my_local, hs.remote_payload.addresses4);
+            same_subnet = subnet_match.has_value();
+        }
+
+        if (same_nat || same_subnet) {
 
             auto my_local = holepunch::local_addresses(0);
             auto matched = holepunch::match_address(

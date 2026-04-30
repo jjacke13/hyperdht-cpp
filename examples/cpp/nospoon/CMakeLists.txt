@@ -18,6 +18,9 @@ target_include_directories(nospoon PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../deps/libudx/include)
 
+# Suppress libudx debug_printf noise (TLP, congestion control chatter)
+target_compile_definitions(nospoon PRIVATE NDEBUG)
+
 find_library(SODIUM_LIB sodium REQUIRED)
 find_library(UV_LIB uv REQUIRED)
 

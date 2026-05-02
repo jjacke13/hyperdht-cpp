@@ -386,7 +386,10 @@ class HyperDHT:
         if self._handle:
             fn = _lib.hyperdht_destroy_force if force else _lib.hyperdht_destroy
             fn(self._handle, CLOSE_CB(0), None)
-            _uv.uv_run(self._loop, UV_RUN_DEFAULT)
+            # Drain with UV_RUN_ONCE so Python signals (Ctrl+C) are
+            # processed between iterations instead of blocking in C.
+            while _uv.uv_run(self._loop, UV_RUN_ONCE):
+                pass
             _lib.hyperdht_free(self._handle)
             self._handle = None
         _uv.uv_loop_close(self._loop)

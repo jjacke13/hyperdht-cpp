@@ -11,6 +11,12 @@
 //
 // Holepunch payloads are encrypted with XSalsa20-Poly1305 using
 // the holepunchSecret derived from the Noise handshake hash.
+//
+// Security:
+//   - Decrypt failure aborts — no fallback to unauthenticated peerAddress
+//   - SecurePayload zeros shared_secret_ and local_secret_ on destruction
+//   - Firewall/mode/id fields validated against legal ranges on decode
+//   - PoolSocket nulls timer->data before deleting Inflight structs
 
 #include <array>
 #include <cstdint>
@@ -38,6 +44,7 @@ class SecurePayload {
 public:
     // key = holepunchSecret from Noise handshake
     explicit SecurePayload(const std::array<uint8_t, 32>& key);
+    ~SecurePayload();
 
     // Encrypt a holepunch payload.
     // Output: nonce(24) + ciphertext + mac(16)

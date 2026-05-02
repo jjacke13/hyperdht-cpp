@@ -16,6 +16,10 @@
 //   - `notify_online()` resets has_reannounced_ so build_relays() runs
 //     again after recovery; JS just notifies the `online` Signal which
 //     unblocks `_background`.
+//
+// Lifetime safety: all async callbacks capture a weak_ptr<bool> alive_
+// sentinel. stop_impl() sets *alive_ = false and resets current_query_
+// so outstanding RPC responses become no-ops when the Announcer is destroyed.
 
 #include "hyperdht/announcer.hpp"
 
@@ -96,6 +100,11 @@ void Announcer::stop_without_unannounce() {
 void Announcer::stop_impl(bool send_unannounce) {
     if (!running_) return;
     running_ = false;
+    *alive_ = false;                        // C7: invalidate sentinel
+    if (current_query_) {                    // M9: cancel live query
+        current_query_.reset();
+    }
+    updating_ = false;
 
     if (ping_timer_) {
         uv_timer_stop(ping_timer_);
@@ -192,6 +201,7 @@ void Announcer::ping_relays() {
     auto total = static_cast<int>(active_relays_.size());
     auto pending = std::make_shared<int>(total);
 
+    auto weak = std::weak_ptr<bool>(alive_);  // C7: sentinel
     for (const auto& relay : active_relays_) {
         messages::Request req;
         req.to.addr = relay.addr;
@@ -199,19 +209,18 @@ void Announcer::ping_relays() {
         req.internal = true;
 
         socket_.request(req,
-            [this, active_count, pending, total](const messages::Response&) {
-                if (!running_) return;
+            [weak, this, active_count, pending, total](const messages::Response&) {
+                if (auto a = weak.lock(); !a || !*a) return;
                 (*active_count)++;
                 (*pending)--;
-                // All done — check health
                 if (*pending == 0 && *active_count < std::min(total, MIN_ACTIVE)) {
                     DHT_LOG("  [announcer] relay health: %d/%d active (min=%d), refreshing\n",
                             *active_count, total, MIN_ACTIVE);
                     refresh();
                 }
             },
-            [this, active_count, pending, total](uint16_t) {
-                if (!running_) return;
+            [weak, this, active_count, pending, total](uint16_t) {
+                if (auto a = weak.lock(); !a || !*a) return;
                 (*pending)--;
                 if (*pending == 0 && *active_count < std::min(total, MIN_ACTIVE)) {
                     DHT_LOG("  [announcer] relay health: %d/%d active (min=%d), refreshing\n",
@@ -239,13 +248,15 @@ void Announcer::update() {
     if (updating_ || !running_) return;
     updating_ = true;
 
+    auto weak = std::weak_ptr<bool>(alive_);  // C7: sentinel
     current_query_ = dht_ops::find_peer(socket_,
         keypair_.public_key,
-        [this](const query::QueryReply& reply) {
-            if (!running_) return;
+        [weak, this](const query::QueryReply& reply) {
+            if (auto a = weak.lock(); !a || !*a) return;
             commit(reply);
         },
-        [this](const std::vector<query::QueryReply>&) {
+        [weak, this](const std::vector<query::QueryReply>&) {
+            if (auto a = weak.lock(); !a || !*a) return;
             updating_ = false;
             current_query_.reset();
             if (running_) build_relays();
@@ -297,9 +308,10 @@ void Announcer::commit(const query::QueryReply& node) {
     req.token = token;
     req.value = std::move(ann_value);
 
+    auto weak = std::weak_ptr<bool>(alive_);  // C7: sentinel
     socket_.request(req,
-        [this, node](const messages::Response& resp) {
-            if (!running_) return;
+        [weak, this, node](const messages::Response& resp) {
+            if (auto a = weak.lock(); !a || !*a) return;
             DHT_LOG("  [announcer] ANNOUNCE accepted by %s:%u\n",
                     node.from_addr.host_string().c_str(), node.from_addr.port);
 

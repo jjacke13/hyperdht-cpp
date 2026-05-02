@@ -3,6 +3,9 @@
 // compact-encoding — binary codec for varints, buffers, IPv4/IPv6, etc.
 // C++ port of JS compact-encoding; wire-compatible with the JS reference.
 // Used by all DHT messages and HyperDHT payloads.
+//
+// Input validation: Buffer::decode capped at 64KB. Array decode capped at
+// 4096 elements. Varint-to-uint8/uint32 casts are range-checked at call sites.
 
 #include <array>
 #include <cstddef>
@@ -198,7 +201,7 @@ struct Ipv6Addr {
 // Array combinator — varint(count) + count * Enc::encode(element)
 //   Decode caps at 0x100000 (1M) elements.
 // ---------------------------------------------------------------------------
-static constexpr size_t ARRAY_MAX_LENGTH = 0x100000;
+static constexpr size_t ARRAY_MAX_LENGTH = 4096;  // H14: lowered from 0x100000
 
 template <typename Enc, typename T>
 struct Array {

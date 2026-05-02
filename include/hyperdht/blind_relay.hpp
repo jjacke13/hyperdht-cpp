@@ -238,6 +238,8 @@ public:
     RelayPair& get_or_create_pair(const Token& token);
     void remove_pair(const Token& token);
     void remove_pair_by_key(const std::string& hex_key);
+    size_t pairing_count() const { return pairings_.size(); }  // H25
+    bool has_pair(const std::string& key) const { return pairings_.count(key) > 0; }
 
     CreateStreamFn create_stream_fn;
 

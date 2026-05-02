@@ -99,6 +99,12 @@ SecurePayload::SecurePayload(const std::array<uint8_t, 32>& key)
     randombytes_buf(local_secret_.data(), 32);
 }
 
+SecurePayload::~SecurePayload() {
+    // H28: zero secrets on destruction
+    sodium_memzero(shared_secret_.data(), 32);
+    sodium_memzero(local_secret_.data(), 32);
+}
+
 std::vector<uint8_t> SecurePayload::encrypt(const uint8_t* data, size_t len) {
     // Output: nonce(24) + ciphertext(len + 16)
     std::vector<uint8_t> out(24 + len + crypto_secretbox_MACBYTES);
@@ -198,6 +204,7 @@ HolepunchPayload decode_holepunch_payload(const uint8_t* data, size_t len) {
     if (state.error) return p;
     p.firewall = static_cast<uint32_t>(Uint::decode(state));
     if (state.error) return p;
+    if (p.firewall > 3) { state.error = true; return p; }  // M7: validate range
     p.round = static_cast<uint32_t>(Uint::decode(state));
     if (state.error) return p;
 
@@ -912,6 +919,7 @@ void PoolSocket::close() {
     for (auto* inf : inflight_) {
         if (inf->timer && !uv_is_closing(reinterpret_cast<uv_handle_t*>(inf->timer))) {
             uv_timer_stop(inf->timer);
+            inf->timer->data = nullptr;  // H6: null before delete to prevent dangling
             uv_close(reinterpret_cast<uv_handle_t*>(inf->timer),
                      [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
         }
@@ -1041,12 +1049,17 @@ HolepunchMessage decode_holepunch_msg(const uint8_t* data, size_t len) {
     State state = State::for_decode(data, len);
     HolepunchMessage m;
 
-    uint8_t flags = static_cast<uint8_t>(Uint::decode(state));
-    if (state.error) return m;
-    m.mode = static_cast<uint32_t>(Uint::decode(state));
-    if (state.error) return m;
-    m.id = static_cast<uint32_t>(Uint::decode(state));
-    if (state.error) return m;
+    uint64_t flags_raw = Uint::decode(state);                             // M6
+    if (state.error || flags_raw > 0xFF) { state.error = true; return m; }
+    uint8_t flags = static_cast<uint8_t>(flags_raw);
+
+    uint64_t mode_raw = Uint::decode(state);                             // M6
+    if (state.error || mode_raw > 0xFF) { state.error = true; return m; }
+    m.mode = static_cast<uint32_t>(mode_raw);
+
+    uint64_t id_raw = Uint::decode(state);                               // M6
+    if (state.error || id_raw > UINT32_MAX) { state.error = true; return m; }
+    m.id = static_cast<uint32_t>(id_raw);
 
     auto payload_result = Buffer::decode(state);
     if (state.error) return m;
@@ -1323,16 +1336,10 @@ void holepunch_connect(rpc::RpcSocket& socket,
             auto decrypted = state->secure->decrypt(
                 hp_resp.payload.data(), hp_resp.payload.size());
             if (!decrypted) {
-                DHT_LOG( "  [hp] Round 1: decrypt FAILED\n");
-                // Decrypt failed — use peerAddress from relay as fallback
-                if (hp_resp.peer_address.has_value()) {
-                    HolepunchResult result;
-                    result.success = true;
-                    result.address = *hp_resp.peer_address;
-                    state->complete(result);
-                }  else {
-                    state->complete({});
-                }
+                // C2: abort on decrypt failure — never fall back to
+                // unauthenticated peerAddress (MITM vector)
+                DHT_LOG( "  [hp] Round 1: decrypt FAILED — aborting (no fallback)\n");
+                state->complete({});
                 return;
             }
 

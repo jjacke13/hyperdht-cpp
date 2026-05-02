@@ -1,6 +1,8 @@
 // PEER_HANDSHAKE implementation — sends the initiator Noise msg1 to a
 // relay DHT node, awaits the responder msg2, and produces a handshake
 // result (keys, hash, encrypted payload) for the holepunch stage.
+//
+// Input validation: relay_count in NoisePayload capped at 128.
 
 #include "hyperdht/peer_connect.hpp"
 
@@ -170,6 +172,7 @@ NoisePayload decode_noise_payload(const uint8_t* data, size_t len) {
         if (state.error) return p;
         auto relay_count = static_cast<uint32_t>(Uint::decode(state));
         if (state.error) return p;
+        if (relay_count > 128) { state.error = true; return p; }  // C4: cap relay count
         for (uint32_t i = 0; i < relay_count && !state.error; i++) {
             RelayInfo ri;
             ri.relay_address = Ipv4Addr::decode(state);

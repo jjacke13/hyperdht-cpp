@@ -3,6 +3,12 @@
 // Phase 4: Noise IK handshake — Noise_IK_Ed25519_ChaChaPoly_BLAKE2b
 // Uses libsodium for all crypto. Ed25519 DH via SHA512 scalar extraction
 // + crypto_scalarmult_ed25519_noclamp (NOT standard X25519).
+//
+// Security invariants:
+//   - mix_key() rejects low-order point attacks (all-zero DH → corrupt_)
+//   - All key material is zeroed on destruction (CipherState, NoiseIK)
+//   - Nonce exhaustion at 2^32 returns empty ciphertext (wire compat)
+//   - Decrypt failures in recv() set corrupt_ to prevent state reuse
 
 #include <array>
 #include <cstddef>
@@ -91,13 +97,15 @@ std::optional<std::vector<uint8_t>> decrypt(const Key& key, uint64_t counter,
                                             const uint8_t* ciphertext, size_t ct_len);
 
 // ---------------------------------------------------------------------------
-// CipherState — holds key + nonce counter
+// CipherState — holds key + nonce counter.
+// Destructor zeros key material. encrypt_with_ad returns empty at 2^32 nonce.
 // ---------------------------------------------------------------------------
 
 class CipherState {
 public:
     CipherState();
     explicit CipherState(const Key& key);
+    ~CipherState();
 
     void initialise_key(const Key& key);
     bool has_key() const;
@@ -116,7 +124,8 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// SymmetricState — chaining key + digest + cipher
+// SymmetricState — chaining key + digest + cipher.
+// mix_key sets corrupt_ on low-order point DH. Callers must check.
 // ---------------------------------------------------------------------------
 
 class SymmetricState {
@@ -146,12 +155,18 @@ public:
     Hash digest;
     Hash chaining_key;
 
+    // Set by mix_key when DH produces an all-zero result (low-order point).
+    // NoiseIK must check this after every mix_key and abort if set.
+    bool corrupt_ = false;
+
 private:
     CipherState cipher_;
 };
 
 // ---------------------------------------------------------------------------
-// NoiseIK — full IK handshake state machine
+// NoiseIK — full IK handshake state machine.
+// Destructor zeros all key material (static, ephemeral, transport, chaining).
+// send()/recv() abort on corrupt_ (low-order point or decrypt failure).
 // ---------------------------------------------------------------------------
 
 class NoiseIK {
@@ -165,6 +180,7 @@ public:
     NoiseIK(bool initiator, const Keypair& static_kp,
             const uint8_t* prologue, size_t prologue_len,
             const PubKey* remote_static = nullptr);
+    ~NoiseIK();
 
     // Write the next handshake message (with optional payload)
     std::vector<uint8_t> send(const uint8_t* payload = nullptr, size_t payload_len = 0);

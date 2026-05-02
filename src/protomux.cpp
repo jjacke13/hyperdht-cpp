@@ -1,6 +1,11 @@
 // Protomux implementation — channel multiplexer over a framed stream.
 // Handles OPEN/CLOSE control messages, per-channel flow, and batching.
 // Matches JS protomux/index.js.
+//
+// Input validation:
+//   - Length-prefixed fields use safe arithmetic (avail check, not ptr+len)
+//   - Channel IDs validated against UINT32_MAX before truncation
+//   - Batch entries capped at 1024 per frame to prevent CPU exhaustion
 
 #include "hyperdht/protomux.hpp"
 
@@ -107,18 +112,24 @@ size_t string_encode(uint8_t* buf, const std::string& str) {
 // Decode a length-prefixed buffer from ptr
 static std::vector<uint8_t> buffer_decode(const uint8_t*& ptr, const uint8_t* end) {
     uint64_t len = varint_decode(ptr, end);
-    if (len == 0 || ptr + len > end) return {};
-    std::vector<uint8_t> result(ptr, ptr + len);
-    ptr += len;
+    // C6: safe arithmetic — avoid ptr+len wrap on 64-bit
+    size_t avail = static_cast<size_t>(end - ptr);
+    if (len == 0 || len > avail) return {};
+    size_t safe_len = static_cast<size_t>(len);
+    std::vector<uint8_t> result(ptr, ptr + safe_len);
+    ptr += safe_len;
     return result;
 }
 
 // Decode a length-prefixed UTF-8 string from ptr
 static std::string string_decode(const uint8_t*& ptr, const uint8_t* end) {
     uint64_t len = varint_decode(ptr, end);
-    if (len == 0 || ptr + len > end) return {};
-    std::string result(reinterpret_cast<const char*>(ptr), len);
-    ptr += len;
+    // C6: safe arithmetic
+    size_t avail = static_cast<size_t>(end - ptr);
+    if (len == 0 || len > avail) return {};
+    size_t safe_len = static_cast<size_t>(len);
+    std::string result(reinterpret_cast<const char*>(ptr), safe_len);
+    ptr += safe_len;
     return result;
 }
 
@@ -561,7 +572,7 @@ void Mux::on_data(const uint8_t* data, size_t len) {
             default: break;
         }
     } else {
-        // Data message for a channel
+        if (channel_id > UINT32_MAX) return;  // C8: reject truncated IDs
         handle_data(static_cast<uint32_t>(channel_id), ptr,
                     static_cast<size_t>(end - ptr));
     }
@@ -589,8 +600,9 @@ void Mux::handle_open(const uint8_t* data, size_t len) {
     const uint8_t* ptr = data;
     const uint8_t* end = data + len;
 
-    uint32_t remote_local_id = static_cast<uint32_t>(varint_decode(ptr, end));
-    if (remote_local_id == 0) return;
+    uint64_t raw_id = varint_decode(ptr, end);
+    if (raw_id == 0 || raw_id > UINT32_MAX) return;  // C8
+    uint32_t remote_local_id = static_cast<uint32_t>(raw_id);
 
     std::string protocol = string_decode(ptr, end);
     if (protocol.empty()) return;
@@ -626,8 +638,9 @@ void Mux::handle_reject(const uint8_t* data, size_t len) {
     const uint8_t* ptr = data;
     const uint8_t* end = data + len;
 
-    uint32_t remote_id = static_cast<uint32_t>(varint_decode(ptr, end));
-    if (remote_id == 0 || ptr > end) return;  // Guard truncation (varint returns 0)
+    uint64_t raw_id = varint_decode(ptr, end);
+    if (raw_id == 0 || raw_id > UINT32_MAX || ptr > end) return;  // C8
+    uint32_t remote_id = static_cast<uint32_t>(raw_id);
 
     auto it = local_to_channel_.find(remote_id);
     if (it != local_to_channel_.end()) {
@@ -639,8 +652,9 @@ void Mux::handle_close(const uint8_t* data, size_t len) {
     const uint8_t* ptr = data;
     const uint8_t* end = data + len;
 
-    uint32_t remote_local_id = static_cast<uint32_t>(varint_decode(ptr, end));
-    if (remote_local_id == 0 || ptr > end) return;  // Guard truncation
+    uint64_t raw_id = varint_decode(ptr, end);
+    if (raw_id == 0 || raw_id > UINT32_MAX || ptr > end) return;  // C8
+    uint32_t remote_local_id = static_cast<uint32_t>(raw_id);
 
     auto it = remote_to_channel_.find(remote_local_id);
     if (it != remote_to_channel_.end()) {
@@ -652,23 +666,32 @@ void Mux::handle_batch(const uint8_t* data, size_t len) {
     // Batch format: [channelId][msg1_len][msg1][msg2_len][msg2]...[0][channelId2]...
     const uint8_t* ptr = data;
     const uint8_t* end = data + len;
+    constexpr size_t MAX_BATCH_ENTRIES = 1024;  // M5: cap batch entries
+    size_t entries = 0;
 
     while (ptr < end) {
         uint64_t channel_id = varint_decode(ptr, end);
+        if (channel_id > UINT32_MAX) return;  // C8: reject truncated IDs
 
         while (ptr < end) {
+            if (++entries > MAX_BATCH_ENTRIES) return;  // M5
+
             uint64_t msg_len = varint_decode(ptr, end);
             if (msg_len == 0) break;  // End of this channel's messages
 
-            if (ptr + msg_len > end) return;  // Truncated
+            // C6: safe arithmetic — avoid ptr+msg_len wrap
+            size_t avail = static_cast<size_t>(end - ptr);
+            if (msg_len > avail) return;  // Truncated
+            size_t safe_len = static_cast<size_t>(msg_len);
 
             // Each sub-message is a complete frame for this channel
             if (channel_id == 0) {
                 // Control sub-message
-                if (msg_len > 0) {
+                if (safe_len > 0) {
                     const uint8_t* sub = ptr;
-                    uint64_t type = varint_decode(sub, ptr + msg_len);
-                    size_t remaining = static_cast<size_t>((ptr + msg_len) - sub);
+                    const uint8_t* sub_end = ptr + safe_len;
+                    uint64_t type = varint_decode(sub, sub_end);
+                    size_t remaining = static_cast<size_t>(sub_end - sub);
                     switch (type) {
                         case CONTROL_OPEN:   handle_open(sub, remaining); break;
                         case CONTROL_REJECT: handle_reject(sub, remaining); break;
@@ -677,11 +700,10 @@ void Mux::handle_batch(const uint8_t* data, size_t len) {
                     }
                 }
             } else {
-                handle_data(static_cast<uint32_t>(channel_id), ptr,
-                            static_cast<size_t>(msg_len));
+                handle_data(static_cast<uint32_t>(channel_id), ptr, safe_len);
             }
 
-            ptr += msg_len;
+            ptr += safe_len;
         }
     }
 }

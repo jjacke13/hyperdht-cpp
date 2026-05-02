@@ -1,6 +1,8 @@
 // HyperDHT message codecs — encode/decode for announce records,
 // peer records, and mutable/immutable storage values. Wire-compatible
 // with hyperdht/lib/messages.js.
+//
+// Input validation: varint-to-uint8 casts are range-checked (flags ≤ 0xFF).
 
 #include "hyperdht/dht_messages.hpp"
 
@@ -137,8 +139,9 @@ AnnounceMessage decode_announce_msg(const uint8_t* data, size_t len) {
     State state = State::for_decode(data, len);
     AnnounceMessage m;
 
-    uint8_t flags = static_cast<uint8_t>(Uint::decode(state));
-    if (state.error) return m;
+    uint64_t flags_raw = Uint::decode(state);                         // H11
+    if (state.error || flags_raw > 0xFF) { state.error = true; return m; }
+    uint8_t flags = static_cast<uint8_t>(flags_raw);
 
     if (flags & 1) {
         PeerRecord peer;

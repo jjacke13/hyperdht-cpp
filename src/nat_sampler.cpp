@@ -1,6 +1,6 @@
 // NAT sampler implementation — collects the `to` address reported by
 // remote DHT nodes and classifies our firewall as CONSISTENT or RANDOM
-// once enough samples are observed.
+// once enough samples are observed. visited_ set capped at 1024 entries.
 //
 // JS: .analysis/js/nat-sampler/index.js:1-64 (whole NatSampler class)
 //
@@ -99,6 +99,8 @@ bool NatSampler::add(const compact::Ipv4Address& addr,
     // Deduplicate by source node — don't sample the same node twice
     auto ref = from.host_string() + ":" + std::to_string(from.port);
     if (visited_.count(ref)) return false;
+    constexpr size_t MAX_VISITED = 1024;  // H24: cap visited set
+    if (visited_.size() >= MAX_VISITED) return false;
     visited_.insert(ref);
 
     add_sample(samples_host_, addr.host_string(), 0);

@@ -6,6 +6,9 @@
 //
 // These handlers make our node a full participant in the DHT network,
 // able to answer queries and store announcements for other peers.
+//
+// DoS hardening: FIND_NODE and DOWN_HINT are per-IP rate-limited (1/sec).
+// DELAYED_PING timers capped at 256. MUTABLE/IMMUTABLE values capped at 32KB.
 
 #include <string>
 #include <vector>
@@ -119,6 +122,11 @@ private:
         bool from_server = false;   // Which socket received the original request
     };
     std::vector<DelayedReply*> pending_delayed_;
+
+    // H21: per-IP rate limiter for FIND_NODE (amplification mitigation)
+    std::unordered_map<uint32_t, uint64_t> find_node_rate_;  // IP → last_ms
+    // H27: per-IP rate limiter for DOWN_HINT (eclipse attack mitigation)
+    std::unordered_map<uint32_t, uint64_t> down_hint_rate_;
 
     static void on_delayed_ping_fire(uv_timer_t* timer);
 

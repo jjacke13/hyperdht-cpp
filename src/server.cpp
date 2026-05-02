@@ -75,6 +75,10 @@
 //   - Probe echo is a single global listener installed on first holepunch via
 //     `add_probe_listener` (multi-listener API), tracked in `probe_listener_id_`
 //     and removed on close().
+//
+// DoS hardening:
+//   - Concurrent pending handshakes capped at 256 (on_handshake_result)
+//   - Holepunch send_fn_ lambda captures weak alive_ sentinel
 
 #include "hyperdht/server.hpp"
 
@@ -540,6 +544,9 @@ void Server::on_handshake_result(
     std::optional<server_connection::ServerConnection> result) {
 
     if (closed_ || suspended_) return;
+    // H23: cap concurrent pending handshakes to prevent resource exhaustion
+    constexpr size_t MAX_PENDING_HANDSHAKES = 256;
+    if (connections_.size() >= MAX_PENDING_HANDSHAKES) return;
 
     if (!result.has_value()) {
         DHT_LOG("  [server] Noise handshake FAILED (finalize error)\n");
@@ -955,7 +962,9 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
 
         if (!conn.puncher) {
             conn.puncher = std::make_shared<holepunch::Holepuncher>(socket_.loop(), false);
-            conn.puncher->set_send_fn([this](const compact::Ipv4Address& addr) {
+            auto weak = std::weak_ptr<bool>(alive_);  // H10: sentinel
+            conn.puncher->set_send_fn([weak, this](const compact::Ipv4Address& addr) {
+                if (auto a = weak.lock(); !a || !*a) return;
                 if (!closed_) socket_.send_probe(addr);
             });
             conn.puncher->set_local_firewall(our_fw);

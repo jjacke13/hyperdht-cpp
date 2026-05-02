@@ -1,4 +1,7 @@
 // Shared internal types and helpers for the FFI shim files (ffi_*.cpp).
+//
+// Safety: hyperdht_stream_s carries a shared_ptr<bool> closed_flag so drain
+// callbacks can detect stream destruction without reading freed memory.
 #pragma once
 
 #include "hyperdht/hyperdht.h"
@@ -95,6 +98,9 @@ struct hyperdht_stream_s {
     void* udp_userdata = nullptr;
 
     bool closed = false;
+    // H18: shared closed flag survives stream deletion — drain callbacks
+    // check this instead of reading freed stream->closed.
+    std::shared_ptr<bool> closed_flag = std::make_shared<bool>(false);
 
     // Keeps the holepunch pool socket alive for the UDX stream's lifetime.
     // The raw UDX stream holds a raw pointer to the pool socket (via
@@ -162,6 +168,7 @@ inline void fill_connection(hyperdht_connection_t* out,
 inline void stream_fire_close(hyperdht_stream_s* s) {
     if (s->closed) return;
     s->closed = true;
+    *s->closed_flag = true;  // H18: notify drain callbacks
     if (s->on_close) s->on_close(s->userdata);
     // destroy() stops the UDX stream (udx_stream_destroy) and timers
     // BEFORE we delete the duplex. Without this, the UDX stream keeps

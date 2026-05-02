@@ -1,6 +1,8 @@
 // compact-encoding implementation — varints, fixed-width ints,
 // raw/length-prefixed buffers, IPv4/IPv6 (compact-encoding-net).
 // Matches the JS reference wire format byte-for-byte.
+//
+// Buffer::decode capped at 64KB to prevent allocation attacks.
 
 #include "hyperdht/compact.hpp"
 
@@ -235,6 +237,8 @@ Buffer::DecodeResult Buffer::decode(State& s) {
     auto len = Uint::decode(s);
     if (s.error) return {};
     if (len == 0) return {};  // null
+    constexpr size_t MAX_BUFFER_DECODE = 65536;  // H12: cap allocation size
+    if (len > MAX_BUFFER_DECODE) { s.error = true; return {}; }
     if (!has_bytes(s, static_cast<size_t>(len))) { s.error = true; return {}; }
     const uint8_t* ptr = s.data() + s.start;
     s.start += static_cast<size_t>(len);

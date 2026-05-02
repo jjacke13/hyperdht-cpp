@@ -1,5 +1,9 @@
 // FFI server: create, listen, firewall, close, state, config, relay, stats.
+//
+// Safety: hyperdht_firewall_done uses atomic<bool> to prevent double-call UAF.
+// srv->server is nulled after close to prevent accidental re-use.
 #include "ffi_internal.hpp"
+#include <atomic>
 
 // ---------------------------------------------------------------------------
 // Server: create, listen, firewall, close, suspend, refresh
@@ -76,6 +80,7 @@ void hyperdht_server_close(hyperdht_server_t* srv,
     }
 
     srv->server->close([srv, cb, userdata]() {
+        srv->server = nullptr;  // M17: prevent accidental re-use
         delete srv;
         if (cb) cb(userdata);
     });
@@ -89,6 +94,7 @@ void hyperdht_server_close_force(hyperdht_server_t* srv,
         return;
     }
     srv->server->close(/*force=*/true, [srv, cb, userdata]() {
+        srv->server = nullptr;  // M17
         delete srv;
         if (cb) cb(userdata);
     });
@@ -202,16 +208,16 @@ struct hyperdht_firewall_done_s {
     hyperdht::server::Server::FirewallDoneCb fn;
     std::array<uint8_t, 32> pk_copy{};
     char host_copy[46] = {0};
+    std::atomic<bool> called{false};  // H15: prevent double-call UAF
 };
 
 void hyperdht_firewall_done(hyperdht_firewall_done_t* done, int reject) {
-    if (!done || !done->fn) return;  // already invoked — no-op
-    // Move the std::function out so a stale pointer can't call twice
-    // through us. The C++ side has its own once-guard; this is belt +
-    // braces for the FFI layer.
-    auto fn = std::move(done->fn);
-    done->fn = nullptr;
-    fn(reject != 0);
+    if (!done) return;
+    if (done->called.exchange(true)) return;  // H15: already invoked
+    if (done->fn) {
+        auto fn = std::move(done->fn);
+        fn(reject != 0);
+    }
     delete done;
 }
 

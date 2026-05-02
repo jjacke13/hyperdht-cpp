@@ -1,4 +1,7 @@
 // FFI stream: encrypted stream open/write/close, file-descriptor polling.
+//
+// Safety: drain callbacks use shared_ptr<bool> closed_flag (survives stream
+// deletion). uv_ip4_addr return value is checked. Zero-event polls rejected.
 #include "ffi_internal.hpp"
 #include "hyperdht/debug.hpp"
 
@@ -47,7 +50,11 @@ hyperdht_stream_t* hyperdht_stream_open(
 
         if (conn->peer_port != 0) {
             struct sockaddr_in dest{};
-            uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
+            int rc = uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
+            if (rc != 0) {  // H19: invalid address
+                udx_stream_destroy(raw);
+                return nullptr;
+            }
             // Use the holepunch-discovered socket when available — it has
             // the correct NAT mapping. Fall back to the main RPC socket.
             udx_socket_t* sock = conn->udx_socket
@@ -196,10 +203,11 @@ int hyperdht_stream_write_with_drain(hyperdht_stream_t* stream,
     if (!on_drain) {
         return stream->duplex->write(data, len, nullptr);
     }
+    // H18: capture shared closed_flag — survives stream deletion
+    auto closed_flag = stream->closed_flag;
     return stream->duplex->write(data, len,
-        [stream, on_drain, userdata](int /*status*/) {
-            // Guard: stream may have been closed between write and drain.
-            if (stream->closed) return;
+        [closed_flag, stream, on_drain, userdata](int /*status*/) {
+            if (*closed_flag) return;
             on_drain(stream, userdata);
         });
 }
@@ -280,6 +288,8 @@ hyperdht_poll_t* hyperdht_poll_start(hyperdht_t* dht,
     int uv_events = 0;
     if (events & HYPERDHT_POLL_READABLE) uv_events |= UV_READABLE;
     if (events & HYPERDHT_POLL_WRITABLE) uv_events |= UV_WRITABLE;
+    // M16: reject zero events — would create zombie poll handle
+    if (uv_events == 0) { delete p; return nullptr; }
 
     if (uv_poll_start(&p->handle, uv_events, on_poll) != 0) {
         uv_close(reinterpret_cast<uv_handle_t*>(&p->handle),

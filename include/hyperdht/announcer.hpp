@@ -9,6 +9,10 @@
 //   4. Ping relays every 5s to keep NAT mappings alive
 //   5. Re-announce every ~5 minutes
 //   6. On stop: UNANNOUNCE from all relay nodes
+//
+// Lifetime: all async callbacks (find_peer, commit, ping_relays) capture a
+// weak_ptr<bool> alive_ sentinel. stop_impl() invalidates the sentinel and
+// resets current_query_ so callbacks become no-ops after destruction.
 
 #include <array>
 #include <cstdint>
@@ -101,6 +105,11 @@ private:
     bool has_reannounced_ = false;  // prevent update→build_relays→update loop
 
     std::shared_ptr<query::Query> current_query_;
+
+    // C7: sentinel for safe async callback invalidation.
+    // Captured as weak_ptr in lambdas — if lock() fails or *alive_ is false,
+    // the Announcer has been stopped/destroyed.
+    std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
 
     void update();
     void commit(const query::QueryReply& node);

@@ -1,6 +1,7 @@
 // Announce store implementation — hash map keyed by 32-byte target.
 // Records are appended with a TTL and scanned/expired on access.
 // Used by the ANNOUNCE / UNANNOUNCE / FIND_PEER / LOOKUP handlers.
+// Total distinct targets capped at 65536 to prevent unbounded growth.
 //
 // JS: .analysis/js/hyperdht/lib/persistent.js:16-24 (Persistent ctor —
 //     creates `records = new RecordCache(opts.records)`)
@@ -25,6 +26,11 @@ namespace hyperdht {
 namespace announce {
 
 void AnnounceStore::put(const TargetKey& target, const PeerAnnouncement& ann) {
+    // C14: cap total distinct targets to prevent unbounded growth
+    constexpr size_t MAX_TOTAL_TARGETS = 65536;
+    if (store_.size() >= MAX_TOTAL_TARGETS && store_.find(target) == store_.end()) {
+        return;
+    }
     auto& peers = store_[target];
 
     // Replace existing from same address

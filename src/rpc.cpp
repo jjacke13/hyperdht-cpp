@@ -19,6 +19,10 @@
 //   - Drain timer fires every 750ms (matches JS io.js:286) handling
 //     congestion window rotation + token rotation in one tick.
 //   - Background tick at 5s matches JS index.js:18 (TICK_INTERVAL).
+//
+// Resource limits:
+//   - pending_ queue capped at 640 (4x congestion window)
+//   - probe_replied_hosts_ capped at 16 during firewall probe
 
 #include "hyperdht/rpc.hpp"
 #include "hyperdht/debug.hpp"
@@ -364,6 +368,13 @@ uint16_t RpcSocket::request(const messages::Request& req,
 
     // Check congestion window
     if (congestion_.is_full()) {
+        // C12: cap pending queue to prevent unbounded memory growth
+        constexpr size_t MAX_PENDING = 640;
+        if (pending_.size() >= MAX_PENDING) {
+            uv_close(reinterpret_cast<uv_handle_t*>(&inflight->timer), nullptr);
+            delete inflight;
+            return 0;
+        }
         pending_.push_back(inflight);
         return msg.tid;
     }
@@ -552,7 +563,8 @@ void RpcSocket::on_recv_server(udx_socket_t* socket, ssize_t nread, const uv_buf
     if (self->firewall_probe_running_) {
         char host[INET_ADDRSTRLEN];
         uv_ip4_name(addr_in, host, sizeof(host));
-        self->probe_replied_hosts_.insert(host);
+        if (self->probe_replied_hosts_.size() < 16)  // H26: cap
+            self->probe_replied_hosts_.insert(host);
         if (self->probe_replied_hosts_.size() >= self->probe_threshold()) {
             self->finish_firewall_probe();
         }

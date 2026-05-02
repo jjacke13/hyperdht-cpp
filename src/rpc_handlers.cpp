@@ -6,7 +6,7 @@
 //     .analysis/js/hyperdht/lib/persistent.js:16-257 (Persistent class —
 //                                                     all HyperDHT cmds)
 //
-// Two protocol-parity behaviors implemented here:
+// Three protocol-parity behaviors implemented here:
 //
 //   1. ID suppression: responses only include our routing table ID when
 //      NOT ephemeral. JS: io.js:488 `ephemeral === false && socket ===
@@ -17,6 +17,12 @@
 //      hyperdht/index.js:404 `if (this._persistent === null) return false`.
 //      Connection-layer commands (PEER_HANDSHAKE, PEER_HOLEPUNCH) pass
 //      through regardless.
+//
+//   3. DoS hardening:
+//      - FIND_NODE rate-limited to 1/sec/IP (6-8x amplification vector)
+//      - DOWN_HINT rate-limited to 1/sec/IP (eclipse attack mitigation)
+//      - DELAYED_PING timers capped at 256 concurrent
+//      - IMMUTABLE/MUTABLE_PUT values capped at 32KB
 //
 // C++ diffs from JS:
 //   - JS Persistent has separate caches for `bumps`, `refreshes`,
@@ -29,6 +35,7 @@
 #include "hyperdht/rpc_handlers.hpp"
 
 #include <cassert>
+#include <cstring>
 
 #include <sodium.h>
 
@@ -242,6 +249,15 @@ void RpcHandlers::handle_ping_nat(const messages::Request& req) {
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_find_node(const messages::Request& req) {
+    // H21: per-IP rate limit — 1 response/sec/IP to mitigate amplification
+    uint32_t ip = 0;
+    std::memcpy(&ip, req.from.addr.host.data(), 4);
+    auto now = uv_now(socket_.loop());
+    auto it = find_node_rate_.find(ip);
+    if (it != find_node_rate_.end() && now - it->second < 1000) return;
+    find_node_rate_[ip] = now;
+    if (find_node_rate_.size() > 8192) find_node_rate_.clear();  // cap map growth
+
     auto resp = make_query_response(req);
     socket_.reply(resp);
 }
@@ -273,6 +289,21 @@ void RpcHandlers::handle_down_hint(const messages::Request& req) {
     if (!req.value.has_value() || req.value->size() < 6) {
         // JS drops silently without replying when value is malformed.
         return;
+    }
+
+    // H27: rate-limit DOWN_HINT per source IP (max 1/sec) to mitigate
+    // eclipse attacks where attacker floods hints for all known nodes.
+    {
+        uint32_t ip = 0;
+        std::memcpy(&ip, req.from.addr.host.data(), 4);
+        auto now = uv_now(socket_.loop());
+        auto it = down_hint_rate_.find(ip);
+        if (it != down_hint_rate_.end() && now - it->second < 1000) {
+            send_empty_reply();
+            return;
+        }
+        down_hint_rate_[ip] = now;
+        if (down_hint_rate_.size() > 4096) down_hint_rate_.clear();
     }
 
     // Respect the rate limit (JS: `if (this._checks < 10)`).
@@ -317,6 +348,8 @@ void RpcHandlers::handle_down_hint(const messages::Request& req) {
 
 void RpcHandlers::handle_delayed_ping(const messages::Request& req) {
     if (!req.value.has_value() || req.value->size() < 4) return;
+    constexpr size_t MAX_PENDING_DELAYED = 256;  // H22: cap timer accumulation
+    if (pending_delayed_.size() >= MAX_PENDING_DELAYED) return;
 
     const auto& v = *req.value;
     uint32_t delay_ms =
@@ -643,8 +676,10 @@ void RpcHandlers::handle_mutable_put(const messages::Request& req) {
                        nullptr, 0);
     if (expected_target != *req.target) return;
 
-    // Verify value is non-empty
+    // Verify value is non-empty and not too large
     if (put.value.empty()) return;
+    constexpr size_t MAX_MUTABLE_VALUE = 32768;  // C16: cap value size
+    if (put.value.size() > MAX_MUTABLE_VALUE) return;
 
     // Verify Ed25519 signature over NS_MUTABLE_PUT + BLAKE2b(seq || value)
     if (!announce_sig::verify_mutable(
@@ -741,6 +776,8 @@ void RpcHandlers::handle_immutable_put(const messages::Request& req) {
     if (!req.target.has_value()) return;
     if (!req.token.has_value()) return;
     if (!req.value.has_value() || req.value->empty()) return;
+    constexpr size_t MAX_IMMUTABLE_VALUE = 32768;  // C15: cap value size
+    if (req.value->size() > MAX_IMMUTABLE_VALUE) return;
 
     // Validate token
     if (!socket_.token_store().validate(

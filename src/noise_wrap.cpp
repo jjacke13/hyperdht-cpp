@@ -1,6 +1,10 @@
 // Noise IK handshake implementation — initiator/responder state machines
 // for Noise_IK_Ed25519_ChaChaPoly_BLAKE2b. All crypto via libsodium;
 // Ed25519 DH uses SHA512 scalar extraction + crypto_scalarmult_ed25519_noclamp.
+//
+// All intermediate key material (DH results, HKDF outputs, HMAC state) is
+// zeroed with sodium_memzero before leaving scope. Low-order Ed25519 points
+// are detected and abort the handshake via the corrupt_ flag.
 
 #include "hyperdht/noise_wrap.hpp"
 
@@ -87,6 +91,7 @@ Hash hmac_blake2b(const uint8_t* key, size_t key_len,
     crypto_generichash_final(&state, out.data(), HASHLEN);
     sodium_memzero(&state, sizeof(state));
     sodium_memzero(outer_pad, BLOCKLEN);
+    sodium_memzero(inner_hash.data(), HASHLEN);  // H4: zero HMAC intermediate
 
     return out;
 }
@@ -217,7 +222,12 @@ CipherState::CipherState() = default;
 
 CipherState::CipherState(const Key& key) : key_(key), nonce_(0) {}
 
+CipherState::~CipherState() {
+    if (key_) sodium_memzero(key_->data(), KEYLEN);  // L1: zero key on destruction
+}
+
 void CipherState::initialise_key(const Key& key) {
+    if (key_) sodium_memzero(key_->data(), KEYLEN);  // Zero old key before overwrite
     key_ = key;
     nonce_ = 0;
 }
@@ -229,6 +239,7 @@ std::vector<uint8_t> CipherState::encrypt_with_ad(const uint8_t* ad, size_t ad_l
     if (!has_key()) {
         return std::vector<uint8_t>(pt, pt + pt_len);
     }
+    if (nonce_ >= UINT32_MAX) return {};  // H1: nonce exhaustion guard
     auto ct = noise::encrypt(*key_, nonce_, ad, ad_len, pt, pt_len);
     nonce_++;
     return ct;
@@ -265,12 +276,21 @@ void SymmetricState::mix_hash(const uint8_t* data, size_t len) {
 
 void SymmetricState::mix_key(const PubKey& remote_key, const Keypair& local_key) {
     auto dh_result = dh(local_key, remote_key);
+    // C1: reject low-order point attacks (all-zero DH output)
+    static constexpr std::array<uint8_t, DHLEN> zero{};
+    if (dh_result == zero) {
+        corrupt_ = true;
+        return;
+    }
     auto [ck, temp_k] = hkdf(chaining_key.data(), HASHLEN,
                               dh_result.data(), DHLEN);
+    sodium_memzero(dh_result.data(), DHLEN);           // C3: zero DH result
     chaining_key = ck;
     Key cipher_key;
     std::copy_n(temp_k.data(), KEYLEN, cipher_key.data());
     cipher_.initialise_key(cipher_key);
+    sodium_memzero(temp_k.data(), HASHLEN);            // C3: zero HKDF output
+    sodium_memzero(cipher_key.data(), KEYLEN);         // C3: zero temp key
 }
 
 std::vector<uint8_t> SymmetricState::encrypt_and_hash(const uint8_t* pt, size_t pt_len) {
@@ -292,6 +312,8 @@ SymmetricState::SplitKeys SymmetricState::split() const {
     SplitKeys keys;
     std::copy_n(h1.data(), KEYLEN, keys.key1.data());
     std::copy_n(h2.data(), KEYLEN, keys.key2.data());
+    sodium_memzero(h1.data(), HASHLEN);   // C3: zero HKDF output
+    sodium_memzero(h2.data(), HASHLEN);   // C3: zero HKDF output
     return keys;
 }
 
@@ -357,6 +379,7 @@ std::vector<uint8_t> NoiseIK::send(const uint8_t* payload, size_t payload_len) {
 
         // es: DH(e, rs) → MixKey
         symmetric_.mix_key(rs_, e_);
+        if (symmetric_.corrupt_) { corrupt_ = true; return {}; }
 
         // s: encrypt our static pubkey and send
         auto enc_s = symmetric_.encrypt_and_hash(
@@ -365,6 +388,7 @@ std::vector<uint8_t> NoiseIK::send(const uint8_t* payload, size_t payload_len) {
 
         // ss: DH(s, rs) → MixKey
         symmetric_.mix_key(rs_, s_);
+        if (symmetric_.corrupt_) { corrupt_ = true; return {}; }
 
     } else if (message_index_ == 1 && !initiator_) {
         // Message 2 (responder → initiator): e, ee, se
@@ -379,11 +403,13 @@ std::vector<uint8_t> NoiseIK::send(const uint8_t* payload, size_t payload_len) {
 
         // ee: DH(e, re) → MixKey
         symmetric_.mix_key(re_, e_);
+        if (symmetric_.corrupt_) { corrupt_ = true; return {}; }
 
         // se: DH(e, rs) → MixKey
         // SE = DH(initiator_static, responder_ephemeral)
         // Responder computes: scalarmult(responder_e_scalar, initiator_s_pubkey)
         symmetric_.mix_key(rs_, e_);
+        if (symmetric_.corrupt_) { corrupt_ = true; return {}; }
     }
 
     // Encrypt payload
@@ -426,41 +452,45 @@ std::optional<std::vector<uint8_t>> NoiseIK::recv(const uint8_t* msg, size_t msg
 
         // e: read ephemeral pubkey
         auto e_data = shift(PKLEN);
-        if (!e_data) return std::nullopt;
+        if (!e_data) { corrupt_ = true; return std::nullopt; }
         std::copy_n(e_data, PKLEN, re_.data());
         symmetric_.mix_hash(re_.data(), PKLEN);
 
         // es: DH(s, re) — responder uses static key with remote ephemeral
         symmetric_.mix_key(re_, s_);
+        if (symmetric_.corrupt_) { corrupt_ = true; return std::nullopt; }
 
         // s: decrypt remote static pubkey
         size_t enc_s_len = PKLEN + MACLEN;  // 32 + 16 = 48
         auto enc_s_data = shift(enc_s_len);
-        if (!enc_s_data) return std::nullopt;
+        if (!enc_s_data) { corrupt_ = true; return std::nullopt; }
         auto dec_s = symmetric_.decrypt_and_hash(enc_s_data, enc_s_len);
-        if (!dec_s) return std::nullopt;
+        if (!dec_s) { corrupt_ = true; return std::nullopt; }
         std::copy_n(dec_s->data(), PKLEN, rs_.data());
         rs_known_ = true;
 
         // ss: DH(s, rs) — both static keys
         symmetric_.mix_key(rs_, s_);
+        if (symmetric_.corrupt_) { corrupt_ = true; return std::nullopt; }
 
     } else if (message_index_ == 1 && initiator_) {
         // Receive Message 2 (initiator side): e, ee, se
 
         // e: read ephemeral pubkey
         auto e_data = shift(PKLEN);
-        if (!e_data) return std::nullopt;
+        if (!e_data) { corrupt_ = true; return std::nullopt; }
         std::copy_n(e_data, PKLEN, re_.data());
         symmetric_.mix_hash(re_.data(), PKLEN);
 
         // ee: DH(e, re) — both ephemeral
         symmetric_.mix_key(re_, e_);
+        if (symmetric_.corrupt_) { corrupt_ = true; return std::nullopt; }
 
         // se: DH(s, re) — our static, their ephemeral
         // Wait — from initiator's perspective, se means: local=static, remote=ephemeral
         // JS keyPattern: SE with initiator=true → local=static, remote=ephemeral
         symmetric_.mix_key(re_, s_);
+        if (symmetric_.corrupt_) { corrupt_ = true; return std::nullopt; }
     }
 
     // Decrypt payload (remaining bytes)
@@ -483,6 +513,16 @@ std::optional<std::vector<uint8_t>> NoiseIK::recv(const uint8_t* msg, size_t msg
     }
 
     return payload;
+}
+
+NoiseIK::~NoiseIK() {
+    // H2: zero all key material on destruction
+    sodium_memzero(s_.secret_key.data(), SKLEN);
+    sodium_memzero(e_.secret_key.data(), SKLEN);
+    sodium_memzero(tx_.data(), KEYLEN);
+    sodium_memzero(rx_.data(), KEYLEN);
+    sodium_memzero(symmetric_.chaining_key.data(), HASHLEN);
+    sodium_memzero(symmetric_.digest.data(), HASHLEN);
 }
 
 void NoiseIK::set_ephemeral(const Keypair& ephemeral) {

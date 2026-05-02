@@ -63,6 +63,7 @@ std::array<uint8_t, 64> ann_signable(
     }
     // If no refresh: JS passes EMPTY (0-length buffer) which is a no-op for the hash
     crypto_generichash_final(&hash_state, signable.data() + 32, 32);
+    sodium_memzero(&hash_state, sizeof(hash_state));  // M4: zero intermediate state
 
     return signable;
 }

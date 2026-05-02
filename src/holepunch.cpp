@@ -280,6 +280,11 @@ Holepuncher::Holepuncher(uv_loop_t* loop, bool is_initiator,
 }
 
 Holepuncher::~Holepuncher() {
+    // M10: clear callbacks on all holders to prevent lingering SocketRefs
+    // from calling back into destroyed Holepuncher during pool linger period
+    for (auto* h : holders_) {
+        h->on_holepunch_message = nullptr;
+    }
     stop();
     if (punch_timer_ && !uv_is_closing(reinterpret_cast<uv_handle_t*>(punch_timer_))) {
         // Timer outlives us — null the back-pointer so callbacks don't dereference
@@ -834,7 +839,9 @@ void PoolSocket::request(const messages::Request& req,
     ctx->buf = std::move(buf);
     ctx->req.data = ctx;
     uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(ctx->buf.data()),
-                                    static_cast<unsigned int>(ctx->buf.size()));
+                                    (ctx->buf.size() <= UINT_MAX
+                                        ? static_cast<unsigned int>(ctx->buf.size())
+                                        : 0u));
     struct sockaddr_in dest{};
     uv_ip4_addr(req.to.addr.host_string().c_str(), req.to.addr.port, &dest);
     DHT_LOG("  [pool] Sending request (tid=%u, cmd=%u, %zu bytes) to %s:%u\n",

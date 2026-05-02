@@ -124,6 +124,7 @@ void SocketRef::on_linger_close(uv_handle_t* handle) {
 
 void SocketRef::on_socket_close(udx_socket_t* socket) {
     auto* self = static_cast<SocketRef*>(socket->data);
+    if (!self) return;  // H9: pool already destroyed, data was nulled
     self->pool_.remove(self);
 }
 
@@ -131,6 +132,7 @@ void SocketRef::on_message(udx_socket_t* socket, ssize_t read_len,
                            const uv_buf_t* buf, const struct sockaddr* addr) {
     if (read_len <= 0 || !addr) return;
     auto* self = static_cast<SocketRef*>(socket->data);
+    if (!self) return;  // H9: pool destroyed
 
     // Extract sender address
     auto* sin = reinterpret_cast<const struct sockaddr_in*>(addr);
@@ -189,9 +191,12 @@ void SocketPool::destroy() {
         ref->unlinger();
         if (!ref->closed_) {
             ref->closed_ = true;
+            ref->socket_.data = nullptr;  // H9: prevent on_socket_close UAF
             udx_socket_close(&ref->socket_);
         }
     }
+    sockets_.clear();     // H9: pool is destroyed, entries are stale
+    lingering_.clear();
 }
 
 void SocketPool::add(SocketRef* ref) {

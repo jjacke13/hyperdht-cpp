@@ -47,6 +47,7 @@ int hyperdht_server_listen(hyperdht_server_t* srv,
             conn.udx_socket = info.udx_socket;
             srv->cb(&conn, srv->userdata);
         });
+    sodium_memzero(cpp_kp.secret_key.data(), 64);  // C10
 
     return 0;
 }

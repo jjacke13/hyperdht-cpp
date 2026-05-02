@@ -48,6 +48,7 @@ void hyperdht_keypair_generate(hyperdht_keypair_t* out) {
     auto kp = hyperdht::noise::generate_keypair();
     memcpy(out->public_key, kp.public_key.data(), 32);
     memcpy(out->secret_key, kp.secret_key.data(), 64);
+    sodium_memzero(kp.secret_key.data(), 64);  // C10: zero stack copy
 }
 
 void hyperdht_keypair_from_seed(hyperdht_keypair_t* out, const uint8_t seed[32]) {
@@ -57,6 +58,14 @@ void hyperdht_keypair_from_seed(hyperdht_keypair_t* out, const uint8_t seed[32])
     auto kp = hyperdht::noise::generate_keypair(s);
     memcpy(out->public_key, kp.public_key.data(), 32);
     memcpy(out->secret_key, kp.secret_key.data(), 64);
+    sodium_memzero(s.data(), 32);              // C10: zero seed
+    sodium_memzero(kp.secret_key.data(), 64);  // C10: zero stack copy
+}
+
+void hyperdht_keypair_zero(hyperdht_keypair_t* kp) {
+    if (!kp) return;
+    sodium_memzero(kp->secret_key, 64);
+    sodium_memzero(kp->public_key, 32);
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +242,8 @@ int hyperdht_connect_ex(hyperdht_t* dht,
             hyperdht::noise::Keypair kp;
             std::memcpy(kp.public_key.data(), opts->keypair->public_key, 32);
             std::memcpy(kp.secret_key.data(), opts->keypair->secret_key, 64);
-            cpp_opts.keypair = std::move(kp);
+            cpp_opts.keypair = kp;
+            sodium_memzero(kp.secret_key.data(), 64);  // C10
         }
         if (opts->relay_through) {
             hyperdht::noise::PubKey rpk{};

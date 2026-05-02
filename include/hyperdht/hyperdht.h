@@ -225,6 +225,10 @@ HYPERDHT_API void hyperdht_keypair_generate(hyperdht_keypair_t* out);
 /** Generate a keypair from a 32-byte seed (deterministic). */
 HYPERDHT_API void hyperdht_keypair_from_seed(hyperdht_keypair_t* out, const uint8_t seed[32]);
 
+/** Zero the secret key material in a keypair. Call when the keypair is no
+ *  longer needed to prevent secret key recovery from process memory. */
+HYPERDHT_API void hyperdht_keypair_zero(hyperdht_keypair_t* kp);
+
 /* =========================================================================
  * Lifecycle
  * ========================================================================= */

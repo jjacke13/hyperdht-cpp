@@ -281,7 +281,9 @@ void RpcSocket::udp_send_on(const std::vector<uint8_t>& buf,
     ctx->req.data = ctx;
 
     uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(ctx->buf.data()),
-                                    static_cast<unsigned int>(ctx->buf.size()));
+                                    (ctx->buf.size() <= UINT_MAX
+                                        ? static_cast<unsigned int>(ctx->buf.size())
+                                        : 0u));
 
     struct sockaddr_in dest{};
     uv_ip4_addr(to.host_string().c_str(), to.port, &dest);
@@ -599,7 +601,9 @@ void RpcSocket::send_probe_ttl(const compact::Ipv4Address& to, int ttl) {
     ctx->req.data = ctx;
 
     uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(ctx->buf.data()),
-                                    static_cast<unsigned int>(ctx->buf.size()));
+                                    (ctx->buf.size() <= UINT_MAX
+                                        ? static_cast<unsigned int>(ctx->buf.size())
+                                        : 0u));
 
     struct sockaddr_in dest{};
     uv_ip4_addr(to.host_string().c_str(), to.port, &dest);

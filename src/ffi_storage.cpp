@@ -56,6 +56,7 @@ int hyperdht_mutable_put(hyperdht_t* dht,
         [cb, userdata](const hyperdht::HyperDHT::MutablePutResult&) {
             if (cb) cb(0, userdata);
         });
+    sodium_memzero(cpp_kp.secret_key.data(), 64);  // C10
     return 0;
 }
 
@@ -354,6 +355,7 @@ int hyperdht_unannounce(hyperdht_t* dht,
         [on_done, userdata]() {
             if (on_done) on_done(0, userdata);
         });
+    sodium_memzero(cpp_kp.secret_key.data(), 64);  // C10
     return 0;
 }
 

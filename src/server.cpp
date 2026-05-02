@@ -368,6 +368,11 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
             noise.size(), peer_address.host_string().c_str(), peer_address.port);
     if (closed_ || suspended_) return;
 
+    // M14: cap dedup map (entries without matching connections are stale)
+    if (handshake_dedup_.size() > 512 && handshake_dedup_.size() > connections_.size() * 2) {
+        handshake_dedup_.clear();
+    }
+
     // Dedup: same noise bytes = same client via different relay.
     // JS: server.js:464-473 (_onpeerhandshake) k = noise.toString('hex');
     //     if (_connects.has(k)) reuse session. We resend cached reply_noise.

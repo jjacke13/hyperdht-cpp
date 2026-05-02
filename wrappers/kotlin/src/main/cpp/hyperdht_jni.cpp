@@ -146,6 +146,7 @@ Java_com_hyperdht_Native_keypairGenerate(
     hyperdht_keypair_generate(&kp);
     env->SetByteArrayRegion(jpk, 0, 32, (jbyte*)kp.public_key);
     env->SetByteArrayRegion(jsk, 0, 64, (jbyte*)kp.secret_key);
+    hyperdht_keypair_zero(&kp);  // C10
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -158,6 +159,8 @@ Java_com_hyperdht_Native_keypairFromSeed(
     hyperdht_keypair_from_seed(&kp, seed);
     env->SetByteArrayRegion(jpk, 0, 32, (jbyte*)kp.public_key);
     env->SetByteArrayRegion(jsk, 0, 64, (jbyte*)kp.secret_key);
+    hyperdht_keypair_zero(&kp);              // C10
+    sodium_memzero(seed, sizeof(seed));      // C10
 }
 
 // ---------------------------------------------------------------------------
@@ -676,7 +679,9 @@ Java_com_hyperdht_Native_serverListen(
     }
     ctx->callback = env->NewGlobalRef(jcallback);
 
-    return hyperdht_server_listen((hyperdht_server_t*)sh, &kp, jni_connection_cb, ctx);
+    int rc = hyperdht_server_listen((hyperdht_server_t*)sh, &kp, jni_connection_cb, ctx);
+    hyperdht_keypair_zero(&kp);  // C10
+    return rc;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -946,6 +951,7 @@ Java_com_hyperdht_Native_mutablePut(
     int rc = hyperdht_mutable_put((hyperdht_t*)h, &kp,
         (const uint8_t*)data, (size_t)len, (uint64_t)seq, jni_done_cb, ctx);
     env->ReleaseByteArrayElements(jval, data, JNI_ABORT);
+    hyperdht_keypair_zero(&kp);  // C10
     if (rc != 0) { env->DeleteGlobalRef(ctx->callback); delete ctx; }
     return rc;
 }
@@ -1098,6 +1104,7 @@ Java_com_hyperdht_Native_unannounce(
     env->GetByteArrayRegion(jsk, 0, 64, (jbyte*)kp.secret_key);
     auto* ctx = new DoneCtx{env->NewGlobalRef(jDoneCb)};
     int rc = hyperdht_unannounce((hyperdht_t*)h, pubkey, &kp, jni_done_cb, ctx);
+    hyperdht_keypair_zero(&kp);  // C10
     if (rc != 0) { env->DeleteGlobalRef(ctx->callback); delete ctx; }
     return rc;
 }
@@ -1294,5 +1301,7 @@ Java_com_hyperdht_Native_connectEx(
     auto* ctx = new ConnectCtx;
     ctx->callback = env->NewGlobalRef(jcallback);
 
-    return hyperdht_connect_ex((hyperdht_t*)h, pk, &opts, jni_connect_cb, ctx);
+    int rc = hyperdht_connect_ex((hyperdht_t*)h, pk, &opts, jni_connect_cb, ctx);
+    if (opts.keypair) hyperdht_keypair_zero(&kp);  // C10
+    return rc;
 }

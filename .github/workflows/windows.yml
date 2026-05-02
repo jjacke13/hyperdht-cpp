@@ -28,6 +28,18 @@ jobs:
           vcpkg install libsodium:x64-windows-static-md libuv:x64-windows-static-md
           echo "VCPKG_TOOLCHAIN=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
 
+      - name: Patch libudx for MSVC compatibility
+        shell: bash
+        run: |
+          # MSVC doesn't support GCC's "X ?: Y" Elvis operator (missing middle
+          # operand). Both sites read pure struct fields so duplicating the
+          # expression is safe (no side effects).
+          sed -i 's|stream->delivered + stream->inflight_queue.len ?: 1|(stream->delivered + stream->inflight_queue.len) ? (stream->delivered + stream->inflight_queue.len) : 1|g' deps/libudx/src/udx_rate.c
+          sed -i 's|(stream->delivered + stream->inflight_queue.len) ?: 1|((stream->delivered + stream->inflight_queue.len) ? (stream->delivered + stream->inflight_queue.len) : 1)|g' deps/libudx/src/udx_bbr.c
+          # Verify the patches stuck (will fail loudly if the upstream lines change)
+          grep -q '?: 1' deps/libudx/src/udx_rate.c && { echo "udx_rate.c not patched"; exit 1; } || true
+          grep -q '?: 1' deps/libudx/src/udx_bbr.c && { echo "udx_bbr.c not patched"; exit 1; } || true
+
       - name: Build static
         shell: pwsh
         run: |

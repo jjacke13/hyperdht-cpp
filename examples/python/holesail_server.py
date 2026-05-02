@@ -340,11 +340,31 @@ def main() -> None:
   Ctrl+C to stop
 """)
 
+    # Diagnostic heartbeat — print DHT state every 30s
+    import time
+    last_heartbeat = [time.monotonic()]
+
+    orig_run = dht.run
+
+    def run_with_heartbeat():
+        while True:
+            dht.run(mode="once")
+            now = time.monotonic()
+            if now - last_heartbeat[0] >= 30:
+                last_heartbeat[0] = now
+                addr = dht.remote_address
+                addr_str = f"{addr.host}:{addr.port}" if addr else "unknown"
+                print(f"  [heartbeat] online={dht.is_online} "
+                      f"persistent={dht.is_persistent} "
+                      f"listening={server.is_listening} "
+                      f"addr={addr_str} "
+                      f"bridges={len(bridges)} "
+                      f"conns={connection_count}")
+
     # Event-driven: TCP sockets are registered with libuv via poll_start,
     # so dht.run() handles everything — DHT, streams, and TCP bridging.
-    # Uses UV_RUN_ONCE loop internally so Ctrl+C is handled properly.
     try:
-        dht.run()
+        run_with_heartbeat()
     except KeyboardInterrupt:
         pass
 

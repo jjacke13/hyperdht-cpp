@@ -55,33 +55,38 @@ Tasks to verify / harden the implementation, organized by category and estimated
 
 ## Missing JS parity features
 
-### `changeRemote` — UDX stream path-switching during connection setup
+### `changeRemote` — UDX stream remote address migration
 
-JS uses `rawStream.changeRemote(socket, remoteId, port, host)` for
-**path-switching during initial connection establishment**, NOT for
-mid-connection NAT remaps as the name might suggest.
+JS uses `rawStream.changeRemote(socket, remoteId, port, host)` to
+update an existing UDX stream's locked remote address without tearing
+down the encrypted channel. The mechanism: udx's `firewall` callback
+fires for any traffic arriving from an unrecognized (host, port) on
+a stream's ID. JS's `onsocket` handler responds:
+- If stream not yet connected → `connect()` (initial path lock)
+- If stream already connected → `changeRemote()` (switch to new path)
 
-Concrete use case: connection establishes via blind relay first (slow but
-works), then holepunch succeeds → switch the rawStream from relay path
-to direct path without tearing down the encrypted channel.
+This handles both:
 
-```
-1. rawStream created (not yet connected)
-2. Relay traffic arrives → rawStream.connect(relay path)
-3. Holepunch succeeds → onsocket fires again
-4. rawStream.connected is true → changeRemote() to direct path
-```
+1. **Path upgrade during initial setup** — connection establishes via
+   blind relay first, then holepunch arrives → upgrade to direct path
+2. **NAT remap mid-connection** — peer's external (host, port) changes,
+   new packets with valid stream ID trigger firewall callback →
+   switch to the new address without dropping the connection
 
-libudx already has `udx_stream_change_remote()` natively — the work is
-just plumbing (~30 lines + handshake-side detection logic).
+libudx has `udx_stream_change_remote()` natively. Work needed:
+- Wrap `udx_stream_change_remote()` in our SecretStreamDuplex (~10 lines)
+- Add to C FFI (~15 lines)
+- Wire the firewall callback to detect new remotes and call it (~30 lines)
+- Python wrapper (~5 lines)
 
-Impact: optimization for connections that establish via relay and later
-upgrade to direct. Lower priority than reusableSocket since most
-connections either work directly or stay on relay.
+Impact: meaningful for long-lived connections (VPN, persistent streams)
+that need to survive NAT mapping changes (router reboot, mobile network
+roaming, idle timeout). For short-lived web requests, less critical
+since reusableSocket already handles fast reconnect.
 
 JS: `udx-native/lib/stream.js:184`, called from `connect.js:457` and
-`server.js:323` (both inside the `onsocket` handler that fires when a
-better path is discovered).
+`server.js:323` (both inside `onsocket` which fires from the rawStream
+firewall callback when a new remote sends valid traffic).
 
 ### `_relayAddressesCache` — client-side relay address cache
 

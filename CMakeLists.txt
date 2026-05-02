@@ -77,7 +77,7 @@ add_library(udx STATIC ${UDX_SOURCES})
 # we both bump the standard and force-include the header.
 if(MSVC)
     set_target_properties(udx PROPERTIES C_STANDARD 11)
-    target_compile_options(udx PRIVATE /FI"stdalign.h")
+    target_compile_options(udx PRIVATE /FIstdalign.h)
 endif()
 target_include_directories(udx
     PUBLIC

@@ -45,6 +45,7 @@ class Server:
         self._callbacks.extend([cb, c_kp])
         rc = _lib.hyperdht_server_listen(
             self._handle, ctypes.byref(c_kp), cb, None)
+        _lib.hyperdht_keypair_zero(ctypes.byref(c_kp))
         if rc != 0:
             raise RuntimeError(f"server_listen failed: {rc}")
 

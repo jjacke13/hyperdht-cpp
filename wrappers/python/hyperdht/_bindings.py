@@ -117,7 +117,9 @@ class KeyPair:
         """Generate a random keypair."""
         kp = _Keypair()
         _lib.hyperdht_keypair_generate(ctypes.byref(kp))
-        return cls(bytes(kp.public_key), bytes(kp.secret_key))
+        result = cls(bytes(kp.public_key), bytes(kp.secret_key))
+        _lib.hyperdht_keypair_zero(ctypes.byref(kp))
+        return result
 
     @classmethod
     def from_seed(cls, seed: bytes) -> KeyPair:
@@ -127,7 +129,9 @@ class KeyPair:
         kp = _Keypair()
         seed_arr = (ctypes.c_uint8 * 32)(*seed)
         _lib.hyperdht_keypair_from_seed(ctypes.byref(kp), seed_arr)
-        return cls(bytes(kp.public_key), bytes(kp.secret_key))
+        result = cls(bytes(kp.public_key), bytes(kp.secret_key))
+        _lib.hyperdht_keypair_zero(ctypes.byref(kp))
+        return result
 
     def _to_c(self) -> _Keypair:
         kp = _Keypair()
@@ -368,7 +372,9 @@ class HyperDHT:
     def default_keypair(self) -> KeyPair:
         kp = _Keypair()
         _lib.hyperdht_default_keypair(self._handle, ctypes.byref(kp))
-        return KeyPair(bytes(kp.public_key), bytes(kp.secret_key))
+        result = KeyPair(bytes(kp.public_key), bytes(kp.secret_key))
+        _lib.hyperdht_keypair_zero(ctypes.byref(kp))
+        return result
 
     @property
     def connection_keep_alive(self) -> int:
@@ -778,6 +784,7 @@ class HyperDHT:
         self._callbacks.append(cb)
         rc = _lib.hyperdht_unannounce(
             self._handle, pk, ctypes.byref(c_kp), cb, None)
+        _lib.hyperdht_keypair_zero(ctypes.byref(c_kp))
         if rc != 0:
             raise RuntimeError(f"unannounce failed: {rc}")
 
@@ -875,6 +882,7 @@ class HyperDHT:
         rc = _lib.hyperdht_mutable_put(
             self._handle, ctypes.byref(c_kp),
             buf, len(value), seq, cb, None)
+        _lib.hyperdht_keypair_zero(ctypes.byref(c_kp))
         if rc != 0:
             raise RuntimeError(f"mutable_put failed: {rc}")
 

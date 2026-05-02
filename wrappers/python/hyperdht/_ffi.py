@@ -172,6 +172,9 @@ lib.hyperdht_keypair_from_seed.argtypes = [
     ctypes.POINTER(Keypair), ctypes.POINTER(ctypes.c_uint8)]
 lib.hyperdht_keypair_from_seed.restype = None
 
+lib.hyperdht_keypair_zero.argtypes = [ctypes.POINTER(Keypair)]
+lib.hyperdht_keypair_zero.restype = None
+
 # ---------------------------------------------------------------------------
 # Function signatures — Lifecycle
 # ---------------------------------------------------------------------------
@@ -264,7 +267,7 @@ lib.hyperdht_connect_relay.argtypes = [
     ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),
     ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint64,
     CONNECT_CB, ctypes.c_void_p]
-lib.hyperdht_connect_relay.restype = None
+lib.hyperdht_connect_relay.restype = ctypes.c_int
 
 # ---------------------------------------------------------------------------
 # Function signatures — Server

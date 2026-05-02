@@ -28,7 +28,7 @@ in
   mkHyperdht = { shared ? false, debug ? false }: pkgs.stdenv.mkDerivation {
     pname = "hyperdht" + (if shared then "-shared" else "")
                        + (if debug then "-debug" else "");
-    version = "0.1.0";
+    version = "0.3.1";
     src = sourceFilter;
     postUnpack = libudxPostUnpack;
 

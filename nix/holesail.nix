@@ -8,7 +8,7 @@ let
   # The hyperdht Python library (installed via pip-style)
   hyperdhtPython = pkgs.python3Packages.buildPythonPackage {
     pname = "hyperdht";
-    version = "0.1.0";
+    version = "0.3.1";
     format = "pyproject";
     src = "${src}/wrappers/python";
     nativeBuildInputs = [ pkgs.python3Packages.setuptools ];

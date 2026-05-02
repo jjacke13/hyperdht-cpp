@@ -16,8 +16,24 @@ option(HYPERDHT_EMBEDDED "Reduce sizing constants for embedded targets (ESP32)" 
 
 # === Dependencies ===
 
-# Support two modes: pkg-config (desktop) or explicit paths (Android cross-compile)
-if(NOT CMAKE_DISABLE_FIND_PACKAGE_PkgConfig AND NOT SODIUM_LIBRARY)
+# Three modes:
+#  1. Windows (vcpkg) — find_package CONFIG packages.
+#  2. Desktop POSIX — pkg-config.
+#  3. Cross-compile / Android — explicit paths via SODIUM_LIBRARY etc.
+if(WIN32)
+    find_package(unofficial-sodium CONFIG REQUIRED)
+    find_package(libuv CONFIG REQUIRED)
+    set(SODIUM_TARGET unofficial-sodium::sodium)
+    # vcpkg ships libuv as either libuv::uv (shared) or libuv::uv_a (static).
+    # The static-md triplet builds the static variant.
+    if(TARGET libuv::uv_a)
+        set(UV_TARGET libuv::uv_a)
+    elseif(TARGET libuv::uv)
+        set(UV_TARGET libuv::uv)
+    else()
+        message(FATAL_ERROR "libuv vcpkg target not found (expected libuv::uv_a or libuv::uv)")
+    endif()
+elseif(NOT CMAKE_DISABLE_FIND_PACKAGE_PkgConfig AND NOT SODIUM_LIBRARY)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium)
     pkg_check_modules(UV REQUIRED IMPORTED_TARGET libuv)

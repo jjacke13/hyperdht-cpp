@@ -388,8 +388,11 @@ class HyperDHT:
             fn(self._handle, CLOSE_CB(0), None)
             # Drain with UV_RUN_ONCE so Python signals (Ctrl+C) are
             # processed between iterations instead of blocking in C.
-            while _uv.uv_run(self._loop, UV_RUN_ONCE):
-                pass
+            try:
+                while _uv.uv_run(self._loop, UV_RUN_ONCE):
+                    pass
+            except KeyboardInterrupt:
+                pass  # second Ctrl+C skips drain — exit immediately
             _lib.hyperdht_free(self._handle)
             self._handle = None
         _uv.uv_loop_close(self._loop)

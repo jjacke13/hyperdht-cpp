@@ -55,14 +55,33 @@ Tasks to verify / harden the implementation, organized by category and estimated
 
 ## Missing JS parity features
 
-### `changeRemote` — UDX stream migration
+### `changeRemote` — UDX stream path-switching during connection setup
 
-When a peer's NAT remaps its external address mid-connection, JS calls
-`rawStream.changeRemote(socket, remoteId, port, host)` to update the UDX
-stream's destination without tearing down the encrypted channel. Without
-this, a remapped peer loses the connection and must do a full reconnect.
+JS uses `rawStream.changeRemote(socket, remoteId, port, host)` for
+**path-switching during initial connection establishment**, NOT for
+mid-connection NAT remaps as the name might suggest.
 
-JS: `udx-native/lib/stream.js:184`, used in `connect.js:457` and `server.js:323`.
+Concrete use case: connection establishes via blind relay first (slow but
+works), then holepunch succeeds → switch the rawStream from relay path
+to direct path without tearing down the encrypted channel.
+
+```
+1. rawStream created (not yet connected)
+2. Relay traffic arrives → rawStream.connect(relay path)
+3. Holepunch succeeds → onsocket fires again
+4. rawStream.connected is true → changeRemote() to direct path
+```
+
+libudx already has `udx_stream_change_remote()` natively — the work is
+just plumbing (~30 lines + handshake-side detection logic).
+
+Impact: optimization for connections that establish via relay and later
+upgrade to direct. Lower priority than reusableSocket since most
+connections either work directly or stay on relay.
+
+JS: `udx-native/lib/stream.js:184`, called from `connect.js:457` and
+`server.js:323` (both inside the `onsocket` handler that fires when a
+better path is discovered).
 
 ### `_relayAddressesCache` — client-side relay address cache
 

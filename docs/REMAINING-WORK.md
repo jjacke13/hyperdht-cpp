@@ -2,7 +2,7 @@
 
 Tasks to verify / harden the implementation, organized by category and estimated effort.
 
-**Last updated: 2026-04-27** (v0.3.0 release)
+**Last updated: 2026-05-02** (v0.3.1 — security audit + reusableSocket)
 
 ---
 
@@ -43,19 +43,37 @@ Tasks to verify / harden the implementation, organized by category and estimated
     Without this, a fast sender can grow our internal buffers.
     Need: expose pause/resume on SecretStreamDuplex, wire to UDX read stop.
 
-- **Nospoon coexistence**
-  - Running nospoon (JS HyperDHT VPN) on the same machine as holesail-py
-    prevents remote clients from connecting. Likely socket/port conflict
-    or NAT mapping collision when two DHT instances share the same public
-    IP. Needs a side-by-side comparison of JS `dht-rpc` socket binding
-    (SO_REUSEPORT, port selection) vs our `rpc.cpp`.
+- ~~**Nospoon coexistence**~~ — **RESOLVED** (v0.3.1). C++ and JS DHT
+  instances coexist on the same machine without conflict.
 
-- **Holesail connection latency vs JS**
-  - Our holesail-py connects noticeably slower than JS holesail to the
-    same server. uv_poll integration eliminated polling overhead but the
-    gap remains. Needs profiling to identify where the extra latency is:
-    bootstrap walk speed, findPeer iterations, handshake relay selection,
-    Python ctypes callback overhead, or something else entirely.
+- ~~**Holesail connection latency vs JS**~~ — **RESOLVED** (v0.3.1).
+  Root cause was `reusableSocket: false` in handshake payload — JS clients
+  couldn't cache UDX routes, so every connection did full holepunch.
+  Fixed by enabling `reusableSocket` and wiring it through FFI.
+
+---
+
+## Missing JS parity features
+
+### `changeRemote` — UDX stream migration
+
+When a peer's NAT remaps its external address mid-connection, JS calls
+`rawStream.changeRemote(socket, remoteId, port, host)` to update the UDX
+stream's destination without tearing down the encrypted channel. Without
+this, a remapped peer loses the connection and must do a full reconnect.
+
+JS: `udx-native/lib/stream.js:184`, used in `connect.js:457` and `server.js:323`.
+
+### `_relayAddressesCache` — client-side relay address cache
+
+After the first successful connection, JS caches the server's relay
+addresses (the 3 DHT nodes that store the announcement) keyed by server
+public key. On reconnect, `dht.connect()` skips the full findPeer walk
+and sends PEER_HANDSHAKE directly to the cached relays — saves 2-3
+seconds per connection.
+
+JS: `hyperdht/index.js:55` (512-entry xache, no TTL), used in
+`connect.js:323` (read) and `connect.js:464` (write).
 
 ---
 
@@ -103,24 +121,30 @@ Currently: most constants are compile-time (`HOLEPUNCH_TIMEOUT_MS`,
 
 ### 5. Rate limiting / DoS protection
 
-Currently: no inbound connection rate limit. A malicious peer could hammer
-PEER_HANDSHAKE and exhaust memory (each handshake allocates session state).
+Implemented in v0.3.1 security audit:
+- ~~Max pending handshakes globally~~ — **DONE** (256 cap)
+- ~~FIND_NODE per-IP rate limit~~ — **DONE** (1/sec/IP)
+- ~~DOWN_HINT per-IP rate limit~~ — **DONE** (1/sec/IP)
+- ~~Unbounded collection caps~~ — **DONE** (pending_, seen_, store_, etc.)
 
+Remaining:
 - Per-source rate limit on PEER_HANDSHAKE
-- Max pending handshakes globally
 - Reject handshakes from IPs in a blocklist
 - Connection age-out under memory pressure
 
 ### 6. Security hardening
 
+Security audit completed v0.3.1 — 62/64 findings fixed:
+- ~~Noise crypto~~ — low-order point rejection, key zeroing, nonce guard
+- ~~Input validation~~ — varint range checks, safe pointer arithmetic, caps
+- ~~UAF/lifecycle~~ — alive_ sentinels, null guards, closed_flag
+- ~~FFI boundary~~ — keypair zeroing, double-call protection, return checks
+- ~~JNI~~ — global ref tracking, null handle guard, fail-closed firewall
+
+Remaining:
 - **Fuzz the wire formats** with sanitizers enabled — AFL++ or libFuzzer
-- **Static analysis CI** — clang-tidy, cppcheck, a few rounds of warning triage
-- **Audit the Noise implementation** — our custom Noise IK with Ed25519 DH is
-  ~300 lines; a cryptographer should eyeball it
-- **Constant-time comparisons** — verify all secret-sensitive comparisons use
-  `sodium_memcmp` (grep for `memcmp` where both sides are secrets)
-- **Input validation at C FFI boundary** — currently permissive; add explicit
-  checks for null pointers, size limits, valid UTF-8, etc.
+- **Static analysis CI** — clang-tidy, cppcheck
+- **Constant-time comparisons** — verify `sodium_memcmp` where needed
 
 ### 7. Packaging + distribution
 

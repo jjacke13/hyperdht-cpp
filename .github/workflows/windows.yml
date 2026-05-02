@@ -87,11 +87,13 @@ jobs:
       - name: Build nospoon.exe
         shell: pwsh
         run: |
+          # Link the STATIC hyperdht.lib from build/ (the DLL only exports
+          # the C FFI; nospoon uses C++ classes directly).
           cmake -B examples/cpp/nospoon/build -G Ninja -S examples/cpp/nospoon `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_TOOLCHAIN" `
             -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
-            -DHYPERDHT_LIB_DIR="$env:GITHUB_WORKSPACE/build-shared"
+            -DHYPERDHT_LIB_DIR="$env:GITHUB_WORKSPACE/build"
           cmake --build examples/cpp/nospoon/build --config Release
 
       - name: Download Wintun runtime DLL
@@ -108,10 +110,11 @@ jobs:
       - name: Package nospoon
         shell: pwsh
         run: |
+          # nospoon.exe statically links hyperdht + libsodium + libuv, so it
+          # only needs wintun.dll alongside it at runtime.
           New-Item -ItemType Directory -Force -Path nospoon-dist | Out-Null
           Copy-Item examples/cpp/nospoon/build/nospoon.exe nospoon-dist/
           Copy-Item examples/cpp/nospoon/build/wintun.dll  nospoon-dist/
-          Copy-Item build-shared/hyperdht.dll              nospoon-dist/
           @"
           Nospoon C++ — Windows x86_64 build
 
@@ -119,8 +122,7 @@ jobs:
           kernel driver on first launch and TUN config requires admin).
 
           Files:
-            nospoon.exe   — the VPN client/server
-            hyperdht.dll  — DHT library (loaded by nospoon.exe)
+            nospoon.exe   — the VPN client/server (statically linked)
             wintun.dll    — Wintun userspace API (TUN driver host)
 
           Quick start:

@@ -56,9 +56,9 @@ if(WIN32)
     target_compile_definitions(nospoon PRIVATE
         WIN32_LEAN_AND_MEAN
         NOMINMAX
-        _CRT_SECURE_NO_WARNINGS
-        # We consume hyperdht as a DLL → header marks symbols dllimport.
-        HYPERDHT_SHARED=1)
+        _CRT_SECURE_NO_WARNINGS)
+    # We link the static hyperdht.lib (the DLL only exports the C FFI;
+    # nospoon uses C++ classes directly). Don't define HYPERDHT_SHARED.
 else()
     find_library(SODIUM_LIB sodium REQUIRED)
     find_library(UV_LIB uv REQUIRED)
@@ -73,8 +73,12 @@ if(NOT DEFINED HYPERDHT_LIB_DIR)
 endif()
 
 if(WIN32)
-    # On Windows, hyperdht ships as DLL + import lib (the linker stub).
+    # Link the STATIC hyperdht.lib — the DLL build only exports the C FFI
+    # surface (HYPERDHT_API), and nospoon uses C++ classes directly.
+    # Pass HYPERDHT_LIB_DIR pointing at the static-build directory.
     set(HYPERDHT_LIB ${HYPERDHT_LIB_DIR}/hyperdht.lib)
+    # libudx is a separate static archive in the same build dir.
+    list(APPEND HYPERDHT_LIB ${HYPERDHT_LIB_DIR}/udx.lib)
 else()
     set(HYPERDHT_LIB ${HYPERDHT_LIB_DIR}/libhyperdht.so)
 endif()

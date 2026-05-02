@@ -71,6 +71,14 @@ else()
     list(APPEND UDX_SOURCES deps/libudx/src/io_posix.c)
 endif()
 add_library(udx STATIC ${UDX_SOURCES})
+
+# libudx's udx.h uses C11 `alignas` (line 432). MSVC's C compiler doesn't
+# recognize the keyword without <stdalign.h>, and it defaults to C89 unless
+# we both bump the standard and force-include the header.
+if(MSVC)
+    set_target_properties(udx PROPERTIES C_STANDARD 11)
+    target_compile_options(udx PRIVATE /FI"stdalign.h")
+endif()
 target_include_directories(udx
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/deps/libudx/include>

@@ -1,0 +1,69 @@
+name: Windows
+
+on:
+  push:
+    branches: ['feat/windows-ci']
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-windows-x86_64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        run: choco install -y ninja
+
+      - name: Install libsodium + libuv via vcpkg
+        shell: pwsh
+        run: |
+          vcpkg install libsodium:x64-windows-static-md libuv:x64-windows-static-md
+          echo "VCPKG_TOOLCHAIN=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
+
+      - name: Build static
+        shell: pwsh
+        run: |
+          cmake -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DHYPERDHT_BUILD_TESTS=OFF `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_TOOLCHAIN" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+          cmake --build build --config Release
+
+      - name: Build shared (DLL)
+        shell: pwsh
+        run: |
+          cmake -B build-shared -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=ON `
+            -DHYPERDHT_BUILD_TESTS=OFF `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_TOOLCHAIN" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+          cmake --build build-shared --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/lib, dist/include | Out-Null
+          # Static lib: hyperdht.lib (built with /MD, no DLL)
+          Copy-Item build/hyperdht.lib dist/lib/hyperdht_static.lib
+          # DLL + its import lib (linker stub)
+          Copy-Item build-shared/hyperdht.dll dist/lib/
+          Copy-Item build-shared/hyperdht.lib dist/lib/
+          # Headers
+          Copy-Item -Recurse include/hyperdht dist/include/
+          # Zip up
+          Compress-Archive -Path dist/* -DestinationPath hyperdht-x86_64-windows.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperdht-x86_64-windows
+          path: hyperdht-x86_64-windows.zip

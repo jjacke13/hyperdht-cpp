@@ -272,12 +272,22 @@ HYPERDHT_API int hyperdht_is_destroyed(const hyperdht_t* dht);
  *   1. Call uv_run() to drain pending close callbacks
  *   2. Call hyperdht_free() to release memory
  *
+ * WARNING — CALLBACK FIRES BEFORE DRAIN:
+ *   The callback fires synchronously to signal that teardown has been
+ *   scheduled — NOT that it is complete. libuv close handles are still
+ *   pending when cb runs. Do NOT call hyperdht_free() inside cb — the
+ *   object is still alive and referenced by libuv. The correct pattern:
+ *
+ *     hyperdht_destroy(dht, my_cb, NULL);   // schedules teardown, fires cb
+ *     uv_run(&loop, UV_RUN_DEFAULT);        // drains all close callbacks
+ *     hyperdht_free(dht);                   // NOW safe to free
+ *
  * BLOCKING: This function and the subsequent uv_run() drain may block
  * for several seconds while libuv close callbacks complete. On mobile
  * platforms (Android/iOS), never call this from the UI/main thread —
  * it will freeze the screen. Use a background thread or dispatch queue.
  *
- * @param cb      optional callback when destruction starts
+ * @param cb      optional callback, fires synchronously (teardown scheduled)
  * @param userdata passed to cb
  */
 HYPERDHT_API void hyperdht_destroy(hyperdht_t* dht, hyperdht_close_cb cb, void* userdata);
@@ -786,8 +796,8 @@ HYPERDHT_API void hyperdht_resume_logged(hyperdht_t* dht,
  * spending a round-trip to the network isn't worth the delay. Matches
  * JS `dht.destroy({ force: true })`.
  *
- * Otherwise identical to `hyperdht_destroy` — caller still needs to
- * run the event loop to drain close callbacks, then call `hyperdht_free`.
+ * Otherwise identical to `hyperdht_destroy` — same callback-before-drain
+ * warning applies. Caller still needs uv_run() then hyperdht_free().
  */
 HYPERDHT_API void hyperdht_destroy_force(hyperdht_t* dht,
                                          hyperdht_close_cb cb,

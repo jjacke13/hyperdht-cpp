@@ -168,6 +168,8 @@ SocketPool::~SocketPool() {
 }
 
 SocketRef* SocketPool::acquire() {
+    constexpr size_t MAX_POOL_SOCKETS = 512;  // L4: prevent fd exhaustion
+    if (sockets_.size() >= MAX_POOL_SOCKETS) return nullptr;
     return new SocketRef(*this, loop_, udx_, host_);
 }
 

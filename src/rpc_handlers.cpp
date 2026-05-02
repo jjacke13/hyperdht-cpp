@@ -108,10 +108,10 @@ void RpcHandlers::install() {
 }
 
 void RpcHandlers::handle(const messages::Request& req) {
-    static int req_count = 0;
+    static uint64_t req_count = 0;  // L3: was int, UB at INT_MAX
     if (++req_count <= 5 || !req.internal) {
-        DHT_LOG( "  [handlers] req #%d: int=%d cmd=%u from %s:%u\n",
-                req_count, req.internal ? 1 : 0, req.command,
+        DHT_LOG( "  [handlers] req #%lu: int=%d cmd=%u from %s:%u\n",
+                (unsigned long)req_count, req.internal ? 1 : 0, req.command,
                 req.from.addr.host_string().c_str(), req.from.addr.port);
     }
     if (req.internal) {

@@ -61,7 +61,7 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
           cmake --build build-shared --config Release
 
-      - name: Package
+      - name: Package library
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist/lib, dist/include | Out-Null
@@ -79,3 +79,60 @@ jobs:
         with:
           name: hyperdht-x86_64-windows
           path: hyperdht-x86_64-windows.zip
+
+      # ----------------------------------------------------------------
+      # Build nospoon-cpp on top of the just-built hyperdht DLL.
+      # ----------------------------------------------------------------
+
+      - name: Build nospoon.exe
+        shell: pwsh
+        run: |
+          cmake -B examples/cpp/nospoon/build -G Ninja -S examples/cpp/nospoon `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_TOOLCHAIN" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            -DHYPERDHT_LIB_DIR="$env:GITHUB_WORKSPACE/build-shared"
+          cmake --build examples/cpp/nospoon/build --config Release
+
+      - name: Download Wintun runtime DLL
+        shell: pwsh
+        run: |
+          # Wintun ships as a DLL only — load via LoadLibrary at runtime.
+          # 0.14.1 is the version nospoon-js currently uses.
+          $url = "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          Invoke-WebRequest -Uri $url -OutFile wintun.zip
+          Expand-Archive -Path wintun.zip -DestinationPath wintun-extract -Force
+          # Layout: wintun-extract/wintun/bin/amd64/wintun.dll
+          Copy-Item wintun-extract/wintun/bin/amd64/wintun.dll examples/cpp/nospoon/build/wintun.dll
+
+      - name: Package nospoon
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path nospoon-dist | Out-Null
+          Copy-Item examples/cpp/nospoon/build/nospoon.exe nospoon-dist/
+          Copy-Item examples/cpp/nospoon/build/wintun.dll  nospoon-dist/
+          Copy-Item build-shared/hyperdht.dll              nospoon-dist/
+          @"
+          Nospoon C++ — Windows x86_64 build
+
+          Run from an elevated PowerShell or cmd window (Wintun installs its
+          kernel driver on first launch and TUN config requires admin).
+
+          Files:
+            nospoon.exe   — the VPN client/server
+            hyperdht.dll  — DHT library (loaded by nospoon.exe)
+            wintun.dll    — Wintun userspace API (TUN driver host)
+
+          Quick start:
+            .\nospoon.exe genkey            # generate a keypair
+            .\nospoon.exe config.jsonc      # start client/server per config
+
+          See https://github.com/jjacke13/hyperdht-cpp/tree/main/examples/cpp/nospoon
+          for config schema.
+          "@ | Out-File -Encoding utf8 nospoon-dist/README.txt
+          Compress-Archive -Path nospoon-dist/* -DestinationPath nospoon-x86_64-windows.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nospoon-x86_64-windows
+          path: nospoon-x86_64-windows.zip

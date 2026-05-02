@@ -1,17 +1,34 @@
-# Nospoon P2P VPN — standalone build
+# Nospoon P2P VPN — cross-platform build (Linux + Windows).
 #
-# Build (from repo root, after building libhyperdht):
+# Build (Linux, after building libhyperdht into ../../../build):
 #   cmake -B build-nospoon -G Ninja -S examples/cpp/nospoon
 #   ninja -C build-nospoon
+#
+# Build (Windows, vcpkg + MSVC, after building hyperdht into ../../../build-shared):
+#   cmake -B build-nospoon -G Ninja -S examples/cpp/nospoon \
+#       -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake \
+#       -DVCPKG_TARGET_TRIPLET=x64-windows-static-md \
+#       -DHYPERDHT_LIB_DIR=../../../build-shared
+#   cmake --build build-nospoon
 
 cmake_minimum_required(VERSION 3.20)
 project(nospoon LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(nospoon
     main.cpp
     server.cpp
     client.cpp)
+
+if(WIN32)
+    target_sources(nospoon PRIVATE
+        tun_windows.cpp
+        full_tunnel_windows.cpp)
+else()
+    target_sources(nospoon PRIVATE
+        full_tunnel_linux.cpp)
+endif()
 
 target_include_directories(nospoon PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -21,11 +38,54 @@ target_include_directories(nospoon PRIVATE
 # Suppress libudx debug_printf noise (TLP, congestion control chatter)
 target_compile_definitions(nospoon PRIVATE NDEBUG)
 
-find_library(SODIUM_LIB sodium REQUIRED)
-find_library(UV_LIB uv REQUIRED)
+# === Dependencies ===
 
-# Link against the shared library (build/ produces .so by default)
+if(WIN32)
+    # vcpkg provides config packages for libsodium + libuv.
+    find_package(unofficial-sodium CONFIG REQUIRED)
+    find_package(libuv CONFIG REQUIRED)
+    set(SODIUM_TARGET unofficial-sodium::sodium)
+    if(TARGET libuv::uv_a)
+        set(UV_TARGET libuv::uv_a)
+    elseif(TARGET libuv::uv)
+        set(UV_TARGET libuv::uv)
+    else()
+        message(FATAL_ERROR "libuv vcpkg target not found")
+    endif()
+
+    target_compile_definitions(nospoon PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        _CRT_SECURE_NO_WARNINGS
+        # We consume hyperdht as a DLL → header marks symbols dllimport.
+        HYPERDHT_SHARED=1)
+else()
+    find_library(SODIUM_LIB sodium REQUIRED)
+    find_library(UV_LIB uv REQUIRED)
+    set(SODIUM_TARGET ${SODIUM_LIB})
+    set(UV_TARGET ${UV_LIB})
+endif()
+
+# hyperdht library — pass HYPERDHT_LIB_DIR to override (Linux defaults to
+# ../../../build, the existing standalone-build convention).
+if(NOT DEFINED HYPERDHT_LIB_DIR)
+    set(HYPERDHT_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../build)
+endif()
+
+if(WIN32)
+    # On Windows, hyperdht ships as DLL + import lib (the linker stub).
+    set(HYPERDHT_LIB ${HYPERDHT_LIB_DIR}/hyperdht.lib)
+else()
+    set(HYPERDHT_LIB ${HYPERDHT_LIB_DIR}/libhyperdht.so)
+endif()
+
 target_link_libraries(nospoon PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../build/libhyperdht.so
-    ${SODIUM_LIB}
-    ${UV_LIB})
+    ${HYPERDHT_LIB}
+    ${SODIUM_TARGET}
+    ${UV_TARGET})
+
+if(WIN32)
+    # raw socket types come in via libuv but we link the SDK libs explicitly
+    # (winsock + ip-helper for routing/forwarding queries used elsewhere).
+    target_link_libraries(nospoon PRIVATE Ws2_32 Iphlpapi)
+endif()

@@ -10,6 +10,7 @@
 
 #include <jni.h>
 #include <hyperdht/hyperdht.h>
+#include <sodium.h>
 #include <uv.h>
 
 #include <cstdio>
@@ -64,6 +65,15 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     g_jvm = vm;
     return JNI_VERSION_1_6;
 }
+
+// H16: track event callback global refs per DHT handle for cleanup in free().
+struct EventRefs {
+    jobject* bootstrapped = nullptr;
+    jobject* networkChange = nullptr;
+    jobject* networkUpdate = nullptr;
+    jobject* persistent = nullptr;
+};
+static std::unordered_map<jlong, EventRefs> g_event_refs;
 
 // ---------------------------------------------------------------------------
 // libuv loop
@@ -327,7 +337,7 @@ static void jni_event_cb(void* ud) {
     env->CallVoidMethod(*ref, mid);
     check_exception(env);
     // Note: don't delete — event callbacks fire multiple times.
-    // Freed when DHT is destroyed (caller must release GlobalRefs).
+    // Freed when DHT is destroyed (via g_event_refs cleanup in Native_free).
 }
 
 // H16: helper to replace an event ref — frees old, stores new, tracks for cleanup
@@ -620,15 +630,6 @@ struct ServerCtx {
 // Map server handle → ServerCtx for cleanup on serverClose.
 // Accessed only from the JNI call thread (all calls dispatch through loopExecutor).
 static std::unordered_map<jlong, ServerCtx*> g_server_ctx;
-
-// H16: track event callback global refs per DHT handle for cleanup in free().
-struct EventRefs {
-    jobject* bootstrapped = nullptr;
-    jobject* networkChange = nullptr;
-    jobject* networkUpdate = nullptr;
-    jobject* persistent = nullptr;
-};
-static std::unordered_map<jlong, EventRefs> g_event_refs;
 
 static void jni_connection_cb(const hyperdht_connection_t* conn, void* ud) {
     auto* ctx = static_cast<ServerCtx*>(ud);

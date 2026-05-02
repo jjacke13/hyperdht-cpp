@@ -10,7 +10,6 @@
 
 #include <jni.h>
 #include <hyperdht/hyperdht.h>
-#include <sodium.h>
 #include <uv.h>
 
 #include <cstdio>
@@ -170,7 +169,8 @@ Java_com_hyperdht_Native_keypairFromSeed(
     env->SetByteArrayRegion(jpk, 0, 32, (jbyte*)kp.public_key);
     env->SetByteArrayRegion(jsk, 0, 64, (jbyte*)kp.secret_key);
     hyperdht_keypair_zero(&kp);              // C10
-    sodium_memzero(seed, sizeof(seed));      // C10
+    volatile uint8_t* vs = seed;             // C10: zero seed (no sodium.h in NDK)
+    for (size_t i = 0; i < 32; i++) vs[i] = 0;
 }
 
 // ---------------------------------------------------------------------------

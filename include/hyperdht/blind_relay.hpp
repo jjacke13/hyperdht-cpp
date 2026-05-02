@@ -47,6 +47,7 @@
 // =========================================================================
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -232,6 +233,8 @@ public:
         bool has(bool is_initiator) const { return links[is_initiator ? 1 : 0].session != nullptr; }
         bool paired() const { return links[0].session != nullptr && links[1].session != nullptr; }
         Link& remote(bool is_initiator) { return links[is_initiator ? 0 : 1]; }
+        // H25: creation time for TTL eviction of unpaired entries
+        std::chrono::steady_clock::time_point created_at = std::chrono::steady_clock::now();
     };
 
     // Get or create a pairing by token

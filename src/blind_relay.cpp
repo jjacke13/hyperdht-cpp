@@ -350,6 +350,17 @@ void BlindRelayServer::close() {
 }
 
 BlindRelayServer::RelayPair& BlindRelayServer::get_or_create_pair(const Token& token) {
+    // H25: evict stale unpaired entries (>30s) on each new pair attempt
+    constexpr auto PAIRING_TTL = std::chrono::seconds(30);
+    auto now = std::chrono::steady_clock::now();
+    for (auto it = pairings_.begin(); it != pairings_.end(); ) {
+        if (!it->second.paired() && (now - it->second.created_at) > PAIRING_TTL) {
+            it = pairings_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     auto key = token_hex(token);
     auto it = pairings_.find(key);
     if (it != pairings_.end()) return it->second;

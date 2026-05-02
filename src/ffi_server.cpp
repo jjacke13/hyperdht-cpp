@@ -275,15 +275,15 @@ void hyperdht_server_set_relay_through(hyperdht_server_t* srv,
     srv->server->relay_keep_alive = keep_alive_ms;
 }
 
-void hyperdht_connect_relay(hyperdht_t* dht,
-                             const uint8_t* remote_pk,
-                             const uint8_t* relay_pk,
-                             uint64_t relay_keep_alive_ms,
-                             hyperdht_connect_cb cb,
-                             void* userdata) {
+int hyperdht_connect_relay(hyperdht_t* dht,
+                            const uint8_t* remote_pk,
+                            const uint8_t* relay_pk,
+                            uint64_t relay_keep_alive_ms,
+                            hyperdht_connect_cb cb,
+                            void* userdata) {
     if (!dht || !dht->dht || !remote_pk || !cb) {
         if (cb) cb(-1, nullptr, userdata);
-        return;
+        return -1;
     }
 
     hyperdht::noise::PubKey pk{};
@@ -301,6 +301,7 @@ void hyperdht_connect_relay(hyperdht_t* dht,
         [cb, userdata](int error, const hyperdht::ConnectResult& result) {
             dispatch_connect_result(cb, userdata, error, result, true);
         });
+    return 0;
 }
 
 int hyperdht_relay_stats_attempts(hyperdht_t* dht) {

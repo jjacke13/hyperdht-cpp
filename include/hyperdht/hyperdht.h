@@ -968,14 +968,16 @@ HYPERDHT_API void hyperdht_server_set_relay_through(hyperdht_server_t* srv,
                                                      uint64_t keep_alive_ms);
 
 /** Connect with relay-through option.
+ *  remote_pk: MUST point to exactly 32 bytes (Ed25519 public key).
  *  relay_pk: 32-byte public key of relay node, or NULL (no relay).
- *  relay_keep_alive_ms: keep-alive for relay socket (default 5000). */
-HYPERDHT_API void hyperdht_connect_relay(hyperdht_t* dht,
-                                          const uint8_t* remote_pk,
-                                          const uint8_t* relay_pk,
-                                          uint64_t relay_keep_alive_ms,
-                                          hyperdht_connect_cb cb,
-                                          void* userdata);
+ *  relay_keep_alive_ms: keep-alive for relay socket (default 5000).
+ *  Returns 0 on success, -1 on invalid arguments (cb is fired with error). */
+HYPERDHT_API int hyperdht_connect_relay(hyperdht_t* dht,
+                                         const uint8_t* remote_pk,
+                                         const uint8_t* relay_pk,
+                                         uint64_t relay_keep_alive_ms,
+                                         hyperdht_connect_cb cb,
+                                         void* userdata);
 
 /** Get relay stats. */
 HYPERDHT_API int hyperdht_relay_stats_attempts(hyperdht_t* dht);

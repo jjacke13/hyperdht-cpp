@@ -289,6 +289,8 @@ def main() -> None:
         bridge = Bridge(tcp_sock, None, dht, bridges)
         bridges.add(bridge)
 
+        conn_id = connection_count
+
         def on_open() -> None:
             bridge.activate()
 
@@ -296,6 +298,7 @@ def main() -> None:
             bridge.write_to_tcp(data)
 
         def on_close() -> None:
+            print(f"  Stream closed  [{conn_id}]")
             bridge.close()
 
         stream = dht.open_stream(
@@ -348,7 +351,8 @@ def main() -> None:
     print(f"\n  Shutting down ({connection_count} connections served)")
     for bridge in list(bridges):
         bridge.close()
-    dht.destroy()
+    server.close_force()  # skip UNANNOUNCE — exit fast
+    dht.destroy(force=True)
 
 
 if __name__ == "__main__":

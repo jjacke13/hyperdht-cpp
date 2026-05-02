@@ -58,13 +58,26 @@
 struct uv_loop_s;
 typedef struct uv_loop_s uv_loop_t;
 
-/* Symbol visibility for shared library builds */
-#if defined(HYPERDHT_SHARED) && defined(__GNUC__)
-#define HYPERDHT_API __attribute__((visibility("default")))
-#elif defined(HYPERDHT_SHARED) && defined(_MSC_VER)
-#define HYPERDHT_API __declspec(dllexport)
+/* Symbol visibility for shared library builds.
+ *
+ * HYPERDHT_SHARED → set when the library is built/consumed as a DLL/.so/.dylib
+ *                    (CMake propagates this via target INTERFACE).
+ * HYPERDHT_BUILD  → set only while compiling the library itself (PRIVATE).
+ *
+ * On Windows, exports differ between build (dllexport) and consumption
+ * (dllimport). Elsewhere, GCC/Clang use the same default-visibility attribute
+ * for both sides and only emit it when actually building shared.
+ */
+#if defined(_WIN32) && defined(HYPERDHT_SHARED)
+#  if defined(HYPERDHT_BUILD)
+#    define HYPERDHT_API __declspec(dllexport)
+#  else
+#    define HYPERDHT_API __declspec(dllimport)
+#  endif
+#elif defined(HYPERDHT_SHARED) && (defined(__GNUC__) || defined(__clang__))
+#  define HYPERDHT_API __attribute__((visibility("default")))
 #else
-#define HYPERDHT_API
+#  define HYPERDHT_API
 #endif
 
 #ifdef __cplusplus

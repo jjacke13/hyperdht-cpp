@@ -39,9 +39,8 @@ endif()
 
 # libudx — C library from git submodule
 # libudx is always static (internal dependency, compiled into libhyperdht)
-add_library(udx STATIC
+set(UDX_SOURCES
     deps/libudx/src/udx.c
-    deps/libudx/src/io_posix.c
     deps/libudx/src/cirbuf.c
     deps/libudx/src/queue.c
     deps/libudx/src/endian.c
@@ -50,6 +49,12 @@ add_library(udx STATIC
     deps/libudx/src/win_filter.c
     deps/libudx/src/win_filter_f64.c
 )
+if(WIN32)
+    list(APPEND UDX_SOURCES deps/libudx/src/io_win.c)
+else()
+    list(APPEND UDX_SOURCES deps/libudx/src/io_posix.c)
+endif()
+add_library(udx STATIC ${UDX_SOURCES})
 target_include_directories(udx
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/deps/libudx/include>
@@ -113,6 +118,22 @@ target_link_libraries(hyperdht PUBLIC
     ${SODIUM_TARGET}
     ${UV_TARGET}
 )
+if(WIN32)
+    # Raw socket types (sockaddr_in, ntohs) come from winsock2; libuv pulls
+    # it in transitively but we still need to link the import lib.
+    target_link_libraries(hyperdht PUBLIC ws2_32 iphlpapi userenv psapi)
+    target_compile_definitions(hyperdht PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        _CRT_SECURE_NO_WARNINGS
+        _WINSOCK_DEPRECATED_NO_WARNINGS
+    )
+    target_link_libraries(udx PUBLIC ws2_32 iphlpapi)
+    target_compile_definitions(udx PRIVATE
+        WIN32_LEAN_AND_MEAN
+        _CRT_SECURE_NO_WARNINGS
+    )
+endif()
 if(HYPERDHT_DEBUG)
     target_compile_definitions(hyperdht PUBLIC HYPERDHT_DEBUG=1)
 endif()
@@ -126,8 +147,15 @@ set_target_properties(udx PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # When building as shared library in Release mode, export only HYPERDHT_API functions.
 # In Debug mode, all symbols are visible (needed for tests that use C++ internals).
+#
+# HYPERDHT_SHARED is INTERFACE so consumers see it (→ dllimport on Windows,
+# default-visibility attribute on GCC/Clang).
+# HYPERDHT_BUILD is PRIVATE so only the library itself sees it (→ dllexport).
 if(BUILD_SHARED_LIBS)
-    target_compile_definitions(hyperdht PRIVATE HYPERDHT_SHARED=1)
+    target_compile_definitions(hyperdht
+        INTERFACE HYPERDHT_SHARED=1
+        PRIVATE HYPERDHT_SHARED=1 HYPERDHT_BUILD=1
+    )
     if(CMAKE_BUILD_TYPE STREQUAL "Release")
         set_target_properties(hyperdht PROPERTIES
             C_VISIBILITY_PRESET hidden

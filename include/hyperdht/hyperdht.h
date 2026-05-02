@@ -960,6 +960,11 @@ HYPERDHT_API void hyperdht_server_set_firewall_async(hyperdht_server_t* srv,
 
 /* ── Phase E: Blind Relay ─────────────────────────────────────────────── */
 
+/** Enable reusable socket — lets clients cache the UDX route after the first
+ *  connection and skip holepunch on reconnect. Essential for web apps behind
+ *  NAT. JS default: false; holesail sets true. */
+HYPERDHT_API void hyperdht_server_set_reusable_socket(hyperdht_server_t* srv, int enabled);
+
 /** Set relay-through public key on a server (enables blind relay fallback).
  *  relay_pk: 32-byte public key of the relay node, or NULL to disable.
  *  keep_alive_ms: keep-alive for relay connection (default 5000). */

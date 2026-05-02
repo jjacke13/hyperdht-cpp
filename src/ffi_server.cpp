@@ -275,6 +275,11 @@ void hyperdht_server_set_relay_through(hyperdht_server_t* srv,
     srv->server->relay_keep_alive = keep_alive_ms;
 }
 
+void hyperdht_server_set_reusable_socket(hyperdht_server_t* srv, int enabled) {
+    if (!srv || !srv->server) return;
+    srv->server->reusable_socket = (enabled != 0);
+}
+
 int hyperdht_connect_relay(hyperdht_t* dht,
                             const uint8_t* remote_pk,
                             const uint8_t* relay_pk,

@@ -218,6 +218,7 @@ public:
     // Can be empty (default, no relay).
     std::optional<noise::PubKey> relay_through;
     uint64_t relay_keep_alive = 5000;  // JS default: 5000ms
+    bool reusable_socket = false;      // JS default: false (holesail sets true)
 
 private:
     rpc::RpcSocket& socket_;

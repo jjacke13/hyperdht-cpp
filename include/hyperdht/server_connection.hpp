@@ -115,7 +115,8 @@ std::optional<ServerConnection> handle_handshake(
     const std::vector<peer_connect::RelayInfo>& relay_infos,
     FirewallFn firewall = nullptr,
     bool has_remote_address = false,
-    const std::optional<peer_connect::RelayThroughInfo>& relay_through = std::nullopt);
+    const std::optional<peer_connect::RelayThroughInfo>& relay_through = std::nullopt,
+    bool reusable_socket = false);
 
 // ---------------------------------------------------------------------------
 // Async firewall split — two-phase handshake
@@ -172,7 +173,8 @@ std::optional<ServerConnection> finalize_handshake(
     const std::vector<peer_connect::RelayInfo>& relay_infos,
     bool firewall_rejected,
     bool has_remote_address = false,
-    const std::optional<peer_connect::RelayThroughInfo>& relay_through = std::nullopt);
+    const std::optional<peer_connect::RelayThroughInfo>& relay_through = std::nullopt,
+    bool reusable_socket = false);
 
 // ---------------------------------------------------------------------------
 // handle_holepunch — process incoming PEER_HOLEPUNCH on the server side

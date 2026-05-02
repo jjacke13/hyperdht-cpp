@@ -149,7 +149,8 @@ std::optional<ServerConnection> finalize_handshake(
     const std::vector<peer_connect::RelayInfo>& relay_infos,
     bool firewall_rejected,
     bool has_remote_address,
-    const std::optional<peer_connect::RelayThroughInfo>& relay_through) {
+    const std::optional<peer_connect::RelayThroughInfo>& relay_through,
+    bool reusable_socket) {
 
     noise::NoiseIK noise_ik = std::move(pending.noise_ik);
 
@@ -206,7 +207,7 @@ std::optional<ServerConnection> finalize_handshake(
     if (!conn.has_error) {
         response.udx = peer_connect::UdxInfo{
             1,     // version
-            false, // reusableSocket (simplified for now)
+            reusable_socket,
             conn.local_udx_id,
             0      // seq
         };
@@ -272,7 +273,8 @@ std::optional<ServerConnection> handle_handshake(
     const std::vector<peer_connect::RelayInfo>& relay_infos,
     FirewallFn firewall,
     bool has_remote_address,
-    const std::optional<peer_connect::RelayThroughInfo>& relay_through) {
+    const std::optional<peer_connect::RelayThroughInfo>& relay_through,
+    bool reusable_socket) {
 
     auto pending = decode_handshake(server_keypair, noise_msg1);
     if (!pending) return std::nullopt;
@@ -284,7 +286,8 @@ std::optional<ServerConnection> handle_handshake(
 
     return finalize_handshake(std::move(*pending), holepunch_id,
                               our_addresses, relay_infos,
-                              rejected, has_remote_address, relay_through);
+                              rejected, has_remote_address, relay_through,
+                              reusable_socket);
 }
 
 // ---------------------------------------------------------------------------

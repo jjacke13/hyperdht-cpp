@@ -262,6 +262,7 @@ def main() -> None:
 
     # Create server with optional firewall
     server = dht.create_server()
+    server.set_reusable_socket(True)  # skip holepunch on reconnect from same peer
 
     if args.secure:
         server.set_firewall(

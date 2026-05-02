@@ -512,7 +512,8 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
             auto res = server_connection::finalize_handshake(
                 std::move(*pending_shared), hp_id,
                 our_addrs, relay_infos, reject,
-                has_remote_addr, relay_through_shared);
+                has_remote_addr, relay_through_shared,
+                reusable_socket);
             on_handshake_result(hp_id, noise_key, has_remote_addr,
                                 relay_through_shared, reply_fn, std::move(res));
         });
@@ -530,7 +531,8 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     auto result = server_connection::finalize_handshake(
         std::move(*pending), hp_id,
         our_addrs, relay_infos, rejected,
-        has_remote_addr, relay_through_info);
+        has_remote_addr, relay_through_info,
+        reusable_socket);
 
     on_handshake_result(hp_id, noise_key, has_remote_addr,
                         relay_through_info, reply_fn, std::move(result));

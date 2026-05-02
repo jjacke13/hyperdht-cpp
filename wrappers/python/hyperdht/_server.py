@@ -115,6 +115,11 @@ class Server:
         self._callbacks.append(cb)
         _lib.hyperdht_server_set_holepunch(self._handle, cb, None)
 
+    def set_reusable_socket(self, enabled: bool = True) -> None:
+        """Enable reusable socket — lets clients cache the UDX route
+        and skip holepunch on reconnect. Essential for web apps behind NAT."""
+        _lib.hyperdht_server_set_reusable_socket(self._handle, 1 if enabled else 0)
+
     # -- Relay --
 
     def set_relay_through(

@@ -335,6 +335,9 @@ lib.hyperdht_server_address.argtypes = [
     ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint16)]
 lib.hyperdht_server_address.restype = ctypes.c_int
 
+lib.hyperdht_server_set_reusable_socket.argtypes = [ctypes.c_void_p, ctypes.c_int]
+lib.hyperdht_server_set_reusable_socket.restype = None
+
 lib.hyperdht_server_set_relay_through.argtypes = [
     ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint64]
 lib.hyperdht_server_set_relay_through.restype = None

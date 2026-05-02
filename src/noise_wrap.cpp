@@ -77,6 +77,7 @@ Hash hmac_blake2b(const uint8_t* key, size_t key_len,
     crypto_generichash_init(&state, nullptr, 0, HASHLEN);
     crypto_generichash_update(&state, inner_pad, BLOCKLEN);
     for (size_t i = 0; i < msg_count; i++) {
+        if (msg_lens[i] == 0) continue;  // skip empty slots (msgs[i] may be nullptr)
         crypto_generichash_update(&state, msgs[i], msg_lens[i]);
     }
     crypto_generichash_final(&state, inner_hash.data(), HASHLEN);
@@ -116,14 +117,14 @@ HkdfPair hkdf(const uint8_t* salt, size_t salt_len,
     // JS: prev = empty_info, then HMAC(key, [prev, info, counter])
     // With empty info: HMAC(PRK, [empty, empty, 0x01]) = HMAC(PRK, 0x01)
     uint8_t counter1[] = {0x01};
-    uint8_t empty[] = {};
-    const uint8_t* msgs1[] = {empty, empty, counter1};
+    // MSVC rejects zero-sized arrays; use nullptr since these slots have len 0.
+    const uint8_t* msgs1[] = {nullptr, nullptr, counter1};
     size_t lens1[] = {0, 0, 1};
     auto t1 = hmac_blake2b(prk.data(), HASHLEN, msgs1, lens1, 3);
 
     // Expand iteration 2: T2 = HMAC(PRK, T1 || 0x02)
     uint8_t counter2[] = {0x02};
-    const uint8_t* msgs2[] = {t1.data(), empty, counter2};
+    const uint8_t* msgs2[] = {t1.data(), nullptr, counter2};
     size_t lens2[] = {HASHLEN, 0, 1};
     auto t2 = hmac_blake2b(prk.data(), HASHLEN, msgs2, lens2, 3);
 
@@ -307,8 +308,7 @@ std::optional<std::vector<uint8_t>> SymmetricState::decrypt_and_hash(const uint8
 }
 
 SymmetricState::SplitKeys SymmetricState::split() const {
-    uint8_t empty[] = {};
-    auto [h1, h2] = hkdf(chaining_key.data(), HASHLEN, empty, 0);
+    auto [h1, h2] = hkdf(chaining_key.data(), HASHLEN, nullptr, 0);
     SplitKeys keys;
     std::copy_n(h1.data(), KEYLEN, keys.key1.data());
     std::copy_n(h2.data(), KEYLEN, keys.key2.data());

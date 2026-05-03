@@ -25,7 +25,7 @@ namespace {
 struct PeerState {
     std::unique_ptr<secret_stream::SecretStreamDuplex> duplex;
     FrameDecoder decoder;
-    uint32_t assigned_ip = 0;
+    std::string assigned_ip;  // empty in open mode (learned from first packet)
     std::string pk_hex;
 };
 
@@ -47,8 +47,8 @@ void send_framed(secret_stream::SecretStreamDuplex* duplex,
 }
 
 void on_tun_packet(ServerCtx& ctx, const uint8_t* data, size_t len) {
-    auto dest = RoutingTable::dest_ip(data, len);
-    if (dest == 0) return;
+    auto dest = RoutingTable::read_dest_ip(data, len);
+    if (dest.empty()) return;
 
     auto* stream = ctx.routes.lookup(dest);
     if (!stream) return;
@@ -60,21 +60,19 @@ void on_tun_packet(ServerCtx& ctx, const uint8_t* data, size_t len) {
 void setup_peer_stream(ServerCtx& ctx, const server::ConnectionInfo& info) {
     auto pk_hex = bytes_to_hex(info.remote_public_key.data(), 32);
 
-    // Look up assigned IP from peers map
+    // Look up assigned IP from peers config (if peers map present).
+    // In open mode (no peers), assigned_ip stays empty and is learned from
+    // the first packet arriving on the stream.
+    std::string peer_ip;
     auto it = ctx.config.peers.find(pk_hex);
-    if (it == ctx.config.peers.end()) {
-        fprintf(stderr, "  Peer %s not in config, rejecting\n", pk_hex.c_str());
-        return;
+    if (it != ctx.config.peers.end()) {
+        peer_ip = it->second;
+        fprintf(stderr, "  Peer %s assigned %s\n",
+                pk_hex.substr(0, 16).c_str(), peer_ip.c_str());
+    } else {
+        fprintf(stderr, "  Peer %s connected (open mode — IP TBD)\n",
+                pk_hex.substr(0, 16).c_str());
     }
-    auto peer_ip = RoutingTable::string_to_ip(it->second);
-    if (peer_ip == 0) {
-        fprintf(stderr, "  Invalid IP for peer %s: %s\n",
-                pk_hex.c_str(), it->second.c_str());
-        return;
-    }
-
-    fprintf(stderr, "  Peer %s assigned %s\n",
-            pk_hex.substr(0, 16).c_str(), it->second.c_str());
 
     // Build SecretStream handshake
     secret_stream::DuplexHandshake hs{};
@@ -112,8 +110,11 @@ void setup_peer_stream(ServerCtx& ctx, const server::ConnectionInfo& info) {
     peer.assigned_ip = peer_ip;
     peer.pk_hex = pk_hex;
 
-    // Add route
-    ctx.routes.add(peer_ip, duplex_ptr);
+    // Add route immediately if we have an assigned IP (auth mode).
+    // In open mode it'll be added when the first packet arrives.
+    if (!peer_ip.empty()) {
+        ctx.routes.add(peer_ip, duplex_ptr);
+    }
 
     // Wire callbacks
     duplex_ptr->on_connect([pk_hex]() {
@@ -129,9 +130,27 @@ void setup_peer_stream(ServerCtx& ctx, const server::ConnectionInfo& info) {
         }
         if (!ps) return;
 
-        ps->decoder.feed(data, len, [&ctx](const uint8_t* pkt, size_t pkt_len) {
-            auto dest = RoutingTable::dest_ip(pkt, pkt_len);
-            auto* target = ctx.routes.lookup(dest);
+        ps->decoder.feed(data, len, [&ctx, ps, duplex_ptr]
+                                   (const uint8_t* pkt, size_t pkt_len) {
+            // Source-IP verification (auth mode) / IP learning (open mode).
+            auto src = RoutingTable::read_src_ip(pkt, pkt_len);
+            if (!ps->assigned_ip.empty()) {
+                // Auth mode: drop packets that don't claim the assigned IP.
+                if (src != ps->assigned_ip) return;
+            } else if (!src.empty()) {
+                // Open mode: learn this peer's IP from its first packet.
+                // Skip IPv6 link-local (fe80:) — not useful for routing.
+                if (src.rfind("fe80:", 0) == 0) return;
+                if (!ctx.routes.lookup(src)) {
+                    ps->assigned_ip = src;
+                    ctx.routes.add(src, duplex_ptr);
+                    fprintf(stderr, "  Learned peer IP %s for %s\n",
+                            src.c_str(), ps->pk_hex.substr(0, 16).c_str());
+                }
+            }
+
+            auto dest = RoutingTable::read_dest_ip(pkt, pkt_len);
+            auto* target = dest.empty() ? nullptr : ctx.routes.lookup(dest);
             if (target) {
                 // Route to another peer
                 send_framed(
@@ -152,7 +171,9 @@ void setup_peer_stream(ServerCtx& ctx, const server::ConnectionInfo& info) {
         fprintf(stderr, "  Peer %s disconnected\n", pk_hex.substr(0, 16).c_str());
         auto it = ctx.peers.find(pk_hex);
         if (it != ctx.peers.end()) {
-            ctx.routes.remove(it->second.assigned_ip);
+            if (!it->second.assigned_ip.empty()) {
+                ctx.routes.remove(it->second.assigned_ip);
+            }
             ctx.peers.erase(it);
         }
     });
@@ -201,8 +222,8 @@ int run_server(const Config& config) {
     ctx.config = config;
     ctx.keypair = kp;
 
-    // Open TUN
-    if (ctx.tun.open(config.ip, config.mtu) != 0) {
+    // Open TUN (IPv4 + optional IPv6)
+    if (ctx.tun.open(config.ip, config.mtu, config.ipv6) != 0) {
         fprintf(stderr, "Error: failed to open TUN device\n");
         return 1;
     }
@@ -215,6 +236,8 @@ int run_server(const Config& config) {
     server->set_firewall([&ctx](const std::array<uint8_t, 32>& remote_pk,
                                 const peer_connect::NoisePayload&,
                                 const compact::Ipv4Address&) -> bool {
+        // Open mode (peers map empty) accepts all peers.
+        if (ctx.config.peers.empty()) return false;
         auto hex = bytes_to_hex(remote_pk.data(), 32);
         bool reject = ctx.config.peers.find(hex) == ctx.config.peers.end();
         if (reject) {

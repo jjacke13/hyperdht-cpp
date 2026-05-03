@@ -25,6 +25,10 @@ if(WIN32)
     target_sources(nospoon PRIVATE
         tun_windows.cpp
         full_tunnel_windows.cpp)
+elseif(APPLE)
+    target_sources(nospoon PRIVATE
+        tun_macos.cpp
+        full_tunnel_macos.cpp)
 else()
     target_sources(nospoon PRIVATE
         full_tunnel_linux.cpp)

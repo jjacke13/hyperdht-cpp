@@ -27,10 +27,11 @@ public:
     Tun(const Tun&) = delete;
     Tun& operator=(const Tun&) = delete;
 
-    // Open Wintun adapter "Nospoon", configure IPv4 + MTU via netsh.
-    // ip_cidr: "10.0.0.1/24" — IPv4 only at the moment.
+    // Open Wintun adapter "Nospoon", configure IPv4 (+ optional IPv6) + MTU
+    // via netsh. ip_cidr: "10.0.0.1/24". ipv6_cidr: "fd00::1/64" or empty.
     // Returns 0 on success, -1 on error.
-    int open(const std::string& ip_cidr, int mtu);
+    int open(const std::string& ip_cidr, int mtu,
+             const std::string& ipv6_cidr = {});
 
     // Spin up the worker thread that waits on the wintun read event and
     // wakes the libuv loop via uv_async_t. on_packet runs on the loop thread.

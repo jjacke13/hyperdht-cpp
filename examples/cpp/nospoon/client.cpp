@@ -11,6 +11,7 @@
 #include <hyperdht/dht.hpp>
 #include <hyperdht/secret_stream.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <memory>
 
@@ -57,9 +58,27 @@ void keepalive_tick(uv_timer_t* handle) {
     }
 }
 
+// After this many consecutive failures while full-tunnel is active, drop
+// the tunnel routes so DHT lookups can reach the real internet again. Routes
+// get re-added on the next successful connect. Matches the JS impl's
+// MAX_FAILURES_BEFORE_RESTART (3).
+constexpr int MAX_FAILURES_BEFORE_TUNNEL_RESET = 3;
+
 void schedule_reconnect(ClientCtx& ctx) {
     if (!ctx.running) return;
     ctx.failures++;
+
+    // Kill-switch lift: full-tunnel routes prevent DHT lookups from reaching
+    // bootstrap nodes via the real network. After repeated failures, remove
+    // the routes so DHT can reconnect; they'll be re-installed on success.
+    if (ctx.full_tunnel_active &&
+        ctx.failures >= MAX_FAILURES_BEFORE_TUNNEL_RESET) {
+        fprintf(stderr,
+                "  %d consecutive failures — dropping tunnel routes "
+                "to let DHT recover\n", ctx.failures);
+        full_tunnel::disable_client_full_tunnel();
+        ctx.full_tunnel_active = false;
+    }
 
     // Exponential backoff: 1s -> 2s -> 4s -> ... -> 30s max
     ctx.backoff_ms = std::min(ctx.backoff_ms * 2, 30000);
@@ -213,8 +232,8 @@ int run_client(const Config& config) {
     ctx.keypair = kp;
     ctx.server_pk = server_pk;
 
-    // Open TUN
-    if (ctx.tun.open(config.ip, config.mtu) != 0) {
+    // Open TUN (IPv4 + optional IPv6)
+    if (ctx.tun.open(config.ip, config.mtu, config.ipv6) != 0) {
         fprintf(stderr, "Error: failed to open TUN device\n");
         return 1;
     }

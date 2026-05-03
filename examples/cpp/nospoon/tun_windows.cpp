@@ -89,7 +89,8 @@ bool load_wintun_dll() {
 
 Tun::~Tun() { close(); }
 
-int Tun::open(const std::string& ip_cidr, int mtu) {
+int Tun::open(const std::string& ip_cidr, int mtu,
+              const std::string& ipv6_cidr) {
     if (!load_wintun_dll()) return -1;
 
     // Parse "10.0.0.1/24" -> ip + prefix -> dotted netmask.
@@ -153,6 +154,17 @@ int Tun::open(const std::string& ip_cidr, int mtu) {
         return -1;
     }
 
+    if (!ipv6_cidr.empty()) {
+        std::snprintf(cmd, sizeof(cmd),
+                      "netsh interface ipv6 add address "
+                      "interface=\"Nospoon\" address=%s > NUL 2>&1",
+                      ipv6_cidr.c_str());
+        if (std::system(cmd) != 0) {
+            std::fprintf(stderr, "Failed: %s\n", cmd);
+            // IPv6 is optional — keep going (matches JS behavior).
+        }
+    }
+
     std::snprintf(cmd, sizeof(cmd),
                   "netsh interface ipv4 set subinterface \"Nospoon\" "
                   "mtu=%d store=active > NUL 2>&1",
@@ -183,8 +195,13 @@ int Tun::open(const std::string& ip_cidr, int mtu) {
 
     mtu_ = mtu;
     name_ = "Nospoon";
-    std::fprintf(stderr, "  TUN Nospoon opened (%s, MTU %d)\n",
-                 ip_cidr.c_str(), mtu);
+    if (ipv6_cidr.empty()) {
+        std::fprintf(stderr, "  TUN Nospoon opened (%s, MTU %d)\n",
+                     ip_cidr.c_str(), mtu);
+    } else {
+        std::fprintf(stderr, "  TUN Nospoon opened (%s + %s, MTU %d)\n",
+                     ip_cidr.c_str(), ipv6_cidr.c_str(), mtu);
+    }
     return 0;
 }
 

@@ -3,6 +3,8 @@
 // Supports // and /* */ comments (stripped before parsing).
 // Schema is fixed and simple — no generic JSON library needed.
 
+#include "validation.hpp"
+
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -15,7 +17,9 @@ namespace nospoon {
 struct Config {
     std::string mode;        // "server" or "client"
     std::string ip;          // "10.0.0.1/24"
+    std::string ipv6;        // "fd00::1/64" (optional)
     std::string seed;        // 64-char hex (optional)
+    std::string seed_file;   // path to file containing 64-hex-char seed (optional)
     std::string server_key;  // client only: server pubkey hex
     int mtu = 1400;
     std::map<std::string, std::string> peers;  // pubkey_hex -> ip
@@ -148,7 +152,9 @@ inline Config load_config(const std::string& path) {
     Config cfg;
     cfg.mode = json_string(json, "mode");
     cfg.ip = json_string(json, "ip");
+    cfg.ipv6 = json_string(json, "ipv6");
     cfg.seed = json_string(json, "seed");
+    cfg.seed_file = json_string(json, "seedFile");
     cfg.server_key = json_string(json, "server");
     cfg.mtu = json_int(json, "mtu", 1400);
     cfg.peers = json_peers(json);
@@ -163,6 +169,40 @@ inline Config load_config(const std::string& path) {
         fprintf(stderr, "Error: config must have \"ip\": \"x.x.x.x/y\"\n");
         std::exit(1);
     }
+
+    // Validate fields (matches nospoon/lib/validation.js behavior).
+    auto require_ok = [](const validation::Result& r) {
+        if (!r.valid) {
+            fprintf(stderr, "Error: %s\n", r.error.c_str());
+            std::exit(1);
+        }
+    };
+    require_ok(validation::validate_cidr(cfg.ip, "ip"));
+    if (!cfg.ipv6.empty())   require_ok(validation::validate_cidr_v6(cfg.ipv6, "ipv6"));
+    if (!cfg.seed.empty())   require_ok(validation::validate_hex64(cfg.seed, "seed"));
+    if (!cfg.server_key.empty())
+        require_ok(validation::validate_hex64(cfg.server_key, "server"));
+    require_ok(validation::validate_mtu(cfg.mtu));
+
+    // Load seed from file if seedFile specified (and seed not already set).
+    if (cfg.seed.empty() && !cfg.seed_file.empty()) {
+        std::ifstream sf(cfg.seed_file);
+        if (!sf.is_open()) {
+            fprintf(stderr, "Error: cannot open seedFile %s\n", cfg.seed_file.c_str());
+            std::exit(1);
+        }
+        std::stringstream sb;
+        sb << sf.rdbuf();
+        cfg.seed = sb.str();
+        // Strip trailing whitespace/newline.
+        while (!cfg.seed.empty() &&
+               (cfg.seed.back() == '\n' || cfg.seed.back() == '\r' ||
+                cfg.seed.back() == ' '  || cfg.seed.back() == '\t')) {
+            cfg.seed.pop_back();
+        }
+        require_ok(validation::validate_hex64(cfg.seed, "seedFile contents"));
+    }
+
     return cfg;
 }
 

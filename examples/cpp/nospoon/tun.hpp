@@ -5,6 +5,8 @@
 
 #ifdef _WIN32
 #include "tun_windows.hpp"
+#elif defined(__APPLE__)
+#include "tun_macos.hpp"
 #else
 #include "tun_linux.hpp"
 #endif

@@ -29,10 +29,12 @@ public:
     Tun(const Tun&) = delete;
     Tun& operator=(const Tun&) = delete;
 
-    // Open TUN device, configure IP + MTU, bring up.
+    // Open TUN device, configure IPv4 (+ optional IPv6) + MTU, bring up.
     // ip_cidr: "10.0.0.1/24"
+    // ipv6_cidr: "fd00::1/64" (empty for IPv4-only)
     // Returns 0 on success, -1 on error.
-    int open(const std::string& ip_cidr, int mtu) {
+    int open(const std::string& ip_cidr, int mtu,
+             const std::string& ipv6_cidr = {}) {
         fd_ = ::open("/dev/net/tun", O_RDWR);
         if (fd_ < 0) {
             perror("open /dev/net/tun");
@@ -60,6 +62,15 @@ public:
             return -1;
         }
 
+        if (!ipv6_cidr.empty()) {
+            snprintf(cmd, sizeof(cmd), "ip -6 addr add %s dev %s",
+                     ipv6_cidr.c_str(), name_.c_str());
+            if (system(cmd) != 0) {
+                fprintf(stderr, "Failed: %s\n", cmd);
+                // IPv6 is optional — keep going (matches JS behavior).
+            }
+        }
+
         snprintf(cmd, sizeof(cmd), "ip link set %s mtu %d up",
                  name_.c_str(), mtu);
         if (system(cmd) != 0) {
@@ -70,8 +81,13 @@ public:
         }
 
         mtu_ = mtu;
-        fprintf(stderr, "  TUN %s opened (%s, MTU %d)\n",
-                name_.c_str(), ip_cidr.c_str(), mtu);
+        if (ipv6_cidr.empty()) {
+            fprintf(stderr, "  TUN %s opened (%s, MTU %d)\n",
+                    name_.c_str(), ip_cidr.c_str(), mtu);
+        } else {
+            fprintf(stderr, "  TUN %s opened (%s + %s, MTU %d)\n",
+                    name_.c_str(), ip_cidr.c_str(), ipv6_cidr.c_str(), mtu);
+        }
         return 0;
     }
 

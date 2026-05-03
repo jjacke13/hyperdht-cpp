@@ -4,6 +4,7 @@
 
 #include "config.hpp"
 #include "framing.hpp"
+#include "full_tunnel.hpp"
 #include "routing.hpp"
 #include "tun.hpp"
 
@@ -32,6 +33,7 @@ struct ClientCtx {
     int failures = 0;
     bool connected = false;
     bool running = true;
+    bool full_tunnel_active = false;  // tracks whether routes/DNS are installed
 };
 
 void do_connect(ClientCtx& ctx);
@@ -146,6 +148,19 @@ void on_connect_result(ClientCtx& ctx, int error,
 
     // Start keepalive
     uv_timer_start(&ctx.keepalive_timer, keepalive_tick, 25000, 25000);
+
+    // Full-tunnel: install routes the first time we connect; on subsequent
+    // reconnects (e.g. server moved hosts) just refresh the host exemption.
+    if (ctx.config.full_tunnel) {
+        std::string server_ip = result.peer_address.host_string();
+        if (!ctx.full_tunnel_active) {
+            if (full_tunnel::enable_client_full_tunnel(ctx.tun.name(), server_ip)) {
+                ctx.full_tunnel_active = true;
+            }
+        } else {
+            full_tunnel::add_host_exemption(server_ip);
+        }
+    }
 }
 
 void do_connect(ClientCtx& ctx) {
@@ -236,6 +251,10 @@ int run_client(const Config& config) {
     while (ctx.running && uv_run(&loop, UV_RUN_ONCE)) {}
 
     // Cleanup
+    if (ctx.full_tunnel_active) {
+        full_tunnel::disable_client_full_tunnel();
+        ctx.full_tunnel_active = false;
+    }
     uv_timer_stop(&ctx.keepalive_timer);
     uv_timer_stop(&ctx.reconnect_timer);
     ctx.tun.close();

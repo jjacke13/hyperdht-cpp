@@ -20,6 +20,13 @@ struct Config {
     int mtu = 1400;
     std::map<std::string, std::string> peers;  // pubkey_hex -> ip
 
+    // Full-tunnel mode: route all traffic through the VPN.
+    // Client: split routes (0.0.0.0/1 + 128.0.0.0/1) via TUN, NRPT DNS,
+    //         IPv6 blackhole, host exemption for the DHT server's IP.
+    // Server: enable IP forwarding + NAT (New-NetNat on Windows).
+    bool full_tunnel = false;
+    std::string out_iface;   // server full-tunnel: outbound net interface
+
     // Parse IP without CIDR prefix
     std::string ip_address() const {
         auto slash = ip.find('/');
@@ -81,6 +88,21 @@ inline int json_int(const std::string& json, const std::string& key, int fallbac
     return std::atoi(json.c_str() + pos);
 }
 
+// Minimal JSON boolean: matches "key": true / "key": false (whitespace-tolerant).
+// Returns fallback if key not present or not a bare true/false.
+inline bool json_bool(const std::string& json, const std::string& key, bool fallback) {
+    auto pattern = "\"" + key + "\"";
+    auto pos = json.find(pattern);
+    if (pos == std::string::npos) return fallback;
+    pos = json.find(':', pos + pattern.size());
+    if (pos == std::string::npos) return fallback;
+    pos++;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    if (pos + 4 <= json.size() && json.compare(pos, 4, "true") == 0) return true;
+    if (pos + 5 <= json.size() && json.compare(pos, 5, "false") == 0) return false;
+    return fallback;
+}
+
 // Parse the peers object: {"hex_key": "ip", ...}
 inline std::map<std::string, std::string> json_peers(const std::string& json) {
     std::map<std::string, std::string> result;
@@ -130,6 +152,8 @@ inline Config load_config(const std::string& path) {
     cfg.server_key = json_string(json, "server");
     cfg.mtu = json_int(json, "mtu", 1400);
     cfg.peers = json_peers(json);
+    cfg.full_tunnel = json_bool(json, "fullTunnel", false);
+    cfg.out_iface = json_string(json, "outInterface");
 
     if (cfg.mode.empty()) {
         fprintf(stderr, "Error: config must have \"mode\": \"server\" or \"client\"\n");

@@ -4,6 +4,7 @@
 
 #include "config.hpp"
 #include "framing.hpp"
+#include "full_tunnel.hpp"
 #include "routing.hpp"
 #include "tun.hpp"
 
@@ -236,6 +237,34 @@ int run_server(const Config& config) {
     ctx.keepalive_timer.data = &ctx;
     uv_timer_start(&ctx.keepalive_timer, keepalive_tick, 25000, 25000);
 
+    // Full-tunnel: enable IP forwarding + NAT.
+    bool full_tunnel_enabled = false;
+    if (config.full_tunnel) {
+        if (config.peers.empty()) {
+            fprintf(stderr,
+                "  WARNING: fullTunnel without peers creates an OPEN PROXY\n");
+        }
+        // Use the bare IP (no /prefix) as the NAT subnet's network address.
+        // The user-provided ip is e.g. "10.0.0.1/24" — we translate to "10.0.0.0/24".
+        std::string subnet;
+        auto slash = config.ip.find('/');
+        if (slash != std::string::npos) {
+            // Quick & dirty: assume /24 mask → zero last octet.
+            // Future: derive from parsed prefix length.
+            std::string addr = config.ip.substr(0, slash);
+            auto last_dot = addr.rfind('.');
+            if (last_dot != std::string::npos) {
+                subnet = addr.substr(0, last_dot) + ".0" + config.ip.substr(slash);
+            } else {
+                subnet = config.ip;
+            }
+        } else {
+            subnet = config.ip;
+        }
+        full_tunnel_enabled = full_tunnel::enable_server_forwarding(
+            ctx.tun.name(), subnet, config.out_iface);
+    }
+
     fprintf(stderr, R"(
   nospoon server — P2P VPN powered by hyperdht-cpp
   -------------------------------------------------
@@ -257,6 +286,9 @@ int run_server(const Config& config) {
     while (ctx.running && uv_run(&loop, UV_RUN_ONCE)) {}
 
     // Cleanup
+    if (full_tunnel_enabled) {
+        full_tunnel::disable_server_forwarding();
+    }
     uv_timer_stop(&ctx.keepalive_timer);
     ctx.tun.close();
     dht.destroy();

@@ -263,6 +263,31 @@ HYPERDHT_API int hyperdht_bind(hyperdht_t* dht, uint16_t port);
 /** Get the bound port (0 if not bound). */
 HYPERDHT_API uint16_t hyperdht_port(const hyperdht_t* dht);
 
+/**
+ * Return the underlying UDP socket file descriptors (libuv-managed),
+ * or -1 if not bound or unavailable.
+ *
+ * The DHT keeps two sockets:
+ *   - `client_socket`: ephemeral outbound (random port).  Used for
+ *     DHT lookups and connect()/holepunch from a firewalled or
+ *     ephemeral node — i.e. the socket that traffic flows through
+ *     for a typical mobile/desktop client.
+ *   - `server_socket`: persistent (user-specified port or 0).  Used
+ *     once the node is determined to be non-firewalled, and for
+ *     incoming UDX streams when running as a server.
+ *
+ * Exposed primarily for Android VpnService.protect(int) — VPN
+ * applications need the actual UDP fds to mark the DHT's sockets as
+ * bypassing the VPN tunnel, otherwise new sockets created after
+ * `establish()` get steered into the VPN's routing rules and
+ * holepunch fails.
+ *
+ * POSIX-only.  On Windows uv_os_fd_t is HANDLE; these accessors
+ * return -1 there.
+ */
+HYPERDHT_API int hyperdht_client_socket_fd(const hyperdht_t* dht);
+HYPERDHT_API int hyperdht_server_socket_fd(const hyperdht_t* dht);
+
 /** Check if the instance has been destroyed. */
 HYPERDHT_API int hyperdht_is_destroyed(const hyperdht_t* dht);
 

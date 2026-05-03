@@ -217,6 +217,16 @@ Java_com_hyperdht_Native_port(JNIEnv*, jobject, jlong h) {
     return hyperdht_port((hyperdht_t*)h);
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_hyperdht_Native_clientSocketFd(JNIEnv*, jobject, jlong h) {
+    return hyperdht_client_socket_fd((hyperdht_t*)h);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_hyperdht_Native_serverSocketFd(JNIEnv*, jobject, jlong h) {
+    return hyperdht_server_socket_fd((hyperdht_t*)h);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_destroy(JNIEnv*, jobject, jlong h) {
     hyperdht_destroy((hyperdht_t*)h, nullptr, nullptr);

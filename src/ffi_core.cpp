@@ -150,6 +150,35 @@ uint16_t hyperdht_port(const hyperdht_t* dht) {
     return dht->dht->port();
 }
 
+namespace {
+int udp_socket_fd(udx_socket_t* s) {
+    if (!s) return -1;
+    // udx_socket_t starts with `uv_udp_t uv_udp` (deps/libudx/include/udx.h).
+    // uv_os_fd_t is `int` on POSIX (Android/Linux/macOS) and HANDLE on Windows;
+    // VpnService.protect()/SO_BINDTODEVICE-style use cases only make sense on
+    // POSIX, so we return -1 on Windows.
+#ifndef _WIN32
+    uv_os_fd_t fd = -1;
+    if (uv_fileno(reinterpret_cast<uv_handle_t*>(&s->uv_udp), &fd) != 0)
+        return -1;
+    return static_cast<int>(fd);
+#else
+    (void)s;
+    return -1;
+#endif
+}
+}  // namespace
+
+int hyperdht_client_socket_fd(const hyperdht_t* dht) {
+    if (!dht || !dht->dht) return -1;
+    return udp_socket_fd(dht->dht->socket().client_socket_handle());
+}
+
+int hyperdht_server_socket_fd(const hyperdht_t* dht) {
+    if (!dht || !dht->dht) return -1;
+    return udp_socket_fd(dht->dht->socket().socket_handle());
+}
+
 int hyperdht_is_destroyed(const hyperdht_t* dht) {
     if (!dht || !dht->dht) return 1;
     return dht->dht->is_destroyed() ? 1 : 0;

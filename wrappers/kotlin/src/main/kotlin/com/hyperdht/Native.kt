@@ -33,6 +33,14 @@ internal object Native {
     ): Long
     external fun bind(handle: Long, port: Int): Int
     external fun port(handle: Long): Int
+    /**
+     * Native UDP socket fds (for VpnService.protect() on Android, or any
+     * other case where the application needs to mark the DHT's sockets as
+     * bypassing a tunnel).  POSIX-only.  Returns -1 if the socket isn't
+     * bound or on Windows.
+     */
+    external fun clientSocketFd(handle: Long): Int
+    external fun serverSocketFd(handle: Long): Int
     external fun destroy(handle: Long)
     external fun destroyForce(handle: Long)
     external fun free(handle: Long)

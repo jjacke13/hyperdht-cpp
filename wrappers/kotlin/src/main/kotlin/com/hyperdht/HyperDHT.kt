@@ -60,6 +60,22 @@ class HyperDHT(
 
     val port: Int get() = Native.port(handle)
 
+    /**
+     * UDP file descriptors backing the DHT's two internal sockets, or -1
+     * if not bound (or on Windows).  Intended for `VpnService.protect(int)`
+     * on Android — without protecting, a HyperDHT instance created after
+     * a VpnService.Builder.establish() gets its UDP sockets steered into
+     * the VPN's routing rules and holepunch breaks.
+     *
+     * For an ephemeral / firewalled node (e.g. a phone client), the
+     * outbound socket that actually carries DHT traffic is
+     * [clientSocketFd]; protect() that one.  Protecting both is cheap
+     * and future-proof if the node ever transitions out of firewalled
+     * state (in which case it switches to [serverSocketFd]).
+     */
+    val clientSocketFd: Int get() = Native.clientSocketFd(handle)
+    val serverSocketFd: Int get() = Native.serverSocketFd(handle)
+
     // --- Lifecycle ---
 
     fun start(): Job {

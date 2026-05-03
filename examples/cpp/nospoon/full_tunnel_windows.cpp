@@ -43,26 +43,53 @@ struct ServerState {
 ClientState g_client;
 ServerState g_server;
 
-// Run a PowerShell snippet, capture its first line of stdout.
-// Returns empty string on failure or no output.
+// Write a PowerShell snippet to a uniquely-named temp .ps1 file.
+// Returns the path; caller must DeleteFileA when done. Empty on failure.
+//
+// We go through a file rather than `powershell -Command "..."` because the
+// cmd.exe → powershell.exe quote-escaping is notoriously fragile (the JS
+// impl avoids this by using execFile with a real argv). A temp .ps1 file
+// dodges shell-escaping entirely.
+std::string write_temp_ps1(const std::string& script) {
+    char temp_dir[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, temp_dir) == 0) return {};
+    char temp_file[MAX_PATH];
+    if (GetTempFileNameA(temp_dir, "nsp", 0, temp_file) == 0) return {};
+    // GetTempFileNameA created an empty .tmp; rename to .ps1 so PowerShell
+    // recognizes it. We just write to a sibling path and delete the .tmp.
+    std::string ps1_path = std::string(temp_file) + ".ps1";
+    DeleteFileA(temp_file);
+    FILE* fp = std::fopen(ps1_path.c_str(), "wb");
+    if (!fp) return {};
+    std::fwrite(script.data(), 1, script.size(), fp);
+    std::fclose(fp);
+    return ps1_path;
+}
+
+// Run a PowerShell snippet, capture its trimmed stdout (first non-empty
+// line, or empty on failure). Stderr is captured into a buffer and emitted
+// to our stderr only on failure for visibility.
 std::string ps_capture(const std::string& script) {
-    // -NoProfile / -NoLogo for fast startup; -Command takes the snippet.
-    std::string cmd = "powershell -NoProfile -NoLogo -Command \"";
-    // Escape inner double-quotes for cmd.exe processing.
-    for (char c : script) {
-        if (c == '"') cmd += "\\\"";
-        else cmd += c;
+    auto path = write_temp_ps1(script);
+    if (path.empty()) {
+        std::fprintf(stderr, "ps_capture: failed to write temp script\n");
+        return {};
     }
-    cmd += "\" 2> NUL";
+
+    // -ExecutionPolicy Bypass so the .ps1 isn't blocked by per-machine policy.
+    // Capture stderr as well (2>&1) so a script error explains itself.
+    std::string cmd = "powershell -NoProfile -NoLogo -ExecutionPolicy Bypass "
+                      "-File \"" + path + "\" 2>&1";
 
     FILE* pipe = _popen(cmd.c_str(), "r");
-    if (!pipe) return {};
-    char buf[512];
     std::string out;
-    while (std::fgets(buf, sizeof(buf), pipe)) out += buf;
-    _pclose(pipe);
+    if (pipe) {
+        char buf[512];
+        while (std::fgets(buf, sizeof(buf), pipe)) out += buf;
+        _pclose(pipe);
+    }
+    DeleteFileA(path.c_str());
 
-    // Strip trailing CR/LF/whitespace.
     while (!out.empty() && (out.back() == '\n' || out.back() == '\r' ||
                             out.back() == ' '  || out.back() == '\t')) {
         out.pop_back();
@@ -70,21 +97,21 @@ std::string ps_capture(const std::string& script) {
     return out;
 }
 
-// Run a command silently (output to NUL). Returns the system() exit code.
+// Run a command silently. Returns std::system() exit code.
 int run_silent(const std::string& cmd) {
     std::string c = cmd + " > NUL 2>&1";
     return std::system(c.c_str());
 }
 
-// Run a PowerShell snippet (no stdout capture).
+// Run a PowerShell snippet without capturing stdout.
 int run_ps(const std::string& script) {
-    std::string cmd = "powershell -NoProfile -NoLogo -Command \"";
-    for (char c : script) {
-        if (c == '"') cmd += "\\\"";
-        else cmd += c;
-    }
-    cmd += "\" > NUL 2>&1";
-    return std::system(cmd.c_str());
+    auto path = write_temp_ps1(script);
+    if (path.empty()) return -1;
+    std::string cmd = "powershell -NoProfile -NoLogo -ExecutionPolicy Bypass "
+                      "-File \"" + path + "\" > NUL 2>&1";
+    int rc = std::system(cmd.c_str());
+    DeleteFileA(path.c_str());
+    return rc;
 }
 
 // Returns "<gateway>|<ifIndex>" or empty string.
@@ -188,13 +215,17 @@ bool enable_client_full_tunnel(const std::string& tun_name_arg,
     std::string gw_combined = get_default_gateway();
     std::string gw_ip, gw_idx;
     if (gw_combined.empty() || !split_pipe(gw_combined, gw_ip, gw_idx)) {
-        std::fprintf(stderr, "Cannot detect default gateway\n");
+        std::fprintf(stderr,
+            "Cannot detect default gateway. PowerShell output was:\n  %s\n",
+            gw_combined.empty() ? "(empty)" : gw_combined.c_str());
         return false;
     }
 
     std::string tun_idx = get_tun_if_index(tun_name);
     if (tun_idx.empty()) {
-        std::fprintf(stderr, "Cannot find Nospoon adapter interface index\n");
+        std::fprintf(stderr,
+            "Cannot find adapter '%s' interface index. PowerShell returned empty.\n",
+            tun_name.c_str());
         return false;
     }
 

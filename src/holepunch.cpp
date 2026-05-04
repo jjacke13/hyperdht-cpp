@@ -1032,7 +1032,6 @@ void discover_pool_addresses(
     PoolSocket& pool,
     const routing::RoutingTable& table,
     const compact::Ipv4Address& relay_addr,
-    const compact::Ipv4Address& peer_addr,
     std::function<void(bool)> on_done) {
 
     struct DiscoverCtx {
@@ -1062,23 +1061,20 @@ void discover_pool_addresses(
         }
     };
 
-    // Ping up to 6 DHT nodes — gives a 2-node cushion above MIN_SAMPLES so
-    // a couple of drops on a lossy carrier still yield 4 successes.
-    // JS autoSample uses exactly `maxPings = _minSamples = 4`; we err on
-    // the side of more attempts because mobile RTT + drop rate is higher
-    // than the typical Node.js residential link.
+    // Ping up to MAX_TARGETS DHT nodes — gives cushion above MIN_SAMPLES so a
+    // couple of drops on a lossy carrier still yield 4 successes. JS autoSample
+    // uses exactly `maxPings = _minSamples = 4`; we err on the side of more
+    // attempts because mobile RTT + drop rate is higher than the typical
+    // Node.js residential link.
     //
-    // Always include the server's announce address so our pool socket
-    // establishes a direct NAT mapping with the server's IP — when the
-    // server's puncher probes us later, our NAT already has a pinhole for
-    // the server's IP (from the PING response). JS gets this implicitly
-    // because its autoSample runs later (during analyze() after findPeer),
-    // when the routing table already contains the server. Our discover
-    // runs earlier, so we add it explicitly.
-    constexpr size_t MAX_TARGETS = 6;
+    // We do NOT ping the server's announce address. Earlier we did, intending
+    // to seed the server's NAT mapping for our IP, but the server has typically
+    // remapped since announce time (CGNAT recycles ports), so the PING reliably
+    // times out and (after the new 3× retry path) burns ~3 s waiting. JS's
+    // nat.autoSample only PINGs routing-table nodes (`nat.js:25-79`); match it.
+    constexpr size_t MAX_TARGETS = 7;
     std::vector<compact::Ipv4Address> targets;
     targets.push_back(relay_addr);
-    targets.push_back(peer_addr);  // Server's announce address
 
     // JS `nat.js:33`: `skip = nodes.length >= 8 ? 5 : 0` — skip the first
     // 5 closest nodes when the table is well-populated, to spread sampling
@@ -1384,7 +1380,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
         holepunch_id,
         local_addresses,
     };
-    discover_pool_addresses(*state->pool, socket.table(), relay_addr, peer_addr,
+    discover_pool_addresses(*state->pool, socket.table(), relay_addr,
         [state, ctx = std::move(ctx)](bool addr_ok) mutable {
             if (state->completed) return;
             DHT_LOG("  [hp] Pool NAT discovery done (addresses_ok=%s)\n",

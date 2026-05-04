@@ -454,8 +454,13 @@ void Holepuncher::on_message(const compact::Ipv4Address& from,
 
 void Holepuncher::consistent_probe() {
     if (!punching_ || connected_ || punch_round_ >= 10) {
+        // JS holepuncher.js:230 calls `_autoDestroy()` once the 10×1s loop
+        // finishes — that's what fires the abort callback so the caller
+        // (PunchState) sees the failure. Without this, the puncher silently
+        // went idle and only the 15s global cap caught it. Replicate JS.
         if (punching_ && !connected_) {
             punching_ = false;
+            destroy();
         }
         return;
     }
@@ -488,7 +493,11 @@ void Holepuncher::consistent_probe() {
 void Holepuncher::random_probes() {
     if (!punching_ || connected_) return;
     if (random_probes_left_ <= 0) {
-        punching_ = false;  // Exhausted — stop, don't fall through to consistent_probe
+        // JS holepuncher.js:243 — `_autoDestroy()` once the 1750-probe budget
+        // is exhausted. Mirror so the abort callback fires (caller learns we
+        // gave up); otherwise the puncher just goes idle.
+        punching_ = false;
+        if (!connected_) destroy();
         return;
     }
 
@@ -1174,8 +1183,6 @@ HolepunchMessage decode_holepunch_msg(const uint8_t* data, size_t len) {
 
 namespace {
 
-constexpr uint64_t HOLEPUNCH_TIMEOUT_MS = 15000;  // 15 seconds overall
-
 struct PunchState {
     std::shared_ptr<SecurePayload> secure;
     std::shared_ptr<Holepuncher> puncher;
@@ -1183,7 +1190,6 @@ struct PunchState {
     std::shared_ptr<async_utils::Sleeper> sleeper;  // For probe retry delay
     OnHolepunchCallback on_done;
     rpc::RpcSocket* socket = nullptr;
-    std::unique_ptr<async_utils::UvTimer> timeout;  // RAII holepunch timeout
     bool completed = false;
     int round = 0;
     // JS connect.js:611-613 — retry probeRound once when remoteFirewall is
@@ -1218,9 +1224,6 @@ struct PunchState {
 
         // Clear probe listener on main socket
         if (socket) socket->on_holepunch_probe(nullptr);
-
-        // Stop and close timeout timer (RAII handles cleanup)
-        timeout.reset();
 
         auto cb = std::move(on_done);
         if (cb) cb(result);
@@ -1331,6 +1334,15 @@ void holepunch_connect(rpc::RpcSocket& socket,
         auto augmented = result;
         augmented.socket_keepalive = state->pool;
         state->complete(augmented);
+    });
+    // JS holepuncher.js fires the abort callback when _autoDestroy() runs
+    // without a connection (consistent / random / birthday probes all
+    // exhausted). Wire it to fail the punch — without this we would hang
+    // when probing finishes unsuccessfully.
+    puncher->on_abort([state]() {
+        if (state->completed) return;
+        DHT_LOG("  [hp] Puncher aborted (probes exhausted) — failing punch\n");
+        state->complete({});
     });
     state->puncher = puncher;
 
@@ -1579,12 +1591,13 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
                 state->puncher->send_probe(server_addrs[0]);
             }
 
-            // Start overall timeout (RAII — auto-cleaned by PunchState destructor)
-            state->timeout = std::make_unique<async_utils::UvTimer>(
-                state->socket->loop());
-            state->timeout->start([state]() {
-                state->complete({});  // Timeout — fail
-            }, HOLEPUNCH_TIMEOUT_MS);
+            // No global timeout — JS holepuncher.js has none either. Per-step
+            // budgets handle the real limits: PoolSocket::request retries up
+            // to 3× via fix #2 (~3s on a healthy link, longer on a lossy one),
+            // each consistent_probe round is bounded to 1s, random_probes to
+            // 1750 × 20ms = 35s, and the puncher's _autoDestroy() chain (now
+            // wired in consistent_probe / random_probes / keep_alive_random_nat)
+            // fires on_abort → state->complete({}) when probes exhaust.
 
             // -------------------------------------------------------------------
             // Round 2: punch exchange — tell server to start probing

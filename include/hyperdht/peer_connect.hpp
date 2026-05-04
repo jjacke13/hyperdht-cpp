@@ -118,6 +118,14 @@ struct HandshakeResult {
     noise::Hash handshake_hash;
     std::array<uint8_t, 32> remote_public_key;
     NoisePayload remote_payload;  // Server's connection metadata
+    // JS parity: `serverAddress = hs.peerAddress || to` (router.js:46-78).
+    // The relay's observation of where the server replied from. Fresh —
+    // observed at handshake time. Used as the fast-open probe target and
+    // as Round 1's `remote_address` field; JS server triggers its
+    // fast-mode punch (server.js:530-538) when this matches one of its
+    // current NAT addresses. std::nullopt when the relay didn't include
+    // peer_address in its reply (rare — direct, non-relayed PEER_HANDSHAKE).
+    std::optional<compact::Ipv4Address> server_address;
 };
 
 // Callback for handshake completion

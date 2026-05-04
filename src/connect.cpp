@@ -653,9 +653,10 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
 
     auto& hp_info = *hs.remote_payload.holepunch;
 
-    // Use handshake relay if in holepunch relay list
+    // Use handshake relay if in holepunch relay list. The relay we just
+    // completed the handshake through is the right one for round 1/2.
     auto hp_relay = hp_info.relays[0].relay_address;
-    auto hp_peer = hp_info.relays[0].peer_address;
+    auto hp_peer = hp_info.relays[0].peer_address;  // announce-time fallback
     for (const auto& r : hp_info.relays) {
         if (r.relay_address.host_string() == state->relay_addr.host_string() &&
             r.relay_address.port == state->relay_addr.port) {
@@ -663,6 +664,16 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
             hp_peer = r.peer_address;
             break;
         }
+    }
+    // JS: c.connect.serverAddress = hs.peerAddress || to (router.js:46-78).
+    // Prefer the relay's *fresh* observation of the server's reply address
+    // over the *stale* announce-time `relays[i].peer_address`. Fresh is
+    // critical: JS server's fast-mode punch (server.js:530-538) only fires
+    // when the client's Round 1 `remoteAddress` matches one of the server's
+    // currently sampled NAT addresses. Announce-time addresses on CGNAT are
+    // typically stale by the time anyone connects.
+    if (hs.server_address.has_value()) {
+        hp_peer = *hs.server_address;
     }
 
     auto fw = state->socket->nat_sampler().firewall();

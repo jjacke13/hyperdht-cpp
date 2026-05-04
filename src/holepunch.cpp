@@ -1188,7 +1188,13 @@ struct PunchState {
     std::shared_ptr<SecurePayload> secure;
     std::shared_ptr<Holepuncher> puncher;
     std::shared_ptr<PoolSocket> pool;  // JS: dht._socketPool.acquire()
-    std::shared_ptr<async_utils::Sleeper> sleeper;  // For probe retry delay
+    std::shared_ptr<async_utils::Sleeper> sleeper;  // For probe retry / pre-Round-2 delay
+    // Separate sleeper for the post-Round-1 sampling-wait poll. We can't share
+    // `sleeper` because it's already used at the UNKNOWN-firewall retry path
+    // and the 500 ms pre-Round-2 nudge — `Sleeper::pause()` cancels and
+    // replaces the prior callback, so reusing it would silently abort either
+    // of those if the wait is still polling.
+    std::shared_ptr<async_utils::Sleeper> wait_sampler;
     OnHolepunchCallback on_done;
     rpc::RpcSocket* socket = nullptr;
     bool completed = false;
@@ -1197,6 +1203,11 @@ struct PunchState {
     // UNKNOWN or no token came back. The retry call passes retry=false so it
     // can only fire once. We track the same with this flag.
     bool retried_round1 = false;
+    // Set by discover_pool_addresses' on_done callback once all probe PINGs
+    // have responded or timed out. Used by run_round1's response handler
+    // to gate the analyze() / Round-2 dispatch — JS parity for
+    // `await this.nat.analyzing` (holepuncher.js:86).
+    bool pool_sampling_done = false;
 
     void complete(const HolepunchResult& result) {
         if (completed) return;
@@ -1209,8 +1220,9 @@ struct PunchState {
             puncher->destroy();
         }
 
-        // Cancel sleeper timer
+        // Cancel sleeper timers
         if (sleeper) sleeper->cancel();
+        if (wait_sampler) wait_sampler->cancel();
 
         // Close pool socket on FAILURE only. On success, the caller needs the
         // pool socket alive for udx_stream_connect — the HolepunchResult.socket
@@ -1299,6 +1311,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
     auto state = std::make_shared<PunchState>();
     state->secure = std::make_shared<SecurePayload>(holepunch_secret);
     state->sleeper = std::make_shared<async_utils::Sleeper>(socket.loop());
+    state->wait_sampler = std::make_shared<async_utils::Sleeper>(socket.loop());
     state->on_done = std::move(on_done);
     state->socket = &socket;
 
@@ -1370,9 +1383,25 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        hs_result.remote_public_key.data(), 32,
                        nullptr, 0);
 
-    // Discover pool socket's external address via PINGs (JS: nat.autoSample()),
-    // then dispatch Round 1. Round 1 logic is in run_round1() so the UNKNOWN-
-    // firewall retry path (Fix 1) can re-invoke it without code duplication.
+    // Kick off pool NAT sampling — fire-and-forget. on_done sets a flag that
+    // run_round1's response handler consults before dispatching Round 2 (the
+    // payload there carries the firewall classification the SERVER's puncher
+    // uses to pick its strategy, so it must reflect post-sampling state).
+    //
+    // JS parity: holepuncher.js:19-20 `this.nat.autoSample()` runs in the
+    // background; `analyze()` (holepuncher.js:86) `await this.nat.analyzing`
+    // ONLY between Round 1 and Round 2. Round 1 itself fires immediately with
+    // `firewall: UNKNOWN`. We do the same.
+    discover_pool_addresses(*state->pool, socket.table(), relay_addr,
+        [state](bool addr_ok) {
+            state->pool_sampling_done = true;
+            DHT_LOG("  [hp] Pool NAT sampling done "
+                    "(ok=%d sampled=%d fw=%u)\n",
+                    addr_ok ? 1 : 0,
+                    state->pool->nat_sampler().sampled(),
+                    state->pool->nat_sampler().firewall());
+        });
+
     Round1Ctx ctx{
         target,
         relay_addr,
@@ -1380,13 +1409,8 @@ void holepunch_connect(rpc::RpcSocket& socket,
         holepunch_id,
         local_addresses,
     };
-    discover_pool_addresses(*state->pool, socket.table(), relay_addr,
-        [state, ctx = std::move(ctx)](bool addr_ok) mutable {
-            if (state->completed) return;
-            DHT_LOG("  [hp] Pool NAT discovery done (addresses_ok=%s)\n",
-                    addr_ok ? "yes" : "no");
-            run_round1(state, std::move(ctx));
-        });
+    // Round 1 fires immediately — does NOT wait for sampling. JS parity.
+    run_round1(state, std::move(ctx));
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,6 +1420,14 @@ void holepunch_connect(rpc::RpcSocket& socket,
 // (JS connect.js:611-613, recursive `probeRound(c, ..., false)`) can call it
 // twice. Reads the latest pool-socket NAT classification on every call so a
 // retry sees freshly-sampled state.
+//
+// Round 1 fires IMMEDIATELY after the handshake reply — pool NAT sampling
+// runs in parallel via discover_pool_addresses (kicked off in
+// holepunch_connect). Round 1's payload may carry `firewall: UNKNOWN` if
+// sampling hasn't progressed yet; that's intentional and matches JS
+// (holepuncher.js:19-20). The response handler awaits sampling completion
+// before dispatching Round 2 — Round 2's payload is what determines the
+// server's punch strategy, so it MUST reflect post-sampling state.
 // ---------------------------------------------------------------------------
 namespace {
 void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
@@ -1407,8 +1439,11 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
     auto pool_fw = state->pool->nat_sampler().firewall();
     state->puncher->set_local_firewall(pool_fw);
 
-    DHT_LOG("  [hp] Pool NAT: fw=%u, %zu addrs (retry=%d)\n",
-            pool_fw, pool_addrs.size(), state->retried_round1 ? 1 : 0);
+    DHT_LOG("  [hp] Pool NAT at Round 1: fw=%u, %zu addrs (retry=%d, "
+            "sampling_done=%d, sampled=%d)\n",
+            pool_fw, pool_addrs.size(), state->retried_round1 ? 1 : 0,
+            state->pool_sampling_done ? 1 : 0,
+            state->pool->nat_sampler().sampled());
 
     // -----------------------------------------------------------------------
     // Round 1: probe exchange — send our firewall info, get server's
@@ -1447,7 +1482,7 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
     // server sees the same address as our probes. Using the main socket
     // would cause a port mismatch on NAT.
     state->pool->request(req,
-        [state, ctx, pool_fw](const messages::Response& resp) {
+        [state, ctx](const messages::Response& resp) {
             if (state->completed) return;
 
             if (!resp.value.has_value() || resp.value->empty()) {
@@ -1504,14 +1539,6 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
                 effective_remote_fw = peer_connect::FIREWALL_CONSISTENT;
             }
 
-            // JS: abort if both sides are RANDOM (impossible to punch)
-            if (effective_remote_fw >= peer_connect::FIREWALL_RANDOM &&
-                pool_fw >= peer_connect::FIREWALL_RANDOM) {
-                DHT_LOG("  [hp] Both sides RANDOM — cannot holepunch\n");
-                state->complete({});
-                return;
-            }
-
             // Collect server's addresses (from payload + relay peerAddress)
             std::vector<Ipv4Address> server_addrs = server_r1.addresses;
             if (hp_resp.peer_address.has_value()) {
@@ -1527,7 +1554,8 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
                 return;
             }
 
-            // If server is OPEN, direct connect — no probing needed
+            // If server is OPEN, direct connect — no probing needed.
+            // No NAT classification or sampling required for this path.
             if (server_r1.firewall == peer_connect::FIREWALL_OPEN) {
                 HolepunchResult result;
                 result.success = true;
@@ -1537,108 +1565,114 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
                 return;
             }
 
-            // Puncher was created early (before fast-open probe). Now update
-            // it with server addresses from Round 1 response.
-            state->puncher->set_remote_firewall(effective_remote_fw);
-            std::string verified_host;
-            if (!server_addrs.empty()) verified_host = server_addrs[0].host_string();
-            state->puncher->update_remote(server_addrs, verified_host);
-
-            // JS parity (connect.js:600-621): analyze() stability check.
-            // Synchronous in C++ (sampling done by discover_pool_addresses).
-            bool stable_ok = false;
-            state->puncher->analyze(false, [&stable_ok](bool s) { stable_ok = s; });
-            if (!stable_ok) {
-                state->puncher->analyze(true, [&stable_ok](bool s) { stable_ok = s; });
-                // TODO(parity): JS connect.js:608 — `if (stable) return
-                // probeRound(c, ..., false)` restarts Round 1 after a
-                // successful reopen instead of falling through with the
-                // stale (pre-reopen) classification we already have.
-                // Wiring `Holepuncher::on_reset_` to a pool-socket reset +
-                // re-running `discover_pool_addresses` + calling run_round1
-                // would close this gap. Not on the CGNAT critical path —
-                // our reopen path today only re-checks stability and
-                // returns the same verdict — but worth fixing.
-            }
-            if (!stable_ok) {
-                DHT_LOG("  [hp] NAT unstable after analyze() — abort\n");
-                state->complete({});
-                return;
-            }
-
-            // JS connect.js:611-613 — retry probeRound once when remote firewall
-            // came back UNKNOWN OR no token was issued (server didn't recognise
-            // us as coming via one of its announced relays). On CGNAT the
-            // server's NAT auto-sampling can take 2-4s; the 1s wait inside
-            // c.sleeper.pause() before the recursive call gives it that
-            // breathing room. Translation: re-issue the same Round 1 request
-            // and let it succeed against the now-stable server NAT.
-            const bool inconclusive =
-                server_r1.firewall == peer_connect::FIREWALL_UNKNOWN ||
-                !server_r1.token.has_value();
-            if (inconclusive && !state->retried_round1) {
-                state->retried_round1 = true;
-                DHT_LOG("  [hp] Round 1 inconclusive (fw=%u, token=%s); "
-                        "retrying in 1s\n",
-                        server_r1.firewall,
-                        server_r1.token.has_value() ? "yes" : "no");
-                state->sleeper->pause(1000, [state, ctx]() mutable {
-                    if (state->completed) return;
-                    run_round1(state, std::move(ctx));
-                });
-                return;
-            }
-
-            // JS: probeRound:582-591 — post-Round1 probe to server's pool
-            // address. The server's puncher echoes ALL probes; if NAT
-            // conditions allow, the echo arrives back before Round 2 and
-            // the connection completes without needing Round 2.
-            if (effective_remote_fw < peer_connect::FIREWALL_RANDOM &&
-                !server_addrs.empty()) {
-                DHT_LOG("  [hp] Post-Round1 probe to %s:%u\n",
-                        server_addrs[0].host_string().c_str(),
-                        server_addrs[0].port);
-                state->puncher->send_probe(server_addrs[0]);
-            }
-
-            // No global timeout — JS holepuncher.js has none either. Per-step
-            // budgets handle the real limits: PoolSocket::request retries up
-            // to 3× via fix #2 (~3s on a healthy link, longer on a lossy one),
-            // each consistent_probe round is bounded to 1s, random_probes to
-            // 1750 × 20ms = 35s, and the puncher's _autoDestroy() chain (now
-            // wired in consistent_probe / random_probes / keep_alive_random_nat)
-            // fires on_abort → state->complete({}) when probes exhaust.
-
-            // -------------------------------------------------------------------
-            // Round 2: punch exchange — tell server to start probing
-            // -------------------------------------------------------------------
-
             // Use our pool address as the relay sees us (resp.from.addr is
             // the wire `to` field set by the relay = our public mapping).
             Ipv4Address our_addr = resp.from.addr;
 
-            auto send_round2 = [state, ctx, pool_fw,
-                                server_addrs, server_r1, our_addr]() {
+            // ------------------------------------------------------------------
+            // Everything from here on (analyze, retry, post-R1 probe, Round 2)
+            // depends on accurate post-sampling pool NAT classification — JS
+            // parity for `await this.nat.analyzing` (holepuncher.js:86).
+            // Wrap in a `proceed` lambda gated on sampling completion.
+            // ------------------------------------------------------------------
+            auto proceed = [state, ctx, server_r1, server_addrs,
+                            our_addr, effective_remote_fw]() mutable {
                 if (state->completed) return;
 
-                // JS: c.puncher.nat.freeze() — prevent NAT updates during punch
-                state->pool->nat_sampler().freeze();
-                DHT_LOG("  [hp] Our pool address (from relay): %s:%u\n",
-                        our_addr.host_string().c_str(), our_addr.port);
+                // Re-derive pool_fw with fresh sampling. The puncher's
+                // local_firewall_ was last set at run_round1 entry — it may
+                // have been UNKNOWN; refresh it before is_unstable() reads it.
+                uint32_t pool_fw_now = state->pool->nat_sampler().firewall();
+                state->puncher->set_local_firewall(pool_fw_now);
+                DHT_LOG("  [hp] Sampling settled: pool_fw=%u, remote_fw=%u "
+                        "(effective=%u)\n",
+                        pool_fw_now, server_r1.firewall, effective_remote_fw);
 
-                HolepunchPayload punch;
-                punch.error = peer_connect::ERROR_NONE;
-                punch.firewall = pool_fw;
-                punch.round = 1;
-                punch.punching = true;
-                punch.addresses.push_back(our_addr);
-
-                // Generate our token for address verification
-                punch.token = state->secure->token(server_addrs[0].host_string());
-                // Echo back the server's token
-                if (server_r1.token.has_value()) {
-                    punch.remote_token = server_r1.token;
+                // JS: abort if both sides are RANDOM (impossible to punch)
+                if (effective_remote_fw >= peer_connect::FIREWALL_RANDOM &&
+                    pool_fw_now >= peer_connect::FIREWALL_RANDOM) {
+                    DHT_LOG("  [hp] Both sides RANDOM — cannot holepunch\n");
+                    state->complete({});
+                    return;
                 }
+
+                // Update puncher with server addresses from Round 1 response.
+                state->puncher->set_remote_firewall(effective_remote_fw);
+                std::string verified_host = server_addrs[0].host_string();
+                state->puncher->update_remote(server_addrs, verified_host);
+
+                // JS parity (connect.js:600-621): analyze() stability check.
+                // Synchronous in C++ (sampling completion is gated above, so
+                // by this point pool_fw_now reflects the final classification).
+                bool stable_ok = false;
+                state->puncher->analyze(false, [&stable_ok](bool s) { stable_ok = s; });
+                if (!stable_ok) {
+                    state->puncher->analyze(true, [&stable_ok](bool s) { stable_ok = s; });
+                    // TODO(parity): JS connect.js:608 — `if (stable) return
+                    // probeRound(c, ..., false)` restarts Round 1 after a
+                    // successful reopen. Our reopen path is unwired today.
+                }
+                if (!stable_ok) {
+                    DHT_LOG("  [hp] NAT unstable after analyze() — abort\n");
+                    state->complete({});
+                    return;
+                }
+
+                // JS connect.js:611-613 — retry probeRound once when remote
+                // firewall came back UNKNOWN OR no token was issued.
+                const bool inconclusive =
+                    server_r1.firewall == peer_connect::FIREWALL_UNKNOWN ||
+                    !server_r1.token.has_value();
+                if (inconclusive && !state->retried_round1) {
+                    state->retried_round1 = true;
+                    DHT_LOG("  [hp] Round 1 inconclusive (fw=%u, token=%s); "
+                            "retrying in 1s\n",
+                            server_r1.firewall,
+                            server_r1.token.has_value() ? "yes" : "no");
+                    state->sleeper->pause(1000, [state, ctx]() mutable {
+                        if (state->completed) return;
+                        run_round1(state, std::move(ctx));
+                    });
+                    return;
+                }
+
+                // JS: probeRound:582-591 — post-Round1 probe.
+                if (effective_remote_fw < peer_connect::FIREWALL_RANDOM) {
+                    DHT_LOG("  [hp] Post-Round1 probe to %s:%u\n",
+                            server_addrs[0].host_string().c_str(),
+                            server_addrs[0].port);
+                    state->puncher->send_probe(server_addrs[0]);
+                }
+
+                // -------------------------------------------------------------
+                // Round 2: punch exchange — tell server to start probing
+                // -------------------------------------------------------------
+                auto send_round2 = [state, ctx, server_addrs, server_r1,
+                                    our_addr]() {
+                    if (state->completed) return;
+
+                    // JS: c.puncher.nat.freeze() — prevent NAT updates during punch
+                    state->pool->nat_sampler().freeze();
+                    DHT_LOG("  [hp] Our pool address (from relay): %s:%u\n",
+                            our_addr.host_string().c_str(), our_addr.port);
+
+                    // Re-derive pool_fw AT SEND TIME — the load-bearing fix.
+                    // This is what the SERVER uses to pick its punch strategy.
+                    uint32_t pool_fw_send = state->pool->nat_sampler().firewall();
+
+                    HolepunchPayload punch;
+                    punch.error = peer_connect::ERROR_NONE;
+                    punch.firewall = pool_fw_send;
+                    punch.round = 1;
+                    punch.punching = true;
+                    punch.addresses.push_back(our_addr);
+
+                    // Generate our token for address verification
+                    punch.token = state->secure->token(server_addrs[0].host_string());
+                    // Echo back the server's token
+                    if (server_r1.token.has_value()) {
+                        punch.remote_token = server_r1.token;
+                    }
 
                 auto punch_bytes = encode_holepunch_payload(punch);
                 auto encrypted_punch = state->secure->encrypt(
@@ -1714,19 +1748,53 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
                 // for relay response. JS: roundPunch calls punch() right after
                 // sending the update.
                 state->puncher->punch();
-            };  // end send_round2 lambda
+                };  // end send_round2 lambda
 
-            // JS: between Round 1 response and Round 2, connect.js calls
-            // `await c.puncher.analyze(false)` which yields to the event loop
-            // for ~analyze duration. During that yield the post-Round1 probe
-            // echo may arrive and complete the connection, skipping Round 2.
-            // Approximate that with a 500ms delay before Round 2.
-            auto sr2 = std::make_shared<std::function<void()>>(
-                std::move(send_round2));
-            state->sleeper->pause(500, [state, sr2]() {
-                if (state->completed) return;  // Probe connected us!
-                (*sr2)();
-            });
+                // JS: between Round 1 response and Round 2, connect.js calls
+                // `await c.puncher.analyze(false)` which yields to the event
+                // loop for ~analyze duration. During that yield the post-Round1
+                // probe echo may arrive and complete the connection, skipping
+                // Round 2. Approximate that with a 500ms delay before Round 2.
+                auto sr2 = std::make_shared<std::function<void()>>(
+                    std::move(send_round2));
+                state->sleeper->pause(500, [state, sr2]() {
+                    if (state->completed) return;  // Probe connected us!
+                    (*sr2)();
+                });
+            };  // end proceed lambda
+
+            // Hybrid wait for pool NAT sampling completion. Fast path: if
+            // either the on_done flag fired OR we already have ≥ MIN_SAMPLES
+            // samples, dispatch immediately. Otherwise poll every 100 ms,
+            // capped at 2 s wall-clock so we don't hang on a stuck sampler.
+            // Mirrors JS `await this.nat.analyzing` (holepuncher.js:86).
+            constexpr int MIN_SAMPLES = 4;
+            if (state->pool_sampling_done ||
+                state->pool->nat_sampler().sampled() >= MIN_SAMPLES) {
+                proceed();
+            } else {
+                auto start = uv_now(state->socket->loop());
+                auto poll = std::make_shared<std::function<void()>>();
+                *poll = [state, proceed, start, poll]() mutable {
+                    if (state->completed) return;
+                    bool enough =
+                        state->pool->nat_sampler().sampled() >= MIN_SAMPLES ||
+                        state->pool_sampling_done;
+                    uint64_t elapsed =
+                        uv_now(state->socket->loop()) - start;
+                    if (enough || elapsed >= 2000) {
+                        DHT_LOG("  [hp] Sampling wait done "
+                                "(sampled=%d, elapsed=%llums, fw=%u)\n",
+                                state->pool->nat_sampler().sampled(),
+                                static_cast<unsigned long long>(elapsed),
+                                state->pool->nat_sampler().firewall());
+                        proceed();
+                        return;
+                    }
+                    state->wait_sampler->pause(100, *poll);
+                };
+                (*poll)();
+            }
         },
         [state](uint16_t) {
             DHT_LOG("  [hp] Round 1: TIMEOUT (no response from relay)\n");

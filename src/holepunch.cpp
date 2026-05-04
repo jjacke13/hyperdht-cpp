@@ -546,10 +546,23 @@ void Holepuncher::decrement_randomized() {
 }
 
 void Holepuncher::analyze(bool allow_reopen, OnAnalyzeDone on_done) {
-    // JS: analyze(allowReopen) — holepuncher.js:62-72
-    // Checks NAT stability. If unstable and allowed to reopen,
-    // calls on_reset_ so the caller can destroy NAT sampler,
-    // acquire a fresh socket, re-sample, and call analyze() again.
+    // JS: analyze(allowReopen) — holepuncher.js:62-72.
+    //   async analyze(allowReopen) {
+    //     await this.nat.analyzing       // <- waits for sampling to finish
+    //     if (this._unstable()) { ... }
+    //     return true
+    //   }
+    //
+    // C++ keeps this synchronous: the `await this.nat.analyzing` step is
+    // satisfied by `discover_pool_addresses` running BEFORE run_round1
+    // (which is what calls analyze()). discover_pool_addresses' callback
+    // only fires when all PINGs have either responded or timed out —
+    // equivalent to JS's `_resolve()` — so by the time analyze() runs,
+    // the pool's NatSampler is in its final post-sampling state. Same
+    // reason JS's promise can resolve with `sampled < _minSamples`: if
+    // sampling didn't reach 4 successes, the firewall stays UNKNOWN, our
+    // is_unstable() returns true, and analyze() reports false → the Fix-1
+    // retry path or the "not stable" abort takes over.
 
     if (is_unstable()) {
         if (!allow_reopen || reopen_count_ >= MAX_REOPENS || is_done() || punching_) {
@@ -1018,41 +1031,60 @@ void discover_pool_addresses(
     ctx->pool = &pool;
     ctx->on_done = std::move(on_done);
 
+    // JS `nat.js:9` sets `_minSamples = 4`. We were finishing at 2, which
+    // on CGNAT can give a wrong classification (two nearby nodes pointing at
+    // the same outgoing mapping → over-confident OPEN/CONSISTENT verdict).
+    // Match JS exactly. Like JS, we still resolve when all pings have either
+    // responded or timed out — even with `sampled < 4` — so the caller
+    // doesn't hang. In that case `ok` is false and the puncher's analyze()
+    // will see UNKNOWN and either retry (fix 1) or abort.
+    constexpr size_t MIN_SAMPLES = 4;
     auto finish = [ctx]() {
         if (ctx->done) return;
         if (--ctx->pending <= 0) {
             ctx->done = true;
-            bool ok = ctx->pool->nat_sampler().sampled() >= 2;
+            bool ok = ctx->pool->nat_sampler().sampled() >= MIN_SAMPLES;
             if (ctx->on_done) ctx->on_done(ok);
         }
     };
 
-    // Pick up to 6 DHT nodes for PING (JS: nat.autoSample with 4+ nodes).
-    // Include the server's announce address so our pool socket establishes
-    // a direct NAT mapping with the server's IP. This is critical for
-    // NAT-to-NAT: when the server's puncher probes us later, our NAT
-    // already has a pinhole for the server's IP (from the PING response).
-    // JS gets this implicitly because its autoSample runs later (during
-    // analyze() after findPeer), when the routing table already contains
-    // the server. Our discover runs earlier, so we add it explicitly.
+    // Ping up to 6 DHT nodes — gives a 2-node cushion above MIN_SAMPLES so
+    // a couple of drops on a lossy carrier still yield 4 successes.
+    // JS autoSample uses exactly `maxPings = _minSamples = 4`; we err on
+    // the side of more attempts because mobile RTT + drop rate is higher
+    // than the typical Node.js residential link.
+    //
+    // Always include the server's announce address so our pool socket
+    // establishes a direct NAT mapping with the server's IP — when the
+    // server's puncher probes us later, our NAT already has a pinhole for
+    // the server's IP (from the PING response). JS gets this implicitly
+    // because its autoSample runs later (during analyze() after findPeer),
+    // when the routing table already contains the server. Our discover
+    // runs earlier, so we add it explicitly.
+    constexpr size_t MAX_TARGETS = 6;
     std::vector<compact::Ipv4Address> targets;
     targets.push_back(relay_addr);
     targets.push_back(peer_addr);  // Server's announce address
 
-    // Use routing table nodes if available
+    // JS `nat.js:33`: `skip = nodes.length >= 8 ? 5 : 0` — skip the first
+    // 5 closest nodes when the table is well-populated, to spread sampling
+    // across IP ranges. Same idea here.
     auto closest = table.closest(routing::NodeId{}, 20);
     int skip = closest.size() >= 8 ? 5 : 0;
-    for (size_t i = skip; i < closest.size() && targets.size() < 5; i++) {
+    for (size_t i = skip;
+         i < closest.size() && targets.size() < MAX_TARGETS; i++) {
         targets.push_back(Ipv4Address::from_string(closest[i]->host, closest[i]->port));
     }
 
-    // Fallback: use bootstrap nodes when routing table is sparse
-    if (targets.size() < 4) {
+    // Fallback: use bootstrap nodes when routing table is sparse. Try to
+    // reach MAX_TARGETS so we still get >= MIN_SAMPLES successes even if
+    // the carrier drops a packet or two.
+    if (targets.size() < MAX_TARGETS) {
         static const char* bootstrap[] = {
             "88.99.3.86", "142.93.90.113", "138.68.147.8"  // Public HyperDHT bootstrap
         };
         for (const auto& host : bootstrap) {
-            if (targets.size() >= 5) break;
+            if (targets.size() >= MAX_TARGETS) break;
             targets.push_back(Ipv4Address::from_string(host, 49737));
         }
     }

@@ -909,11 +909,16 @@ void PoolSocket::send_inflight(Inflight* inf) {
     }
     uv_timer_start(inf->timer, [](uv_timer_t* t) {
         auto* inf = static_cast<Inflight*>(t->data);
-        if (!inf) return;
+        // Defensive bail-out: close() nulls t->data before deleting Inflight,
+        // and uv_timer_stop() removes the timer from libuv's heap before that
+        // happens, so this branch shouldn't be reachable today. Keep the
+        // explicit check so a future close-path edit cannot regress us into
+        // an iterate-and-delete-already-freed-Inflight scenario.
+        if (!inf || inf->pool->closing_) return;
 
         // More attempts left → resend without firing on_timeout.
         // Same TID, so a late response from any prior attempt still matches.
-        if (inf->attempts_left > 0 && !inf->pool->closing_) {
+        if (inf->attempts_left > 0) {
             DHT_LOG("  [pool] Timeout on tid=%u, retrying (%d attempt(s) left)\n",
                     inf->tid, inf->attempts_left);
             inf->pool->send_inflight(inf);
@@ -1549,6 +1554,15 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
             state->puncher->analyze(false, [&stable_ok](bool s) { stable_ok = s; });
             if (!stable_ok) {
                 state->puncher->analyze(true, [&stable_ok](bool s) { stable_ok = s; });
+                // TODO(parity): JS connect.js:608 — `if (stable) return
+                // probeRound(c, ..., false)` restarts Round 1 after a
+                // successful reopen instead of falling through with the
+                // stale (pre-reopen) classification we already have.
+                // Wiring `Holepuncher::on_reset_` to a pool-socket reset +
+                // re-running `discover_pool_addresses` + calling run_round1
+                // would close this gap. Not on the CGNAT critical path —
+                // our reopen path today only re-checks stability and
+                // returns the same verdict — but worth fixing.
             }
             if (!stable_ok) {
                 DHT_LOG("  [hp] NAT unstable after analyze() — abort\n");

@@ -188,7 +188,7 @@ private:
         // Retry support — JS dht-rpc retries up to 3 with the same TID.
         std::vector<uint8_t> buffer;          // pre-encoded request body
         compact::Ipv4Address dest;            // re-send target
-        int attempts_left = 0;                // initial sends + remaining retries
+        int attempts_left = 0;                // total remaining attempts (incl. current)
         uint64_t sent_at = 0;                 // monotonic ms, for RTT
     };
 

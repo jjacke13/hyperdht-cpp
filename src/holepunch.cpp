@@ -730,8 +730,9 @@ void Holepuncher::on_punch_timer(uv_timer_t* timer) {
 //     when PunchState is destroyed.
 // ---------------------------------------------------------------------------
 
-PoolSocket::PoolSocket(uv_loop_t* loop, udx_t* udx)
-    : loop_(loop), socket_(new udx_socket_t{}) {
+PoolSocket::PoolSocket(uv_loop_t* loop, udx_t* udx,
+                       rpc::RpcSocket* rpc_socket)
+    : loop_(loop), socket_(new udx_socket_t{}), rpc_socket_(rpc_socket) {
     udx_socket_init(udx, socket_, nullptr);
     socket_->data = this;
     next_tid_ = static_cast<uint16_t>(randombytes_uniform(0xFFFF));
@@ -802,6 +803,15 @@ void PoolSocket::handle_message(const uint8_t* data, size_t len,
             if ((*it)->tid == resp.tid) {
                 auto* inf = *it;
                 inflight_.erase(it);
+
+                // Feed the per-peer RTT EMA so subsequent requests adapt
+                // their timeout. Mirrors JS dht-rpc/lib/io.js:116-118 where
+                // adt.put() runs on every successful response.
+                if (rpc_socket_ && inf->sent_at > 0) {
+                    uint64_t rtt = uv_now(loop_) - inf->sent_at;
+                    rpc_socket_->record_rtt(inf->dest, rtt);
+                }
+
                 if (inf->timer) {
                     uv_timer_stop(inf->timer);
                     inf->timer->data = nullptr;  // Prevent timeout callback from using freed inf
@@ -817,36 +827,36 @@ void PoolSocket::handle_message(const uint8_t* data, size_t len,
     }
 }
 
-void PoolSocket::request(const messages::Request& req,
-                          rpc::OnResponseCallback on_response,
-                          rpc::OnTimeoutCallback on_timeout) {
-    auto* inf = new Inflight;
-    inf->tid = next_tid_++;
-    inf->on_response = std::move(on_response);
-    inf->on_timeout = std::move(on_timeout);
+// Send (or re-send) the cached buffer for an Inflight and arm its timer
+// for the next attempt. Caller is responsible for inserting `inf` into
+// `inflight_` on first send (re-sends use the same TID, so the entry
+// stays in the vector). Each call decrements `attempts_left`.
+void PoolSocket::send_inflight(Inflight* inf) {
+    if (closing_ || !inf) return;
 
-    // Encode request with our TID
-    messages::Request msg = req;
-    msg.tid = inf->tid;
-    auto buf = messages::encode_request(msg);
-
-    // Send from pool socket
+    // Per-send context — the udx send callback frees this; we cannot
+    // reuse a single udx_socket_send_t across retries because libudx
+    // may still be holding the previous one.
     struct SendCtx {
         udx_socket_send_t req{};
         std::vector<uint8_t> buf;
     };
     auto* ctx = new SendCtx;
-    ctx->buf = std::move(buf);
+    ctx->buf = inf->buffer;          // copy — buffer must outlive the send
     ctx->req.data = ctx;
-    uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(ctx->buf.data()),
-                                    (ctx->buf.size() <= UINT_MAX
-                                        ? static_cast<unsigned int>(ctx->buf.size())
-                                        : 0u));
+    uv_buf_t uv_buf = uv_buf_init(
+        reinterpret_cast<char*>(ctx->buf.data()),
+        (ctx->buf.size() <= UINT_MAX
+            ? static_cast<unsigned int>(ctx->buf.size())
+            : 0u));
     struct sockaddr_in dest{};
-    uv_ip4_addr(req.to.addr.host_string().c_str(), req.to.addr.port, &dest);
-    DHT_LOG("  [pool] Sending request (tid=%u, cmd=%u, %zu bytes) to %s:%u\n",
-            inf->tid, msg.command, ctx->buf.size(),
-            req.to.addr.host_string().c_str(), req.to.addr.port);
+    uv_ip4_addr(inf->dest.host_string().c_str(), inf->dest.port, &dest);
+
+    int attempt_no = MAX_REQUEST_ATTEMPTS - inf->attempts_left + 1;
+    DHT_LOG("  [pool] Sending request (tid=%u, %zu bytes, attempt %d/%d) to %s:%u\n",
+            inf->tid, ctx->buf.size(), attempt_no, MAX_REQUEST_ATTEMPTS,
+            inf->dest.host_string().c_str(), inf->dest.port);
+
     int rc = udx_socket_send(&ctx->req, socket_, &uv_buf, 1,
                     reinterpret_cast<const struct sockaddr*>(&dest),
                     [](udx_socket_send_t* r, int status) {
@@ -859,27 +869,67 @@ void PoolSocket::request(const messages::Request& req,
         DHT_LOG("  [pool] udx_socket_send returned: %d\n", rc);
     }
 
-    // Timeout (2s, no retries — matches JS {retry: false}).
-    // The timer callback must remove the Inflight from the vector before
-    // freeing it — otherwise handle_message iterates a dangling pointer.
-    inf->pool = this;
-    inf->timer = new uv_timer_t;
-    uv_timer_init(loop_, inf->timer);
-    inf->timer->data = inf;
+    inf->sent_at = uv_now(loop_);
+    inf->attempts_left--;
+
+    // Adaptive timeout from RpcSocket if available, else default 1s.
+    // Matches JS dht-rpc/lib/io.js:458 — `_adt.get(host:port, sent) || 1000`.
+    uint64_t timeout_ms = rpc_socket_
+        ? rpc_socket_->timeout_for(inf->dest)
+        : 1000;
+
+    if (!inf->timer) {
+        inf->timer = new uv_timer_t;
+        uv_timer_init(loop_, inf->timer);
+        inf->timer->data = inf;
+    } else {
+        uv_timer_stop(inf->timer);
+    }
     uv_timer_start(inf->timer, [](uv_timer_t* t) {
         auto* inf = static_cast<Inflight*>(t->data);
-        // Remove from vector BEFORE freeing
+        if (!inf) return;
+
+        // More attempts left → resend without firing on_timeout.
+        // Same TID, so a late response from any prior attempt still matches.
+        if (inf->attempts_left > 0 && !inf->pool->closing_) {
+            DHT_LOG("  [pool] Timeout on tid=%u, retrying (%d attempt(s) left)\n",
+                    inf->tid, inf->attempts_left);
+            inf->pool->send_inflight(inf);
+            return;
+        }
+
+        // All attempts exhausted — drop and fire on_timeout.
         auto& vec = inf->pool->inflight_;
         vec.erase(std::remove(vec.begin(), vec.end(), inf), vec.end());
         auto timeout_cb = std::move(inf->on_timeout);
-        uv_close(reinterpret_cast<uv_handle_t*>(t),
+        inf->timer->data = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(inf->timer),
                  [](uv_handle_t* h) { delete reinterpret_cast<uv_timer_t*>(h); });
         uint16_t tid = inf->tid;
         delete inf;
         if (timeout_cb) timeout_cb(tid);
-    }, 2000, 0);
+    }, timeout_ms, 0);
+}
+
+void PoolSocket::request(const messages::Request& req,
+                          rpc::OnResponseCallback on_response,
+                          rpc::OnTimeoutCallback on_timeout) {
+    auto* inf = new Inflight;
+    inf->tid = next_tid_++;
+    inf->on_response = std::move(on_response);
+    inf->on_timeout = std::move(on_timeout);
+    inf->pool = this;
+    inf->dest = req.to.addr;
+    inf->attempts_left = MAX_REQUEST_ATTEMPTS;
+
+    // Encode once with our TID — re-sends reuse the buffer (same TID, so
+    // a late response from attempt 1 still matches the inflight on attempt 2/3).
+    messages::Request msg = req;
+    msg.tid = inf->tid;
+    inf->buffer = messages::encode_request(msg);
 
     inflight_.push_back(inf);
+    send_inflight(inf);
 }
 
 void PoolSocket::send_probe(const Ipv4Address& to) {
@@ -1217,7 +1267,11 @@ void holepunch_connect(rpc::RpcSocket& socket,
     state->socket = &socket;
 
     // Create pool socket (JS: dht._socketPool.acquire())
-    state->pool = std::make_shared<PoolSocket>(socket.loop(), socket.udx_handle());
+    // Pass &socket so the pool socket reuses the main RPC's per-peer RTT
+    // EMA — adaptive timeouts and learned latency, matching JS dht-rpc's
+    // shared `_adt` map.
+    state->pool = std::make_shared<PoolSocket>(
+        socket.loop(), socket.udx_handle(), &socket);
     state->pool->bind();
 
     // Expose pool socket to caller so the rawStream firewall callback can

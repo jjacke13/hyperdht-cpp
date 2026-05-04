@@ -136,7 +136,13 @@ struct RemoteAddr {
 
 class PoolSocket {
 public:
-    PoolSocket(uv_loop_t* loop, udx_t* udx);
+    // `rpc_socket` is optional — when non-null, request() reuses its
+    // peer_rtt_ EMA for adaptive timeouts and feeds RTT samples back so
+    // both the main RPC and the holepunch pool socket share one learned
+    // view of each peer's latency. JS keeps this map per-DHT in
+    // dht-rpc/lib/io.js (`this._adt`); we mirror that.
+    PoolSocket(uv_loop_t* loop, udx_t* udx,
+               rpc::RpcSocket* rpc_socket = nullptr);
     ~PoolSocket();
 
     PoolSocket(const PoolSocket&) = delete;
@@ -145,10 +151,17 @@ public:
     int bind();
     bool is_bound() const { return bound_; }
 
-    // Send an RPC request from this socket. Minimal: no retries, 2s timeout.
+    // Send an RPC request from this socket. Retries up to MAX_REQUEST_ATTEMPTS
+    // times keeping the same TID — matches JS dht-rpc/lib/io.js:366
+    // (`this.retries = 3`) and io.js:458 (adaptive `_adt.get`). Each retry
+    // consults `rpc_socket_->timeout_for(peer)` (or DEFAULT_TIMEOUT_MS when
+    // no shared RTT map), so a successful early response trains the per-peer
+    // EMA and shortens the next attempt's wait.
     void request(const messages::Request& req,
                  rpc::OnResponseCallback on_response,
                  rpc::OnTimeoutCallback on_timeout = nullptr);
+
+    static constexpr int MAX_REQUEST_ATTEMPTS = 3;
 
     // Probes
     void send_probe(const compact::Ipv4Address& to);
@@ -172,12 +185,18 @@ private:
         rpc::OnTimeoutCallback on_timeout;
         uv_timer_t* timer = nullptr;
         PoolSocket* pool = nullptr;  // Back-pointer for timer callback cleanup
+        // Retry support — JS dht-rpc retries up to 3 with the same TID.
+        std::vector<uint8_t> buffer;          // pre-encoded request body
+        compact::Ipv4Address dest;            // re-send target
+        int attempts_left = 0;                // initial sends + remaining retries
+        uint64_t sent_at = 0;                 // monotonic ms, for RTT
     };
 
     uv_loop_t* loop_;
     udx_socket_t* socket_;  // Heap-allocated — freed in uv_close callback,
                             // NOT with PoolSocket. Prevents use-after-free
                             // when GrapheneOS/scudo unmaps freed pages.
+    rpc::RpcSocket* rpc_socket_ = nullptr;  // Optional — adaptive RTT source
     bool bound_ = false;
     bool closing_ = false;
 
@@ -190,6 +209,10 @@ private:
                         const struct sockaddr_in* addr);
     static void on_recv(udx_socket_t* socket, ssize_t nread,
                         const uv_buf_t* buf, const struct sockaddr* addr);
+
+    // Wire send + (re-)arm timer for an Inflight. Reused by initial send
+    // and the timer-driven retry path.
+    void send_inflight(Inflight* inf);
 };
 
 // Discover pool socket's external address by PINGing DHT nodes.

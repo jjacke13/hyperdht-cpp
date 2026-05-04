@@ -1104,7 +1104,10 @@ struct PunchState {
     std::unique_ptr<async_utils::UvTimer> timeout;  // RAII holepunch timeout
     bool completed = false;
     int round = 0;
-    bool retried_unknown = false;  // JS: retry flag in probeRound
+    // JS connect.js:611-613 — retry probeRound once when remoteFirewall is
+    // UNKNOWN or no token came back. The retry call passes retry=false so it
+    // can only fire once. We track the same with this flag.
+    bool retried_round1 = false;
 
     void complete(const HolepunchResult& result) {
         if (completed) return;
@@ -1141,6 +1144,19 @@ struct PunchState {
         if (cb) cb(result);
     }
 };
+
+// Inputs to Round 1 — copied so they outlive the calling stack frame
+// and survive across a sleeper-driven retry (Fix 1, JS connect.js:611-613).
+struct Round1Ctx {
+    std::array<uint8_t, 32> target{};
+    compact::Ipv4Address relay_addr;
+    compact::Ipv4Address peer_addr;
+    uint32_t holepunch_id = 0;
+    std::vector<compact::Ipv4Address> local_addresses;
+};
+
+// Forward declaration — body lives below holepunch_connect.
+void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx);
 
 }  // anonymous namespace
 
@@ -1255,28 +1271,45 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        hs_result.remote_public_key.data(), 32,
                        nullptr, 0);
 
-    // Discover pool socket's external address via PINGs (JS: nat.autoSample())
+    // Discover pool socket's external address via PINGs (JS: nat.autoSample()),
+    // then dispatch Round 1. Round 1 logic is in run_round1() so the UNKNOWN-
+    // firewall retry path (Fix 1) can re-invoke it without code duplication.
+    Round1Ctx ctx{
+        target,
+        relay_addr,
+        peer_addr,
+        holepunch_id,
+        local_addresses,
+    };
     discover_pool_addresses(*state->pool, socket.table(), relay_addr, peer_addr,
-        [state, target, relay_addr, peer_addr, holepunch_id,
-         local_addresses](bool addr_ok) {
+        [state, ctx = std::move(ctx)](bool addr_ok) mutable {
+            if (state->completed) return;
+            DHT_LOG("  [hp] Pool NAT discovery done (addresses_ok=%s)\n",
+                    addr_ok ? "yes" : "no");
+            run_round1(state, std::move(ctx));
+        });
+}
 
-        if (state->completed) return;
+// ---------------------------------------------------------------------------
+// run_round1 — issue PEER_HOLEPUNCH Round 1 and wire Round 2 in the response.
+//
+// Extracted from holepunch_connect so the UNKNOWN-firewall retry path
+// (JS connect.js:611-613, recursive `probeRound(c, ..., false)`) can call it
+// twice. Reads the latest pool-socket NAT classification on every call so a
+// retry sees freshly-sampled state.
+// ---------------------------------------------------------------------------
+namespace {
+void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
+    if (state->completed) return;
 
-        // Use pool socket's discovered addresses if available, else fall back to main
-        auto pool_addrs = state->pool->addresses();
-        auto& addrs = pool_addrs.empty() ? local_addresses : pool_addrs;
+    // Re-derive on every call — a retry may see new samples / addresses.
+    auto pool_addrs = state->pool->addresses();
+    auto& addrs = pool_addrs.empty() ? ctx.local_addresses : pool_addrs;
+    auto pool_fw = state->pool->nat_sampler().firewall();
+    state->puncher->set_local_firewall(pool_fw);
 
-        // Use pool socket's firewall classification (not the main socket's).
-        // JS: holepuncher.js uses its own nat.firewall for holepunch rounds,
-        // which is sampled from the pool socket's PING responses.
-        auto pool_fw = state->pool->nat_sampler().firewall();
-
-        // Update puncher with pool socket's classification now that we know it
-        state->puncher->set_local_firewall(pool_fw);
-
-        DHT_LOG("  [hp] Pool NAT: fw=%u, %zu addrs (discovered=%s)\n",
-                pool_fw, pool_addrs.size(),
-                addr_ok ? "yes" : "no");
+    DHT_LOG("  [hp] Pool NAT: fw=%u, %zu addrs (retry=%d)\n",
+            pool_fw, pool_addrs.size(), state->retried_round1 ? 1 : 0);
 
     // -----------------------------------------------------------------------
     // Round 1: probe exchange — send our firewall info, get server's
@@ -1286,27 +1319,28 @@ void holepunch_connect(rpc::RpcSocket& socket,
     probe.firewall = pool_fw;
     probe.round = 0;
     probe.addresses = addrs;
-    probe.remote_address = peer_addr;
+    probe.remote_address = ctx.peer_addr;
 
     auto probe_bytes = encode_holepunch_payload(probe);
-    auto encrypted_probe = state->secure->encrypt(probe_bytes.data(), probe_bytes.size());
+    auto encrypted_probe = state->secure->encrypt(probe_bytes.data(),
+                                                    probe_bytes.size());
 
     HolepunchMessage hp_msg;
     hp_msg.mode = peer_connect::MODE_FROM_CLIENT;
-    hp_msg.id = holepunch_id;
+    hp_msg.id = ctx.holepunch_id;
     hp_msg.payload = std::move(encrypted_probe);
-    hp_msg.peer_address = peer_addr;
+    hp_msg.peer_address = ctx.peer_addr;
 
     messages::Request req;
-    req.to.addr = relay_addr;
+    req.to.addr = ctx.relay_addr;
     req.command = messages::CMD_PEER_HOLEPUNCH;
-    req.target = target;
+    req.target = ctx.target;
     req.value = encode_holepunch_msg(hp_msg);
 
-    DHT_LOG( "  [hp] Sending round 1 to relay %s:%u (id=%u, peer=%s:%u)\n",
-            relay_addr.host_string().c_str(), relay_addr.port,
-            holepunch_id,
-            peer_addr.host_string().c_str(), peer_addr.port);
+    DHT_LOG("  [hp] Sending round 1 to relay %s:%u (id=%u, peer=%s:%u)\n",
+            ctx.relay_addr.host_string().c_str(), ctx.relay_addr.port,
+            ctx.holepunch_id,
+            ctx.peer_addr.host_string().c_str(), ctx.peer_addr.port);
 
     // Send Round 1 from POOL socket — JS sends holepunch rounds via
     // c.puncher.socket (connect.js:505-516, updateHolepunch). The relay
@@ -1314,25 +1348,25 @@ void holepunch_connect(rpc::RpcSocket& socket,
     // server sees the same address as our probes. Using the main socket
     // would cause a port mismatch on NAT.
     state->pool->request(req,
-        [state, relay_addr, peer_addr, holepunch_id, target, pool_fw]
-        (const messages::Response& resp) {
+        [state, ctx, pool_fw](const messages::Response& resp) {
             if (state->completed) return;
 
             if (!resp.value.has_value() || resp.value->empty()) {
-                DHT_LOG( "  [hp] Round 1: no response value\n");
+                DHT_LOG("  [hp] Round 1: no response value\n");
                 state->complete({});
                 return;
             }
-            DHT_LOG( "  [hp] Round 1: got response (%zu bytes)\n",
+            DHT_LOG("  [hp] Round 1: got response (%zu bytes)\n",
                     resp.value->size());
 
-            auto hp_resp = decode_holepunch_msg(resp.value->data(), resp.value->size());
+            auto hp_resp = decode_holepunch_msg(
+                resp.value->data(), resp.value->size());
             if (hp_resp.payload.empty()) {
-                DHT_LOG( "  [hp] Round 1: empty payload in decoded msg\n");
+                DHT_LOG("  [hp] Round 1: empty payload in decoded msg\n");
                 state->complete({});
                 return;
             }
-            DHT_LOG( "  [hp] Round 1: payload %zu bytes, peerAddr=%s\n",
+            DHT_LOG("  [hp] Round 1: payload %zu bytes, peerAddr=%s\n",
                     hp_resp.payload.size(),
                     hp_resp.peer_address.has_value()
                         ? (hp_resp.peer_address->host_string() + ":" +
@@ -1345,13 +1379,14 @@ void holepunch_connect(rpc::RpcSocket& socket,
             if (!decrypted) {
                 // C2: abort on decrypt failure — never fall back to
                 // unauthenticated peerAddress (MITM vector)
-                DHT_LOG( "  [hp] Round 1: decrypt FAILED — aborting (no fallback)\n");
+                DHT_LOG("  [hp] Round 1: decrypt FAILED — aborting (no fallback)\n");
                 state->complete({});
                 return;
             }
 
-            auto server_r1 = decode_holepunch_payload(decrypted->data(), decrypted->size());
-            DHT_LOG( "  [hp] Round 1 server: fw=%u err=%u round=%u "
+            auto server_r1 = decode_holepunch_payload(
+                decrypted->data(), decrypted->size());
+            DHT_LOG("  [hp] Round 1 server: fw=%u err=%u round=%u "
                     "addrs=%zu punching=%d connected=%d token=%s\n",
                     server_r1.firewall, server_r1.error, server_r1.round,
                     server_r1.addresses.size(),
@@ -1359,22 +1394,15 @@ void holepunch_connect(rpc::RpcSocket& socket,
                     server_r1.token.has_value() ? "yes" : "no");
 
             if (server_r1.error != peer_connect::ERROR_NONE) {
-                DHT_LOG( "  [hp] Round 1: server error %u\n", server_r1.error);
+                DHT_LOG("  [hp] Round 1: server error %u\n", server_r1.error);
                 state->complete({});
                 return;
             }
 
-            // JS: probeRound (connect.js:593-598) — sleeper.pause(1000)
-            //     when remoteFirewall is UNKNOWN
-            // If remote firewall is UNKNOWN, treat as CONSISTENT but delay
-            // Round 2 by 1s to give the server time to sample its own NAT.
-            // This is the fix for the NAT-to-NAT failure.
             uint32_t effective_remote_fw = server_r1.firewall;
-            bool delay_round2 = false;
             if (effective_remote_fw == peer_connect::FIREWALL_UNKNOWN) {
-                DHT_LOG("  [hp] Server firewall UNKNOWN, treating as CONSISTENT (1s delay)\n");
+                DHT_LOG("  [hp] Server firewall UNKNOWN, treating as CONSISTENT\n");
                 effective_remote_fw = peer_connect::FIREWALL_CONSISTENT;
-                delay_round2 = true;
             }
 
             // JS: abort if both sides are RANDOM (impossible to punch)
@@ -1392,7 +1420,8 @@ void holepunch_connect(rpc::RpcSocket& socket,
             }
             for (size_t i = 0; i < server_addrs.size(); i++) {
                 DHT_LOG("  [hp] Server addr[%zu]: %s:%u\n", i,
-                        server_addrs[i].host_string().c_str(), server_addrs[i].port);
+                        server_addrs[i].host_string().c_str(),
+                        server_addrs[i].port);
             }
             if (server_addrs.empty()) {
                 state->complete({});
@@ -1416,23 +1445,8 @@ void holepunch_connect(rpc::RpcSocket& socket,
             if (!server_addrs.empty()) verified_host = server_addrs[0].host_string();
             state->puncher->update_remote(server_addrs, verified_host);
 
-            // JS parity (connect.js:600-621): analyze() stability check
-            //
-            //   stable = await puncher.analyze(false)
-            //   if (!stable) stable = await puncher.analyze(true)    // allow_reopen
-            //   if (still UNKNOWN on either side) → abort PROBE_TIMEOUT
-            //
-            // Our Holepuncher::analyze() is synchronous (no `await` over
-            // nat.analyzing — our pool socket discovery already completed
-            // the NAT sampling before we got here). It returns `true` when
-            // both sides are classified and we are NOT in a double-RANDOM
-            // dead-end. Without it, an UNKNOWN local NAT would walk into
-            // Round 2 and waste the full holepunch timeout.
-            //
-            // The reopen path (`analyze(true)`) signals `on_reset_` — not
-            // currently wired from holepunch_connect, so in practice the
-            // fallback just re-checks and aborts. Wiring a pool-socket
-            // reset here would be a future improvement.
+            // JS parity (connect.js:600-621): analyze() stability check.
+            // Synchronous in C++ (sampling done by discover_pool_addresses).
             bool stable_ok = false;
             state->puncher->analyze(false, [&stable_ok](bool s) { stable_ok = s; });
             if (!stable_ok) {
@@ -1444,16 +1458,33 @@ void holepunch_connect(rpc::RpcSocket& socket,
                 return;
             }
 
-            // JS: probeRound:582-591 — if the server's address from the
-            // Round 1 payload differs from the announce address and the
-            // firewall isn't RANDOM, send an openSession (TTL=5) probe.
-            // The server's puncher (created during _addHandshake) echoes
-            // ALL probes on its pool socket. If the echo arrives back
-            // before Round 2, we connect without holepunch rounds.
-            // Post-Round1 probe: send to server's pool address so the
-            // server's puncher echoes it. If NAT conditions allow, the
-            // echo arrives before Round 2 → connected without holepunch
-            // rounds (matching JS probeRound:582-591).
+            // JS connect.js:611-613 — retry probeRound once when remote firewall
+            // came back UNKNOWN OR no token was issued (server didn't recognise
+            // us as coming via one of its announced relays). On CGNAT the
+            // server's NAT auto-sampling can take 2-4s; the 1s wait inside
+            // c.sleeper.pause() before the recursive call gives it that
+            // breathing room. Translation: re-issue the same Round 1 request
+            // and let it succeed against the now-stable server NAT.
+            const bool inconclusive =
+                server_r1.firewall == peer_connect::FIREWALL_UNKNOWN ||
+                !server_r1.token.has_value();
+            if (inconclusive && !state->retried_round1) {
+                state->retried_round1 = true;
+                DHT_LOG("  [hp] Round 1 inconclusive (fw=%u, token=%s); "
+                        "retrying in 1s\n",
+                        server_r1.firewall,
+                        server_r1.token.has_value() ? "yes" : "no");
+                state->sleeper->pause(1000, [state, ctx]() mutable {
+                    if (state->completed) return;
+                    run_round1(state, std::move(ctx));
+                });
+                return;
+            }
+
+            // JS: probeRound:582-591 — post-Round1 probe to server's pool
+            // address. The server's puncher echoes ALL probes; if NAT
+            // conditions allow, the echo arrives back before Round 2 and
+            // the connection completes without needing Round 2.
             if (effective_remote_fw < peer_connect::FIREWALL_RANDOM &&
                 !server_addrs.empty()) {
                 DHT_LOG("  [hp] Post-Round1 probe to %s:%u\n",
@@ -1471,154 +1502,129 @@ void holepunch_connect(rpc::RpcSocket& socket,
 
             // -------------------------------------------------------------------
             // Round 2: punch exchange — tell server to start probing
-            // Delayed by 1s if server firewall was UNKNOWN (gives server time)
             // -------------------------------------------------------------------
 
-            // Use our main RPC socket's external address (from relay response).
-            // The server probes this address. We send probes from both main
-            // and pool sockets to maximize NAT punch chances.
+            // Use our pool address as the relay sees us (resp.from.addr is
+            // the wire `to` field set by the relay = our public mapping).
             Ipv4Address our_addr = resp.from.addr;
 
-            auto send_round2 = [state, relay_addr, peer_addr,
-                                holepunch_id, target, pool_fw,
+            auto send_round2 = [state, ctx, pool_fw,
                                 server_addrs, server_r1, our_addr]() {
-            if (state->completed) return;
+                if (state->completed) return;
 
-            // JS: c.puncher.nat.freeze() — prevent NAT updates during punch
-            state->pool->nat_sampler().freeze();
-            DHT_LOG("  [hp] Our pool address (from relay): %s:%u\n",
-                    our_addr.host_string().c_str(), our_addr.port);
+                // JS: c.puncher.nat.freeze() — prevent NAT updates during punch
+                state->pool->nat_sampler().freeze();
+                DHT_LOG("  [hp] Our pool address (from relay): %s:%u\n",
+                        our_addr.host_string().c_str(), our_addr.port);
 
-            HolepunchPayload punch;
-            punch.error = peer_connect::ERROR_NONE;
-            punch.firewall = pool_fw;
-            punch.round = 1;
-            punch.punching = true;
-            punch.addresses.push_back(our_addr);
+                HolepunchPayload punch;
+                punch.error = peer_connect::ERROR_NONE;
+                punch.firewall = pool_fw;
+                punch.round = 1;
+                punch.punching = true;
+                punch.addresses.push_back(our_addr);
 
-            // Generate our token for address verification
-            punch.token = state->secure->token(server_addrs[0].host_string());
-            // Echo back the server's token
-            if (server_r1.token.has_value()) {
-                punch.remote_token = server_r1.token;
-            }
+                // Generate our token for address verification
+                punch.token = state->secure->token(server_addrs[0].host_string());
+                // Echo back the server's token
+                if (server_r1.token.has_value()) {
+                    punch.remote_token = server_r1.token;
+                }
 
-            auto punch_bytes = encode_holepunch_payload(punch);
-            auto encrypted_punch = state->secure->encrypt(
-                punch_bytes.data(), punch_bytes.size());
+                auto punch_bytes = encode_holepunch_payload(punch);
+                auto encrypted_punch = state->secure->encrypt(
+                    punch_bytes.data(), punch_bytes.size());
 
-            HolepunchMessage hp_msg2;
-            hp_msg2.mode = peer_connect::MODE_FROM_CLIENT;
-            hp_msg2.id = holepunch_id;
-            hp_msg2.payload = std::move(encrypted_punch);
-            hp_msg2.peer_address = peer_addr;
+                HolepunchMessage hp_msg2;
+                hp_msg2.mode = peer_connect::MODE_FROM_CLIENT;
+                hp_msg2.id = ctx.holepunch_id;
+                hp_msg2.payload = std::move(encrypted_punch);
+                hp_msg2.peer_address = ctx.peer_addr;
 
-            messages::Request req2;
-            req2.to.addr = relay_addr;
-            req2.command = messages::CMD_PEER_HOLEPUNCH;
-            req2.target = target;
-            req2.value = encode_holepunch_msg(hp_msg2);
+                messages::Request req2;
+                req2.to.addr = ctx.relay_addr;
+                req2.command = messages::CMD_PEER_HOLEPUNCH;
+                req2.target = ctx.target;
+                req2.value = encode_holepunch_msg(hp_msg2);
 
-            DHT_LOG( "  [hp] Sending round 2 (punching=true) to %s:%u\n",
-                    relay_addr.host_string().c_str(), relay_addr.port);
+                DHT_LOG("  [hp] Sending round 2 (punching=true) to %s:%u\n",
+                        ctx.relay_addr.host_string().c_str(),
+                        ctx.relay_addr.port);
 
-            // JS: openSession BEFORE sending round 2 (connect.js:557)
-            // Prime our NAT mapping with low-TTL probe
-            if (!server_addrs.empty()) {
-                state->puncher->open_session(server_addrs[0]);
-            }
+                // JS: openSession BEFORE sending round 2 (connect.js:557).
+                // Prime our NAT mapping with low-TTL probe.
+                if (!server_addrs.empty()) {
+                    state->puncher->open_session(server_addrs[0]);
+                }
 
-            // Round 2 also sent from pool socket — same rationale as Round 1.
-            // JS: connect.js:505-516 (updateHolepunch) uses c.puncher.socket.
-            // PoolSocket::request() handles encoding, TID, and timeout.
-            state->pool->request(req2,
-                [state, server_addrs](const messages::Response& r2resp) {
-                    if (state->completed) return;
+                // Round 2 also via the pool socket — same rationale as Round 1.
+                state->pool->request(req2,
+                    [state](const messages::Response& r2resp) {
+                        if (state->completed) return;
+                        if (r2resp.value.has_value() && !r2resp.value->empty()) {
+                            auto r2_msg = decode_holepunch_msg(
+                                r2resp.value->data(), r2resp.value->size());
+                            if (!r2_msg.payload.empty()) {
+                                auto r2_dec = state->secure->decrypt(
+                                    r2_msg.payload.data(), r2_msg.payload.size());
+                                if (r2_dec) {
+                                    auto r2_pay = decode_holepunch_payload(
+                                        r2_dec->data(), r2_dec->size());
+                                    DHT_LOG(
+                                        "  [hp] Round 2 server: fw=%u err=%u "
+                                        "punching=%d connected=%d addrs=%zu\n",
+                                        r2_pay.firewall, r2_pay.error,
+                                        r2_pay.punching ? 1 : 0,
+                                        r2_pay.connected ? 1 : 0,
+                                        r2_pay.addresses.size());
 
-                    // Decode round 2 response to check for errors
-                    if (r2resp.value.has_value() && !r2resp.value->empty()) {
-                        auto r2_msg = decode_holepunch_msg(
-                            r2resp.value->data(), r2resp.value->size());
-                        if (!r2_msg.payload.empty()) {
-                            auto r2_dec = state->secure->decrypt(
-                                r2_msg.payload.data(), r2_msg.payload.size());
-                            if (r2_dec) {
-                                auto r2_pay = decode_holepunch_payload(
-                                    r2_dec->data(), r2_dec->size());
-                                DHT_LOG(
-                                    "  [hp] Round 2 server: fw=%u err=%u "
-                                    "punching=%d connected=%d addrs=%zu\n",
-                                    r2_pay.firewall, r2_pay.error,
-                                    r2_pay.punching ? 1 : 0,
-                                    r2_pay.connected ? 1 : 0,
-                                    r2_pay.addresses.size());
+                                    if (r2_pay.error != peer_connect::ERROR_NONE) {
+                                        state->complete({});
+                                        return;
+                                    }
 
-                                if (r2_pay.error != peer_connect::ERROR_NONE) {
-                                    state->complete({});
-                                    return;
-                                }
-
-                                // JS: updateRemote with Round 2 addresses
-                                // Server may report its holepunch socket address
-                                // which differs from its main socket address in Round 1
-                                if (!r2_pay.addresses.empty() && state->puncher) {
-                                    std::string verified;
-                                    if (!r2_pay.addresses.empty())
-                                        verified = r2_pay.addresses[0].host_string();
-                                    state->puncher->update_remote(
-                                        r2_pay.addresses, verified);
-                                    DHT_LOG("  [hp] Updated puncher addresses from Round 2 (%zu addrs)\n",
-                                            r2_pay.addresses.size());
+                                    if (!r2_pay.addresses.empty() && state->puncher) {
+                                        std::string verified =
+                                            r2_pay.addresses[0].host_string();
+                                        state->puncher->update_remote(
+                                            r2_pay.addresses, verified);
+                                        DHT_LOG("  [hp] Updated puncher addresses "
+                                                "from Round 2 (%zu addrs)\n",
+                                                r2_pay.addresses.size());
+                                    }
                                 }
                             }
                         }
-                    }
-                },
-                [state](uint16_t) {
-                    DHT_LOG( "  [hp] Round 2: TIMEOUT (relay)\n");
-                    // Timeout is OK — probing is already in progress
-                });
+                    },
+                    [](uint16_t) {
+                        DHT_LOG("  [hp] Round 2: TIMEOUT (relay)\n");
+                        // Timeout is OK — probing is already in progress
+                    });
 
-            // Start probing IMMEDIATELY after sending Round 2 — don't wait
-            // for relay response. JS: roundPunch calls punch() right after
-            // sending the update, not in the response callback.
-            state->puncher->punch();
+                // Start probing IMMEDIATELY after sending Round 2 — don't wait
+                // for relay response. JS: roundPunch calls punch() right after
+                // sending the update.
+                state->puncher->punch();
             };  // end send_round2 lambda
 
-            // Dispatch Round 2 with appropriate delay.
             // JS: between Round 1 response and Round 2, connect.js calls
-            // `await c.puncher.analyze(false)` which waits for the client's
-            // NAT sampling (~200-400ms). This delay also gives the SERVER's
-            // puncher time to complete its own autoSample. Without it, the
-            // server's punch() → analyze() returns UNKNOWN → abort → no probes.
-            // JS: between Round 1 and Round 2, connect.js calls
-            // `await c.puncher.analyze(false)` which yields to the event loop.
-            // During this yield, the post-Round1 probe echo may arrive and
-            // complete the connection (via puncher on_connect) — skipping
-            // Round 2 entirely. We replicate this with a polling check:
-            // yield 50ms at a time (up to 500ms), checking if the probe
-            // connected us. libuv processes I/O between timer callbacks.
-            if (delay_round2) {
-                DHT_LOG("  [hp] Delaying Round 2 by 1s (server fw was UNKNOWN)\n");
-                state->sleeper->pause(1000, send_round2);
-            } else {
-                // Delay 500ms before Round 2, matching JS analyze() wait.
-                // During this time, the post-Round1 probe echo may arrive
-                // and complete the connection, skipping Round 2.
-                auto sr2 = std::make_shared<std::function<void()>>(
-                    std::move(send_round2));
-                state->sleeper->pause(500, [state, sr2]() {
-                    if (state->completed) return;  // Probe connected us!
-                    (*sr2)();
-                });
-            }
+            // `await c.puncher.analyze(false)` which yields to the event loop
+            // for ~analyze duration. During that yield the post-Round1 probe
+            // echo may arrive and complete the connection, skipping Round 2.
+            // Approximate that with a 500ms delay before Round 2.
+            auto sr2 = std::make_shared<std::function<void()>>(
+                std::move(send_round2));
+            state->sleeper->pause(500, [state, sr2]() {
+                if (state->completed) return;  // Probe connected us!
+                (*sr2)();
+            });
         },
         [state](uint16_t) {
-            DHT_LOG( "  [hp] Round 1: TIMEOUT (no response from relay)\n");
+            DHT_LOG("  [hp] Round 1: TIMEOUT (no response from relay)\n");
             state->complete({});
         });
-    });  // end discover_pool_addresses callback
 }
+}  // anonymous namespace
 
 // ---------------------------------------------------------------------------
 // localAddresses — enumerate non-internal local IPv4 interfaces.

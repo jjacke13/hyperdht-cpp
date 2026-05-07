@@ -2,7 +2,7 @@
 
 Tasks to verify / harden the implementation, organized by category and estimated effort.
 
-**Last updated: 2026-05-02** (v0.3.1 — security audit + reusableSocket)
+**Last updated: 2026-05-08** (v0.4.0 — Windows port + CGNAT holepunch + ESP32 single-socket)
 
 ---
 
@@ -213,8 +213,10 @@ Still not exposed:
 
 - **Run a public node** — announce on the public DHT, serve real nospoon traffic
 - **Multi-region test** — clients in US, EU, Asia connecting through each other
-- **Mobile network test** — 4G/5G NAT behavior verified (v0.3.0: Android echo
-  works over carrier NAT, both ephemeral and persistent server states)
+- **Mobile network test** — 4G/5G NAT behavior verified. v0.3.0 fixed the
+  post-persistent echo bug; CGNAT holepunch landed post-v0.3.1 via
+  `HandshakeResult::server_address` propagation (relay's fresh observation
+  triggers JS server fast-mode punch — see CLAUDE.md gotcha #19).
 - **IPv6 validation** — protocol has IPv6 fields (`addresses6`); we don't exercise them
 
 ---

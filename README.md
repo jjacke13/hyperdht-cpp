@@ -23,10 +23,10 @@ Wire-compatible with JS `hyperdht@6.29.1`. Live-tested in both directions on the
 
 | | |
 |---|---|
-| **Tests** | 566 unit + 6 live, ASAN/UBSan clean |
+| **Tests** | 578 unit + 6 live, ASAN/UBSan clean |
 | **API parity** | Full -- wire-compatible with JS `hyperdht@6.29.1` ([audit](docs/archive/JS-PARITY-GAPS.md)) |
 | **Languages** | C++ / C / Python / Kotlin (Swift, Go, Rust planned) |
-| **Platforms** | Linux, macOS, ESP32, Android |
+| **Platforms** | Linux, macOS, Windows, Android, ESP32 |
 
 ## Build
 
@@ -34,13 +34,13 @@ Wire-compatible with JS `hyperdht@6.29.1`. Live-tested in both directions on the
 nix develop && mkdir -p build && cd build && cmake .. -G Ninja && ninja && ctest -L unit
 ```
 
-Without Nix: install `cmake`, `ninja`, `libsodium`, `libuv`, then the same cmake flow. Docker also works (`docker build -t hyperdht .`). See [BUILDING.md](docs/BUILDING.md) for full instructions (Linux, macOS, Docker, linking, troubleshooting).
+Without Nix: install `cmake`, `ninja`, `libsodium`, `libuv`, then the same cmake flow. Docker also works (`docker build -t hyperdht .`). On Windows, use vcpkg for the dependencies and MSVC — CI builds the static and shared variants on every push (`.github/workflows/windows.yml`). See [BUILDING.md](docs/BUILDING.md) for full instructions (Linux, macOS, Windows, Docker, linking, troubleshooting).
 
 ## Documentation
 
 | | |
 |---|---|
-| [Build instructions](docs/BUILDING.md) | Linux, macOS, Docker, Nix — deps, compile, link, troubleshoot |
+| [Build instructions](docs/BUILDING.md) | Linux, macOS, Windows, Docker, Nix — deps, compile, link, troubleshoot |
 | [C API reference](docs/C-API.md) | 76 functions, opaque-pointer pattern, callback-based async |
 | [C++ API reference](docs/CPP-API.md) | RAII wrappers, error codes, single-threaded event loop |
 | [Python examples](examples/python/) | Server, client, holesail tunnel, 22 wrapper tests |

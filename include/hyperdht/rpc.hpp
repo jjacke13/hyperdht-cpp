@@ -281,8 +281,12 @@ public:
         if (on_health_change_) on_health_change_();
     }
 
-    // Get adaptive timeout for a peer (returns DEFAULT_TIMEOUT_MS if unknown)
+    // Adaptive timeout: get / record per-peer RTT samples.
+    // PoolSocket (holepunch.cpp) reuses the same EMA so its RPC retries
+    // adapt to the same network conditions the main RPC sees, matching
+    // JS dht-rpc's shared `_adt` adaptive-timeout map (io.js:78,116-118,458).
     uint64_t timeout_for(const compact::Ipv4Address& peer) const;
+    void record_rtt(const compact::Ipv4Address& peer, uint64_t rtt_ms);
 
     // Access internals for testing
     const routing::RoutingTable& table() const { return table_; }
@@ -440,9 +444,6 @@ private:
     void udp_send_on(const std::vector<uint8_t>& buf,
                      const compact::Ipv4Address& to,
                      udx_socket_t* socket);
-
-    // Adaptive timeout: record RTT sample
-    void record_rtt(const compact::Ipv4Address& peer, uint64_t rtt_ms);
 
     // UDP receive callbacks — one per socket
     static void on_recv_client(udx_socket_t* socket, ssize_t nread, const uv_buf_t* buf,

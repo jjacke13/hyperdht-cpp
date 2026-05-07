@@ -391,6 +391,12 @@ void peer_handshake(rpc::RpcSocket& socket,
             result.rx_key = noise_ik->rx_key();
             result.handshake_hash = noise_ik->handshake_hash();
             result.remote_public_key = remote_pubkey;
+            // JS `router.js:46-78`: serverAddress = hs.peerAddress || to.
+            // The relay's observation of where the server replied from —
+            // the fresh address. Used downstream as Round 1's
+            // `remote_address` field which triggers the server's
+            // fast-mode punch (server.js:530-538).
+            result.server_address = hs_resp.peer_address;
 
             on_done(result);
         },
@@ -470,6 +476,8 @@ void peer_handshake(rpc::RpcSocket& socket,
             result.rx_key = noise_ik->rx_key();
             result.handshake_hash = noise_ik->handshake_hash();
             result.remote_public_key = remote_pubkey;
+            // JS `router.js:46-78`: serverAddress = hs.peerAddress || to.
+            result.server_address = hs_resp.peer_address;
             on_done(result);
         },
         [noise_ik, on_done](uint16_t) {

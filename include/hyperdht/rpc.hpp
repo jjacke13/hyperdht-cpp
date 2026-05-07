@@ -221,13 +221,27 @@ public:
     udx_t* udx_handle() { return &udx_; }
     // Always returns server socket — UDX streams use the persistent port.
     // Matches JS: index.js:139 where dht.socket returns serverSocket.
-    udx_socket_t* socket_handle() { return &server_socket_; }
+    // EMBEDDED (ESP32): single-socket build, returns the only socket.
+    udx_socket_t* socket_handle() {
+#ifdef HYPERDHT_EMBEDDED
+        return &client_socket_;
+#else
+        return &server_socket_;
+#endif
+    }
     // Ephemeral outbound socket (random port). Used for DHT lookups and
     // connect()/holepunch on a firewalled / ephemeral node.
     udx_socket_t* client_socket_handle() { return &client_socket_; }
 
-    // Returns the currently active socket (client while firewalled, server after)
-    udx_socket_t* active_socket() { return firewalled_ ? &client_socket_ : &server_socket_; }
+    // Returns the currently active socket (client while firewalled, server after).
+    // EMBEDDED: always the single client_socket_; node never goes persistent.
+    udx_socket_t* active_socket() {
+#ifdef HYPERDHT_EMBEDDED
+        return &client_socket_;
+#else
+        return firewalled_ ? &client_socket_ : &server_socket_;
+#endif
+    }
 
     // Close the socket and stop all timers
     void close();

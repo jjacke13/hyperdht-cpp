@@ -14,10 +14,39 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(HYPERDHT_DEBUG "Enable debug logging to stderr" OFF)
 option(HYPERDHT_EMBEDDED "Reduce sizing constants for embedded targets (ESP32)" OFF)
 
+# When BUILD_SHARED_LIBS=ON in Release, the default is to hide C++ symbols and
+# export only the C FFI surface marked with HYPERDHT_API. That keeps the public
+# ABI tight and the .so small, but it means downstream C++ consumers (e.g.
+# nospoon-cpp) can't link against internal classes like HyperDHT, Server, or
+# SecretStreamDuplex.
+#
+# Set HYPERDHT_EXPORT_CXX=ON to export *every* symbol from the shared library
+# instead — gives downstream consumers the full C++ API at the cost of a
+# larger .so and a much wider implicit ABI surface.
+option(HYPERDHT_EXPORT_CXX
+    "Export all C++ symbols from the shared library (in addition to the C FFI)"
+    OFF)
+
 # === Dependencies ===
 
-# Support two modes: pkg-config (desktop) or explicit paths (Android cross-compile)
-if(NOT CMAKE_DISABLE_FIND_PACKAGE_PkgConfig AND NOT SODIUM_LIBRARY)
+# Three modes:
+#  1. Windows (vcpkg) — find_package CONFIG packages.
+#  2. Desktop POSIX — pkg-config.
+#  3. Cross-compile / Android — explicit paths via SODIUM_LIBRARY etc.
+if(WIN32)
+    find_package(unofficial-sodium CONFIG REQUIRED)
+    find_package(libuv CONFIG REQUIRED)
+    set(SODIUM_TARGET unofficial-sodium::sodium)
+    # vcpkg ships libuv as either libuv::uv (shared) or libuv::uv_a (static).
+    # The static-md triplet builds the static variant.
+    if(TARGET libuv::uv_a)
+        set(UV_TARGET libuv::uv_a)
+    elseif(TARGET libuv::uv)
+        set(UV_TARGET libuv::uv)
+    else()
+        message(FATAL_ERROR "libuv vcpkg target not found (expected libuv::uv_a or libuv::uv)")
+    endif()
+elseif(NOT CMAKE_DISABLE_FIND_PACKAGE_PkgConfig AND NOT SODIUM_LIBRARY)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium)
     pkg_check_modules(UV REQUIRED IMPORTED_TARGET libuv)
@@ -39,9 +68,8 @@ endif()
 
 # libudx — C library from git submodule
 # libudx is always static (internal dependency, compiled into libhyperdht)
-add_library(udx STATIC
+set(UDX_SOURCES
     deps/libudx/src/udx.c
-    deps/libudx/src/io_posix.c
     deps/libudx/src/cirbuf.c
     deps/libudx/src/queue.c
     deps/libudx/src/endian.c
@@ -50,6 +78,20 @@ add_library(udx STATIC
     deps/libudx/src/win_filter.c
     deps/libudx/src/win_filter_f64.c
 )
+if(WIN32)
+    list(APPEND UDX_SOURCES deps/libudx/src/io_win.c)
+else()
+    list(APPEND UDX_SOURCES deps/libudx/src/io_posix.c)
+endif()
+add_library(udx STATIC ${UDX_SOURCES})
+
+# libudx's udx.h uses C11 `alignas` (line 432). MSVC's C compiler doesn't
+# recognize the keyword without <stdalign.h>, and it defaults to C89 unless
+# we both bump the standard and force-include the header.
+if(MSVC)
+    set_target_properties(udx PROPERTIES C_STANDARD 11)
+    target_compile_options(udx PRIVATE /FIstdalign.h)
+endif()
 target_include_directories(udx
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/deps/libudx/include>
@@ -113,6 +155,22 @@ target_link_libraries(hyperdht PUBLIC
     ${SODIUM_TARGET}
     ${UV_TARGET}
 )
+if(WIN32)
+    # Raw socket types (sockaddr_in, ntohs) come from winsock2; libuv pulls
+    # it in transitively but we still need to link the import lib.
+    target_link_libraries(hyperdht PUBLIC ws2_32 iphlpapi userenv psapi)
+    target_compile_definitions(hyperdht PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        _CRT_SECURE_NO_WARNINGS
+        _WINSOCK_DEPRECATED_NO_WARNINGS
+    )
+    target_link_libraries(udx PUBLIC ws2_32 iphlpapi)
+    target_compile_definitions(udx PRIVATE
+        WIN32_LEAN_AND_MEAN
+        _CRT_SECURE_NO_WARNINGS
+    )
+endif()
 if(HYPERDHT_DEBUG)
     target_compile_definitions(hyperdht PUBLIC HYPERDHT_DEBUG=1)
 endif()
@@ -124,11 +182,20 @@ endif()
 set_target_properties(hyperdht PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set_target_properties(udx PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# When building as shared library in Release mode, export only HYPERDHT_API functions.
-# In Debug mode, all symbols are visible (needed for tests that use C++ internals).
+# Symbol-visibility policy for the shared library:
+#   Debug                       → everything visible (tests need C++ internals)
+#   Release + HYPERDHT_EXPORT_CXX=ON  → everything visible (consumer opt-in)
+#   Release + HYPERDHT_EXPORT_CXX=OFF → only HYPERDHT_API (the C FFI) exported
+#
+# HYPERDHT_SHARED is INTERFACE so consumers see it (→ dllimport on Windows,
+# default-visibility attribute on GCC/Clang).
+# HYPERDHT_BUILD is PRIVATE so only the library itself sees it (→ dllexport).
 if(BUILD_SHARED_LIBS)
-    target_compile_definitions(hyperdht PRIVATE HYPERDHT_SHARED=1)
-    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_definitions(hyperdht
+        INTERFACE HYPERDHT_SHARED=1
+        PRIVATE HYPERDHT_SHARED=1 HYPERDHT_BUILD=1
+    )
+    if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT HYPERDHT_EXPORT_CXX)
         set_target_properties(hyperdht PROPERTIES
             C_VISIBILITY_PRESET hidden
             CXX_VISIBILITY_PRESET hidden
@@ -163,10 +230,27 @@ install(DIRECTORY deps/libudx/include/
     FILES_MATCHING PATTERN "*.h"
 )
 
-# Install CMake package config (for find_package(hyperdht))
+# Install CMake package config (for find_package(hyperdht)).
+# Two pieces:
+#   hyperdht-targets.cmake     — generated by install(EXPORT), contains the
+#                                imported library targets.
+#   hyperdht-config.cmake      — wrapper we ship that calls find_dependency
+#                                for sodium/uv before including the targets
+#                                file. Without this, consumers see dangling
+#                                PkgConfig::SODIUM references in the import.
 install(EXPORT hyperdht-targets
-    FILE hyperdht-config.cmake
+    FILE hyperdht-targets.cmake
     NAMESPACE hyperdht::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hyperdht
+)
+
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/hyperdht-config.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/hyperdht-config.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hyperdht
+)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/hyperdht-config.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hyperdht
 )
 

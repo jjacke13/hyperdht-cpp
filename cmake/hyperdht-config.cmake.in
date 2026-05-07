@@ -1,0 +1,20 @@
+@PACKAGE_INIT@
+
+# Re-discover hyperdht's dependencies before pulling in the imported
+# targets, otherwise consumers see references to PkgConfig::SODIUM /
+# PkgConfig::UV that don't exist in their CMake context.
+include(CMakeFindDependencyMacro)
+
+if(WIN32)
+    # vcpkg-style config packages on Windows.
+    find_dependency(unofficial-sodium CONFIG)
+    find_dependency(libuv CONFIG)
+else()
+    find_dependency(PkgConfig)
+    pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium)
+    pkg_check_modules(UV REQUIRED IMPORTED_TARGET libuv)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/hyperdht-targets.cmake")
+
+check_required_components(hyperdht)

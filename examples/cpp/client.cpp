@@ -22,8 +22,14 @@ struct ClientCtx {
 };
 
 static void on_data(const uint8_t* data, size_t len, void* ud) {
+    auto* ctx = static_cast<ClientCtx*>(ud);
     printf("Received: %.*s\n", (int)len, data);
     fflush(stdout);
+    // Half-close our side. Server's on_close fires once it also finishes,
+    // and CLAUDE.md gotcha #12: both sides must write_end before either
+    // side's on_close callback runs. Without this the stream lingers
+    // until UDX times out, leaving the peer to clean up via TLP/RTO.
+    hyperdht_stream_close(ctx->stream);
 }
 
 static void on_open(void* ud) {
@@ -38,6 +44,12 @@ static void on_close(void* ud) {
     printf("Stream closed\n");
     fflush(stdout);
     delete static_cast<ClientCtx*>(ud);
+    // Tear the DHT down so uv_run() in main() returns. hyperdht_free()
+    // is deferred to main() per the API contract — destroy() schedules,
+    // the post-destroy uv_run drains, then free() is safe.
+    if (g_dht) {
+        hyperdht_destroy(g_dht, nullptr, nullptr);
+    }
 }
 
 static void on_connect(int error, const hyperdht_connection_t* conn, void* ud) {

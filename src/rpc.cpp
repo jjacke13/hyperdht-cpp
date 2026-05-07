@@ -135,9 +135,13 @@ RpcSocket::RpcSocket(uv_loop_t* loop, const routing::NodeId& local_id)
 
     udx_init(loop_, &udx_, nullptr);
     udx_socket_init(&udx_, &client_socket_, nullptr);
-    udx_socket_init(&udx_, &server_socket_, nullptr);
     client_socket_.data = this;
+#ifndef HYPERDHT_EMBEDDED
+    // EMBEDDED (ESP32): single-socket build. Skip server_socket_ init —
+    // node never goes persistent, never passes firewall probe.
+    udx_socket_init(&udx_, &server_socket_, nullptr);
     server_socket_.data = this;
+#endif
 
     // Drain timer (heap-allocated to outlive RpcSocket on close)
     drain_timer_ = new uv_timer_t;
@@ -171,7 +175,21 @@ RpcSocket::~RpcSocket() {
 
 // JS: io.js:224-228 (bind) + io.js:230-295 (_bindSockets — JS binds
 //     serverSocket to user port, clientSocket to random port.)
+//
+// EMBEDDED (ESP32): single-socket build. Bind client_socket_ to the
+// user-supplied port (the only socket); skip server_socket_ entirely.
 int RpcSocket::bind(uint16_t port, const std::string& host) {
+#ifdef HYPERDHT_EMBEDDED
+    // Single socket: bind to user port (or 0 for OS-assigned).
+    struct sockaddr_in addr{};
+    if (uv_ip4_addr(host.c_str(), port, &addr) != 0) return UV_EINVAL;
+    int rc = udx_socket_bind(&client_socket_,
+                             reinterpret_cast<const struct sockaddr*>(&addr), 0);
+    if (rc != 0) return rc;
+    client_bound_ = true;
+
+    udx_socket_recv_start(&client_socket_, on_recv_client);
+#else
     // Server socket: user-specified port (or 0 for OS-assigned)
     struct sockaddr_in server_addr{};
     if (uv_ip4_addr(host.c_str(), port, &server_addr) != 0) return UV_EINVAL;
@@ -199,6 +217,7 @@ int RpcSocket::bind(uint16_t port, const std::string& host) {
     // Both sockets receive messages
     udx_socket_recv_start(&client_socket_, on_recv_client);
     udx_socket_recv_start(&server_socket_, on_recv_server);
+#endif
 
     // Start drain timer
     uv_timer_start(drain_timer_, on_drain_tick, DRAIN_INTERVAL_MS, DRAIN_INTERVAL_MS);
@@ -209,11 +228,17 @@ int RpcSocket::bind(uint16_t port, const std::string& host) {
 }
 
 uint16_t RpcSocket::port() const {
-    // Return server socket port — the persistent/advertised port
+    // Return server socket port — the persistent/advertised port.
+    // EMBEDDED: read client_socket_ — the only socket on this build.
     struct sockaddr_in addr{};
     int len = sizeof(addr);
+#ifdef HYPERDHT_EMBEDDED
+    udx_socket_getsockname(const_cast<udx_socket_t*>(&client_socket_),
+                           reinterpret_cast<struct sockaddr*>(&addr), &len);
+#else
     udx_socket_getsockname(const_cast<udx_socket_t*>(&server_socket_),
                            reinterpret_cast<struct sockaddr*>(&addr), &len);
+#endif
     return ntohs(addr.sin_port);
 }
 
@@ -476,7 +501,9 @@ void RpcSocket::close() {
     }
     pending_.clear();
 
-    // Cancel firewall probe if running
+#ifndef HYPERDHT_EMBEDDED
+    // Cancel firewall probe if running. EMBEDDED: probe never runs (node
+    // is always ephemeral), so this block is dead code on that build.
     if (firewall_probe_running_) {
         firewall_probe_running_ = false;
         if (probe_timer_) uv_timer_stop(probe_timer_);
@@ -486,10 +513,13 @@ void RpcSocket::close() {
         uv_close(reinterpret_cast<uv_handle_t*>(probe_timer_), free_timer);
         probe_timer_ = nullptr;
     }
+#endif
 
-    // Close both sockets
+    // Close socket(s). EMBEDDED: single-socket build, only client_socket_.
     if (client_bound_) udx_socket_close(&client_socket_);
+#ifndef HYPERDHT_EMBEDDED
     if (server_bound_) udx_socket_close(&server_socket_);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -921,6 +951,13 @@ void RpcSocket::background_tick() {
 //
 // Idempotency: once `ephemeral_` has flipped to false, this is a no-op.
 void RpcSocket::check_persistent() {
+#ifdef HYPERDHT_EMBEDDED
+    // ESP32 is always behind home WiFi NAT and never goes persistent. The
+    // firewall probe, persistent transition, and the second socket are all
+    // skipped on this build — see HYPERDHT_EMBEDDED in rpc.cpp::bind() and
+    // RpcSocket::active_socket().
+    return;
+#else
     if (!ephemeral_) return;
     if (firewall_probe_running_) return;  // probe already in flight
 
@@ -947,6 +984,7 @@ void RpcSocket::check_persistent() {
         // JS: index.js:821 — `const firewalled = this.firewalled && (await this._checkIfFirewalled(natSampler))`
         start_firewall_probe();
     }
+#endif  // HYPERDHT_EMBEDDED
 }
 
 // ---------------------------------------------------------------------------

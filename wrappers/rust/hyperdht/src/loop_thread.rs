@@ -218,6 +218,33 @@ pub(crate) enum Command {
         ctx: ServerCtxPtr,
     },
 
+    /// Install (or remove) a firewall callback on a server. Pass
+    /// `cb=None` to detach.
+    ServerSetFirewall {
+        server: ServerPtr,
+        ctx: ServerCtxPtr,
+        cb: Option<FirewallCallback>,
+    },
+
+    /// Subscribe to the next "listening" event for a server. The
+    /// libuv thread fires the oneshot after the announcer's first
+    /// cycle completes (or immediately if it already has).
+    ServerWaitListening {
+        ctx: ServerCtxPtr,
+        signal: oneshot::Sender<()>,
+    },
+
+    /// Trigger an explicit re-announce on a server.
+    ServerRefresh {
+        server: ServerPtr,
+    },
+
+    /// Get the server's NAT-sampled public address.
+    ServerAddress {
+        server: ServerPtr,
+        response: oneshot::Sender<Result<Option<(String, u16)>>>,
+    },
+
     /// Store a value at a target on the DHT.
     Announce {
         target: [u8; 32],
@@ -339,6 +366,17 @@ struct StreamCtx {
     closed: Arc<AtomicBool>,
 }
 
+/// Boxed user-supplied firewall callback. Called from the libuv thread
+/// inside the C `hyperdht_firewall_cb`; must return `true` to accept
+/// the connection or `false` to reject it.
+pub(crate) type FirewallCallback =
+    Box<dyn Fn(&crate::keypair::PublicKey, &str, u16) -> bool + Send + 'static>;
+
+/// One-shot signal that a server has finished its first announcer
+/// cycle (i.e. is ready to be discovered). Optional — `None` until
+/// `wait_listening()` subscribes for the first time.
+pub(crate) type ListeningWaiter = oneshot::Sender<()>;
+
 /// Per-server state. Owned by `hyperdht_server_listen` as userdata,
 /// freed in `hyperdht_server_close`'s callback. Stays on the libuv
 /// thread for its entire lifetime — never sent across threads.
@@ -353,6 +391,16 @@ struct ServerCtx {
     cmd_tx: mpsc::UnboundedSender<Command>,
     /// Same — given to each Stream for waking the loop.
     waker: AsyncWaker,
+    /// User-supplied firewall callback. Single-threaded (libuv only),
+    /// no synchronisation needed beyond raw pointer access.
+    firewall: Option<FirewallCallback>,
+    /// One-shot subscribers to the "first announcer cycle done" event.
+    /// Multiple awaiters can subscribe; they are all fired when the C
+    /// `on_listening` event lands.
+    listening_waiters: Vec<ListeningWaiter>,
+    /// `true` once the C `on_listening` hook has fired. New
+    /// `ServerWaitListening` requests resolve immediately.
+    already_listening: bool,
 }
 
 // ============================================================================
@@ -626,8 +674,17 @@ fn dispatch_command(
                 incoming_tx,
                 cmd_tx: new_stream_cmd_tx,
                 waker: new_stream_waker,
+                firewall: None,
+                listening_waiters: Vec::new(),
+                already_listening: false,
             });
             let ctx_ptr = Box::into_raw(ctx) as *mut c_void;
+
+            // Wire the "listening" event to fan out one-shot signals
+            // queued via Command::ServerWaitListening.
+            unsafe {
+                hyperdht_server_on_listening(server, Some(on_server_listening_cb), ctx_ptr);
+            }
 
             let kp = hyperdht_keypair_t {
                 public_key,
@@ -658,6 +715,62 @@ fn dispatch_command(
         Command::ServerClose { server, ctx } => {
             unsafe {
                 hyperdht_server_close(server.0, Some(on_server_closed_cb), ctx.0);
+            }
+        }
+
+        Command::ServerSetFirewall { server, ctx, cb } => {
+            // SAFETY: ServerCtx pointer is valid until on_server_closed_cb;
+            // we're on the libuv thread, which is the only thread that
+            // accesses the box. No synchronisation needed.
+            let server_ctx = unsafe { &mut *(ctx.0 as *mut ServerCtx) };
+            server_ctx.firewall = cb;
+            // If cb is Some, install our trampoline; if None, detach.
+            unsafe {
+                if server_ctx.firewall.is_some() {
+                    hyperdht_server_set_firewall(
+                        server.0,
+                        Some(on_server_firewall_cb),
+                        ctx.0,
+                    );
+                } else {
+                    hyperdht_server_set_firewall(server.0, None, std::ptr::null_mut());
+                }
+            }
+        }
+
+        Command::ServerWaitListening { ctx, signal } => {
+            let server_ctx = unsafe { &mut *(ctx.0 as *mut ServerCtx) };
+            if server_ctx.already_listening {
+                let _ = signal.send(());
+            } else {
+                server_ctx.listening_waiters.push(signal);
+            }
+        }
+
+        Command::ServerRefresh { server } => {
+            unsafe { hyperdht_server_refresh(server.0) };
+        }
+
+        Command::ServerAddress { server, response } => {
+            let mut host = [0i8; 46];
+            let mut port: u16 = 0;
+            let rc = unsafe {
+                hyperdht_server_address(
+                    server.0,
+                    host.as_mut_ptr() as *mut _,
+                    &mut port,
+                )
+            };
+            if rc != 0 {
+                let _ = response.send(Ok(None));
+            } else {
+                let bytes: Vec<u8> = host
+                    .iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| b as u8)
+                    .collect();
+                let s = String::from_utf8_lossy(&bytes).into_owned();
+                let _ = response.send(Ok(Some((s, port))));
             }
         }
 
@@ -1207,7 +1320,58 @@ extern "C" fn on_server_closed_cb(userdata: *mut c_void) {
         return;
     }
     let ctx = unsafe { Box::from_raw(userdata as *mut ServerCtx) };
+    // Dropping the listening_waiters Vec drops each oneshot::Sender,
+    // signalling Err to any awaiter still parked on .await.
     drop(ctx);
+}
+
+/// Firewall trampoline: forwards the C call to the user's Rust
+/// closure stored in ServerCtx. Returns 0 to accept, 1 to reject.
+extern "C" fn on_server_firewall_cb(
+    remote_pk: *const u8,
+    peer_host: *const ::std::os::raw::c_char,
+    peer_port: u16,
+    userdata: *mut c_void,
+) -> c_int {
+    let server_ctx = unsafe { &*(userdata as *const ServerCtx) };
+    let cb = match server_ctx.firewall.as_ref() {
+        Some(cb) => cb,
+        None => return 0, // accept by default if no callback installed
+    };
+
+    // SAFETY: hyperdht guarantees both pointers are valid for the
+    // duration of this call.
+    let mut pk = [0u8; 32];
+    if !remote_pk.is_null() {
+        unsafe { std::ptr::copy_nonoverlapping(remote_pk, pk.as_mut_ptr(), 32) };
+    }
+    let pk = crate::keypair::PublicKey(pk);
+    let host = if peer_host.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(peer_host) }
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    if cb(&pk, &host, peer_port) {
+        0 // accept
+    } else {
+        1 // reject
+    }
+}
+
+/// `on_listening` trampoline: marks the server as listening and
+/// fires every queued one-shot waiter.
+extern "C" fn on_server_listening_cb(userdata: *mut c_void) {
+    if userdata.is_null() {
+        return;
+    }
+    let server_ctx = unsafe { &mut *(userdata as *mut ServerCtx) };
+    server_ctx.already_listening = true;
+    for tx in server_ctx.listening_waiters.drain(..) {
+        let _ = tx.send(());
+    }
 }
 
 // ============================================================================

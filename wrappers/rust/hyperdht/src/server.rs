@@ -6,10 +6,11 @@
 //! opens a stream via `hyperdht_stream_open` and pushes the resulting
 //! [`Stream`] onto an mpsc channel that [`Server::accept`] drains.
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
+use crate::error::{HyperDhtError, Result};
 use crate::keypair::PublicKey;
-use crate::loop_thread::{AsyncWaker, Command, ServerCtxPtr, ServerPtr};
+use crate::loop_thread::{AsyncWaker, Command, FirewallCallback, ServerCtxPtr, ServerPtr};
 use crate::stream::Stream;
 
 /// A server listening for incoming HyperDHT connections.
@@ -62,6 +63,97 @@ impl Server {
     pub fn close(mut self) {
         self.send_close_once();
         // self drops here; mpsc receiver closes when sender drops.
+    }
+
+    /// Install a firewall callback. The callback is invoked from the
+    /// libuv thread before the Noise handshake completes; return
+    /// `true` to accept, `false` to reject.
+    ///
+    /// Pass an `Option::None` to detach a previously-installed
+    /// callback. The closure must be `Send` because it crosses the
+    /// command channel; per-call invocation is single-threaded.
+    pub fn set_firewall<F>(&self, cb: F) -> Result<()>
+    where
+        F: Fn(&PublicKey, &str, u16) -> bool + Send + 'static,
+    {
+        if self.close_sent {
+            return Err(HyperDhtError::DhtClosed);
+        }
+        let boxed: FirewallCallback = Box::new(cb);
+        self.cmd_tx
+            .send(Command::ServerSetFirewall {
+                server: self.server_ptr,
+                ctx: self.ctx_ptr,
+                cb: Some(boxed),
+            })
+            .map_err(|_| HyperDhtError::DhtClosed)?;
+        self.waker.wake();
+        Ok(())
+    }
+
+    /// Detach a previously-installed firewall callback.
+    pub fn clear_firewall(&self) -> Result<()> {
+        if self.close_sent {
+            return Err(HyperDhtError::DhtClosed);
+        }
+        self.cmd_tx
+            .send(Command::ServerSetFirewall {
+                server: self.server_ptr,
+                ctx: self.ctx_ptr,
+                cb: None,
+            })
+            .map_err(|_| HyperDhtError::DhtClosed)?;
+        self.waker.wake();
+        Ok(())
+    }
+
+    /// Trigger an explicit re-announce on the DHT (useful after
+    /// network changes).
+    pub fn refresh(&self) -> Result<()> {
+        if self.close_sent {
+            return Err(HyperDhtError::DhtClosed);
+        }
+        self.cmd_tx
+            .send(Command::ServerRefresh {
+                server: self.server_ptr,
+            })
+            .map_err(|_| HyperDhtError::DhtClosed)?;
+        self.waker.wake();
+        Ok(())
+    }
+
+    /// The server's externally-visible address (NAT-sampled). Returns
+    /// `Ok(None)` while the address is not yet known.
+    pub async fn address(&self) -> Result<Option<(String, u16)>> {
+        if self.close_sent {
+            return Err(HyperDhtError::DhtClosed);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::ServerAddress {
+                server: self.server_ptr,
+                response: tx,
+            })
+            .map_err(|_| HyperDhtError::DhtClosed)?;
+        self.waker.wake();
+        rx.await?
+    }
+
+    /// Resolve once the announcer has completed its first cycle and
+    /// the server is fully discoverable on the DHT.
+    pub async fn wait_listening(&self) -> Result<()> {
+        if self.close_sent {
+            return Err(HyperDhtError::DhtClosed);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::ServerWaitListening {
+                ctx: self.ctx_ptr,
+                signal: tx,
+            })
+            .map_err(|_| HyperDhtError::DhtClosed)?;
+        self.waker.wake();
+        rx.await.map_err(|_| HyperDhtError::DhtClosed)
     }
 
     fn send_close_once(&mut self) {

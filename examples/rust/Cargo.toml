@@ -1,0 +1,24 @@
+[package]
+name = "hyperdht-examples"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0"
+description = "Echo server + client examples for the hyperdht Rust wrapper"
+publish = false
+
+[dependencies]
+hyperdht = { path = "../../wrappers/rust/hyperdht" }
+tokio = { version = "1", features = ["full"] }
+hex = "0.4"
+
+[[bin]]
+name = "echo-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "echo-client"
+path = "src/client.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

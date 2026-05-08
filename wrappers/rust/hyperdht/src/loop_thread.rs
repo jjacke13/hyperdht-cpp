@@ -192,10 +192,16 @@ pub(crate) struct InitResult {
 // ============================================================================
 
 struct StreamCtx {
-    /// `Some` until on_connect fires (client-side connect path); on_connect
-    /// takes the sender out and delivers the stream pointer (or an error).
-    /// `None` for server-accepted streams (open is synchronous).
+    /// `Some` until on_open fires (client-side connect path) or until
+    /// on_close fires before that (failure). `None` for server-accepted
+    /// streams (open is observed synchronously).
     response: Mutex<Option<oneshot::Sender<Result<StreamPtr>>>>,
+
+    /// Stored by on_connect_cb (client path) so on_open_cb can deliver
+    /// it via `response`. The C SecretStream header exchange isn't
+    /// complete until on_open fires; writing before that drops bytes
+    /// (see CLAUDE.md gotcha #7).
+    pending_stream: Mutex<Option<StreamPtr>>,
 
     /// Sender for incoming data chunks (delivered to the Rust `Stream`'s
     /// AsyncRead via the corresponding `Receiver`).
@@ -404,6 +410,7 @@ fn dispatch_command(dht: *mut hyperdht_t, cmd: Command) {
             // (success path) or on_connect with error (failure path).
             let ctx = Box::new(StreamCtx {
                 response: Mutex::new(Some(response)),
+                pending_stream: Mutex::new(None),
                 data_tx,
                 closed,
             });
@@ -682,7 +689,6 @@ extern "C" fn on_connect_cb(
     if err != 0 {
         // Connect failed → stream was never opened → reclaim box now.
         let mut ctx = unsafe { Box::from_raw(userdata as *mut StreamCtx) };
-        // We have exclusive access via Box, so Mutex::get_mut is fine.
         if let Ok(slot) = ctx.response.get_mut() {
             if let Some(tx) = slot.take() {
                 let _ = tx.send(Err(HyperDhtError::from_ffi_code(err, "connect failed")));
@@ -691,19 +697,35 @@ extern "C" fn on_connect_cb(
         return;
     }
 
-    // Success — deliver the stream pointer.
+    // Success — store the stream pointer. Don't deliver yet; wait for
+    // on_open_cb so the SecretStream header exchange has completed
+    // (otherwise the user's first write goes into the void —
+    // CLAUDE.md gotcha #7).
     let ctx = unsafe { &*(userdata as *const StreamCtx) };
-    let mut guard = match ctx.response.lock() {
+    let mut pending = match ctx.pending_stream.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some(tx) = guard.take() {
-        let _ = tx.send(Ok(StreamPtr(stream)));
-    }
+    *pending = Some(StreamPtr(stream));
 }
 
-extern "C" fn on_open_cb(_userdata: *mut c_void) {
-    // No-op. Could log "header exchange complete" if desired.
+extern "C" fn on_open_cb(userdata: *mut c_void) {
+    // SecretStream header exchange is complete — stream is now safe to
+    // write to. For client-connect path, deliver the stream pointer now.
+    // For server-accept path, response is None (already delivered);
+    // this is a no-op.
+    let ctx = unsafe { &*(userdata as *const StreamCtx) };
+    let stream_ptr = match ctx.pending_stream.lock() {
+        Ok(mut g) => g.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    let mut response_guard = match ctx.response.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let (Some(ptr), Some(tx)) = (stream_ptr, response_guard.take()) {
+        let _ = tx.send(Ok(ptr));
+    }
 }
 
 extern "C" fn on_data_cb(data: *const u8, len: usize, userdata: *mut c_void) {
@@ -720,8 +742,20 @@ extern "C" fn on_data_cb(data: *const u8, len: usize, userdata: *mut c_void) {
 extern "C" fn on_close_cb(userdata: *mut c_void) {
     // Reclaim the box. Dropping it closes the data sender (rx returns
     // None → AsyncRead returns EOF) and decrements the closed Arc.
-    let ctx = unsafe { Box::from_raw(userdata as *mut StreamCtx) };
+    let mut ctx = unsafe { Box::from_raw(userdata as *mut StreamCtx) };
     ctx.closed.store(true, Ordering::SeqCst);
+
+    // If on_open never fired but on_close did, surface the failure to
+    // any caller still awaiting connect (otherwise it would hang
+    // forever on the oneshot).
+    if let Ok(slot) = ctx.response.get_mut() {
+        if let Some(tx) = slot.take() {
+            let _ = tx.send(Err(HyperDhtError::Internal(
+                "stream closed before SecretStream header exchange (on_open) completed".into(),
+            )));
+        }
+    }
+
     drop(ctx);
 }
 
@@ -745,6 +779,7 @@ extern "C" fn on_server_connection_cb(
 
     let stream_ctx = Box::new(StreamCtx {
         response: Mutex::new(None),
+        pending_stream: Mutex::new(None),
         data_tx,
         closed: closed.clone(),
     });

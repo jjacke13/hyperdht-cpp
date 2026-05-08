@@ -662,13 +662,43 @@ fn dispatch_command(dht: *mut hyperdht_t, cmd: Command) {
 
 fn teardown(dht: *mut hyperdht_t, async_ptr: *mut uv_async_t, loop_ptr: *mut uv_loop_t) {
     unsafe {
+        // 1. Schedule DHT destruction (async, drains over next uv_run cycles).
         hyperdht_destroy(dht, None, ptr::null_mut());
+        // 2. Schedule async wakeup handle close.
         uv_close(async_ptr as *mut uv_handle_t, None);
+
+        // 3. Give hyperdht a bounded number of iterations to drain its
+        //    own teardown gracefully (close streams, stop announcer/probe
+        //    timers, etc.).
+        for _ in 0..100 {
+            let active = uv_run(loop_ptr, uv_run_mode::UV_RUN_NOWAIT);
+            if active == 0 {
+                break;
+            }
+        }
+
+        // 4. If anything is still open (streams mid-close, stuck timers,
+        //    UDX retransmits waiting for ACK), force-close every remaining
+        //    handle. This is the standard libuv shutdown idiom.
+        uv_walk(loop_ptr, Some(force_close_handle_cb), ptr::null_mut());
+
+        // 5. Drain the close callbacks scheduled by uv_walk.
         uv_run(loop_ptr, uv_run_mode::UV_RUN_DEFAULT);
+
+        // 6. Now safe to free the DHT and close the loop.
         hyperdht_free(dht);
         let rc = uv_loop_close(loop_ptr);
         if rc != 0 {
             tracing::warn!(rc, "uv_loop_close returned non-zero");
+        }
+    }
+}
+
+/// `uv_walk` callback: force-close every open handle.
+extern "C" fn force_close_handle_cb(handle: *mut uv_handle_t, _arg: *mut c_void) {
+    unsafe {
+        if !handle.is_null() && uv_is_closing(handle) == 0 {
+            uv_close(handle, None);
         }
     }
 }

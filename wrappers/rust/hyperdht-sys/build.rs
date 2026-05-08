@@ -78,6 +78,8 @@ fn main() {
         .allowlist_function("uv_async_init")
         .allowlist_function("uv_async_send")
         .allowlist_function("uv_close")
+        .allowlist_function("uv_is_closing")
+        .allowlist_function("uv_walk")
         .allowlist_function("uv_default_loop")
         .allowlist_type("uv_loop_t")
         .allowlist_type("uv_async_t")

@@ -20,3 +20,40 @@ managed_components/
 dependencies.lock
 sdkconfig
 sdkconfig.old
+
+# Rust (covers wrappers/rust/, examples/rust/, and any future crates)
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editors / IDEs
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.#*
+\#*#
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Coverage / profiling output
+*.profraw
+*.profdata
+*.lcov
+coverage/
+lcov.info
+*.gcda
+*.gcno
+
+# Sanitizer / valgrind / perf outputs
+asan.log
+ubsan.log
+*.suppressions
+perf.data
+perf.data.old
+massif.out.*
+callgrind.out.*

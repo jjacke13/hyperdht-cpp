@@ -15,10 +15,10 @@ bytes = "1"
 zeroize = { version = "1", features = ["derive"] }
 thiserror = "1"
 tracing = { version = "0.1", default-features = false }
+hex = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-hex = "0.4"
 
 [lib]
 doctest = false

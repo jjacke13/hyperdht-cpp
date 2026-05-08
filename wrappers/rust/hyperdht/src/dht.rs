@@ -3,13 +3,16 @@
 //! Internally owns a dedicated libuv pump thread (see [`loop_thread`])
 //! and bridges async tokio operations to the libuv side via channels.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::error::{HyperDhtError, Result};
+use crate::keypair::PublicKey;
 use crate::loop_thread::{self, AsyncWaker, Command, Shutdown};
-use crate::options::DhtOptions;
+use crate::options::{ConnectOptions, DhtOptions};
+use crate::stream::{build_stream, Stream};
 
 /// A HyperDHT instance.
 ///
@@ -75,6 +78,45 @@ impl Dht {
     /// The port this DHT is bound to.
     pub fn port(&self) -> u16 {
         self.bound_port
+    }
+
+    /// Open an encrypted stream to the peer with the given public key.
+    ///
+    /// `_opts` is currently a placeholder — v0.1 uses the library
+    /// defaults (fast_open=true, local_connection=true, no relay).
+    /// Future versions will plumb the fields through.
+    pub async fn connect(
+        &self,
+        peer: PublicKey,
+        _opts: ConnectOptions,
+    ) -> Result<Stream> {
+        if self.is_destroyed() {
+            return Err(HyperDhtError::DhtClosed);
+        }
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let (data_tx, data_rx) = mpsc::unbounded_channel();
+        let closed = Arc::new(AtomicBool::new(false));
+
+        self.cmd_tx
+            .send(Command::Connect {
+                peer_pk: *peer.as_bytes(),
+                response: response_tx,
+                data_tx,
+                closed: closed.clone(),
+            })
+            .map_err(|_| HyperDhtError::DhtClosed)?;
+        self.waker.wake();
+
+        let stream_ptr = response_rx.await??;
+
+        Ok(build_stream(
+            stream_ptr,
+            data_rx,
+            closed,
+            self.cmd_tx.clone(),
+            self.waker.clone(),
+        ))
     }
 
     /// Return `true` if [`destroy`] (or `Drop`) has been called.
@@ -181,6 +223,31 @@ mod tests {
         assert!(dht.port() != 0);
         // Drop runs here at end of scope — should not deadlock.
         drop(dht);
+    }
+
+    #[tokio::test]
+    async fn connect_to_unknown_peer_fails_gracefully() {
+        let opts = DhtOptions {
+            use_public_bootstrap: false,
+            ..Default::default()
+        };
+        let dht = Dht::new(opts).await.expect("create dht");
+
+        // No DHT to walk → connect should fail (not hang).
+        let unknown_peer = PublicKey([0xAA; 32]);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dht.connect(unknown_peer, ConnectOptions::default()),
+        )
+        .await;
+
+        match result {
+            Ok(Err(_)) => { /* expected: returned an error */ }
+            Ok(Ok(_)) => panic!("connect to random pubkey should not succeed"),
+            Err(_) => panic!("connect should not hang past 10s without bootstrap"),
+        }
+
+        dht.destroy().await.unwrap();
     }
 
     #[tokio::test]

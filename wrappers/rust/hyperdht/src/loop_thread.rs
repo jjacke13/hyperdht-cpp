@@ -5,54 +5,36 @@
 //! send commands via an mpsc channel; the thread drains them between
 //! `uv_run` cycles. The wakeup handle is woken (via `uv_async_send`)
 //! whenever a new command arrives, so the loop unblocks immediately.
-//!
-//! # Lifetime contract
-//!
-//! Every `Dht` handle owns one of these threads. The thread runs
-//! until [`Shutdown::shutdown`] is set AND `uv_async_send` wakes the
-//! loop. The teardown sequence is:
-//!
-//! 1. `hyperdht_destroy` — schedules DHT cleanup
-//! 2. `uv_close` on the async wakeup handle
-//! 3. `uv_run(UV_RUN_DEFAULT)` — drains all pending closes
-//! 4. `hyperdht_free` — releases DHT memory
-//! 5. `uv_loop_close` — releases the loop
 
 use std::ffi::CString;
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use hyperdht_sys::*;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{HyperDhtError, Result};
 use crate::options::DhtOptions;
 
-/// A command sent from a tokio task to the libuv thread.
-#[allow(dead_code)] // variants populated incrementally as features are added
-pub(crate) enum Command {
-    /// Just wake the loop (used when shutdown is requested).
-    Wake,
-}
+// ============================================================================
+// Send wrappers around raw libuv/hyperdht pointers
+// ============================================================================
 
-/// A thread-safe wrapper around a `uv_async_t*` that lets tokio tasks
-/// wake the libuv loop from any thread.
-///
-/// `uv_async_send` is documented as thread-safe by libuv.
+/// `*mut uv_async_t` wrapped Send/Sync (uv_async_send is the only
+/// thread-safe libuv API; we never deref this pointer outside the
+/// loop thread).
+#[derive(Clone, Copy)]
+pub(crate) struct AsyncPtr(*mut uv_async_t);
+unsafe impl Send for AsyncPtr {}
+unsafe impl Sync for AsyncPtr {}
+
 #[derive(Clone)]
 pub(crate) struct AsyncWaker {
     ptr: AsyncPtr,
 }
-
-#[derive(Clone, Copy)]
-struct AsyncPtr(*mut uv_async_t);
-
-// SAFETY: uv_async_send is the one libuv API documented as thread-safe;
-// we only ever pass `ptr` to that function from outside the loop thread.
-unsafe impl Send for AsyncPtr {}
-unsafe impl Sync for AsyncPtr {}
 
 impl AsyncWaker {
     /// Wake the libuv loop. Idempotent (multiple wakes coalesce).
@@ -61,7 +43,18 @@ impl AsyncWaker {
     }
 }
 
-/// Shared shutdown signal between the tokio side and the loop thread.
+/// `*mut hyperdht_stream_t` Send-wrapped. Streams are owned by the
+/// libuv thread; the Rust `Stream` only sends commands referencing
+/// the pointer.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamPtr(pub(crate) *mut hyperdht_stream_t);
+unsafe impl Send for StreamPtr {}
+unsafe impl Sync for StreamPtr {}
+
+// ============================================================================
+// Shared shutdown signal
+// ============================================================================
+
 pub(crate) struct Shutdown {
     flag: AtomicBool,
 }
@@ -82,18 +75,71 @@ impl Shutdown {
     }
 }
 
-/// What the loop thread reports back to `Dht::new` after initialization.
+// ============================================================================
+// Commands sent from tokio side to the libuv thread
+// ============================================================================
+
+pub(crate) enum Command {
+    /// Just wake the loop (used when shutdown is requested).
+    #[allow(dead_code)] // reserved for explicit wake outside command flow
+    Wake,
+
+    /// Initiate a connect to a remote peer. The libuv thread calls
+    /// `hyperdht_connect_and_open_stream` and delivers the resulting
+    /// stream pointer (or error) via `response`.
+    Connect {
+        peer_pk: [u8; 32],
+        /// Sender for delivering the open stream pointer on success.
+        response: oneshot::Sender<Result<StreamPtr>>,
+        /// Sender for incoming data chunks (saved into `StreamCtx`,
+        /// dispatched from the C `on_data` callback).
+        data_tx: mpsc::UnboundedSender<Bytes>,
+        /// Set when on_close fires.
+        closed: Arc<AtomicBool>,
+    },
+
+    /// Write data to a stream.
+    StreamWrite {
+        stream: StreamPtr,
+        data: Bytes,
+    },
+
+    /// Close a stream.
+    StreamClose {
+        stream: StreamPtr,
+    },
+}
+
+// ============================================================================
+// Init result reported back to Dht::new
+// ============================================================================
+
 pub(crate) struct InitResult {
-    /// The bound port (after `hyperdht_bind`).
     pub bound_port: u16,
-    /// Wakeup handle for the loop thread.
     pub waker: AsyncWaker,
 }
 
-/// Spawn the dedicated libuv pump thread.
-///
-/// Returns the join handle plus what the thread initialized to. Errors
-/// out via the `init_tx` channel if cmake/bind fails.
+// ============================================================================
+// Per-stream state, lives on the heap, freed in on_close
+// ============================================================================
+
+struct StreamCtx {
+    /// `Some` until on_connect fires; on_connect takes the sender out
+    /// and delivers the stream pointer (or an error).
+    response: Mutex<Option<oneshot::Sender<Result<StreamPtr>>>>,
+
+    /// Sender for incoming data chunks (delivered to the Rust `Stream`'s
+    /// AsyncRead via the corresponding `Receiver`).
+    data_tx: mpsc::UnboundedSender<Bytes>,
+
+    /// Flipped to `true` by on_close.
+    closed: Arc<AtomicBool>,
+}
+
+// ============================================================================
+// Spawn the pump thread
+// ============================================================================
+
 pub(crate) fn spawn(
     opts: DhtOptions,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
@@ -112,15 +158,17 @@ pub(crate) fn spawn(
     (join, init_rx)
 }
 
-/// The thread main. Initializes libuv + DHT, reports back, then runs
-/// the pump loop until shutdown.
+// ============================================================================
+// Pump thread main
+// ============================================================================
+
 fn run(
     opts: DhtOptions,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     shutdown: Arc<Shutdown>,
     init_tx: oneshot::Sender<Result<InitResult>>,
 ) {
-    // ---- Allocate libuv loop on the heap (must outlive any borrowed pointers) ----
+    // ---- libuv loop ----
     let mut loop_storage: Box<uv_loop_t> = Box::new(unsafe { std::mem::zeroed() });
     let loop_ptr: *mut uv_loop_t = &mut *loop_storage;
 
@@ -133,7 +181,7 @@ fn run(
         return;
     }
 
-    // ---- Allocate the async wakeup handle ----
+    // ---- async wakeup handle ----
     let mut async_storage: Box<uv_async_t> = Box::new(unsafe { std::mem::zeroed() });
     let async_ptr: *mut uv_async_t = &mut *async_storage;
 
@@ -151,10 +199,11 @@ fn run(
         ptr: AsyncPtr(async_ptr),
     };
 
-    // ---- Build hyperdht_opts_t from DhtOptions ----
-    // Strings (host, bootstrap nodes) need to outlive hyperdht_create.
-    // The C API documents these as borrowed only during the call.
-    let host_cstr = opts.host.as_deref().map(|s| CString::new(s).ok()).flatten();
+    // ---- build hyperdht_opts_t ----
+    let host_cstr = opts
+        .host
+        .as_deref()
+        .and_then(|s| CString::new(s).ok());
     let bootstrap_cstrs: Vec<CString> = opts
         .bootstrap_nodes
         .iter()
@@ -180,19 +229,13 @@ fn run(
         c_opts.seed.copy_from_slice(seed);
         c_opts.seed_is_set = 1;
     }
-    if let Some(ms) = opts.connection_keep_alive_ms {
-        c_opts.connection_keep_alive = ms;
-    } else {
-        // UINT64_MAX sentinel = "use C++ default"
-        c_opts.connection_keep_alive = u64::MAX;
-    }
+    c_opts.connection_keep_alive = opts.connection_keep_alive_ms.unwrap_or(u64::MAX);
 
-    // ---- Create the DHT instance ----
+    // ---- create DHT ----
     let dht = unsafe { hyperdht_create(loop_ptr, &c_opts) };
     if dht.is_null() {
         unsafe {
             uv_close(async_ptr as *mut uv_handle_t, None);
-            // Drain the pending close
             uv_run(loop_ptr, uv_run_mode::UV_RUN_DEFAULT);
             uv_loop_close(loop_ptr);
         }
@@ -202,10 +245,9 @@ fn run(
         return;
     }
 
-    // ---- Bind the UDP socket ----
+    // ---- bind ----
     let rc = unsafe { hyperdht_bind(dht, opts.port) };
     if rc != 0 {
-        // Bind failed: clean up.
         unsafe {
             hyperdht_destroy(dht, None, ptr::null_mut());
             uv_close(async_ptr as *mut uv_handle_t, None);
@@ -222,11 +264,10 @@ fn run(
 
     let bound_port = unsafe { hyperdht_port(dht) };
 
-    // Drop the C strings now — hyperdht_create only borrowed them.
     drop(host_cstr);
     drop(bootstrap_cstrs);
 
-    // ---- Report success back to the tokio side ----
+    // ---- report success ----
     if init_tx
         .send(Ok(InitResult {
             bound_port,
@@ -234,22 +275,17 @@ fn run(
         }))
         .is_err()
     {
-        // Tokio side dropped the receiver before we initialized.
-        // Tear down and exit.
         teardown(dht, async_ptr, loop_ptr);
         return;
     }
 
-    // ---- Pump loop ----
+    // ---- pump loop ----
     loop {
-        // Drain pending commands. try_recv is non-blocking and works
-        // outside a tokio runtime.
         loop {
             match cmd_rx.try_recv() {
-                Ok(Command::Wake) => { /* explicit wake; no-op handler */ }
+                Ok(cmd) => dispatch_command(dht, cmd),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    // Tokio side dropped the sender — same as shutdown.
                     shutdown.signal();
                     break;
                 }
@@ -260,13 +296,8 @@ fn run(
             break;
         }
 
-        // Run libuv. UV_RUN_ONCE blocks until next event. The async
-        // wakeup fires when tokio side calls waker.wake(), so this
-        // unblocks promptly when commands arrive.
         let active = unsafe { uv_run(loop_ptr, uv_run_mode::UV_RUN_ONCE) };
         if active == 0 {
-            // No more handles — nothing keeps the loop alive. Shouldn't
-            // happen while async_handle is open, but break defensively.
             break;
         }
     }
@@ -274,37 +305,133 @@ fn run(
     teardown(dht, async_ptr, loop_ptr);
 }
 
-/// Tear down DHT + libuv handles + the loop.
+fn dispatch_command(dht: *mut hyperdht_t, cmd: Command) {
+    match cmd {
+        Command::Wake => { /* handled by the surrounding loop */ }
+
+        Command::Connect {
+            peer_pk,
+            response,
+            data_tx,
+            closed,
+        } => {
+            // Allocate per-stream context. Lives until on_close fires
+            // (success path) or on_connect with error (failure path).
+            let ctx = Box::new(StreamCtx {
+                response: Mutex::new(Some(response)),
+                data_tx,
+                closed,
+            });
+            let userdata = Box::into_raw(ctx) as *mut c_void;
+
+            let rc = unsafe {
+                hyperdht_connect_and_open_stream(
+                    dht,
+                    peer_pk.as_ptr(),
+                    Some(on_connect_cb),
+                    Some(on_open_cb),
+                    Some(on_data_cb),
+                    Some(on_close_cb),
+                    userdata,
+                )
+            };
+
+            if rc != 0 {
+                // Synchronous error — reclaim the box and respond.
+                let mut ctx = unsafe { Box::from_raw(userdata as *mut StreamCtx) };
+                if let Some(tx) = ctx.response.get_mut().unwrap().take() {
+                    let _ = tx.send(Err(HyperDhtError::from_ffi_code(
+                        rc,
+                        "hyperdht_connect_and_open_stream returned error",
+                    )));
+                }
+                // ctx drops here.
+            }
+        }
+
+        Command::StreamWrite { stream, data } => {
+            unsafe {
+                hyperdht_stream_write(stream.0, data.as_ptr(), data.len());
+            }
+            // The Bytes is dropped after the call. libudx copies the data
+            // internally before returning, so this is safe.
+        }
+
+        Command::StreamClose { stream } => {
+            unsafe { hyperdht_stream_close(stream.0) };
+            // on_close will eventually fire and free the StreamCtx.
+        }
+    }
+}
+
 fn teardown(dht: *mut hyperdht_t, async_ptr: *mut uv_async_t, loop_ptr: *mut uv_loop_t) {
     unsafe {
-        // Schedule DHT destruction (async).
         hyperdht_destroy(dht, None, ptr::null_mut());
-
-        // Schedule async handle close.
         uv_close(async_ptr as *mut uv_handle_t, None);
-
-        // Drain everything.
         uv_run(loop_ptr, uv_run_mode::UV_RUN_DEFAULT);
-
-        // Now safe to free DHT memory.
         hyperdht_free(dht);
-
-        // Close the loop itself.
         let rc = uv_loop_close(loop_ptr);
         if rc != 0 {
-            // Should not happen if we drained properly; log and continue.
             tracing::warn!(rc, "uv_loop_close returned non-zero");
         }
     }
 }
 
-/// No-op callback for the async wakeup handle. The wakeup itself is
-/// what we need; the data is already in the cmd channel.
+// ============================================================================
+// C callbacks (fire on the libuv thread)
+// ============================================================================
+
 extern "C" fn noop_async_cb(_handle: *mut uv_async_t) {
-    // Intentionally empty.
+    // Wakeup is the signal — no per-call work needed.
 }
 
-#[allow(dead_code)] // used in upcoming bind/connect/listen plumbing
-fn _link_check() -> c_int {
-    0
+extern "C" fn on_connect_cb(
+    err: c_int,
+    stream: *mut hyperdht_stream_t,
+    userdata: *mut c_void,
+) {
+    if err != 0 {
+        // Connect failed → stream was never opened → reclaim box now.
+        let mut ctx = unsafe { Box::from_raw(userdata as *mut StreamCtx) };
+        // We have exclusive access via Box, so Mutex::get_mut is fine.
+        if let Ok(slot) = ctx.response.get_mut() {
+            if let Some(tx) = slot.take() {
+                let _ = tx.send(Err(HyperDhtError::from_ffi_code(err, "connect failed")));
+            }
+        }
+        return;
+    }
+
+    // Success — deliver the stream pointer.
+    let ctx = unsafe { &*(userdata as *const StreamCtx) };
+    let mut guard = match ctx.response.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(tx) = guard.take() {
+        let _ = tx.send(Ok(StreamPtr(stream)));
+    }
+}
+
+extern "C" fn on_open_cb(_userdata: *mut c_void) {
+    // No-op. Could log "header exchange complete" if desired.
+}
+
+extern "C" fn on_data_cb(data: *const u8, len: usize, userdata: *mut c_void) {
+    let ctx = unsafe { &*(userdata as *const StreamCtx) };
+    if len == 0 {
+        return;
+    }
+    // SAFETY: hyperdht guarantees data is valid for `len` bytes for the
+    // duration of this callback.
+    let chunk = Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
+    let _ = ctx.data_tx.send(chunk);
+}
+
+extern "C" fn on_close_cb(userdata: *mut c_void) {
+    // Reclaim the box. Dropping it closes the data sender (rx returns
+    // None → AsyncRead returns EOF) and decrements the closed Arc.
+    let ctx = unsafe { Box::from_raw(userdata as *mut StreamCtx) };
+    ctx.closed.store(true, Ordering::SeqCst);
+    drop(ctx);
 }

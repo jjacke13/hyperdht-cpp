@@ -9,8 +9,10 @@ mod error;
 mod keypair;
 mod loop_thread;
 mod options;
+mod stream;
 
 pub use dht::Dht;
 pub use error::{HyperDhtError, Result};
 pub use keypair::{Keypair, PublicKey, PUBLIC_KEY_LEN, SEED_LEN};
 pub use options::{ConnectOptions, DhtOptions, ServerOptions};
+pub use stream::Stream;

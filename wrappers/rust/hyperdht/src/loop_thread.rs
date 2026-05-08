@@ -90,6 +90,52 @@ impl Shutdown {
 }
 
 // ============================================================================
+// Shared mirror of the DHT's lifecycle flags
+//
+// The C library's `hyperdht_is_online` etc. are documented as
+// loop-thread-only. To expose them as cheap sync inspectors on the
+// public Rust API, we keep an atomic mirror: the pump thread refreshes
+// it each iteration and event callbacks bump it instantly.
+// ============================================================================
+
+pub(crate) struct DhtState {
+    pub(crate) online: AtomicBool,
+    pub(crate) persistent: AtomicBool,
+    pub(crate) bootstrapped: AtomicBool,
+    pub(crate) degraded: AtomicBool,
+    pub(crate) suspended: AtomicBool,
+}
+
+impl DhtState {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(DhtState {
+            online: AtomicBool::new(false),
+            persistent: AtomicBool::new(false),
+            bootstrapped: AtomicBool::new(false),
+            degraded: AtomicBool::new(false),
+            suspended: AtomicBool::new(false),
+        })
+    }
+
+    /// Read the current C-side flags into this mirror. Must be called
+    /// from the libuv thread (matches the C contract).
+    fn refresh_from(&self, dht: *mut hyperdht_t) {
+        unsafe {
+            self.online
+                .store(hyperdht_is_online(dht) != 0, Ordering::Relaxed);
+            self.persistent
+                .store(hyperdht_is_persistent(dht) != 0, Ordering::Relaxed);
+            self.bootstrapped
+                .store(hyperdht_is_bootstrapped(dht) != 0, Ordering::Relaxed);
+            self.degraded
+                .store(hyperdht_is_degraded(dht) != 0, Ordering::Relaxed);
+            self.suspended
+                .store(hyperdht_is_suspended(dht) != 0, Ordering::Relaxed);
+        }
+    }
+}
+
+// ============================================================================
 // Commands sent from tokio side to the libuv thread
 // ============================================================================
 
@@ -176,6 +222,62 @@ pub(crate) enum Command {
         response:
             oneshot::Sender<Result<Option<crate::dht_ops::MutableRecord>>>,
     },
+
+    /// Withdraw a previously-announced value from a target. Requires
+    /// the same keypair as the original announce.
+    Unannounce {
+        target: [u8; 32],
+        public_key: [u8; 32],
+        secret_key: [u8; 64],
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Resolve a peer's network address records by their public key.
+    /// Returns peer records collected during the iterative DHT walk.
+    FindPeer {
+        public_key: [u8; 32],
+        response: oneshot::Sender<Result<Vec<crate::dht_ops::LookupEntry>>>,
+    },
+
+    /// Store a content-addressed value (target = BLAKE2b(value)).
+    ImmutablePut {
+        value: Vec<u8>,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Retrieve a content-addressed value by its BLAKE2b target.
+    ImmutableGet {
+        target: [u8; 32],
+        response: oneshot::Sender<Result<Option<Vec<u8>>>>,
+    },
+
+    /// Snapshot the routing table (host:port pairs).
+    NodesSnapshot {
+        response: oneshot::Sender<Result<Vec<crate::dht::NodeAddr>>>,
+    },
+
+    /// Get the public-facing host:port (NAT-sampled). Returns None if
+    /// the DHT hasn't observed enough samples yet.
+    RemoteAddress {
+        response: oneshot::Sender<Result<Option<(String, u16)>>>,
+    },
+
+    /// Insert a routing-table entry at runtime.
+    AddNode {
+        host: String,
+        port: u16,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Suspend the DHT (mobile background transition).
+    Suspend {
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Resume the DHT after a suspend.
+    Resume {
+        response: oneshot::Sender<Result<()>>,
+    },
 }
 
 // ============================================================================
@@ -235,6 +337,7 @@ pub(crate) fn spawn(
     opts: DhtOptions,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     shutdown: Arc<Shutdown>,
+    state: Arc<DhtState>,
 ) -> (
     std::thread::JoinHandle<()>,
     oneshot::Receiver<Result<InitResult>>,
@@ -243,7 +346,7 @@ pub(crate) fn spawn(
 
     let join = std::thread::Builder::new()
         .name("hyperdht-loop".to_string())
-        .spawn(move || run(opts, cmd_rx, shutdown, init_tx))
+        .spawn(move || run(opts, cmd_rx, shutdown, state, init_tx))
         .expect("spawn hyperdht-loop thread");
 
     (join, init_rx)
@@ -257,6 +360,7 @@ fn run(
     opts: DhtOptions,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     shutdown: Arc<Shutdown>,
+    state: Arc<DhtState>,
     init_tx: oneshot::Sender<Result<InitResult>>,
 ) {
     // ---- libuv loop ----
@@ -358,6 +462,8 @@ fn run(
     drop(host_cstr);
     drop(bootstrap_cstrs);
 
+    state.refresh_from(dht);
+
     // ---- report success ----
     if init_tx
         .send(Ok(InitResult {
@@ -374,7 +480,7 @@ fn run(
     loop {
         loop {
             match cmd_rx.try_recv() {
-                Ok(cmd) => dispatch_command(dht, cmd),
+                Ok(cmd) => dispatch_command(dht, cmd, &state),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     shutdown.signal();
@@ -388,6 +494,10 @@ fn run(
         }
 
         let active = unsafe { uv_run(loop_ptr, uv_run_mode::UV_RUN_ONCE) };
+        // Refresh state after each loop tick so flips like "we just
+        // got bootstrapped" or "first persistent transition" become
+        // visible to user-side reads without a wait.
+        state.refresh_from(dht);
         if active == 0 {
             break;
         }
@@ -396,7 +506,11 @@ fn run(
     teardown(dht, async_ptr, loop_ptr);
 }
 
-fn dispatch_command(dht: *mut hyperdht_t, cmd: Command) {
+fn dispatch_command(
+    dht: *mut hyperdht_t,
+    cmd: Command,
+    state: &Arc<DhtState>,
+) {
     match cmd {
         Command::Wake => { /* handled by the surrounding loop */ }
 
@@ -656,6 +770,220 @@ fn dispatch_command(dht: *mut hyperdht_t, cmd: Command) {
                     }
                 }
             }
+        }
+
+        Command::Unannounce {
+            target,
+            public_key,
+            secret_key,
+            response,
+        } => {
+            use crate::dht_ops::PutCtx;
+            let kp = hyperdht_keypair_t {
+                public_key,
+                secret_key,
+            };
+            let ctx = Box::new(PutCtx {
+                response: Mutex::new(Some(response)),
+            });
+            let userdata = Box::into_raw(ctx) as *mut c_void;
+            let rc = unsafe {
+                hyperdht_unannounce(
+                    dht,
+                    target.as_ptr(),
+                    &kp,
+                    Some(on_put_done_cb),
+                    userdata,
+                )
+            };
+            if rc != 0 {
+                let mut ctx = unsafe { Box::from_raw(userdata as *mut PutCtx) };
+                if let Ok(slot) = ctx.response.get_mut() {
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(Err(HyperDhtError::from_ffi_code(
+                            rc,
+                            "hyperdht_unannounce returned error",
+                        )));
+                    }
+                }
+            }
+        }
+
+        Command::FindPeer {
+            public_key,
+            response,
+        } => {
+            use crate::dht_ops::LookupCtx;
+            let ctx = Box::new(LookupCtx {
+                results: Mutex::new(Vec::new()),
+                response: Mutex::new(Some(response)),
+            });
+            let userdata = Box::into_raw(ctx) as *mut c_void;
+            let rc = unsafe {
+                hyperdht_find_peer(
+                    dht,
+                    public_key.as_ptr(),
+                    Some(on_lookup_reply_cb),
+                    Some(on_lookup_done_cb),
+                    userdata,
+                )
+            };
+            if rc != 0 {
+                let mut ctx = unsafe { Box::from_raw(userdata as *mut LookupCtx) };
+                if let Ok(slot) = ctx.response.get_mut() {
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(Err(HyperDhtError::from_ffi_code(
+                            rc,
+                            "hyperdht_find_peer returned error",
+                        )));
+                    }
+                }
+            }
+        }
+
+        Command::ImmutablePut { value, response } => {
+            use crate::dht_ops::PutCtx;
+            let ctx = Box::new(PutCtx {
+                response: Mutex::new(Some(response)),
+            });
+            let userdata = Box::into_raw(ctx) as *mut c_void;
+            let rc = unsafe {
+                hyperdht_immutable_put(
+                    dht,
+                    value.as_ptr(),
+                    value.len(),
+                    Some(on_put_done_cb),
+                    userdata,
+                )
+            };
+            if rc != 0 {
+                let mut ctx = unsafe { Box::from_raw(userdata as *mut PutCtx) };
+                if let Ok(slot) = ctx.response.get_mut() {
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(Err(HyperDhtError::from_ffi_code(
+                            rc,
+                            "hyperdht_immutable_put returned error",
+                        )));
+                    }
+                }
+            }
+        }
+
+        Command::ImmutableGet { target, response } => {
+            use crate::dht_ops::ImmutableGetCtx;
+            let ctx = Box::new(ImmutableGetCtx {
+                value: Mutex::new(None),
+                response: Mutex::new(Some(response)),
+            });
+            let userdata = Box::into_raw(ctx) as *mut c_void;
+            let rc = unsafe {
+                hyperdht_immutable_get(
+                    dht,
+                    target.as_ptr(),
+                    Some(on_immutable_reply_cb),
+                    Some(on_immutable_done_cb),
+                    userdata,
+                )
+            };
+            if rc != 0 {
+                let mut ctx = unsafe { Box::from_raw(userdata as *mut ImmutableGetCtx) };
+                if let Ok(slot) = ctx.response.get_mut() {
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(Err(HyperDhtError::from_ffi_code(
+                            rc,
+                            "hyperdht_immutable_get returned error",
+                        )));
+                    }
+                }
+            }
+        }
+
+        Command::NodesSnapshot { response } => {
+            use crate::dht::NodeAddr;
+            const CAP: usize = 256;
+            const STRIDE: usize = HYPERDHT_HOST_STRIDE as usize;
+            let mut hosts_flat: Vec<u8> = vec![0u8; CAP * STRIDE];
+            let mut ports: Vec<u16> = vec![0u16; CAP];
+            let n = unsafe {
+                hyperdht_to_array(
+                    dht,
+                    hosts_flat.as_mut_ptr() as *mut ::std::os::raw::c_char,
+                    ports.as_mut_ptr(),
+                    CAP,
+                )
+            };
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let start = i * STRIDE;
+                let end = start + STRIDE;
+                let slice = &hosts_flat[start..end];
+                let nul = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+                let host = String::from_utf8_lossy(&slice[..nul]).into_owned();
+                out.push(NodeAddr {
+                    host,
+                    port: ports[i],
+                });
+            }
+            let _ = response.send(Ok(out));
+        }
+
+        Command::RemoteAddress { response } => {
+            let mut host = [0i8; 46];
+            let mut port: u16 = 0;
+            let rc = unsafe {
+                hyperdht_remote_address(dht, host.as_mut_ptr() as *mut _, &mut port)
+            };
+            if rc != 0 {
+                let _ = response.send(Ok(None));
+            } else {
+                let bytes: Vec<u8> = host
+                    .iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| b as u8)
+                    .collect();
+                let s = String::from_utf8_lossy(&bytes).into_owned();
+                let _ = response.send(Ok(Some((s, port))));
+            }
+        }
+
+        Command::AddNode {
+            host,
+            port,
+            response,
+        } => {
+            let host_c = match CString::new(host) {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = response.send(Err(HyperDhtError::InvalidArgument(
+                        "host contained NUL byte",
+                    )));
+                    return;
+                }
+            };
+            let rc = unsafe { hyperdht_add_node(dht, host_c.as_ptr(), port) };
+            if rc == 0 {
+                let _ = response.send(Ok(()));
+            } else {
+                let _ = response.send(Err(HyperDhtError::from_ffi_code(
+                    rc,
+                    "hyperdht_add_node returned error",
+                )));
+            }
+        }
+
+        Command::Suspend { response } => {
+            unsafe { hyperdht_suspend(dht) };
+            // Refresh state synchronously so the caller's next
+            // is_suspended() observes the new value without waiting
+            // for the next loop tick.
+            state.refresh_from(dht);
+            let _ = response.send(Ok(()));
+        }
+
+        Command::Resume { response } => {
+            unsafe { hyperdht_resume(dht) };
+            state.refresh_from(dht);
+            let _ = response.send(Ok(()));
         }
     }
 }
@@ -965,6 +1293,41 @@ extern "C" fn on_mutable_done_cb(err: c_int, userdata: *mut c_void) {
                 let _ = tx.send(Err(HyperDhtError::from_ffi_code(
                     err,
                     "mutable_get failed",
+                )));
+            }
+        }
+    }
+}
+
+extern "C" fn on_immutable_reply_cb(value: *const u8, len: usize, userdata: *mut c_void) {
+    use crate::dht_ops::ImmutableGetCtx;
+    let ctx = unsafe { &*(userdata as *const ImmutableGetCtx) };
+    if value.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: hyperdht guarantees value/len validity for this call.
+    let bytes = unsafe { std::slice::from_raw_parts(value, len) }.to_vec();
+    if let Ok(mut slot) = ctx.value.lock() {
+        // First reply wins (value is content-addressed and verified by
+        // the C library, so any further replies must hold the same bytes).
+        if slot.is_none() {
+            *slot = Some(bytes);
+        }
+    }
+}
+
+extern "C" fn on_immutable_done_cb(err: c_int, userdata: *mut c_void) {
+    use crate::dht_ops::ImmutableGetCtx;
+    let mut ctx = unsafe { Box::from_raw(userdata as *mut ImmutableGetCtx) };
+    let value = ctx.value.get_mut().map(std::mem::take).unwrap_or(None);
+    if let Ok(slot) = ctx.response.get_mut() {
+        if let Some(tx) = slot.take() {
+            if err == 0 {
+                let _ = tx.send(Ok(value));
+            } else {
+                let _ = tx.send(Err(HyperDhtError::from_ffi_code(
+                    err,
+                    "immutable_get failed",
                 )));
             }
         }

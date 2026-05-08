@@ -269,10 +269,11 @@ impl Dht {
             .map_err(|_| HyperDhtError::DhtClosed)?;
         self.waker.wake();
 
-        let stream_ptr = response_rx.await??;
+        let (stream_ptr, ctx_ptr) = response_rx.await??;
 
         Ok(build_stream(
             stream_ptr,
+            ctx_ptr,
             data_rx,
             closed,
             self.cmd_tx.clone(),

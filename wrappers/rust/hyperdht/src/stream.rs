@@ -13,10 +13,10 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::error::HyperDhtError;
-use crate::loop_thread::{AsyncWaker, Command, StreamPtr};
+use crate::error::{HyperDhtError, Result};
+use crate::loop_thread::{AsyncWaker, Command, StreamCtxPtr, StreamPtr};
 
 /// An encrypted, ordered, bidirectional stream to a remote peer.
 ///
@@ -26,6 +26,10 @@ pub struct Stream {
     /// The underlying C stream pointer. Used for writes/close commands
     /// dispatched to the libuv thread.
     pub(crate) stream_ptr: StreamPtr,
+
+    /// The associated `StreamCtx` heap pointer. Required as `userdata`
+    /// when installing secondary callbacks (e.g. datagram receive).
+    pub(crate) ctx_ptr: StreamCtxPtr,
 
     /// Channel of incoming data chunks (copied from the C on_data callback).
     pub(crate) rx: mpsc::UnboundedReceiver<Bytes>,
@@ -44,6 +48,9 @@ pub struct Stream {
 
     /// Set when we've sent the close command (so Drop is idempotent).
     pub(crate) close_sent: bool,
+
+    /// Set after `enable_datagrams` to prevent double-installation.
+    pub(crate) datagrams_enabled: bool,
 }
 
 impl std::fmt::Debug for Stream {
@@ -159,6 +166,7 @@ impl Drop for Stream {
 #[allow(dead_code)] // helper for connect()
 pub(crate) fn build_stream(
     stream_ptr: StreamPtr,
+    ctx_ptr: StreamCtxPtr,
     rx: mpsc::UnboundedReceiver<Bytes>,
     closed: Arc<AtomicBool>,
     cmd_tx: mpsc::UnboundedSender<Command>,
@@ -166,12 +174,82 @@ pub(crate) fn build_stream(
 ) -> Stream {
     Stream {
         stream_ptr,
+        ctx_ptr,
         rx,
         closed,
         cmd_tx,
         waker,
         current_chunk: None,
         close_sent: false,
+        datagrams_enabled: false,
+    }
+}
+
+impl Stream {
+    /// Install the datagram receive channel and return the receiver.
+    ///
+    /// Each `Bytes` payload is one decrypted, unordered, unreliable
+    /// datagram (mirrors `hyperdht_stream_set_on_udp_message`). May
+    /// only be called once per stream.
+    pub async fn enable_datagrams(&mut self) -> Result<mpsc::UnboundedReceiver<Bytes>> {
+        if self.datagrams_enabled {
+            return Err(HyperDhtError::InvalidArgument(
+                "datagrams already enabled on this stream",
+            ));
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(HyperDhtError::DhtClosed);
+        }
+        let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::StreamEnableDatagrams {
+                stream: self.stream_ptr,
+                ctx: self.ctx_ptr,
+                tx,
+                response: resp_tx,
+            })
+            .map_err(|_| HyperDhtError::DhtClosed)?;
+        self.waker.wake();
+        resp_rx.await??;
+        self.datagrams_enabled = true;
+        Ok(rx)
+    }
+
+    /// Send an unreliable encrypted datagram. Returns once the C
+    /// library has accepted the submission for transmission. Errors
+    /// when the stream is closed or the underlying UDX socket is
+    /// applying backpressure.
+    pub async fn send_datagram(&self, payload: &[u8]) -> Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(HyperDhtError::DhtClosed);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::StreamSendUdp {
+                stream: self.stream_ptr,
+                data: payload.to_vec(),
+                response: tx,
+            })
+            .map_err(|_| HyperDhtError::DhtClosed)?;
+        self.waker.wake();
+        rx.await?
+    }
+
+    /// Best-effort variant — drops the payload if UDX is applying
+    /// backpressure. Never blocks past command dispatch.
+    pub fn try_send_datagram(&self, payload: &[u8]) -> Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(HyperDhtError::DhtClosed);
+        }
+        self.cmd_tx
+            .send(Command::StreamTrySendUdp {
+                stream: self.stream_ptr,
+                data: payload.to_vec(),
+            })
+            .map_err(|_| HyperDhtError::DhtClosed)?;
+        self.waker.wake();
+        Ok(())
     }
 }
 

@@ -65,6 +65,14 @@ pub(crate) struct ServerCtxPtr(pub(crate) *mut c_void);
 unsafe impl Send for ServerCtxPtr {}
 unsafe impl Sync for ServerCtxPtr {}
 
+/// `*mut c_void` for a heap-allocated `StreamCtx` box (lives while
+/// the underlying C stream lives, freed in `on_close_cb`). Used to
+/// install secondary callbacks like UDP datagrams.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamCtxPtr(pub(crate) *mut c_void);
+unsafe impl Send for StreamCtxPtr {}
+unsafe impl Sync for StreamCtxPtr {}
+
 // ============================================================================
 // Shared shutdown signal
 // ============================================================================
@@ -175,8 +183,9 @@ pub(crate) enum Command {
     /// stream pointer (or error) via `response`.
     Connect {
         peer_pk: [u8; 32],
-        /// Sender for delivering the open stream pointer on success.
-        response: oneshot::Sender<Result<StreamPtr>>,
+        /// Sender for delivering the open stream pointer + ctx pointer
+        /// (the latter is needed to install datagram callbacks later).
+        response: oneshot::Sender<Result<(StreamPtr, StreamCtxPtr)>>,
         /// Sender for incoming data chunks (saved into `StreamCtx`,
         /// dispatched from the C `on_data` callback).
         data_tx: mpsc::UnboundedSender<Bytes>,
@@ -193,6 +202,30 @@ pub(crate) enum Command {
     /// Close a stream.
     StreamClose {
         stream: StreamPtr,
+    },
+
+    /// Enable datagram reception on a stream — installs the C
+    /// callback and stores the user's tokio mpsc sender in StreamCtx.
+    StreamEnableDatagrams {
+        stream: StreamPtr,
+        ctx: StreamCtxPtr,
+        tx: mpsc::UnboundedSender<Bytes>,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Send an unreliable encrypted datagram on a stream. Reports
+    /// the FFI return code via `response`.
+    StreamSendUdp {
+        stream: StreamPtr,
+        data: Vec<u8>,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Fire-and-forget variant — never reports back, drops on
+    /// pressure rather than blocking.
+    StreamTrySendUdp {
+        stream: StreamPtr,
+        data: Vec<u8>,
     },
 
     /// Create a server and start listening on the given keypair.
@@ -350,7 +383,7 @@ struct StreamCtx {
     /// `Some` until on_open fires (client-side connect path) or until
     /// on_close fires before that (failure). `None` for server-accepted
     /// streams (open is observed synchronously).
-    response: Mutex<Option<oneshot::Sender<Result<StreamPtr>>>>,
+    response: Mutex<Option<oneshot::Sender<Result<(StreamPtr, StreamCtxPtr)>>>>,
 
     /// Stored by on_connect_cb (client path) so on_open_cb can deliver
     /// it via `response`. The C SecretStream header exchange isn't
@@ -361,6 +394,11 @@ struct StreamCtx {
     /// Sender for incoming data chunks (delivered to the Rust `Stream`'s
     /// AsyncRead via the corresponding `Receiver`).
     data_tx: mpsc::UnboundedSender<Bytes>,
+
+    /// Sender for incoming unreliable datagrams. `None` until the
+    /// user calls `Stream::enable_datagrams`. Set on the libuv thread
+    /// inside the matching command dispatcher.
+    udp_tx: Mutex<Option<mpsc::UnboundedSender<Bytes>>>,
 
     /// Flipped to `true` by on_close.
     closed: Arc<AtomicBool>,
@@ -600,6 +638,7 @@ fn dispatch_command(
                 response: Mutex::new(Some(response)),
                 pending_stream: Mutex::new(None),
                 data_tx,
+                udp_tx: Mutex::new(None),
                 closed,
             });
             let userdata = Box::into_raw(ctx) as *mut c_void;
@@ -640,6 +679,67 @@ fn dispatch_command(
         Command::StreamClose { stream } => {
             unsafe { hyperdht_stream_close(stream.0) };
             // on_close will eventually fire and free the StreamCtx.
+        }
+
+        Command::StreamEnableDatagrams {
+            stream,
+            ctx,
+            tx,
+            response,
+        } => {
+            // Install the sender into StreamCtx, then register the C
+            // callback (using the same ctx pointer as userdata so the
+            // callback can locate the sender).
+            let stream_ctx = unsafe { &*(ctx.0 as *const StreamCtx) };
+            if let Ok(mut slot) = stream_ctx.udp_tx.lock() {
+                *slot = Some(tx);
+            }
+            let rc = unsafe {
+                hyperdht_stream_set_on_udp_message(
+                    stream.0,
+                    Some(on_stream_udp_msg_cb),
+                    ctx.0,
+                )
+            };
+            if rc == 0 {
+                let _ = response.send(Ok(()));
+            } else {
+                // Detach on failure so we don't dangle a sender.
+                if let Ok(mut slot) = stream_ctx.udp_tx.lock() {
+                    *slot = None;
+                }
+                let _ = response.send(Err(HyperDhtError::from_ffi_code(
+                    rc,
+                    "hyperdht_stream_set_on_udp_message failed",
+                )));
+            }
+        }
+
+        Command::StreamSendUdp {
+            stream,
+            data,
+            response,
+        } => {
+            let rc = unsafe {
+                hyperdht_stream_send_udp(stream.0, data.as_ptr(), data.len())
+            };
+            if rc == 0 {
+                let _ = response.send(Ok(()));
+            } else {
+                let _ = response.send(Err(HyperDhtError::from_ffi_code(
+                    rc,
+                    "hyperdht_stream_send_udp failed",
+                )));
+            }
+        }
+
+        Command::StreamTrySendUdp { stream, data } => {
+            // Best-effort — discard the rc. The C variant returns
+            // 0 on submission and negative on hard failure; we don't
+            // surface either.
+            unsafe {
+                hyperdht_stream_try_send_udp(stream.0, data.as_ptr(), data.len());
+            }
         }
 
         Command::ServerListen {
@@ -1221,7 +1321,11 @@ extern "C" fn on_open_cb(userdata: *mut c_void) {
         Err(poisoned) => poisoned.into_inner(),
     };
     if let (Some(ptr), Some(tx)) = (stream_ptr, response_guard.take()) {
-        let _ = tx.send(Ok(ptr));
+        // Hand back both the stream pointer and the ctx pointer (the
+        // latter doubles as userdata for any secondary callbacks the
+        // user installs later — e.g. datagrams).
+        let ctx_ptr = StreamCtxPtr(userdata);
+        let _ = tx.send(Ok((ptr, ctx_ptr)));
     }
 }
 
@@ -1278,6 +1382,7 @@ extern "C" fn on_server_connection_cb(
         response: Mutex::new(None),
         pending_stream: Mutex::new(None),
         data_tx,
+        udp_tx: Mutex::new(None),
         closed: closed.clone(),
     });
     let stream_ctx_ptr = Box::into_raw(stream_ctx) as *mut c_void;
@@ -1302,6 +1407,7 @@ extern "C" fn on_server_connection_cb(
     // Build the Rust Stream and deliver via the Server's mpsc channel.
     let stream = crate::stream::build_stream(
         StreamPtr(stream_ptr),
+        StreamCtxPtr(stream_ctx_ptr),
         data_rx,
         closed,
         server_ctx.cmd_tx.clone(),
@@ -1503,6 +1609,30 @@ extern "C" fn on_immutable_reply_cb(value: *const u8, len: usize, userdata: *mut
         if slot.is_none() {
             *slot = Some(bytes);
         }
+    }
+}
+
+/// Datagram trampoline: forwards each unreliable encrypted datagram
+/// to the user's tokio mpsc receiver. Drops the bytes silently if
+/// `enable_datagrams` was never called or the receiver was dropped.
+extern "C" fn on_stream_udp_msg_cb(
+    data: *const u8,
+    len: usize,
+    userdata: *mut c_void,
+) {
+    let ctx = unsafe { &*(userdata as *const StreamCtx) };
+    if data.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: hyperdht guarantees data is valid for `len` bytes for
+    // the duration of this callback.
+    let bytes = Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
+    let tx_guard = match ctx.udp_tx.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(tx) = tx_guard.as_ref() {
+        let _ = tx.send(bytes);
     }
 }
 

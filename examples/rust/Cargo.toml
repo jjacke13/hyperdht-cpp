@@ -10,6 +10,7 @@ publish = false
 hyperdht = { path = "../../wrappers/rust/hyperdht" }
 tokio = { version = "1", features = ["full"] }
 hex = "0.4"
+clap = { version = "4", features = ["derive"] }
 
 [[bin]]
 name = "echo-server"
@@ -18,6 +19,14 @@ path = "src/server.rs"
 [[bin]]
 name = "echo-client"
 path = "src/client.rs"
+
+[[bin]]
+name = "holesail-server"
+path = "src/holesail_server.rs"
+
+[[bin]]
+name = "static-http"
+path = "src/static_http.rs"
 
 [profile.release]
 lto = "thin"

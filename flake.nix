@@ -147,6 +147,8 @@
               pkgs.gcc14 pkgs.llvmPackages.clang pkgs.git
               pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy
               pkgs.rust-bindgen pkgs.rust-analyzer
+              # demo helpers (examples/rust/scripts/*)
+              pkgs.socat pkgs.curl
             ];
             buildInputs = [ pkgs.libsodium pkgs.libuv ];
             # bindgen needs LIBCLANG_PATH to find libclang at runtime

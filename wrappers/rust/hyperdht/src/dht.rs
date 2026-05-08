@@ -3,17 +3,26 @@
 //! Internally owns a dedicated libuv pump thread (see [`loop_thread`])
 //! and bridges async tokio operations to the libuv side via channels.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::error::{HyperDhtError, Result};
 use crate::keypair::{Keypair, PublicKey};
-use crate::loop_thread::{self, AsyncWaker, Command, Shutdown};
+use crate::loop_thread::{self, AsyncWaker, Command, DhtState, Shutdown};
 use crate::options::{ConnectOptions, DhtOptions, ServerOptions};
 use crate::server::{build_server, Server};
 use crate::stream::{build_stream, Stream};
+
+/// One entry in a routing-table snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeAddr {
+    /// IPv4 dotted-quad host string.
+    pub host: String,
+    /// UDP port.
+    pub port: u16,
+}
 
 /// A HyperDHT instance.
 ///
@@ -35,6 +44,9 @@ pub struct Dht {
     waker: AsyncWaker,
     /// Shared shutdown signal.
     shutdown: Arc<Shutdown>,
+    /// Mirror of the DHT's lifecycle flags (online, persistent, etc.).
+    /// Updated by the libuv thread; read lock-free by Rust callers.
+    state: Arc<DhtState>,
     /// The pump thread's join handle. `Mutex` because we take it from
     /// `&mut self` in `destroy()` and from `&mut self` in `Drop`.
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -59,8 +71,10 @@ impl Dht {
     pub async fn new(opts: DhtOptions) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let shutdown = Shutdown::new();
+        let state = DhtState::new();
 
-        let (join, init_rx) = loop_thread::spawn(opts, cmd_rx, shutdown.clone());
+        let (join, init_rx) =
+            loop_thread::spawn(opts, cmd_rx, shutdown.clone(), state.clone());
 
         // Wait for thread to finish initialization.
         let init = init_rx
@@ -71,6 +85,7 @@ impl Dht {
             cmd_tx,
             waker: init.waker,
             shutdown,
+            state,
             join: Mutex::new(Some(join)),
             bound_port: init.bound_port,
         })
@@ -79,6 +94,101 @@ impl Dht {
     /// The port this DHT is bound to.
     pub fn port(&self) -> u16 {
         self.bound_port
+    }
+
+    /// `true` once the DHT has heard from at least one peer (a
+    /// reachable bootstrap node responded). Cleared by `suspend`.
+    pub fn is_online(&self) -> bool {
+        self.state.online.load(Ordering::Relaxed)
+    }
+
+    /// `true` once the node has transitioned to a persistent role
+    /// (port-preservation NAT confirmed; eligible to serve DHT
+    /// traffic on its server socket).
+    pub fn is_persistent(&self) -> bool {
+        self.state.persistent.load(Ordering::Relaxed)
+    }
+
+    /// `true` once the initial bootstrap walk has populated the
+    /// routing table. Subsequent reads remain `true` until the DHT
+    /// is destroyed.
+    pub fn is_bootstrapped(&self) -> bool {
+        self.state.bootstrapped.load(Ordering::Relaxed)
+    }
+
+    /// `true` if the DHT has dropped below the healthy peer threshold
+    /// after a network change.
+    pub fn is_degraded(&self) -> bool {
+        self.state.degraded.load(Ordering::Relaxed)
+    }
+
+    /// `true` between [`suspend`](Self::suspend) and
+    /// [`resume`](Self::resume).
+    pub fn is_suspended(&self) -> bool {
+        self.state.suspended.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot the routing table — returns up to 256 known peer
+    /// addresses. Mobile apps can persist this and feed it back via
+    /// [`add_node`](Self::add_node) on next launch to skip a cold
+    /// bootstrap.
+    pub async fn nodes_snapshot(&self) -> Result<Vec<NodeAddr>> {
+        if self.is_destroyed() {
+            return Err(HyperDhtError::DhtClosed);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send_command_internal(Command::NodesSnapshot { response: tx })?;
+        rx.await?
+    }
+
+    /// The DHT's externally-visible address as observed via NAT
+    /// sampling. Returns `Ok(None)` if the address isn't yet known
+    /// (firewalled, fresh start, sampled port mismatch).
+    pub async fn remote_address(&self) -> Result<Option<(String, u16)>> {
+        if self.is_destroyed() {
+            return Err(HyperDhtError::DhtClosed);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send_command_internal(Command::RemoteAddress { response: tx })?;
+        rx.await?
+    }
+
+    /// Insert a routing-table entry by `host:port` — used to restore
+    /// a snapshot taken via [`nodes_snapshot`](Self::nodes_snapshot)
+    /// or to seed a private DHT.
+    pub async fn add_node(&self, host: &str, port: u16) -> Result<()> {
+        if self.is_destroyed() {
+            return Err(HyperDhtError::DhtClosed);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send_command_internal(Command::AddNode {
+            host: host.to_owned(),
+            port,
+            response: tx,
+        })?;
+        rx.await?
+    }
+
+    /// Suspend background activity (announcer, probes, holepunch
+    /// timers) — for mobile apps entering background. Pair with
+    /// [`resume`](Self::resume) on foregrounding.
+    pub async fn suspend(&self) -> Result<()> {
+        if self.is_destroyed() {
+            return Err(HyperDhtError::DhtClosed);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send_command_internal(Command::Suspend { response: tx })?;
+        rx.await?
+    }
+
+    /// Resume background activity after a [`suspend`](Self::suspend).
+    pub async fn resume(&self) -> Result<()> {
+        if self.is_destroyed() {
+            return Err(HyperDhtError::DhtClosed);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send_command_internal(Command::Resume { response: tx })?;
+        rx.await?
     }
 
     /// Open an encrypted stream to the peer with the given public key.
@@ -383,6 +493,57 @@ mod tests {
             Ok(Some(_)) => panic!("mutable_get returned a record we never put"),
             Err(_) => { /* also acceptable on isolated node */ }
         }
+
+        dht.destroy().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn state_inspectors_return_without_blocking() {
+        let opts = DhtOptions {
+            use_public_bootstrap: false,
+            ..Default::default()
+        };
+        let dht = Dht::new(opts).await.expect("create dht");
+
+        // The inspectors must answer instantly without going
+        // through the command channel. We don't assert specific
+        // truth values for is_online / is_persistent because the
+        // C library updates them based on internal heuristics
+        // that vary by platform; just confirm the calls return.
+        let _ = dht.is_online();
+        let _ = dht.is_persistent();
+        let _ = dht.is_bootstrapped();
+        assert!(!dht.is_suspended());
+
+        // Async one-shots resolve immediately even on an isolated node.
+        let snapshot = dht.nodes_snapshot().await.expect("snapshot");
+        // With no bootstrap and no peers, the routing table only
+        // contains our self-entry (or is empty).
+        assert!(snapshot.len() <= 1);
+
+        let addr = dht.remote_address().await.expect("remote address call");
+        // Isolated node has no NAT samples → None.
+        assert!(addr.is_none());
+
+        dht.destroy().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_node_and_suspend_resume_round_trip() {
+        let opts = DhtOptions {
+            use_public_bootstrap: false,
+            ..Default::default()
+        };
+        let dht = Dht::new(opts).await.expect("create dht");
+
+        // 127.0.0.1:1 won't respond to anything but the call should
+        // succeed at the syscall level (host is parseable).
+        dht.add_node("127.0.0.1", 1).await.expect("add_node");
+
+        dht.suspend().await.expect("suspend");
+        assert!(dht.is_suspended());
+        dht.resume().await.expect("resume");
+        assert!(!dht.is_suspended());
 
         dht.destroy().await.unwrap();
     }

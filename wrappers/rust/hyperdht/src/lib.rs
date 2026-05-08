@@ -13,7 +13,7 @@ mod options;
 mod server;
 mod stream;
 
-pub use dht::Dht;
+pub use dht::{Dht, NodeAddr};
 pub use dht_ops::{LookupEntry, MutableRecord};
 pub use error::{HyperDhtError, Result};
 pub use keypair::{Keypair, PublicKey, PUBLIC_KEY_LEN, SEED_LEN};

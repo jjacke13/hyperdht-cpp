@@ -213,8 +213,7 @@ impl Dht {
     }
 
     /// Internal: send a command to the libuv thread, then wake the loop.
-    #[allow(dead_code)]
-    pub(crate) fn send_command(&self, cmd: Command) -> Result<()> {
+    pub(crate) fn send_command_internal(&self, cmd: Command) -> Result<()> {
         self.cmd_tx
             .send(cmd)
             .map_err(|_| HyperDhtError::DhtClosed)?;
@@ -324,6 +323,67 @@ mod tests {
         assert_eq!(server.public_key(), expected_pk);
         // Drop server first, then dht (close order matters for clean teardown).
         drop(server);
+        dht.destroy().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dht_op_methods_compile_and_return_errors_on_isolated_node() {
+        // With no bootstrap, DHT ops have no peers to walk. Most should
+        // return quickly (success or known error) — the point of this
+        // test is to verify the call paths are wired through the libuv
+        // thread + callback bridge without hanging.
+        let opts = DhtOptions {
+            use_public_bootstrap: false,
+            ..Default::default()
+        };
+        let dht = Dht::new(opts).await.expect("create dht");
+
+        let target = [0xABu8; 32];
+
+        // Lookup with no DHT to walk → should complete quickly with empty result.
+        let lookup = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dht.lookup(target),
+        )
+        .await
+        .expect("lookup did not hang");
+        assert!(lookup.is_ok(), "lookup returned err: {:?}", lookup);
+
+        // Announce with no DHT → completes (might be Ok with 0 peers reached, or err).
+        let announce = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dht.announce(target, b"hello"),
+        )
+        .await
+        .expect("announce did not hang");
+        // Don't assert success — can be Ok(()) or Err(_). Just verify completion.
+        let _ = announce;
+
+        dht.destroy().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mutable_get_returns_none_for_unknown_key() {
+        use crate::keypair::Keypair;
+        let opts = DhtOptions {
+            use_public_bootstrap: false,
+            ..Default::default()
+        };
+        let dht = Dht::new(opts).await.expect("create dht");
+
+        let kp = Keypair::generate();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dht.mutable_get(kp.public(), 0),
+        )
+        .await
+        .expect("mutable_get did not hang");
+        match result {
+            Ok(None) => { /* expected */ }
+            Ok(Some(_)) => panic!("mutable_get returned a record we never put"),
+            Err(_) => { /* also acceptable on isolated node */ }
+        }
+
         dht.destroy().await.unwrap();
     }
 

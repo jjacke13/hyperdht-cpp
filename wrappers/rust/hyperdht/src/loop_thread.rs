@@ -145,6 +145,37 @@ pub(crate) enum Command {
         server: ServerPtr,
         ctx: ServerCtxPtr,
     },
+
+    /// Store a value at a target on the DHT.
+    Announce {
+        target: [u8; 32],
+        value: Vec<u8>,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Look up values stored at a target. Returns all matching peer
+    /// records collected during the iterative DHT walk.
+    Lookup {
+        target: [u8; 32],
+        response: oneshot::Sender<Result<Vec<crate::dht_ops::LookupEntry>>>,
+    },
+
+    /// Store a signed mutable value at target=BLAKE2b(pubkey).
+    MutablePut {
+        public_key: [u8; 32],
+        secret_key: [u8; 64],
+        value: Vec<u8>,
+        seq: u64,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Retrieve the latest signed mutable value for a public key.
+    MutableGet {
+        public_key: [u8; 32],
+        min_seq: u64,
+        response:
+            oneshot::Sender<Result<Option<crate::dht_ops::MutableRecord>>>,
+    },
 }
 
 // ============================================================================
@@ -482,6 +513,143 @@ fn dispatch_command(dht: *mut hyperdht_t, cmd: Command) {
                 hyperdht_server_close(server.0, Some(on_server_closed_cb), ctx.0);
             }
         }
+
+        Command::Announce {
+            target,
+            value,
+            response,
+        } => {
+            use crate::dht_ops::PutCtx;
+            let ctx = Box::new(PutCtx {
+                response: Mutex::new(Some(response)),
+            });
+            let userdata = Box::into_raw(ctx) as *mut c_void;
+            let rc = unsafe {
+                hyperdht_announce(
+                    dht,
+                    target.as_ptr(),
+                    value.as_ptr(),
+                    value.len(),
+                    Some(on_put_done_cb),
+                    userdata,
+                )
+            };
+            if rc != 0 {
+                let mut ctx = unsafe { Box::from_raw(userdata as *mut PutCtx) };
+                if let Ok(slot) = ctx.response.get_mut() {
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(Err(HyperDhtError::from_ffi_code(
+                            rc,
+                            "hyperdht_announce returned error",
+                        )));
+                    }
+                }
+            }
+        }
+
+        Command::Lookup { target, response } => {
+            use crate::dht_ops::LookupCtx;
+            let ctx = Box::new(LookupCtx {
+                results: Mutex::new(Vec::new()),
+                response: Mutex::new(Some(response)),
+            });
+            let userdata = Box::into_raw(ctx) as *mut c_void;
+            let rc = unsafe {
+                hyperdht_lookup(
+                    dht,
+                    target.as_ptr(),
+                    Some(on_lookup_reply_cb),
+                    Some(on_lookup_done_cb),
+                    userdata,
+                )
+            };
+            if rc != 0 {
+                let mut ctx = unsafe { Box::from_raw(userdata as *mut LookupCtx) };
+                if let Ok(slot) = ctx.response.get_mut() {
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(Err(HyperDhtError::from_ffi_code(
+                            rc,
+                            "hyperdht_lookup returned error",
+                        )));
+                    }
+                }
+            }
+        }
+
+        Command::MutablePut {
+            public_key,
+            secret_key,
+            value,
+            seq,
+            response,
+        } => {
+            use crate::dht_ops::PutCtx;
+            let kp = hyperdht_keypair_t {
+                public_key,
+                secret_key,
+            };
+            let ctx = Box::new(PutCtx {
+                response: Mutex::new(Some(response)),
+            });
+            let userdata = Box::into_raw(ctx) as *mut c_void;
+            let rc = unsafe {
+                hyperdht_mutable_put(
+                    dht,
+                    &kp,
+                    value.as_ptr(),
+                    value.len(),
+                    seq,
+                    Some(on_put_done_cb),
+                    userdata,
+                )
+            };
+            if rc != 0 {
+                let mut ctx = unsafe { Box::from_raw(userdata as *mut PutCtx) };
+                if let Ok(slot) = ctx.response.get_mut() {
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(Err(HyperDhtError::from_ffi_code(
+                            rc,
+                            "hyperdht_mutable_put returned error",
+                        )));
+                    }
+                }
+            }
+        }
+
+        Command::MutableGet {
+            public_key,
+            min_seq,
+            response,
+        } => {
+            use crate::dht_ops::MutableGetCtx;
+            let ctx = Box::new(MutableGetCtx {
+                record: Mutex::new(None),
+                seen: Arc::new(AtomicBool::new(false)),
+                response: Mutex::new(Some(response)),
+            });
+            let userdata = Box::into_raw(ctx) as *mut c_void;
+            let rc = unsafe {
+                hyperdht_mutable_get(
+                    dht,
+                    public_key.as_ptr(),
+                    min_seq,
+                    Some(on_mutable_reply_cb),
+                    Some(on_mutable_done_cb),
+                    userdata,
+                )
+            };
+            if rc != 0 {
+                let mut ctx = unsafe { Box::from_raw(userdata as *mut MutableGetCtx) };
+                if let Ok(slot) = ctx.response.get_mut() {
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(Err(HyperDhtError::from_ffi_code(
+                            rc,
+                            "hyperdht_mutable_get returned error",
+                        )));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -621,4 +789,119 @@ extern "C" fn on_server_closed_cb(userdata: *mut c_void) {
     }
     let ctx = unsafe { Box::from_raw(userdata as *mut ServerCtx) };
     drop(ctx);
+}
+
+// ============================================================================
+// DHT op callbacks (announce / lookup / mutable_put / mutable_get)
+// ============================================================================
+
+extern "C" fn on_put_done_cb(err: c_int, userdata: *mut c_void) {
+    use crate::dht_ops::PutCtx;
+    let mut ctx = unsafe { Box::from_raw(userdata as *mut PutCtx) };
+    if let Ok(slot) = ctx.response.get_mut() {
+        if let Some(tx) = slot.take() {
+            if err == 0 {
+                let _ = tx.send(Ok(()));
+            } else {
+                let _ = tx.send(Err(HyperDhtError::from_ffi_code(err, "DHT op failed")));
+            }
+        }
+    }
+}
+
+extern "C" fn on_lookup_reply_cb(
+    value: *const u8,
+    len: usize,
+    from_host: *const ::std::os::raw::c_char,
+    from_port: u16,
+    userdata: *mut c_void,
+) {
+    use crate::dht_ops::{LookupCtx, LookupEntry};
+    let ctx = unsafe { &*(userdata as *const LookupCtx) };
+    let value_vec = if value.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(value, len) }.to_vec()
+    };
+    let host = if from_host.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(from_host) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    if let Ok(mut results) = ctx.results.lock() {
+        results.push(LookupEntry {
+            value: value_vec,
+            from_host: host,
+            from_port,
+        });
+    }
+}
+
+extern "C" fn on_lookup_done_cb(err: c_int, userdata: *mut c_void) {
+    use crate::dht_ops::LookupCtx;
+    let mut ctx = unsafe { Box::from_raw(userdata as *mut LookupCtx) };
+    let results = ctx.results.get_mut().map(std::mem::take).unwrap_or_default();
+    if let Ok(slot) = ctx.response.get_mut() {
+        if let Some(tx) = slot.take() {
+            if err == 0 {
+                let _ = tx.send(Ok(results));
+            } else {
+                let _ = tx.send(Err(HyperDhtError::from_ffi_code(err, "lookup failed")));
+            }
+        }
+    }
+}
+
+extern "C" fn on_mutable_reply_cb(
+    seq: u64,
+    value: *const u8,
+    len: usize,
+    signature: *const u8,
+    userdata: *mut c_void,
+) {
+    use crate::dht_ops::{MutableGetCtx, MutableRecord};
+    let ctx = unsafe { &*(userdata as *const MutableGetCtx) };
+    let value_vec = if value.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(value, len) }.to_vec()
+    };
+    let mut sig = [0u8; 64];
+    if !signature.is_null() {
+        unsafe { std::ptr::copy_nonoverlapping(signature, sig.as_mut_ptr(), 64) };
+    }
+    if let Ok(mut record) = ctx.record.lock() {
+        // Keep the highest-seq record we've seen.
+        match &*record {
+            Some(prev) if prev.seq >= seq => {}
+            _ => {
+                *record = Some(MutableRecord {
+                    seq,
+                    value: value_vec,
+                    signature: sig,
+                });
+            }
+        }
+    }
+    ctx.seen.store(true, Ordering::SeqCst);
+}
+
+extern "C" fn on_mutable_done_cb(err: c_int, userdata: *mut c_void) {
+    use crate::dht_ops::MutableGetCtx;
+    let mut ctx = unsafe { Box::from_raw(userdata as *mut MutableGetCtx) };
+    let record = ctx.record.get_mut().map(std::mem::take).unwrap_or(None);
+    if let Ok(slot) = ctx.response.get_mut() {
+        if let Some(tx) = slot.take() {
+            if err == 0 {
+                let _ = tx.send(Ok(record));
+            } else {
+                let _ = tx.send(Err(HyperDhtError::from_ffi_code(
+                    err,
+                    "mutable_get failed",
+                )));
+            }
+        }
+    }
 }

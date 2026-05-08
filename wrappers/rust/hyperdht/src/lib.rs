@@ -5,6 +5,7 @@
 #![warn(missing_docs)]
 
 mod dht;
+mod dht_ops;
 mod error;
 mod keypair;
 mod loop_thread;
@@ -13,6 +14,7 @@ mod server;
 mod stream;
 
 pub use dht::Dht;
+pub use dht_ops::{LookupEntry, MutableRecord};
 pub use error::{HyperDhtError, Result};
 pub use keypair::{Keypair, PublicKey, PUBLIC_KEY_LEN, SEED_LEN};
 pub use options::{ConnectOptions, DhtOptions, ServerOptions};

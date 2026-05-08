@@ -1,0 +1,23 @@
+# LSan suppressions for the Rust wrapper test suite.
+#
+# These are leaks reported by third-party / system libraries whose
+# allocations we don't control.  Add a line per pattern; LSan does
+# substring matching against the topmost frame of the leak's stack.
+#
+# Add `print_suppressions=1` to LSAN_OPTIONS to verify a rule is
+# matching as expected.
+
+# libuv keeps the default loop and a small global state pool alive
+# until the process ends — these intentionally leak on shutdown.
+leak:uv_default_loop
+leak:uv__loop_init
+leak:uv_loop_init
+
+# libsodium initializes a few one-time globals (chacha20 lookup
+# tables, randombytes state).
+leak:sodium_init
+leak:randombytes_buf
+
+# DNS resolver / threadpool from libuv.
+leak:uv__work_submit
+leak:uv_getaddrinfo

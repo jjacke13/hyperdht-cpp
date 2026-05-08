@@ -22,13 +22,28 @@ fn main() {
     let include_dir = project_root.join("include");
     let wrapper = manifest_dir.join("wrapper.h");
 
+    // Optional: ASAN-instrumented build for Phase 2.5 sanitizer runs.
+    // Set HYPERDHT_ASAN=1 in the env to force the C library compile
+    // with `-fsanitize=address` and have us inject `-lasan` into the
+    // final rustc link line.
+    let asan = env::var("HYPERDHT_ASAN")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+
     // ---- Step 1: Build the C library via CMake ----
-    let dst = cmake::Config::new(&project_root)
-        .define("HYPERDHT_BUILD_TESTS", "OFF")
-        .define("CMAKE_BUILD_TYPE", "Release")
-        .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
-        .build_target("hyperdht")
-        .build();
+    let mut cfg = cmake::Config::new(&project_root);
+    cfg.define("HYPERDHT_BUILD_TESTS", "OFF")
+        .define("CMAKE_BUILD_TYPE", if asan { "RelWithDebInfo" } else { "Release" })
+        .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
+    if asan {
+        cfg.cflag("-fsanitize=address")
+            .cflag("-fno-omit-frame-pointer")
+            .cflag("-g")
+            .cxxflag("-fsanitize=address")
+            .cxxflag("-fno-omit-frame-pointer")
+            .cxxflag("-g");
+    }
+    let dst = cfg.build_target("hyperdht").build();
 
     let build_dir = dst.join("build");
 
@@ -54,6 +69,56 @@ fn main() {
         println!("cargo:rustc-link-lib=pthread");
         println!("cargo:rustc-link-lib=dl");
         println!("cargo:rustc-link-lib=m");
+    }
+
+    if asan {
+        // ASAN runtime injection.
+        //
+        // rustc on this system links with `-nodefaultlibs`, which
+        // makes gcc skip its auto-add of libasan even when we pass
+        // `-fsanitize=address` as a link arg. The fix is to inject
+        // the preinit object + the runtime explicitly, in the order
+        // gcc would.
+        //
+        // We resolve the absolute paths via `gcc -print-file-name=…`
+        // so this stays robust across nixpkgs upgrades that change
+        // the gcc store path.
+        let preinit = std::process::Command::new("gcc")
+            .args(["-print-file-name=libasan_preinit.o"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| std::path::Path::new(s).exists())
+            .expect("HYPERDHT_ASAN=1 set but gcc has no libasan_preinit.o");
+
+        let asan_so = std::process::Command::new("gcc")
+            .args(["-print-file-name=libasan.so"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| std::path::Path::new(s).exists())
+            .expect("HYPERDHT_ASAN=1 set but gcc has no libasan.so");
+
+        let asan_dir = std::path::Path::new(&asan_so)
+            .parent()
+            .expect("libasan.so has no parent dir")
+            .display()
+            .to_string();
+
+        // Order matters: preinit (provides __asan_init via .preinit_array)
+        // must be earliest in the link line so its constructors run first.
+        // --no-as-needed forces ld to keep libasan even though preceding
+        // .o references appear before it in the rustc-emitted line.
+        println!("cargo:rustc-link-arg={}", preinit);
+        println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
+        println!("cargo:rustc-link-arg={}", asan_so);
+        println!("cargo:rustc-link-arg=-Wl,--as-needed");
+        // rpath so the resulting binary finds libasan.so at runtime
+        // without needing LD_LIBRARY_PATH.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", asan_dir);
+        println!("cargo:rerun-if-env-changed=HYPERDHT_ASAN");
     }
 
     // ---- Step 2: Generate Rust FFI bindings ----

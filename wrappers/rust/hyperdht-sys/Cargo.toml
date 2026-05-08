@@ -1,0 +1,22 @@
+[package]
+name = "hyperdht-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Raw FFI bindings for hyperdht-cpp (C++ reimplementation of HyperDHT)"
+readme = "README.md"
+links = "hyperdht"
+build = "build.rs"
+
+[lib]
+name = "hyperdht_sys"
+# Disable doctests: bindgen carries C-language code examples from the
+# header docs into Rust doc comments, which Rust then tries to compile
+# as doctests. The C examples are illustrative, not valid Rust.
+doctest = false
+
+[build-dependencies]
+bindgen = "0.69"
+cmake = "0.1"

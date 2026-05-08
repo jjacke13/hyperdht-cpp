@@ -9,9 +9,10 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::error::{HyperDhtError, Result};
-use crate::keypair::PublicKey;
+use crate::keypair::{Keypair, PublicKey};
 use crate::loop_thread::{self, AsyncWaker, Command, Shutdown};
-use crate::options::{ConnectOptions, DhtOptions};
+use crate::options::{ConnectOptions, DhtOptions, ServerOptions};
+use crate::server::{build_server, Server};
 use crate::stream::{build_stream, Stream};
 
 /// A HyperDHT instance.
@@ -116,6 +117,58 @@ impl Dht {
             closed,
             self.cmd_tx.clone(),
             self.waker.clone(),
+        ))
+    }
+
+    /// Start listening for incoming connections on the given keypair.
+    ///
+    /// Each accepted connection becomes a [`Stream`] returned by
+    /// [`Server::accept`]. Drop the [`Server`] (or call
+    /// [`Server::close`]) to stop listening and unannounce.
+    pub async fn listen(&self, kp: Keypair, opts: ServerOptions) -> Result<Server> {
+        if self.is_destroyed() {
+            return Err(HyperDhtError::DhtClosed);
+        }
+
+        let public_key = kp.public();
+
+        // SAFETY: Keypair::as_ffi returns a valid pointer; we read
+        // the bytes synchronously, before the keypair could be freed.
+        let (pk_bytes, sk_bytes) = unsafe {
+            let kp_ffi = &*kp.as_ffi();
+            (kp_ffi.public_key, kp_ffi.secret_key)
+        };
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        self.cmd_tx
+            .send(Command::ServerListen {
+                public_key: pk_bytes,
+                secret_key: sk_bytes,
+                share_local_address: opts.share_local_address,
+                reusable_socket: opts.reusable_socket,
+                incoming_tx,
+                response: response_tx,
+                new_stream_cmd_tx: self.cmd_tx.clone(),
+                new_stream_waker: self.waker.clone(),
+            })
+            .map_err(|_| HyperDhtError::DhtClosed)?;
+        self.waker.wake();
+
+        let (server_ptr, ctx_ptr) = response_rx.await??;
+
+        // The keypair was copied bytewise into the command; we can drop
+        // it now (zeroing happens in Drop).
+        drop(kp);
+
+        Ok(build_server(
+            incoming_rx,
+            server_ptr,
+            ctx_ptr,
+            self.cmd_tx.clone(),
+            self.waker.clone(),
+            public_key,
         ))
     }
 
@@ -247,6 +300,30 @@ mod tests {
             Err(_) => panic!("connect should not hang past 10s without bootstrap"),
         }
 
+        dht.destroy().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listen_returns_server_with_correct_pubkey() {
+        use crate::keypair::Keypair;
+
+        let opts = DhtOptions {
+            use_public_bootstrap: false,
+            ..Default::default()
+        };
+        let dht = Dht::new(opts).await.expect("create dht");
+
+        let kp = Keypair::generate();
+        let expected_pk = kp.public();
+
+        let server = dht
+            .listen(kp, ServerOptions::default())
+            .await
+            .expect("listen");
+
+        assert_eq!(server.public_key(), expected_pk);
+        // Drop server first, then dht (close order matters for clean teardown).
+        drop(server);
         dht.destroy().await.unwrap();
     }
 

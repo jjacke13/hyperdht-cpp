@@ -51,6 +51,20 @@ pub(crate) struct StreamPtr(pub(crate) *mut hyperdht_stream_t);
 unsafe impl Send for StreamPtr {}
 unsafe impl Sync for StreamPtr {}
 
+/// `*mut hyperdht_server_t` Send-wrapped (server lifetime is tied to
+/// the DHT instance and to the Server handle).
+#[derive(Clone, Copy)]
+pub(crate) struct ServerPtr(pub(crate) *mut hyperdht_server_t);
+unsafe impl Send for ServerPtr {}
+unsafe impl Sync for ServerPtr {}
+
+/// `*mut c_void` for a heap-allocated `ServerCtx` box, freed in the
+/// `hyperdht_server_close` callback.
+#[derive(Clone, Copy)]
+pub(crate) struct ServerCtxPtr(pub(crate) *mut c_void);
+unsafe impl Send for ServerCtxPtr {}
+unsafe impl Sync for ServerCtxPtr {}
+
 // ============================================================================
 // Shared shutdown signal
 // ============================================================================
@@ -108,6 +122,29 @@ pub(crate) enum Command {
     StreamClose {
         stream: StreamPtr,
     },
+
+    /// Create a server and start listening on the given keypair.
+    ServerListen {
+        public_key: [u8; 32],
+        secret_key: [u8; 64],
+        share_local_address: bool,
+        reusable_socket: bool,
+        /// Sender for incoming streams (one per accepted connection).
+        incoming_tx: mpsc::UnboundedSender<crate::stream::Stream>,
+        /// Reply channel for the server pointer + ctx pointer (for close).
+        response: oneshot::Sender<Result<(ServerPtr, ServerCtxPtr)>>,
+        /// Cmd sender given to each new Stream (so writes/closes route
+        /// back to the libuv thread). Cloned from the Dht's cmd_tx.
+        new_stream_cmd_tx: mpsc::UnboundedSender<Command>,
+        /// Waker given to each new Stream.
+        new_stream_waker: AsyncWaker,
+    },
+
+    /// Close a server.
+    ServerClose {
+        server: ServerPtr,
+        ctx: ServerCtxPtr,
+    },
 }
 
 // ============================================================================
@@ -124,8 +161,9 @@ pub(crate) struct InitResult {
 // ============================================================================
 
 struct StreamCtx {
-    /// `Some` until on_connect fires; on_connect takes the sender out
-    /// and delivers the stream pointer (or an error).
+    /// `Some` until on_connect fires (client-side connect path); on_connect
+    /// takes the sender out and delivers the stream pointer (or an error).
+    /// `None` for server-accepted streams (open is synchronous).
     response: Mutex<Option<oneshot::Sender<Result<StreamPtr>>>>,
 
     /// Sender for incoming data chunks (delivered to the Rust `Stream`'s
@@ -134,6 +172,22 @@ struct StreamCtx {
 
     /// Flipped to `true` by on_close.
     closed: Arc<AtomicBool>,
+}
+
+/// Per-server state. Owned by `hyperdht_server_listen` as userdata,
+/// freed in `hyperdht_server_close`'s callback. Stays on the libuv
+/// thread for its entire lifetime — never sent across threads.
+struct ServerCtx {
+    /// DHT pointer needed to call `hyperdht_stream_open` from within
+    /// the on_connection callback.
+    dht: *mut hyperdht_t,
+    /// Sender for newly-accepted streams.
+    incoming_tx: mpsc::UnboundedSender<crate::stream::Stream>,
+    /// Cloned from the loop's command sender, given to each new Stream
+    /// so writes/closes route back to the libuv thread.
+    cmd_tx: mpsc::UnboundedSender<Command>,
+    /// Same — given to each Stream for waking the loop.
+    waker: AsyncWaker,
 }
 
 // ============================================================================
@@ -361,6 +415,73 @@ fn dispatch_command(dht: *mut hyperdht_t, cmd: Command) {
             unsafe { hyperdht_stream_close(stream.0) };
             // on_close will eventually fire and free the StreamCtx.
         }
+
+        Command::ServerListen {
+            public_key,
+            secret_key,
+            share_local_address: _share_local, // server-side default in C++; no FFI knob
+            reusable_socket,
+            incoming_tx,
+            response,
+            new_stream_cmd_tx,
+            new_stream_waker,
+        } => {
+            let server = unsafe { hyperdht_server_create(dht) };
+            if server.is_null() {
+                let _ = response.send(Err(HyperDhtError::Internal(
+                    "hyperdht_server_create returned null".into(),
+                )));
+                return;
+            }
+
+            unsafe {
+                hyperdht_server_set_reusable_socket(
+                    server,
+                    if reusable_socket { 1 } else { 0 },
+                );
+            }
+
+            // Allocate the per-server context box. Stays alive until
+            // hyperdht_server_close fires its callback.
+            let ctx = Box::new(ServerCtx {
+                dht,
+                incoming_tx,
+                cmd_tx: new_stream_cmd_tx,
+                waker: new_stream_waker,
+            });
+            let ctx_ptr = Box::into_raw(ctx) as *mut c_void;
+
+            let kp = hyperdht_keypair_t {
+                public_key,
+                secret_key,
+            };
+
+            let rc = unsafe {
+                hyperdht_server_listen(
+                    server,
+                    &kp,
+                    Some(on_server_connection_cb),
+                    ctx_ptr,
+                )
+            };
+
+            if rc != 0 {
+                drop(unsafe { Box::from_raw(ctx_ptr as *mut ServerCtx) });
+                let _ = response.send(Err(HyperDhtError::from_ffi_code(
+                    rc,
+                    "hyperdht_server_listen failed",
+                )));
+                return;
+            }
+
+            let _ = response.send(Ok((ServerPtr(server), ServerCtxPtr(ctx_ptr))));
+        }
+
+        Command::ServerClose { server, ctx } => {
+            unsafe {
+                hyperdht_server_close(server.0, Some(on_server_closed_cb), ctx.0);
+            }
+        }
     }
 }
 
@@ -433,5 +554,71 @@ extern "C" fn on_close_cb(userdata: *mut c_void) {
     // None → AsyncRead returns EOF) and decrements the closed Arc.
     let ctx = unsafe { Box::from_raw(userdata as *mut StreamCtx) };
     ctx.closed.store(true, Ordering::SeqCst);
+    drop(ctx);
+}
+
+/// Server-side callback: a peer just connected. Atomically open a
+/// stream on this connection and deliver it to the Server's incoming
+/// channel.
+extern "C" fn on_server_connection_cb(
+    conn: *const hyperdht_connection_t,
+    userdata: *mut c_void,
+) {
+    let server_ctx = unsafe { &*(userdata as *const ServerCtx) };
+
+    if conn.is_null() {
+        return;
+    }
+
+    // Allocate a per-stream context (no response — server streams open
+    // synchronously via hyperdht_stream_open's return value).
+    let (data_tx, data_rx) = mpsc::unbounded_channel::<Bytes>();
+    let closed = Arc::new(AtomicBool::new(false));
+
+    let stream_ctx = Box::new(StreamCtx {
+        response: Mutex::new(None),
+        data_tx,
+        closed: closed.clone(),
+    });
+    let stream_ctx_ptr = Box::into_raw(stream_ctx) as *mut c_void;
+
+    let stream_ptr = unsafe {
+        hyperdht_stream_open(
+            server_ctx.dht,
+            conn,
+            Some(on_open_cb),
+            Some(on_data_cb),
+            Some(on_close_cb),
+            stream_ctx_ptr,
+        )
+    };
+
+    if stream_ptr.is_null() {
+        // Open failed — reclaim the box.
+        drop(unsafe { Box::from_raw(stream_ctx_ptr as *mut StreamCtx) });
+        return;
+    }
+
+    // Build the Rust Stream and deliver via the Server's mpsc channel.
+    let stream = crate::stream::build_stream(
+        StreamPtr(stream_ptr),
+        data_rx,
+        closed,
+        server_ctx.cmd_tx.clone(),
+        server_ctx.waker.clone(),
+    );
+
+    // If the Server handle was dropped, this send fails silently —
+    // we have no way to "un-open" the stream now, so let it dangle
+    // until DHT teardown closes it.
+    let _ = server_ctx.incoming_tx.send(stream);
+}
+
+/// Server-close callback: free the ServerCtx box.
+extern "C" fn on_server_closed_cb(userdata: *mut c_void) {
+    if userdata.is_null() {
+        return;
+    }
+    let ctx = unsafe { Box::from_raw(userdata as *mut ServerCtx) };
     drop(ctx);
 }

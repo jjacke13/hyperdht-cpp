@@ -6,11 +6,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use crate::error::{HyperDhtError, Result};
 use crate::keypair::{Keypair, PublicKey};
-use crate::loop_thread::{self, AsyncWaker, Command, DhtState, Shutdown};
+use crate::loop_thread::{self, AsyncWaker, Command, DhtFlags, DhtState, Shutdown};
 use crate::options::{ConnectOptions, DhtOptions, ServerOptions};
 use crate::server::{build_server, Server};
 use crate::stream::{build_stream, Stream};
@@ -47,6 +47,11 @@ pub struct Dht {
     /// Mirror of the DHT's lifecycle flags (online, persistent, etc.).
     /// Updated by the libuv thread; read lock-free by Rust callers.
     state: Arc<DhtState>,
+    /// Subscribe-handle for lifecycle events (bootstrapped, persistent,
+    /// online flips). One persistent receiver per Dht; `wait_*` methods
+    /// clone via `subscribe()` so multiple awaiters can wait
+    /// independently without stealing each other's notifications.
+    events_rx: watch::Receiver<DhtFlags>,
     /// The pump thread's join handle. `Mutex` because we take it from
     /// `&mut self` in `destroy()` and from `&mut self` in `Drop`.
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -71,7 +76,7 @@ impl Dht {
     pub async fn new(opts: DhtOptions) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let shutdown = Shutdown::new();
-        let state = DhtState::new();
+        let (state, events_rx) = DhtState::new();
 
         let (join, init_rx) =
             loop_thread::spawn(opts, cmd_rx, shutdown.clone(), state.clone());
@@ -86,6 +91,7 @@ impl Dht {
             waker: init.waker,
             shutdown,
             state,
+            events_rx,
             join: Mutex::new(Some(join)),
             bound_port: init.bound_port,
         })
@@ -189,6 +195,50 @@ impl Dht {
         let (tx, rx) = oneshot::channel();
         self.send_command_internal(Command::Resume { response: tx })?;
         rx.await?
+    }
+
+    /// Resolve once the DHT has finished its initial bootstrap walk.
+    ///
+    /// Returns immediately if already bootstrapped. Otherwise awaits
+    /// the next state flip; resolves with [`HyperDhtError::DhtClosed`]
+    /// if the DHT is destroyed before the flip.
+    pub async fn wait_bootstrapped(&self) -> Result<()> {
+        self.wait_for_flag(|f| f.bootstrapped).await
+    }
+
+    /// Resolve once the DHT has heard from at least one peer (`is_online`).
+    pub async fn wait_online(&self) -> Result<()> {
+        self.wait_for_flag(|f| f.online).await
+    }
+
+    /// Resolve once the DHT has transitioned to a persistent role.
+    pub async fn wait_persistent(&self) -> Result<()> {
+        self.wait_for_flag(|f| f.persistent).await
+    }
+
+    async fn wait_for_flag<F>(&self, predicate: F) -> Result<()>
+    where
+        F: Fn(&DhtFlags) -> bool,
+    {
+        // Subscribe a fresh receiver so multiple awaiters don't steal
+        // each other's `changed()` notifications.
+        let mut rx = self.events_rx.clone();
+        loop {
+            // borrow_and_update returns the current value AND clears
+            // the "changed" flag, so the subsequent `changed().await`
+            // only fires on a fresh flip.
+            let satisfied = predicate(&*rx.borrow_and_update());
+            if satisfied {
+                return Ok(());
+            }
+            if self.is_destroyed() {
+                return Err(HyperDhtError::DhtClosed);
+            }
+            match rx.changed().await {
+                Ok(()) => continue,
+                Err(_) => return Err(HyperDhtError::DhtClosed),
+            }
+        }
     }
 
     /// Open an encrypted stream to the peer with the given public key.
@@ -526,6 +576,49 @@ mod tests {
         assert!(addr.is_none());
 
         dht.destroy().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_flag_unblocks_when_dht_destroyed() {
+        // wait_persistent on an isolated node never flips the flag;
+        // dropping the DHT must unblock the waiter with DhtClosed.
+        let opts = DhtOptions {
+            use_public_bootstrap: false,
+            ..Default::default()
+        };
+        let dht = Dht::new(opts).await.expect("create dht");
+        let events_rx = dht.events_rx.clone();
+
+        // Spawn a waiter that uses the same predicate machinery as
+        // wait_persistent, but operates on a cloned receiver so we
+        // can drop the dht without moving it.
+        let waiter = tokio::spawn(async move {
+            let mut rx = events_rx;
+            // Receiver returns Err on Sender drop → loop exits.
+            loop {
+                if rx.borrow_and_update().persistent {
+                    return Ok::<(), HyperDhtError>(());
+                }
+                if rx.changed().await.is_err() {
+                    return Err(HyperDhtError::DhtClosed);
+                }
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        dht.destroy().await.unwrap();
+
+        // Waiter should resolve quickly with an error once the
+        // watch::Sender (held by DhtState) is dropped during teardown.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            waiter,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "wait_for_flag did not unblock within 3s of dht destroy"
+        );
     }
 
     #[tokio::test]

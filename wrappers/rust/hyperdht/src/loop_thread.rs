@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use hyperdht_sys::*;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::error::{HyperDhtError, Result};
 use crate::options::DhtOptions;
@@ -104,33 +104,59 @@ pub(crate) struct DhtState {
     pub(crate) bootstrapped: AtomicBool,
     pub(crate) degraded: AtomicBool,
     pub(crate) suspended: AtomicBool,
+    /// `watch::Sender` writes (online, persistent, bootstrapped) so
+    /// awaiters can `recv().await` the next flip without polling.
+    /// Wrapped in `Mutex` only because `watch::Sender` requires `&mut`
+    /// to call `send`; contention is negligible (libuv thread only).
+    events: std::sync::Mutex<watch::Sender<DhtFlags>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DhtFlags {
+    pub online: bool,
+    pub persistent: bool,
+    pub bootstrapped: bool,
+    pub degraded: bool,
+    pub suspended: bool,
 }
 
 impl DhtState {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(DhtState {
+    pub(crate) fn new() -> (Arc<Self>, watch::Receiver<DhtFlags>) {
+        let (tx, rx) = watch::channel(DhtFlags::default());
+        let state = Arc::new(DhtState {
             online: AtomicBool::new(false),
             persistent: AtomicBool::new(false),
             bootstrapped: AtomicBool::new(false),
             degraded: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
-        })
+            events: std::sync::Mutex::new(tx),
+        });
+        (state, rx)
     }
 
     /// Read the current C-side flags into this mirror. Must be called
     /// from the libuv thread (matches the C contract).
     fn refresh_from(&self, dht: *mut hyperdht_t) {
-        unsafe {
-            self.online
-                .store(hyperdht_is_online(dht) != 0, Ordering::Relaxed);
-            self.persistent
-                .store(hyperdht_is_persistent(dht) != 0, Ordering::Relaxed);
-            self.bootstrapped
-                .store(hyperdht_is_bootstrapped(dht) != 0, Ordering::Relaxed);
-            self.degraded
-                .store(hyperdht_is_degraded(dht) != 0, Ordering::Relaxed);
-            self.suspended
-                .store(hyperdht_is_suspended(dht) != 0, Ordering::Relaxed);
+        let flags = unsafe {
+            DhtFlags {
+                online: hyperdht_is_online(dht) != 0,
+                persistent: hyperdht_is_persistent(dht) != 0,
+                bootstrapped: hyperdht_is_bootstrapped(dht) != 0,
+                degraded: hyperdht_is_degraded(dht) != 0,
+                suspended: hyperdht_is_suspended(dht) != 0,
+            }
+        };
+        self.online.store(flags.online, Ordering::Relaxed);
+        self.persistent.store(flags.persistent, Ordering::Relaxed);
+        self.bootstrapped
+            .store(flags.bootstrapped, Ordering::Relaxed);
+        self.degraded.store(flags.degraded, Ordering::Relaxed);
+        self.suspended.store(flags.suspended, Ordering::Relaxed);
+        if let Ok(events) = self.events.lock() {
+            // send_replace returns the previous value; we don't care.
+            // Awaiters of changed() will only wake if the new value
+            // differs from the last observed one.
+            let _ = events.send_replace(flags);
         }
     }
 }

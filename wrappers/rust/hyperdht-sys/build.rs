@@ -20,6 +20,7 @@ fn main() {
 
     let header = project_root.join("include/hyperdht/hyperdht.h");
     let include_dir = project_root.join("include");
+    let wrapper = manifest_dir.join("wrapper.h");
 
     // ---- Step 1: Build the C library via CMake ----
     let dst = cmake::Config::new(&project_root)
@@ -57,17 +58,31 @@ fn main() {
 
     // ---- Step 2: Generate Rust FFI bindings ----
     println!("cargo:rerun-if-changed={}", header.display());
+    println!("cargo:rerun-if-changed={}", wrapper.display());
     println!("cargo:rerun-if-changed=build.rs");
 
     let bindings = bindgen::Builder::default()
-        .header(header.to_str().expect("header path utf-8"))
+        .header(wrapper.to_str().expect("wrapper path utf-8"))
         .clang_arg(format!("-I{}", include_dir.display()))
-        // Allowlist the public C API only (matches `hyperdht_*` and a few
-        // top-level types).
+        // Allowlist the hyperdht public C API.
         .allowlist_function("hyperdht_.*")
         .allowlist_type("hyperdht_.*")
         .allowlist_type("HYPERDHT_.*")
         .allowlist_var("HYPERDHT_.*")
+        // Allowlist the libuv subset our Rust safe-wrapper pump thread uses.
+        .allowlist_function("uv_loop_init")
+        .allowlist_function("uv_loop_close")
+        .allowlist_function("uv_loop_alive")
+        .allowlist_function("uv_run")
+        .allowlist_function("uv_stop")
+        .allowlist_function("uv_async_init")
+        .allowlist_function("uv_async_send")
+        .allowlist_function("uv_close")
+        .allowlist_function("uv_default_loop")
+        .allowlist_type("uv_loop_t")
+        .allowlist_type("uv_async_t")
+        .allowlist_type("uv_handle_t")
+        .allowlist_type("uv_run_mode")
         // Pretty-print constants instead of numeric literals.
         .default_enum_style(bindgen::EnumVariation::Rust {
             non_exhaustive: false,

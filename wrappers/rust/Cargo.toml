@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "hyperdht-sys",
-    # "hyperdht",   # Phase 2 — added when we get there
+    "hyperdht",
     # "holesail",   # Phase 2.5
 ]
 

@@ -101,6 +101,84 @@ JS: `hyperdht/index.js:55` (512-entry xache, no TTL), used in
 
 ---
 
+## ESP32 (`HYPERDHT_EMBEDDED`) — known issues
+
+### Birthday-paradox 256-socket OOM risk
+
+The `RANDOM+CONSISTENT` holepunch strategy spawns up to **256
+ephemeral `PoolSocket`s** on the CONSISTENT side to brute-force the
+RANDOM peer's NAT mapping (`include/hyperdht/holepunch.hpp:130-220`,
+`src/holepunch.cpp:745+`). On ESP32-S3 with ~150KB free RAM after
+lwIP/wifi, allocating 256 UDP sockets will OOM and crash the device.
+
+**Trigger condition:** ESP32 (CONSISTENT — typical home WiFi) is
+asked to punch to a peer on RANDOM/symmetric NAT (CGNAT, some
+mobile carriers). Hasn't been hit yet in testing because all ESP32
+field tests so far have been:
+- same-LAN (LAN shortcut bypasses holepunch entirely), or
+- home-WiFi-to-home-WiFi (CONSISTENT+CONSISTENT, no PoolSockets needed).
+
+**Mitigation options** (pick one before shipping ESP32-on-CGNAT
+deployments):
+- `#ifdef HYPERDHT_EMBEDDED` cap birthday-paradox count at e.g. 16,
+  trade success rate for memory safety
+- `#ifdef HYPERDHT_EMBEDDED` skip birthday-paradox entirely → fall
+  through to `BlindRelayClient` (still compiled in on EMBEDDED, only
+  the relay-server side was excluded in v0.4.0)
+- Make `MAX_PUNCH_SOCKETS` runtime-configurable via `DhtOptions` and
+  let the ESP32 example set it to a small value
+
+Recommendation: skip birthday-paradox on EMBEDDED, fall through to
+BlindRelay. Same memory footprint as steady-state, and BlindRelay
+already works for the RANDOM+RANDOM case anyway.
+
+### Max-concurrent-clients cap (TODO — required before multi-client deployments)
+
+Each active **cross-NAT** client connection consumes one fresh
+`PoolSocket` (ephemeral UDP socket) on the ESP32 side, on top of the
+single main socket. See memory note
+`holepunch_uses_fresh_poolsocket.md` for the architecture detail.
+
+ESP32-S3 has **two** stacked ceilings on concurrent clients:
+
+1. **lwIP UDP socket ceiling** — `MEMP_NUM_UDP_PCB` in sdkconfig
+   (default 8-16 depending on ESP-IDF version). Hits first if RAM
+   budget is generous. Each PoolSocket consumes one PCB.
+2. **RAM ceiling** — ~5-10 KB per connection (UDX state +
+   SecretStream + Noise + buffers). With ~150 KB free heap, that's
+   roughly 10-15 concurrent streams before fragmentation/allocation
+   failures dominate.
+
+**Practical cap:**
+`max_clients = min(MEMP_NUM_UDP_PCB - reserved_pcbs,
+                   free_heap_at_idle / per_conn_RAM_estimate) - safety_margin`
+where `reserved_pcbs` covers the ESP32's own single_socket + lwIP
+internals (~3-4) and `safety_margin` is a 1-2 connection cushion for
+holepunch races. With ESP-IDF defaults that lands around **5-8 max
+concurrent cross-NAT clients** before things start failing.
+
+**Implementation TODO:**
+- Add a `Server::max_connections` option (default `unlimited` on
+  desktop, default `8` or runtime-configurable on EMBEDDED).
+- Reject incoming PEER_HANDSHAKE with `OVER_CAPACITY` error when
+  `connections_.size() >= max_connections` — fires *before* the
+  holepunch path tries to acquire a PoolSocket, avoiding the lwIP
+  PCB exhaustion that would manifest as cryptic ENOMEM later.
+- Expose via C FFI: `hyperdht_server_set_max_connections(srv, int)`.
+- Document in `examples/esp32/README.md` how to bump
+  `MEMP_NUM_UDP_PCB` in sdkconfig if the user needs more.
+- LAN-shortcut connections do NOT consume a PoolSocket (they ride on
+  single_socket). The cap should only count cross-NAT connections.
+  Distinguishing requires checking `c.lan` at accept time.
+
+**Why this matters:** without a cap, the 9th simultaneous cross-NAT
+client triggers a silent failure mode — `udx_socket_init()` returns
+ENOMEM, the holepunch path partially completes, then leaves orphaned
+state. Capping at the application layer surfaces a clean
+`OVER_CAPACITY` to the connecting peer instead.
+
+---
+
 ## Going one step up: "app-level" production readiness
 
 Everything above is "does the systems code work correctly". A real product

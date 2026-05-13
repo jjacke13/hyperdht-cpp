@@ -1,0 +1,24 @@
+[package]
+name = "hyperdht"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Async-friendly Rust wrapper for hyperdht-cpp (HyperDHT P2P networking with NAT traversal and end-to-end encryption)"
+readme = "README.md"
+
+[dependencies]
+hyperdht-sys = { path = "../hyperdht-sys", version = "0.4.0" }
+tokio = { version = "1", features = ["sync", "rt", "io-util", "time", "macros"] }
+bytes = "1"
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "1"
+tracing = { version = "0.1", default-features = false }
+hex = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[lib]
+doctest = false

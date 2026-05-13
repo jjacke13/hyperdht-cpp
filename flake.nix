@@ -138,6 +138,32 @@
             '';
           };
 
+          # Rust wrapper development (hyperdht-sys + hyperdht crates)
+          # Provides cargo + rustc + bindgen + libclang for the FFI build.
+          # Includes all C deps so build.rs can run CMake against them.
+          rust = pkgs.mkShell {
+            nativeBuildInputs = [
+              pkgs.cmake pkgs.ninja pkgs.pkg-config
+              pkgs.gcc14 pkgs.llvmPackages.clang pkgs.git
+              pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy
+              pkgs.rust-bindgen pkgs.rust-analyzer
+              # demo helpers (examples/rust/scripts/*)
+              pkgs.socat pkgs.curl
+            ];
+            buildInputs = [ pkgs.libsodium pkgs.libuv ];
+            # bindgen needs LIBCLANG_PATH to find libclang at runtime
+            shellHook = ''
+              export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+              export BINDGEN_EXTRA_CLANG_ARGS="-I${pkgs.libsodium.dev}/include -I${pkgs.libuv.dev}/include"
+              echo "hyperdht-cpp Rust dev shell"
+              echo "  cargo:   $(cargo --version)"
+              echo "  rustc:   $(rustc --version)"
+              echo "  bindgen: $(bindgen --version)"
+              echo ""
+              echo "  cd wrappers/rust/hyperdht-sys && cargo build"
+            '';
+          };
+
           # ESP32 development (ESP-IDF + Xtensa toolchain)
           esp32 = let
             espPkgs = import nixpkgs {

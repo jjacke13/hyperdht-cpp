@@ -1,0 +1,179 @@
+name: Android ASAN JNI (manual)
+
+# Manually-triggered build of an AddressSanitizer-instrumented
+# libhyperdht_jni.so for arm64-v8a. Use it to chase memory bugs that only
+# manifest in long-uptime on-device runs (e.g. the hardened_malloc WAF
+# crash documented in QUERY-PUSH-CLOSEST-WAF-CRASH.md). The artifact ships
+# the .so + ASAN runtime + a wrap.sh template + a short README.
+#
+# Not wired to push/tag — run from the GitHub Actions UI.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-android-arm64-asan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build autoconf automake libtool
+
+      - name: Cross-compile libsodium for Android
+        run: |
+          git clone --depth 1 --branch stable https://github.com/jedisct1/libsodium.git /tmp/libsodium
+          cd /tmp/libsodium
+          ./autogen.sh
+          export ANDROID_NDK_HOME=$ANDROID_NDK
+          export NDK_PLATFORM=android-26
+          export LIBSODIUM_FULL_BUILD=1
+          dist-build/android-armv8-a.sh
+          echo "SODIUM_PREFIX=/tmp/libsodium/libsodium-android-armv8-a+crypto" >> $GITHUB_ENV
+
+      - name: Cross-compile libuv for Android
+        run: |
+          git clone --depth 1 --branch v1.51.0 https://github.com/libuv/libuv.git /tmp/libuv
+          cmake -B /tmp/libuv-build -S /tmp/libuv -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release -DLIBUV_BUILD_TESTS=OFF \
+            -DCMAKE_INSTALL_PREFIX=/tmp/libuv-android
+          ninja -C /tmp/libuv-build install
+          UV_LIB=$(find /tmp/libuv-android/lib -name "*.a" | head -1)
+          echo "UV_LIB=$UV_LIB" >> $GITHUB_ENV
+
+      - name: Build hyperdht static libs with ASAN
+        run: |
+          cmake -B build-android-asan -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1" \
+            -DHYPERDHT_BUILD_TESTS=OFF \
+            -DHYPERDHT_DEBUG=ON \
+            -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON \
+            -DSODIUM_INCLUDE_DIR=$SODIUM_PREFIX/include \
+            -DSODIUM_LIBRARY=$SODIUM_PREFIX/lib/libsodium.a \
+            -DUV_INCLUDE_DIR=/tmp/libuv-android/include \
+            -DUV_LIBRARY=$UV_LIB
+          ninja -C build-android-asan
+
+      - name: Build JNI bridge with ASAN
+        run: |
+          NDK_CXX=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++
+          $NDK_CXX -std=c++20 -O1 -g -shared -fPIC \
+            -fsanitize=address -fno-omit-frame-pointer \
+            -DHYPERDHT_JNI_DEBUG \
+            -I include -I deps/libudx/include \
+            -I /tmp/libuv-android/include \
+            -I $JAVA_HOME/include -I $JAVA_HOME/include/linux \
+            wrappers/kotlin/src/main/cpp/hyperdht_jni.cpp \
+            build-android-asan/libhyperdht.a build-android-asan/libudx.a \
+            $SODIUM_PREFIX/lib/libsodium.a $UV_LIB \
+            -llog \
+            -o build-android-asan/libhyperdht_jni.so
+
+      - name: Locate ASAN runtime DSO from NDK
+        run: |
+          NDK_LIB=$(find $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/lib/clang \
+                    -name 'libclang_rt.asan-aarch64-android.so' | head -1)
+          if [ -z "$NDK_LIB" ]; then
+            echo "ERROR: ASAN runtime DSO not found in NDK"
+            exit 1
+          fi
+          echo "Found ASAN runtime: $NDK_LIB"
+          cp "$NDK_LIB" build-android-asan/
+
+      - name: Write wrap.sh template
+        run: |
+          cat > build-android-asan/wrap.sh <<'EOF'
+          #!/system/bin/sh
+          # Drop this into nospoon/android/app/src/main/resources/lib/arm64-v8a/wrap.sh
+          # Make sure it's executable (chmod +x). Only honoured by Android when
+          # android:debuggable="true" — i.e. the debug build variant.
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+          export ASAN_OPTIONS="log_to_stderr=1:abort_on_error=1:halt_on_error=1:detect_leaks=0:symbolize=1:print_summary=1:fast_unwind_on_fatal=0"
+          export LD_PRELOAD="$HERE/libclang_rt.asan-aarch64-android.so"
+          exec "$@"
+          EOF
+          chmod +x build-android-asan/wrap.sh
+
+      - name: Write README
+        run: |
+          cat > build-android-asan/README.md <<'EOF'
+          # ASAN JNI build for nospoon Android
+
+          Drop-in replacement for the normal `libhyperdht_jni.so`. The ASAN
+          runtime catches use-after-free / write-after-free at the actual
+          store site, not at the next malloc like hardened_malloc does.
+
+          ## Files
+
+          - `libhyperdht_jni.so` — JNI bridge built with `-fsanitize=address`
+          - `libclang_rt.asan-aarch64-android.so` — ASAN runtime (from NDK)
+          - `wrap.sh` — sets LD_PRELOAD so ASAN initialises before malloc
+
+          ## Install into nospoon
+
+          1. Copy both `.so` files into
+             `nospoon/android/app/src/main/jniLibs/arm64-v8a/`,
+             replacing the existing `libhyperdht_jni.so`.
+
+          2. Copy `wrap.sh` into
+             `nospoon/android/app/src/main/resources/lib/arm64-v8a/wrap.sh`
+             (the `resources/lib/<abi>/` path is what Android packages into
+             the APK at the right location). Ensure the executable bit is
+             preserved — verify with `unzip -l app-debug.apk | grep wrap.sh`.
+
+          3. Confirm the debug build manifest has `android:debuggable="true"`.
+             The default debug variant already does.
+
+          4. `./gradlew assembleDebug`, install, repro. App will be ~2×
+             slower and use more memory.
+
+          ## Reading the report
+
+          When ASAN trips, the app SIGABRTs and dumps to logcat:
+
+              adb logcat -d AndroidRuntime:E DEBUG:V '*:S' \
+                | grep -E 'AddressSanitizer|ERROR: AddressSanitizer|SUMMARY|^\s+#[0-9]+'
+
+          The report names: the bug (heap-use-after-free, etc.), the bad
+          access stack, the freed-at stack, and the allocated-at stack.
+
+          Symbolise unsymbolised frames with:
+
+              llvm-symbolizer --obj=libhyperdht_jni.so 0x<offset>
+
+          using the unstripped `.so` from this artifact.
+
+          ## Notes
+
+          - Symbol info is preserved (`-g`, no strip).
+          - Optimisations are at `-O1` so stack frames are still readable.
+          - GrapheneOS may warn once about LD_PRELOAD on a debuggable app;
+            accept it.
+          - If the bug doesn't reproduce under ASAN (timing-sensitive race
+            that ASAN slowdown perturbs), try HWASan: rebuild with
+            `-fsanitize=hwaddress` instead. Pixel 8 Pro supports it.
+          EOF
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build-android-asan/libhyperdht_jni.so dist/
+          cp build-android-asan/libclang_rt.asan-aarch64-android.so dist/
+          cp build-android-asan/wrap.sh dist/
+          cp build-android-asan/README.md dist/
+          tar czf hyperdht-android-arm64-asan.tar.gz -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperdht-android-arm64-asan
+          path: hyperdht-android-arm64-asan.tar.gz
+          retention-days: 30

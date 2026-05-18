@@ -99,6 +99,37 @@ seconds per connection.
 JS: `hyperdht/index.js:55` (512-entry xache, no TTL), used in
 `connect.js:323` (read) and `connect.js:464` (write).
 
+### Sleeping-interval wakeup detection (`_onwakeup`)
+
+JS's `_ontick` (`dht-rpc/index.js:764-799`) compares wall-clock time
+between ticks against `SLEEPING_INTERVAL = 3 * TICK_INTERVAL = 15s`.
+If the gap exceeds 15s — typical when a laptop wakes from sleep or
+a phone is unbacked — it skips the normal `this._tick++` increment
+and calls `_onwakeup` instead, which:
+
+- bumps `_tick` enough that everything looks old (forces re-ping)
+- arranges a series of `_pingSome` runs over the next ~2 ticks
+- sets `_refreshTicks = 1` to force a routing-table refresh next tick
+
+Without this, after a long sleep the routing table contains nodes
+that have silently expired on the other side, and the first attempted
+operation (connect/lookup) hits dead nodes before the periodic refresh
+catches up.
+
+Our `RpcSocket::background_tick` (`src/rpc.cpp:915`) just bumps `tick_`
+unconditionally — no wall-clock comparison, no wake-up detection.
+Comment at line 905 notes this is deliberate ("we don't have a
+sleeping interval semantic yet"). Trivial to add: stash `last_tick_wall_`
+in `RpcSocket`, compare against `uv_hrtime()` each tick, on gap >15s
+trigger a refresh + ping-some burst.
+
+Impact: laptops/phones that resume from sleep with stale routing tables
+recover slower than JS peers (one missed refresh cycle = up to 5min
+extra before all stale nodes are repinged out).
+
+JS: `dht-rpc/index.js:18-19` (constants), `:764-773` (gap check),
+`:550-557` (`_onwakeup` body).
+
 ---
 
 ## ESP32 (`HYPERDHT_EMBEDDED`) — known issues

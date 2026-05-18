@@ -1,5 +1,15 @@
 # Building hyperdht-cpp
 
+This page covers the **core C++ library**. For language wrappers
+and embedded targets:
+
+| Target | Doc |
+|--------|-----|
+| Python (ctypes) | [BUILDING-PYTHON.md](BUILDING-PYTHON.md) |
+| Android (Kotlin + JNI) | [BUILDING-ANDROID.md](BUILDING-ANDROID.md) |
+| Rust (`hyperdht-sys` + `hyperdht`) | [BUILDING-RUST.md](BUILDING-RUST.md) |
+| ESP32-S3 (ESP-IDF component) | [BUILDING-ESP32.md](BUILDING-ESP32.md) |
+
 ## Dependencies
 
 | Library | Version | Purpose |

@@ -755,7 +755,14 @@ void Holepuncher::on_punch_timer(uv_timer_t* timer) {
 PoolSocket::PoolSocket(uv_loop_t* loop, udx_t* udx,
                        rpc::RpcSocket* rpc_socket)
     : loop_(loop), socket_(new udx_socket_t{}), rpc_socket_(rpc_socket) {
-    udx_socket_init(udx, socket_, nullptr);
+    // Pass libudx a close-cb that frees our heap-alloc'd socket_t. Combined
+    // with udx_socket_close() in close(), this ensures the socket gets
+    // properly unlinked from udx_t.sockets (via udx__link_remove inside
+    // udx_socket_close) before its memory goes away. Passing nullptr + raw
+    // uv_close was the prior shape and left a dangling entry in
+    // udx_t.sockets — next udx_socket_close on a sibling tripped UAF
+    // (ASAN-caught 2026-05-20 during wifi-toggle teardown).
+    udx_socket_init(udx, socket_, [](udx_socket_t* s) { delete s; });
     socket_->data = this;
     next_tid_ = static_cast<uint16_t>(randombytes_uniform(0xFFFF));
 }
@@ -1011,10 +1018,12 @@ void PoolSocket::close() {
     }
     inflight_.clear();
     if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(socket_))) {
-        // Socket is heap-allocated — free it in the close callback so it
-        // survives until libuv has finished processing (QUEUE_REMOVE etc.)
-        uv_close(reinterpret_cast<uv_handle_t*>(socket_),
-                 [](uv_handle_t* h) { delete reinterpret_cast<udx_socket_t*>(h); });
+        // Use the libudx API rather than raw uv_close so the socket gets
+        // properly unlinked from udx_t.sockets. uv_close alone leaves a
+        // dangling entry that the next udx_socket_close walks → UAF.
+        // The heap-alloc'd socket_t is freed by the on_close cb we
+        // registered in PoolSocket's constructor.
+        udx_socket_close(socket_);
         socket_ = nullptr;
     }
 }

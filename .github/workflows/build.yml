@@ -187,6 +187,12 @@ jobs:
       - name: Build JNI bridge (release + debug)
         run: |
           NDK_CC=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++
+          # 16 KB page-size alignment — Google Play requirement for apps
+          # targeting SDK 35+ (new apps since 2025-11-01, updates from
+          # 2026-11-01). NDK r28+ enables this by default; runner ships
+          # r27.3 so we set it explicitly. Affects only the final .so
+          # ELF LOAD segment alignment; static archives are unchanged.
+          PAGE_ALIGN_LDFLAGS="-Wl,-z,max-page-size=16384"
           # Release
           $NDK_CC -std=c++20 -O2 -shared -fPIC \
             -static-libstdc++ \
@@ -197,6 +203,7 @@ jobs:
             build-android/libhyperdht.a build-android/libudx.a \
             $SODIUM_PREFIX/lib/libsodium.a $UV_LIB \
             -llog \
+            $PAGE_ALIGN_LDFLAGS \
             -o build-android/libhyperdht_jni.so
           # Debug (with LOGT logging to logcat + DHT_LOG to stderr/logcat)
           $NDK_CC -std=c++20 -O0 -g -shared -fPIC \
@@ -209,6 +216,7 @@ jobs:
             build-android-debug/libhyperdht.a build-android-debug/libudx.a \
             $SODIUM_PREFIX/lib/libsodium.a $UV_LIB \
             -llog \
+            $PAGE_ALIGN_LDFLAGS \
             -o build-android/libhyperdht_jni_debug.so
 
       - name: Build native echo test (no JNI, pure C++)

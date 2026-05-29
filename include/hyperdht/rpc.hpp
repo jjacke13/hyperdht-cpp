@@ -183,7 +183,23 @@ public:
     void set_max_ping_delay_ms(uint64_t ms) { max_ping_delay_ms_ = ms; }
 
     // Send a response (reply to a received request)
-    void reply(const messages::Response& resp);
+    // Send a response back to the peer.
+    //
+    // JS parity: dht-rpc/lib/io.js — Request stores its receiving socket and
+    // replies use that socket (io.js:352-396, 414, 448, 517). C++ requests
+    // similarly carry `req.from_server` (set in handle_message), and the
+    // caller must pass it here so the reply leaves on the same socket the
+    // request arrived on.
+    //
+    // Why it matters: when the persistent-mode `server_socket_` and the
+    // ephemeral `client_socket_` are bound to different UDP ports (the
+    // default — `bind()` picks two random ports), a reply that leaves on
+    // a different socket than the request arrived on has a source port
+    // that doesn't match the destination port of the original outbound
+    // request. Stateful conntrack/firewalls (NixOS host firewall, carrier
+    // CGNAT) then drop the reply as "unsolicited" and the originator's
+    // RPC times out even though the server answered.
+    void reply(const messages::Response& resp, bool from_server = false);
 
     // Set handler for incoming requests
     void on_request(OnRequestCallback cb) { on_request_ = std::move(cb); }

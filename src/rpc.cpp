@@ -443,14 +443,21 @@ uint16_t RpcSocket::delayed_ping(const compact::Ipv4Address& to,
                    std::move(on_response), std::move(on_timeout));
 }
 
-void RpcSocket::reply(const messages::Response& resp) {
+void RpcSocket::reply(const messages::Response& resp, bool from_server) {
     if (closing_) return;
     auto buf = messages::encode_response(resp);
-    // Replies always go from server_socket_ when persistent — the ID in
-    // the response is computed from the server socket's address, so the
-    // receiver's validateId must see that source port. When ephemeral,
-    // active_socket() returns client_socket_ (no ID in response anyway).
-    udp_send_on(buf, resp.from.addr, active_socket());
+    // JS parity: dht-rpc replies leave on the same socket the request
+    // arrived on (io.js: Request.socket / _sendReply). Without that,
+    // stateful conntrack/firewalls (NixOS host firewall, carrier CGNAT)
+    // drop our reply because the source port differs from the destination
+    // port of the original outbound request — see the long comment on
+    // the declaration in rpc.hpp.
+    //
+    // The single-socket EMBEDDED build only has client_socket_; the
+    // active_socket() helper returns it in both branches so the explicit
+    // socket selection below collapses to the same result.
+    udx_socket_t* sock = from_server ? &server_socket_ : &client_socket_;
+    udp_send_on(buf, resp.from.addr, sock);
 }
 
 void RpcSocket::stop_tick() {

@@ -132,7 +132,10 @@ void RpcHandlers::handle(const messages::Request& req) {
             case messages::CMD_PEER_HANDSHAKE:
                 if (router_) {
                     router_->handle_peer_handshake(req,
-                        [this](const messages::Response& resp) { socket_.reply(resp); },
+                        [this, from_server = req.from_server]
+                        (const messages::Response& resp) {
+                            socket_.reply(resp, from_server);
+                        },
                         [this](const messages::Request& req) {
                             auto buf = messages::encode_request(req);
                             socket_.udp_send(buf, req.to.addr);
@@ -142,7 +145,10 @@ void RpcHandlers::handle(const messages::Request& req) {
             case messages::CMD_PEER_HOLEPUNCH:
                 if (router_) {
                     router_->handle_peer_holepunch(req,
-                        [this](const messages::Response& resp) { socket_.reply(resp); },
+                        [this, from_server = req.from_server]
+                        (const messages::Response& resp) {
+                            socket_.reply(resp, from_server);
+                        },
                         [this](const messages::Request& req) {
                             auto buf = messages::encode_request(req);
                             socket_.udp_send(buf, req.to.addr);
@@ -218,7 +224,7 @@ messages::Response RpcHandlers::make_query_response(const messages::Request& req
 void RpcHandlers::handle_ping(const messages::Request& req) {
     auto resp = make_query_response(req);
     resp.closer_nodes.clear();  // PING doesn't return closer nodes
-    socket_.reply(resp);
+    socket_.reply(resp, req.from_server);
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +245,7 @@ void RpcHandlers::handle_ping_nat(const messages::Request& req) {
     resp.from.addr = compact::Ipv4Address::from_string(
         req.from.addr.host_string(), port);
 
-    socket_.reply(resp);
+    socket_.reply(resp, req.from_server);
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +265,7 @@ void RpcHandlers::handle_find_node(const messages::Request& req) {
     if (find_node_rate_.size() > 8192) find_node_rate_.clear();  // cap map growth
 
     auto resp = make_query_response(req);
-    socket_.reply(resp);
+    socket_.reply(resp, req.from_server);
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +289,7 @@ void RpcHandlers::handle_down_hint(const messages::Request& req) {
         if (!socket_.is_ephemeral() && req.from_server) {
             resp.id = socket_.table().id();
         }
-        socket_.reply(resp);
+        socket_.reply(resp, req.from_server);
     };
 
     if (!req.value.has_value() || req.value->size() < 6) {
@@ -390,7 +396,7 @@ void RpcHandlers::on_delayed_ping_fire(uv_timer_t* timer) {
         if (!dr->owner->socket_.is_ephemeral() && dr->from_server) {
             resp.id = dr->owner->socket_.table().id();
         }
-        dr->owner->socket_.reply(resp);
+        dr->owner->socket_.reply(resp, dr->from_server);
 
         // Remove from pending list (swap-and-pop)
         auto& vec = dr->owner->pending_delayed_;
@@ -435,7 +441,7 @@ void RpcHandlers::handle_find_peer(const messages::Request& req) {
         const auto* rec = router_->record(target);
         if (rec) {
             resp.value = *rec;
-            socket_.reply(resp);
+            socket_.reply(resp, req.from_server);
             return;
         }
     }
@@ -446,7 +452,7 @@ void RpcHandlers::handle_find_peer(const messages::Request& req) {
         resp.value = peers.back().value;
     }
 
-    socket_.reply(resp);
+    socket_.reply(resp, req.from_server);
 }
 
 // ---------------------------------------------------------------------------
@@ -494,7 +500,7 @@ void RpcHandlers::handle_lookup(const messages::Request& req) {
         }
     }
 
-    socket_.reply(resp);
+    socket_.reply(resp, req.from_server);
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +544,7 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
         if (!socket_.is_ephemeral() && req.from_server) {
             resp.id = socket_.table().id();
         }
-        socket_.reply(resp);
+        socket_.reply(resp, req.from_server);
         return;
     }
 
@@ -586,7 +592,7 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
         resp.id = socket_.table().id();
     }
 
-    socket_.reply(resp);
+    socket_.reply(resp, req.from_server);
 }
 
 // ---------------------------------------------------------------------------
@@ -644,7 +650,7 @@ void RpcHandlers::handle_unannounce(const messages::Request& req) {
         resp.id = socket_.table().id();
     }
 
-    socket_.reply(resp);
+    socket_.reply(resp, req.from_server);
 }
 
 // ---------------------------------------------------------------------------
@@ -703,7 +709,7 @@ void RpcHandlers::handle_mutable_put(const messages::Request& req) {
             resp.tid = req.tid;
             resp.from.addr = req.from.addr;
             resp.error = messages::ERR_SEQ_REUSED;
-            socket_.reply(resp);
+            socket_.reply(resp, req.from_server);
             return;
         }
 
@@ -713,7 +719,7 @@ void RpcHandlers::handle_mutable_put(const messages::Request& req) {
             resp.tid = req.tid;
             resp.from.addr = req.from.addr;
             resp.error = messages::ERR_SEQ_TOO_LOW;
-            socket_.reply(resp);
+            socket_.reply(resp, req.from_server);
             return;
         }
     }
@@ -730,7 +736,7 @@ void RpcHandlers::handle_mutable_put(const messages::Request& req) {
     messages::Response resp;
     resp.tid = req.tid;
     resp.from.addr = req.from.addr;
-    socket_.reply(resp);
+    socket_.reply(resp, req.from_server);
 }
 
 // ---------------------------------------------------------------------------
@@ -763,7 +769,7 @@ void RpcHandlers::handle_mutable_get(const messages::Request& req) {
         }
     }
 
-    socket_.reply(resp);
+    socket_.reply(resp, req.from_server);
 }
 
 // ---------------------------------------------------------------------------
@@ -799,7 +805,7 @@ void RpcHandlers::handle_immutable_put(const messages::Request& req) {
     messages::Response resp;
     resp.tid = req.tid;
     resp.from.addr = req.from.addr;
-    socket_.reply(resp);
+    socket_.reply(resp, req.from_server);
 }
 
 // ---------------------------------------------------------------------------
@@ -819,7 +825,7 @@ void RpcHandlers::handle_immutable_get(const messages::Request& req) {
         resp.value = *stored;
     }
 
-    socket_.reply(resp);
+    socket_.reply(resp, req.from_server);
 }
 
 }  // namespace rpc

@@ -1036,6 +1036,10 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
         // Include peer_address (the relay-observed source) as the first
         // candidate so the puncher's continuous probes hit a known-open
         // mapping on symmetric / port-incrementing NATs.
+        //
+        // Mark peer_address.host as VERIFIED so the puncher probes every
+        // round (10x) instead of every 4 rounds (~3x). Matches JS
+        // server.js:515 — `verified: echoed ? peerAddress.host : null`.
         std::vector<compact::Ipv4Address> valid_addrs;
         valid_addrs.push_back(peer_address);
         for (const auto& addr : reply.remote_addresses) {
@@ -1044,7 +1048,7 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                 addr.port == peer_address.port) continue;
             valid_addrs.push_back(addr);
         }
-        conn.puncher->set_remote_addresses(valid_addrs);
+        conn.puncher->update_remote(valid_addrs, peer_address.host_string());
         conn.puncher->punch();
 
         // Note: rawStream is already registered in pending_punch_streams_

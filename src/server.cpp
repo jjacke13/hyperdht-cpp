@@ -172,8 +172,9 @@ void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection)
     };
     entry.on_peer_holepunch = [this](const std::vector<uint8_t>& value,
                                       const compact::Ipv4Address& peer_addr,
+                                      const compact::Ipv4Address& to_addr,
                                       std::function<void(std::vector<uint8_t>)> reply_fn) {
-        on_peer_holepunch(value, peer_addr, std::move(reply_fn));
+        on_peer_holepunch(value, peer_addr, to_addr, std::move(reply_fn));
     };
 
     // Start the Announcer
@@ -862,6 +863,7 @@ void Server::on_handshake_result(
 
 void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                                 const compact::Ipv4Address& peer_address,
+                                const compact::Ipv4Address& to_address,
                                 std::function<void(std::vector<uint8_t>)> reply_fn) {
     if (closed_) return;
 
@@ -890,9 +892,17 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
 
     // A2: feed NAT sampler from the holepunch request. We always feed
     // because we use a single socket (no pool socket on the server).
-    socket_.nat_sampler().add(
-        compact::Ipv4Address::from_string(peer_address.host_string(), peer_address.port),
-        peer_address);
+    //
+    // JS server.js:510 — `p.nat.add(req.to, req.from)`. The first arg
+    // is the address the client targeted us at (= our public address as
+    // the client sees us). The second arg is the peer (sampling source).
+    //
+    // Previously this code passed `peer_address` for BOTH arguments,
+    // which poisoned the NAT sampler with every connecting client's IP
+    // and made the server announce arbitrary client addresses as its
+    // own. Off-LAN peers then tried to reach the server at random other
+    // clients' addresses and timed out (-5 holepunch failed).
+    socket_.nat_sampler().add(to_address, peer_address);
 
     // A5: NAT freeze — once we have a firm classification, lock it so
     // late samples cannot contradict what the reply is about to say.

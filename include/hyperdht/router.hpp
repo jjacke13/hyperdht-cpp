@@ -38,10 +38,17 @@ struct ForwardEntry {
 
     // Called when PEER_HOLEPUNCH arrives for this target.
     // msg: the decoded holepunch message (id, payload, peerAddress)
+    // peer_address: the client's address as seen by the relay (= req.from)
+    // to_address: the address the client targeted us at (= req.to). Needed
+    //   so the server-side NAT sampler can record what the client thinks
+    //   our address is — JS server.js:510 `p.nat.add(req.to, req.from)`.
+    //   Without it the sampler is fed (peer, peer) and Pi5 ends up
+    //   announcing every connecting client's IP as one of its own.
     // reply_fn: call with encoded reply value
     using HolepunchFn = std::function<void(
         const std::vector<uint8_t>& value,
         const compact::Ipv4Address& peer_address,
+        const compact::Ipv4Address& to_address,
         std::function<void(std::vector<uint8_t> reply_value)> reply_fn)>;
 
     HandshakeFn on_peer_handshake;

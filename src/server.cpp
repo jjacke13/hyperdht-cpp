@@ -1015,23 +1015,34 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
         conn.puncher->set_remote_firewall(reply.remote_firewall);
 
         // A4: Fast-mode ping — if we're CONSISTENT and client opened
-        // a matching session, send immediate ping back
-        // JS: server.js:530-537
+        // a matching session, send immediate ping back.
+        //
+        // JS server.js:530-537 pings `peerAddress` — the address the
+        // relay actually observed for the incoming holepunch packet —
+        // NOT the addresses field the client encoded in its payload.
+        // For symmetric / port-incrementing CGNAT (Cosmote, Vodafone GR,
+        // many mobile carriers) the relay-observed source IS the open
+        // NAT pinhole for the round-1 flow, while the client-reported
+        // address was observed by some other relay on a different flow
+        // with a different NAT-mapped port and is dead from our angle.
         if (socket_.nat_sampler().firewall() == peer_connect::FIREWALL_CONSISTENT ||
             socket_.nat_sampler().firewall() == peer_connect::FIREWALL_OPEN) {
-            // Send a probe back to the client's address immediately
-            if (!reply.remote_addresses.empty()) {
-                DHT_LOG("  [server] Fast-mode ping to %s:%u\n",
-                        reply.remote_addresses[0].host_string().c_str(),
-                        reply.remote_addresses[0].port);
-                socket_.send_probe(reply.remote_addresses[0]);
-            }
+            DHT_LOG("  [server] Fast-mode ping to %s:%u (peer_address)\n",
+                    peer_address.host_string().c_str(), peer_address.port);
+            socket_.send_probe(peer_address);
         }
 
-        // Filter out port-0 addresses and set as remote targets
+        // Filter out port-0 addresses and set as remote targets.
+        // Include peer_address (the relay-observed source) as the first
+        // candidate so the puncher's continuous probes hit a known-open
+        // mapping on symmetric / port-incrementing NATs.
         std::vector<compact::Ipv4Address> valid_addrs;
+        valid_addrs.push_back(peer_address);
         for (const auto& addr : reply.remote_addresses) {
-            if (addr.port != 0) valid_addrs.push_back(addr);
+            if (addr.port == 0) continue;
+            if (addr.host_string() == peer_address.host_string() &&
+                addr.port == peer_address.port) continue;
+            valid_addrs.push_back(addr);
         }
         conn.puncher->set_remote_addresses(valid_addrs);
         conn.puncher->punch();

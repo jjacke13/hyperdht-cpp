@@ -20,6 +20,7 @@
 //   dht.destroy();
 //   uv_run(&loop, UV_RUN_DEFAULT);
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -435,6 +436,29 @@ public:
     // `share_local_address=true`. Matches JS `server._localAddresses()`.
     const std::vector<compact::Ipv4Address>& validated_local_addresses() const {
         return validated_local_addresses_;
+    }
+
+    // Drop a host from the validated-local-address cache so the server
+    // side never advertises it in handshake replies.
+    //
+    // Use case: a process that hosts both a HyperDHT server and a TUN
+    // interface (e.g. nospoon-cpp) will, by default, announce its TUN
+    // address (e.g. 10.0.0.1) alongside its real LAN address. Remote
+    // peers running `match_address` then see the TUN entry as a same-/8
+    // candidate and try to reach it directly — but the TUN interface
+    // routes IP packets, not UDP, so the holepunch path silently times
+    // out. Filtering at the source mirrors the JS-side workaround in
+    // nospoon's `js/lib/server.js` (the `patchAnnouncedAddresses` helper).
+    void exclude_local_address(const std::string& host) {
+        validated_local_addresses_.erase(
+            std::remove_if(
+                validated_local_addresses_.begin(),
+                validated_local_addresses_.end(),
+                [&host](const compact::Ipv4Address& a) {
+                    return a.host_string() == host;
+                }),
+            validated_local_addresses_.end());
+        validated_host_cache_[host] = false;
     }
 
     // --- Static helpers (B3-B6) ---

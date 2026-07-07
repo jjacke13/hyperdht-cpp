@@ -295,6 +295,7 @@ TEST(Router, HolepunchRelayIsRequest) {
     ForwardEntry entry;
     entry.on_peer_holepunch = [](const std::vector<uint8_t>& value,
                                   const Ipv4Address&,
+                                  const Ipv4Address&,
                                   std::function<void(std::vector<uint8_t>)> reply_fn) {
         // Build a reply holepunch message
         holepunch::HolepunchMessage reply_hp;

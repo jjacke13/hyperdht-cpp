@@ -182,9 +182,10 @@ void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection)
     };
     entry.on_peer_holepunch = [this](const std::vector<uint8_t>& value,
                                       const compact::Ipv4Address& peer_addr,
+                                      const compact::Ipv4Address& from_addr,
                                       const compact::Ipv4Address& to_addr,
                                       std::function<void(std::vector<uint8_t>)> reply_fn) {
-        on_peer_holepunch(value, peer_addr, to_addr, std::move(reply_fn));
+        on_peer_holepunch(value, peer_addr, from_addr, to_addr, std::move(reply_fn));
     };
 
     // Install the probe echo listener for the server's whole listening
@@ -888,6 +889,7 @@ void Server::on_handshake_result(
 
 void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                                 const compact::Ipv4Address& peer_address,
+                                const compact::Ipv4Address& from_address,
                                 const compact::Ipv4Address& to_address,
                                 std::function<void(std::vector<uint8_t>)> reply_fn) {
     if (closed_) return;
@@ -920,14 +922,15 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     //
     // JS server.js:510 — `p.nat.add(req.to, req.from)`. The first arg
     // is the address the client targeted us at (= our public address as
-    // the client sees us). The second arg is the peer (sampling source).
+    // the client sees us). The second arg is the UDP source — the
+    // relaying DHT node — used by the sampler as its dedup key, so the
+    // three holepunch relays count as three independent observations.
     //
-    // Previously this code passed `peer_address` for BOTH arguments,
-    // which poisoned the NAT sampler with every connecting client's IP
-    // and made the server announce arbitrary client addresses as its
-    // own. Off-LAN peers then tried to reach the server at random other
-    // clients' addresses and timed out (-5 holepunch failed).
-    socket_.nat_sampler().add(to_address, peer_address);
+    // History: this once passed `peer_address` for BOTH arguments, which
+    // poisoned the NAT sampler with every connecting client's IP and made
+    // the server announce arbitrary client addresses as its own (-5 on
+    // every off-LAN client).
+    socket_.nat_sampler().add(to_address, from_address);
 
     // A5: NAT freeze — once we have a firm classification, lock it so
     // late samples cannot contradict what the reply is about to say.
@@ -940,12 +943,18 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     auto our_fw = socket_.nat_sampler().firewall();
     auto our_addrs = socket_.nat_sampler().addresses();
 
-    // Check if request came from one of our relay nodes (JS: _announcer.isRelay)
+    // Check if the request came from one of our relay nodes.
+    // JS: server.js:495 — `this._announcer.isRelay(req.from)`, i.e. the
+    // UDP source of the request, NOT the client's address. This gates
+    // holepunch token issuance (handle_holepunch only returns our token
+    // when is_server_relay): comparing against the client meant the token
+    // was never issued, every client round 1 came back tokenless
+    // ("inconclusive") and burned 1-2.5s on the round-1 retry.
     bool is_relay = false;
     if (announcer_) {
         for (const auto& ri : announcer_->relays()) {
-            if (ri.relay_address.host_string() == peer_address.host_string() &&
-                ri.relay_address.port == peer_address.port) {
+            if (ri.relay_address.host_string() == from_address.host_string() &&
+                ri.relay_address.port == from_address.port) {
                 is_relay = true;
                 break;
             }

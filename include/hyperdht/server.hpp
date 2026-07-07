@@ -306,6 +306,7 @@ private:
 
     void on_peer_holepunch(const std::vector<uint8_t>& value,
                            const compact::Ipv4Address& peer_address,
+                           const compact::Ipv4Address& from_address,
                            const compact::Ipv4Address& to_address,
                            std::function<void(std::vector<uint8_t>)> reply_fn);
 

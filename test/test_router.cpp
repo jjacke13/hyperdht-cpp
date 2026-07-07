@@ -294,9 +294,19 @@ TEST(Router, HolepunchRelayIsRequest) {
 
     ForwardEntry entry;
     entry.on_peer_holepunch = [](const std::vector<uint8_t>& value,
-                                  const Ipv4Address&,
-                                  const Ipv4Address&,
+                                  const Ipv4Address& peer_addr,
+                                  const Ipv4Address& from_addr,
+                                  const Ipv4Address& to_addr,
                                   std::function<void(std::vector<uint8_t>)> reply_fn) {
+        // peer_address = client's address from the message (JS peerAddress)
+        EXPECT_EQ(peer_addr.host_string(), "192.168.1.50");
+        EXPECT_EQ(peer_addr.port, 8888);
+        // from_address = UDP source = the relaying DHT node (JS req.from)
+        EXPECT_EQ(from_addr.host_string(), "10.0.0.5");
+        EXPECT_EQ(from_addr.port, 6000);
+        // to_address = the address the request targeted us at (JS req.to)
+        EXPECT_EQ(to_addr.host_string(), "10.0.0.2");
+        EXPECT_EQ(to_addr.port, 5001);
         // Build a reply holepunch message
         holepunch::HolepunchMessage reply_hp;
         reply_hp.mode = peer_connect::MODE_FROM_SERVER;

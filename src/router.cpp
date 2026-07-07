@@ -197,7 +197,7 @@ bool Router::handle_peer_holepunch(const messages::Request& req,
     // peerAddress, then re-encodes. This is asymmetric with the handshake path
     // (which returns raw Noise bytes) but functionally correct.
     entry->on_peer_holepunch(
-        *req.value, client_addr, req.to.addr,
+        *req.value, client_addr, req.from.addr, req.to.addr,
         [req_tid, req_from, req_command, req_target,
          reply, relay, client_addr, incoming_mode](std::vector<uint8_t> reply_value) {
             if (incoming_mode == peer_connect::MODE_FROM_CLIENT) {

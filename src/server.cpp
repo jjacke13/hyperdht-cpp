@@ -177,6 +177,21 @@ void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection)
         on_peer_holepunch(value, peer_addr, to_addr, std::move(reply_fn));
     };
 
+    // Install the probe echo listener for the server's whole listening
+    // lifetime (removed in close()). JS echoes any inbound 1-byte probe
+    // from the moment the puncher's socket exists at HANDSHAKE time
+    // (holepuncher.js:118-128, non-initiator branch of _onholepunchmessage).
+    // This was previously installed on the first should_punch round, so
+    // the client's round-1 fast-open and post-round-1 probes were silently
+    // dropped (rpc.cpp probe path) and could never complete the punch.
+    if (probe_listener_id_ == 0) {
+        probe_listener_id_ = socket_.add_probe_listener(
+            [this](const compact::Ipv4Address& from) {
+                if (closed_) return;
+                socket_.send_probe(from);
+            });
+    }
+
     // Start the Announcer
     announcer_ = std::make_unique<announcer::Announcer>(socket_, keypair_, target_);
     announcer_->start();
@@ -1070,17 +1085,6 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
 
         // Note: rawStream is already registered in pending_punch_streams_
         // at handshake time (line ~756). No need to register again here.
-
-        // Install probe echo listener ONCE — echoes probes from ALL clients.
-        // Uses add_probe_listener so it doesn't clobber other listeners.
-        // The listener stays active for the server's lifetime (removed in close).
-        if (probe_listener_id_ == 0) {
-            probe_listener_id_ = socket_.add_probe_listener(
-                [this](const compact::Ipv4Address& from) {
-                    if (closed_) return;
-                    socket_.send_probe(from);
-                });
-        }
     }
 }
 

@@ -363,6 +363,7 @@ private:
 
     std::vector<RemoteAddr> remote_addresses_;
     int punch_round_ = 0;
+    bool did_initial_delay_ = false;  // non-initiator 1s lead-in consumed
     int random_probes_left_ = 0;
     size_t birthday_index_ = 0;      // Current index for keepAliveRandomNat cycling
     int low_ttl_rounds_ = 1;         // First cycle uses low TTL (JS: lowTTLRounds)

@@ -194,6 +194,36 @@ TEST(Holepuncher, ConsistentConsistent) {
     uv_loop_close(&loop);
 }
 
+// JS parity: holepuncher.js:215-231 — the non-initiator sleeps 1s before
+// the probe loop but still runs the FULL 10 tries. The lead-in delay must
+// not consume a probe round (regression: round 0 was burned → 9 rounds).
+// Slow test: drives the real 1s-per-round schedule (~11s wall time).
+TEST(Holepuncher, NonInitiatorRunsAllTenRounds) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, false);
+    hp.set_local_firewall(FIREWALL_CONSISTENT);
+    hp.set_remote_firewall(FIREWALL_CONSISTENT);
+    // Verified address → probed every round (JS holepuncher.js:224)
+    hp.update_remote({Ipv4Address::from_string("10.0.0.1", 3000)}, "10.0.0.1");
+
+    int probes = 0;
+    hp.set_send_fn([&](const Ipv4Address&) { probes++; });
+    bool aborted = false;
+    hp.on_abort([&]() { aborted = true; });
+
+    EXPECT_TRUE(hp.punch());
+    uv_run(&loop, UV_RUN_DEFAULT);  // run the schedule to exhaustion
+
+    EXPECT_EQ(probes, 10) << "verified addr must be probed once per round, 10 rounds";
+    EXPECT_TRUE(aborted) << "exhaustion without connection must fire abort";
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
 TEST(Holepuncher, RandomRandomFails) {
     uv_loop_t loop;
     uv_loop_init(&loop);

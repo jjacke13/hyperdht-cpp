@@ -466,21 +466,26 @@ void Holepuncher::consistent_probe() {
     }
 
     // JS: non-initiator waits 1s before first round (holepuncher.js:217)
-    // Gives initiator's openSession time to prime NAT
-    if (!is_initiator_ && punch_round_ == 0) {
-        punch_round_++;
+    // Gives initiator's openSession time to prime NAT. The wait must not
+    // consume a probe round — JS runs the full 10 tries after the sleep.
+    if (!is_initiator_ && !did_initial_delay_) {
+        did_initial_delay_ = true;
         uv_timer_start(punch_timer_, on_punch_timer, 1000, 0);
         return;
     }
 
-    // Send probes, filtering unverified addrs (JS: holepuncher.js:224)
+    // JS: `while (this.punching && tries++ < 10)` — tries is incremented
+    // before the probe loop, so unverified addrs ((tries & 3) === 0,
+    // holepuncher.js:224) are hit on tries 4 and 8. Mirror that by
+    // incrementing punch_round_ first.
+    punch_round_++;
+
     for (const auto& ra : remote_addresses_) {
         if (!ra.verified && (punch_round_ & 3) != 0) continue;
         if (ra.addr.port == 0) continue;
         send_probe(ra.addr);
     }
 
-    punch_round_++;
     uv_timer_start(punch_timer_, on_punch_timer, 1000, 0);
 }
 

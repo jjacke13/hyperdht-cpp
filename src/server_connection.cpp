@@ -368,6 +368,7 @@ HolepunchReply handle_holepunch(
     // Extract client's info
     reply.remote_firewall = client_hp.firewall;
     reply.remote_addresses = client_hp.addresses;
+    reply.remote_address = client_hp.remote_address;
 
     // Generate our token for the client's address
     auto our_token = conn.secure->token(client_address.host_string());

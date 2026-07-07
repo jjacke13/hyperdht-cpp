@@ -111,6 +111,16 @@ static int server_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket
 namespace hyperdht {
 namespace server {
 
+// JS: server.js:697-704 (hasSameAddr) — exact host:port membership test.
+static bool has_same_addr(const std::vector<compact::Ipv4Address>& addrs,
+                          const compact::Ipv4Address& other) {
+    for (const auto& addr : addrs) {
+        if (addr.port == other.port &&
+            addr.host_string() == other.host_string()) return true;
+    }
+    return false;
+}
+
 static std::string to_hex(const uint8_t* data, size_t len) {
     static const char h[] = "0123456789abcdef";
     std::string out;
@@ -964,6 +974,23 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
         reply_fn(std::move(reply.value));
     }
 
+    // Fast mode! JS: server.js:528-537 — runs on EVERY round, BEFORE the
+    // remoteHolepunching gate, so it fires on round 1 while the client is
+    // still `punching=false`. If we are port-consistent and the client has
+    // already opened a session to us (its remoteAddress echo matches one
+    // of our sampled addresses), fire a quick probe back at the
+    // relay-observed source. The client's round-1 TTL fast-open primed its
+    // NAT for exactly this packet — on well-behaved NATs the punch
+    // completes here, ~1 RTT after handshake, without a round 2.
+    if ((our_fw == peer_connect::FIREWALL_CONSISTENT ||
+         our_fw == peer_connect::FIREWALL_OPEN) &&
+        reply.remote_address.has_value() &&
+        has_same_addr(our_addrs, *reply.remote_address)) {
+        DHT_LOG("  [server] Fast-mode ping to %s:%u (peer_address)\n",
+                peer_address.host_string().c_str(), peer_address.port);
+        socket_.send_probe(peer_address);
+    }
+
     if (reply.should_punch) {
         DHT_LOG("  [server] Client punching (id=%d, fw=%u, %zu addrs)\n",
                 hp_msg.id, reply.remote_firewall,
@@ -1046,23 +1073,13 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
         }
         conn.puncher->set_remote_firewall(reply.remote_firewall);
 
-        // A4: Fast-mode ping — if we're CONSISTENT and client opened
-        // a matching session, send immediate ping back.
-        //
-        // JS server.js:530-537 pings `peerAddress` — the address the
-        // relay actually observed for the incoming holepunch packet —
-        // NOT the addresses field the client encoded in its payload.
-        // For symmetric / port-incrementing CGNAT (Cosmote, Vodafone GR,
-        // many mobile carriers) the relay-observed source IS the open
-        // NAT pinhole for the round-1 flow, while the client-reported
-        // address was observed by some other relay on a different flow
-        // with a different NAT-mapped port and is dead from our angle.
-        if (socket_.nat_sampler().firewall() == peer_connect::FIREWALL_CONSISTENT ||
-            socket_.nat_sampler().firewall() == peer_connect::FIREWALL_OPEN) {
-            DHT_LOG("  [server] Fast-mode ping to %s:%u (peer_address)\n",
-                    peer_address.host_string().c_str(), peer_address.port);
-            socket_.send_probe(peer_address);
-        }
+        // Fast-mode ping happens BEFORE this block on every round (JS
+        // server.js:528-537) — see above. It pings `peer_address`, the
+        // relay-observed source: for symmetric / port-incrementing CGNAT
+        // (Cosmote, Vodafone GR, many mobile carriers) that IS the open
+        // NAT pinhole for this round's flow, while the client-reported
+        // addresses came from other relays on different flows with
+        // different NAT-mapped ports and are dead from our angle.
 
         // Filter out port-0 addresses and set as remote targets.
         // Include peer_address (the relay-observed source) as the first

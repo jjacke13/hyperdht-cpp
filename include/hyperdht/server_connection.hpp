@@ -194,6 +194,10 @@ struct HolepunchReply {
     uint32_t remote_firewall = 0;     // Client's reported firewall
     std::vector<compact::Ipv4Address> remote_addresses;  // Client's addresses to probe
     bool try_later = false;           // JS: server.js:558-573 — TRY_LATER sent; caller must NOT start probing
+    // Client's remoteAddress echo — the address the client targeted us at.
+    // Gates the fast-mode ping (JS server.js:530-533); set on every
+    // non-error round the client includes it in, round 1 included.
+    std::optional<compact::Ipv4Address> remote_address;
 };
 
 // random_throttled: caller-provided gate. When true AND this is a random

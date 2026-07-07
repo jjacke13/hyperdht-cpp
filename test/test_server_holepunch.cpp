@@ -213,6 +213,56 @@ TEST(ServerHolepunch, ThrottleIgnoredOnConsistentConsistent) {
     EXPECT_TRUE(reply.should_punch);  // Consistent-consistent: punch normally.
 }
 
+// JS parity: server.js:528-537 — the fast-mode ping gate needs the
+// client's remoteAddress echo (the address the client targeted us at).
+// handle_holepunch must surface it to the caller; round 1 carries it
+// with punching=false, so it must be visible even when should_punch
+// stays false.
+TEST(ServerHolepunch, RemoteAddressSurfacedOnRoundOne) {
+    auto setup = make_test_setup();
+
+    holepunch::HolepunchPayload hp;
+    hp.firewall = peer_connect::FIREWALL_CONSISTENT;
+    hp.round = 0;
+    hp.punching = false;
+    hp.remote_address = Ipv4Address::from_string("5.6.7.8", 49737);
+
+    auto value = make_client_holepunch(*setup.client_secure, hp);
+
+    auto reply = handle_holepunch(
+        setup.conn, value,
+        Ipv4Address::from_string("10.0.0.1", 5000),
+        peer_connect::FIREWALL_CONSISTENT,
+        {Ipv4Address::from_string("5.6.7.8", 49737)},
+        true);
+
+    EXPECT_FALSE(reply.should_punch);
+    ASSERT_TRUE(reply.remote_address.has_value());
+    EXPECT_EQ(reply.remote_address->host_string(), "5.6.7.8");
+    EXPECT_EQ(reply.remote_address->port, 49737);
+}
+
+// No remoteAddress in the payload → none surfaced (fast ping must not fire).
+TEST(ServerHolepunch, RemoteAddressAbsentWhenNotSent) {
+    auto setup = make_test_setup();
+
+    holepunch::HolepunchPayload hp;
+    hp.firewall = peer_connect::FIREWALL_CONSISTENT;
+    hp.round = 0;
+    hp.punching = false;
+
+    auto value = make_client_holepunch(*setup.client_secure, hp);
+
+    auto reply = handle_holepunch(
+        setup.conn, value,
+        Ipv4Address::from_string("10.0.0.1", 5000),
+        peer_connect::FIREWALL_CONSISTENT,
+        {Ipv4Address::from_string("5.6.7.8", 49737)},
+        true);
+
+    EXPECT_FALSE(reply.remote_address.has_value());
+}
+
 TEST(ServerHolepunch, ClientErrorAborts) {
     auto setup = make_test_setup();
 

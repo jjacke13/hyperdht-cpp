@@ -977,6 +977,23 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
             }
         }
 
+        // JS: server.js:548-551 — clearTimeout(h.prepunching). The 10s
+        // handshake timer only bounds how long a session may sit idle
+        // BEFORE punching starts. Previously it kept running and
+        // clear_session() destroyed the puncher + rawStream mid-punch at
+        // t=10s, so every remote punch that needed more than ~10s from
+        // HANDSHAKE (not from punch start) failed with -5 on the client.
+        // Re-arm to punch_clear_wait instead of erasing (see server.hpp).
+        {
+            auto tit = session_timers_.find(hp_msg.id);
+            if (tit != session_timers_.end()) {
+                uint32_t timer_hp_id = hp_msg.id;
+                tit->second->start([this, timer_hp_id]() {
+                    if (!closed_) clear_session(timer_hp_id);
+                }, punch_clear_wait);
+            }
+        }
+
         if (!conn.puncher) {
             conn.puncher = std::make_shared<holepunch::Holepuncher>(socket_.loop(), false);
             auto weak = std::weak_ptr<bool>(alive_);  // H10: sentinel

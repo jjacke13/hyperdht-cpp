@@ -209,6 +209,14 @@ public:
     bool share_local_address = true;   // JS: opts.shareLocalAddress (default true)
     uint64_t handshake_clear_wait = 10000;  // JS: opts.handshakeClearWait (default 10s)
 
+    // GC backstop for sessions whose punch has STARTED. JS clears the 10s
+    // timer entirely once the client declares punching (server.js:548-551)
+    // and relies on puncher.onabort for cleanup; we re-arm instead — firing
+    // on_abort from Holepuncher::destroy() would tear the puncher down
+    // inside its own destroy() frame. Must outlive the longest punch
+    // schedule (random spray = 1750 probes x 20ms = 35s).
+    uint64_t punch_clear_wait = 45000;
+
     // Blind-relay options (Phase E)
     // JS: server.js:28-29 — this.relayThrough, this.relayKeepAlive
     //

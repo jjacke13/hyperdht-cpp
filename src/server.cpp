@@ -1103,6 +1103,32 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                         hp.address.host_string().c_str(), hp.address.port);
                 on_socket(*conn_ptr, hp.address, hp.socket);
             });
+
+            // Wire puncher→abort so a FAILED punch clears its session as
+            // soon as the probe schedule exhausts, instead of lingering
+            // until punch_clear_wait (45s). Without this, every failed
+            // punch on symmetric CGNAT sits for 45s; during a client
+            // reconnect storm the dead sessions pile up, hit
+            // MAX_PENDING_HANDSHAKES (256, ~line 583), and the server then
+            // silently drops new handshakes with no reply — the client
+            // sees -3 "all relay handshakes failed" and can't recover.
+            // JS relies on puncher.onabort for exactly this cleanup.
+            //
+            // Reentrancy: on_abort fires from inside Holepuncher::destroy()
+            // (driven by the punch timer). Clearing the session here would
+            // erase the ServerConnection that owns this puncher, destroying
+            // it inside its own callback (UAF). Defer by re-arming the
+            // session timer to run clear_session on the next tick — the
+            // same proven-safe path the timeout already uses.
+            conn.puncher->on_abort([this, session_id]() {
+                if (closed_) return;
+                auto tit = session_timers_.find(session_id);
+                if (tit != session_timers_.end()) {
+                    tit->second->start([this, session_id]() {
+                        if (!closed_) clear_session(session_id);
+                    }, 1);
+                }
+            });
         }
         conn.puncher->set_remote_firewall(reply.remote_firewall);
 

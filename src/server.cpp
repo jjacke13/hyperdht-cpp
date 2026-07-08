@@ -795,8 +795,32 @@ void Server::on_handshake_result(
                                            reinterpret_cast<const struct sockaddr*>(relay_addr));
                     }
 
+                    // Detach the rawStream from the stored session BEFORE
+                    // clear_session(): ~ServerConnection unconditionally
+                    // udx_stream_destroy()s conn.raw_stream — which is the
+                    // exact stream we are about to emit to the caller.
+                    // Without this the caller receives a destroyed stream
+                    // ("connected" but no data ever flows). Also drop the
+                    // firewall ctx + pending-punch entry, as on_socket()
+                    // does, so later packets can't re-enter server maps
+                    // for a session that no longer exists.
+                    {
+                        auto cit = self->connections_.find(hp_id);
+                        if (cit != self->connections_.end() && cit->second &&
+                            cit->second->raw_stream == relay_raw) {
+                            cit->second->raw_stream = nullptr;
+                        }
+                    }
+                    if (relay_raw) {
+                        self->pending_punch_streams_.erase(relay_raw->local_id);
+                        if (relay_raw->data) {
+                            delete static_cast<RawStreamCtx*>(relay_raw->data);
+                            relay_raw->data = nullptr;
+                        }
+                    }
+
                     // Clean up session BEFORE emitting connection —
-                    // prevents the 10s timer from destroying the stream
+                    // prevents the session timer from destroying the stream
                     // the caller is about to use.
                     self->clear_session(hp_id);
 

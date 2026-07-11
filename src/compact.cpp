@@ -201,7 +201,10 @@ void Bool::encode(State& s, bool v) {
 }
 
 bool Bool::decode(State& s) {
-    return Uint8::decode(s) != 0;
+    // JS parity: compact-encoding bool.decode returns `byte === 1` — only
+    // the exact byte 0x01 is true; every other value (incl. 0x02..0xFF)
+    // decodes as false.
+    return Uint8::decode(s) == 1;
 }
 
 // ---------------------------------------------------------------------------

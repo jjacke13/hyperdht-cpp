@@ -222,6 +222,29 @@ TEST(RoutingTable, FullBucketCallback) {
     EXPECT_EQ(rejected_node.id, extra);
 }
 
+// routing-2 regression: re-adding an already-present id returns true, does
+// not grow size, and must NOT fire the bucket-full / ping-and-swap callback
+// (JS Row.add overwrites in place with no 'full' event).
+TEST(RoutingTable, ReAddExistingDoesNotTriggerPingAndSwap) {
+    NodeId local = make_id(0x00);
+    RoutingTable table(local);
+
+    bool callback_called = false;
+    table.on_full([&](size_t, const Node&) { callback_called = true; });
+
+    NodeId id = local;
+    id[0] = 0x80;  // bucket 0
+    id[31] = 0x01;
+
+    EXPECT_TRUE(table.add(make_node(id)));
+    EXPECT_EQ(table.size(), 1u);
+
+    // Re-add the same id: true, no growth, no callback.
+    EXPECT_TRUE(table.add(make_node(id)));
+    EXPECT_EQ(table.size(), 1u);
+    EXPECT_FALSE(callback_called);
+}
+
 TEST(RoutingTable, Closest) {
     NodeId local = make_id(0x00);
     RoutingTable table(local);

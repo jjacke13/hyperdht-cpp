@@ -199,7 +199,14 @@ struct Ipv6Addr {
 
 // ---------------------------------------------------------------------------
 // Array combinator — varint(count) + count * Enc::encode(element)
-//   Decode caps at 0x100000 (1M) elements.
+//   Decode caps at ARRAY_MAX_LENGTH elements.
+//
+// DELIBERATE divergence from JS (accepted, not a parity bug): JS
+// compact-encoding array.decode caps at 0x100000 (1M). We cap at 4096 as
+// anti-DoS hardening (H14) — a single 1-byte-element datagram could
+// otherwise force a 1M-element allocation. This fails in the SAFE
+// direction (rejects more than JS, never accepts more) and never triggers
+// against conformant HyperDHT peers (real arrays: relays ~3, closest k=20).
 // ---------------------------------------------------------------------------
 static constexpr size_t ARRAY_MAX_LENGTH = 4096;  // H14: lowered from 0x100000
 

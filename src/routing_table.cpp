@@ -118,12 +118,23 @@ bool RoutingTable::add(const Node& node) {
 
     auto& bucket = buckets_[idx];
 
+    // JS Row.add overwrites an already-present id in place and returns true
+    // with NO size change and NO 'full' event (kademlia-routing-table
+    // index.js:125-127). Match that: a re-add of an existing node must not
+    // spuriously fire the bucket-full / ping-and-swap callback. We keep the
+    // existing entry — its tick metadata (added/pinged/seen/sampled) is
+    // owned by the get_mut() update path, so we deliberately do NOT clobber
+    // it with a wholesale overwrite the way JS does.
+    if (bucket.get(node.id) != nullptr) {
+        return true;
+    }
+
     if (bucket.add(node)) {
         size_++;
         return true;
     }
 
-    // Bucket is full
+    // Bucket is full and the id is not already present → ping-and-swap.
     if (on_full_) {
         on_full_(idx, node);
     }

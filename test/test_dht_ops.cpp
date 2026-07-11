@@ -70,7 +70,7 @@ TEST(DhtOps, FindPeerRandomKey) {
                 values_found++;
             }
         },
-        [&](const std::vector<QueryReply>& closest) {
+        [&](int /*error*/, const std::vector<QueryReply>& closest) {
             done = true;
             rpc.close();
         });

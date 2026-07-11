@@ -205,6 +205,12 @@ void Channel::open(const uint8_t* handshake, size_t handshake_len) {
     if (open_sent_ || closed_ || destroyed_) return;
     open_sent_ = true;
 
+    // Assign our local id at OPEN time (JS index.js:71-79), not at create time.
+    // This guarantees the peer receives ids in strictly increasing order, which
+    // its grow-by-one sequence check (handle_open) requires.
+    local_id_ = mux_.next_local_id_++;
+    mux_.local_to_channel_[local_id_] = this;
+
     // Save handshake for later (if remote hasn't opened yet)
     if (handshake && handshake_len > 0) {
         local_handshake_.assign(handshake, handshake + handshake_len);
@@ -230,15 +236,17 @@ void Channel::open(const uint8_t* handshake, size_t handshake_len) {
     frame.resize(static_cast<size_t>(p - frame.data()));
     mux_.write_frame(frame.data(), frame.size());
 
-    // Check if there's already a pending remote OPEN for any of our
-    // pair keys (primary or alias). This happens when the remote
-    // opened before we did.
+    // If the remote already opened this (protocol,id) — its OPEN is queued in
+    // incoming_ — pair with the first such open now (JS createChannel incoming
+    // path, index.js:399-414). Skip if the outgoing path already paired us.
+    if (remote_id_ != 0) return;
     for (const auto& k : pair_keys_) {
-        auto it = mux_.pending_remote_.find(k);
-        if (it != mux_.pending_remote_.end()) {
-            auto pending = it->second;
-            mux_.pending_remote_.erase(it);
-            mux_.try_pair(this, pending);
+        auto it = mux_.incoming_.find(k);
+        if (it != mux_.incoming_.end() && !it->second.empty()) {
+            auto pend = std::move(it->second.front());
+            it->second.pop_front();
+            if (it->second.empty()) mux_.incoming_.erase(it);
+            mux_.pair_with_remote(this, pend);
             break;
         }
     }
@@ -250,14 +258,18 @@ void Channel::open(const uint8_t* handshake, size_t handshake_len) {
 bool Channel::send(int message_type, const uint8_t* data, size_t len) {
     if (!opened_ || closed_ || remote_id_ == 0) return false;
 
-    // Build data frame: [remoteId][messageType][data]
-    size_t frame_size = varint_size(remote_id_)
+    // Build data frame: [localId][messageType][data]. JS puts the SENDER's own
+    // localId on every data frame (index.js:270-278); the receiver maps it via
+    // its _remote slot keyed by our localId. Encoding remote_id_ here was a
+    // silent data-loss bug whenever the two ends assigned different local ids
+    // (finding protomux-1).
+    size_t frame_size = varint_size(local_id_)
                       + varint_size(static_cast<uint64_t>(message_type))
                       + len;
 
     std::vector<uint8_t> frame(frame_size);
     uint8_t* p = frame.data();
-    p += varint_encode(p, remote_id_);
+    p += varint_encode(p, local_id_);
     p += varint_encode(p, static_cast<uint64_t>(message_type));
     if (data && len > 0) {
         std::memcpy(p, data, len);
@@ -297,31 +309,12 @@ void Channel::close() {
 }
 
 // JS: index.js:117-131 — _fullyOpen(): flips opened, calls onopen with the
-//     remote handshake, drains any pending messages buffered while we
-//     waited for the local Channel to appear.
+//     remote handshake. The pre-pair data drain (JS _drain) is done by
+//     Mux::pair_with_remote from the remote slot's buffer, right after this.
 void Channel::fully_open(const uint8_t* remote_handshake, size_t len) {
     if (opened_ || destroyed_) return;
     opened_ = true;
     if (on_open) on_open(remote_handshake, len);
-    drain_pending();
-}
-
-// JS: index.js:147-156 — _drain(remote): replays r.pending while
-//     decrementing the mux-level _buffered counter, then resumeMaybe()s
-//     the underlying stream if backpressure had paused it.
-void Channel::drain_pending() {
-    // Process any messages that arrived before channel was fully opened
-    auto pending = std::move(pending_messages_);
-    pending_messages_.clear();
-    for (const auto& pm : pending) {
-        if (mux_.buffered_bytes_ >= pm.data.size())
-            mux_.buffered_bytes_ -= pm.data.size();
-        else
-            mux_.buffered_bytes_ = 0;
-        if (!destroyed_) {
-            dispatch(pm.type, pm.data.data(), pm.data.size());
-        }
-    }
 }
 
 // JS: index.js:167-191 — _close(isRemote): tears down local/remote slot
@@ -355,7 +348,14 @@ void Channel::destroy() {
 
 void Channel::dispatch(uint32_t type, const uint8_t* data, size_t len) {
     if (type < messages_.size() && messages_[type].on_message) {
-        messages_[type].on_message(data, len);
+        // Copy the handler onto the stack before invoking: a handler is
+        // allowed to tear down its own channel (e.g. blind-relay closing the
+        // channel on a malformed message), which frees `messages_` — and with
+        // it the std::function currently executing. The stack copy keeps the
+        // callable alive for the duration of the call. dispatch touches no
+        // `this` state after the call returns, so `this` may be dangling then.
+        auto handler = messages_[type].on_message;
+        handler(data, len);
     }
 }
 
@@ -406,13 +406,14 @@ Channel* Mux::create_channel(const std::string& protocol,
         }
     }
 
-    uint32_t local_id = next_local_id_++;
+    // Local id and local_to_channel_ registration happen at open() time
+    // (JS assigns _localId in Channel.open, not the constructor) so the peer
+    // sees ids in open order — see Channel::open.
     auto ch = aliases.empty()
-        ? std::make_unique<Channel>(*this, protocol, id, local_id)
-        : std::make_unique<Channel>(*this, protocol, aliases, id, local_id);
+        ? std::make_unique<Channel>(*this, protocol, id, 0)
+        : std::make_unique<Channel>(*this, protocol, aliases, id, 0);
     Channel* ptr = ch.get();
     channels_.push_back(std::move(ch));
-    local_to_channel_[local_id] = ptr;
 
     // Register every pair key (primary + aliases) in the last-channel map.
     for (const auto& k : ptr->pair_keys_) {
@@ -466,6 +467,19 @@ void Mux::write_frame(const uint8_t* data, size_t len) {
         const uint8_t* end = data + len;
         uint32_t local_id = static_cast<uint32_t>(varint_decode(ptr, end));
         size_t payload_len = static_cast<size_t>(end - ptr);
+
+        // JS _pushBatch (index.js:417-422): flush the current batch first if it
+        // already reached MAX_BATCH, then start a fresh one (finding 6). Keeps a
+        // single batch frame under the 8 MB boundary.
+        if (batch_size_ >= MAX_BATCH) flush_batch();
+
+        if (batch_.empty()) {
+            batch_size_ = 2 + varint_size(local_id);       // 0x00 0x00 + first id
+        } else if (batch_.back().local_id != local_id) {
+            batch_size_ += 1 + varint_size(local_id);      // switch marker + id
+        }
+        batch_size_ += varint_size(payload_len) + payload_len;
+
         BatchEntry e;
         e.local_id = local_id;
         e.payload.assign(ptr, ptr + payload_len);
@@ -489,7 +503,13 @@ void Mux::uncork() {
         return;
     }
     if (--cork_count_ > 0) return;
-    if (batch_.empty()) return;
+    flush_batch();
+}
+
+// Encode the accumulated batch entries as a single [0x00, 0x00, ...] control
+// frame and write it, then reset the batch. JS _sendBatch (index.js:432-453).
+void Mux::flush_batch() {
+    if (batch_.empty()) { batch_size_ = 0; return; }
 
     // Compute the encoded size.
     // Header: 0x00 0x00 + varint(first_localId)
@@ -533,7 +553,8 @@ void Mux::uncork() {
     frame.resize(static_cast<size_t>(p - frame.data()));
 
     batch_.clear();
-    if (write_fn_) {
+    batch_size_ = 0;
+    if (write_fn_ && !destroyed_) {
         drained_ = write_fn_(frame.data(), frame.size());
     }
 }
@@ -551,19 +572,22 @@ void Mux::uncork() {
 // ---------------------------------------------------------------------------
 
 void Mux::on_data(const uint8_t* data, size_t len) {
-    if (len == 0) return;
+    if (len == 0) return;  // JS _ondata: ignore empty frames
 
     const uint8_t* ptr = data;
     const uint8_t* end = data + len;
 
     uint64_t channel_id = varint_decode(ptr, end);
-    if (ptr >= end) return;
+    if (channel_id > UINT32_MAX) { safe_destroy(); return; }  // C8
+    dispatch_frame(static_cast<uint32_t>(channel_id), ptr, end);
+}
 
+// JS _decode (index.js:504-522): route a decoded frame to the control-session
+// handlers (channelId 0) or the data path. Shared by on_data and handle_batch.
+void Mux::dispatch_frame(uint32_t channel_id, const uint8_t* ptr, const uint8_t* end) {
     if (channel_id == 0) {
-        // Control session
         uint64_t type = varint_decode(ptr, end);
         size_t remaining = static_cast<size_t>(end - ptr);
-
         switch (type) {
             case CONTROL_BATCH:  handle_batch(ptr, remaining); break;
             case CONTROL_OPEN:   handle_open(ptr, remaining); break;
@@ -572,9 +596,7 @@ void Mux::on_data(const uint8_t* data, size_t len) {
             default: break;
         }
     } else {
-        if (channel_id > UINT32_MAX) return;  // C8: reject truncated IDs
-        handle_data(static_cast<uint32_t>(channel_id), ptr,
-                    static_cast<size_t>(end - ptr));
+        handle_data(channel_id, ptr, static_cast<size_t>(end - ptr));
     }
 }
 
@@ -583,170 +605,186 @@ void Mux::on_data(const uint8_t* data, size_t len) {
 //
 // JS: .analysis/js/protomux/index.js:595-646 (_onopensession — decodes
 //     remoteId/protocol/id, hooks an existing local channel via
-//     info.outgoing or queues into info.incoming and runs _requestSession)
+//     info.outgoing, or allocates a buffering _remote slot, queues into
+//     info.incoming and runs _requestSession)
 //     .analysis/js/protomux/index.js:648-668 (_onrejectsession)
 //     .analysis/js/protomux/index.js:670-681 (_onclosesession)
 //     .analysis/js/protomux/index.js:565-593 (_onbatch — the decode loop;
 //     msg_len==0 means "switch channel id")
-//
-// C++ diffs from JS:
-//   - JS handles sessions using a per-info `incoming` queue and lazily
-//     allocates `_remote[rid] = { state, pending: [], session }`. C++ uses
-//     a flat `pending_remote_` map keyed by pair-key — equivalent state.
-//   - JS REJECTs control session opens (remoteId=0); C++ silently ignores.
 // ---------------------------------------------------------------------------
+
+// JS MAX_BACKLOG = Infinity (index.js:8). We keep a very high documented cap
+// as anti-DoS defence — the count of still-buffering (unclaimed) remote slots.
+static constexpr size_t kMaxRemoteBacklog = 1u << 20;
+// JS byteSize (index.js:755): per-buffered-message accounting overhead.
+static constexpr size_t kBufferOverhead = 512;
 
 void Mux::handle_open(const uint8_t* data, size_t len) {
     const uint8_t* ptr = data;
     const uint8_t* end = data + len;
 
     uint64_t raw_id = varint_decode(ptr, end);
-    if (raw_id == 0 || raw_id > UINT32_MAX) return;  // C8
-    uint32_t remote_local_id = static_cast<uint32_t>(raw_id);
+    if (raw_id > UINT32_MAX) { safe_destroy(); return; }  // C8
+    uint32_t remote_id = static_cast<uint32_t>(raw_id);
 
     std::string protocol = string_decode(ptr, end);
-    if (protocol.empty()) return;
-
     auto id = buffer_decode(ptr, end);
     auto handshake = buffer_decode(ptr, end);
 
-    // Build pair key
-    std::string key = protocol + "##";
-    if (!id.empty()) {
-        key += to_hex(id.data(), id.size());
+    // Remote opened the control session → REJECT (JS index.js:602-605).
+    if (remote_id == 0) { reject_session(0); return; }
+
+    // Sequence validation (JS index.js:610-617): incoming remote ids grow by at
+    // most one and may not reuse a live slot; a violation is a fatal protocol
+    // error that tears the whole mux down (finding protomux-4).
+    uint32_t rid = remote_id - 1;
+    if (remote_len_ == rid) remote_len_ = static_cast<size_t>(rid) + 1;
+    if (rid >= remote_len_ || remote_slots_.count(remote_id)) {
+        safe_destroy();
+        return;
     }
 
-    // Check if we already have a local channel for this (protocol, id)
-    Channel* local = find_by_pair_key(key);
-    if (local && local->open_sent_ && !local->opened_) {
-        // Pairing: local channel exists and was opened → link them
-        PendingOpen pending{remote_local_id, std::move(handshake),
-                            std::move(protocol), std::move(id)};
-        try_pair(local, pending);
-    } else {
-        // No local channel yet — store as pending and notify.
-        // Copy values for the callback since the callback may erase
-        // from pending_remote_ (by calling create_channel + open).
-        PendingOpen pending{remote_local_id, handshake, protocol, id};
-        pending_remote_[key] = std::move(pending);
+    std::string key = build_pair_key(protocol, id);
 
-        dispatch_notify(protocol, id, handshake.data(), handshake.size());
+    // Outgoing path (JS index.js:619-632): a local channel already opened for
+    // this (protocol,id) is awaiting pairing → link them immediately.
+    if (Channel* local = find_awaiting_local(key)) {
+        remote_slots_[remote_id].buffering = false;  // paired now, never buffers
+        PendingOpen pend{remote_id, std::move(handshake),
+                         std::move(protocol), std::move(id)};
+        pair_with_remote(local, pend);
+        return;
     }
+
+    // No local channel yet (JS index.js:635-645): create a buffering slot so
+    // subsequent data frames for this remote id are held (not dropped), queue
+    // the incoming open, run the (synchronous) notify round, then reject the
+    // open if nothing local claimed it.
+    remote_slots_[remote_id];  // default-construct: buffering=true, session=null
+    if (++remote_backlog_ > kMaxRemoteBacklog) { safe_destroy(); return; }
+
+    incoming_[key].push_back(PendingOpen{remote_id, handshake, protocol, id});
+    bool notified = dispatch_notify(protocol, id, handshake.data(), handshake.size());
+    if (destroyed_) return;
+
+    // JS _requestSession tail: reject every incoming open the pairing attempt
+    // left unclaimed. In C++ the notify IS the (synchronous) pairing attempt —
+    // reject only if a handler ran and declined. With no handler, the app pairs
+    // by opening its own channel later, so the open stays parked (finding 3).
+    if (notified) request_session(key);
 }
 
+// JS _onrejectsession (index.js:648-668): only a channel still awaiting open
+// (in info.outgoing) may be rejected. An unmatched reject — including one for
+// an already-opened channel — is a fatal protocol error (finding protomux-10).
 void Mux::handle_reject(const uint8_t* data, size_t len) {
     const uint8_t* ptr = data;
     const uint8_t* end = data + len;
 
     uint64_t raw_id = varint_decode(ptr, end);
-    if (raw_id == 0 || raw_id > UINT32_MAX || ptr > end) return;  // C8
-    uint32_t remote_id = static_cast<uint32_t>(raw_id);
+    if (raw_id > UINT32_MAX) { safe_destroy(); return; }  // C8
+    uint32_t local_id = static_cast<uint32_t>(raw_id);
 
-    auto it = local_to_channel_.find(remote_id);
-    if (it != local_to_channel_.end()) {
-        it->second->remote_close();
+    auto it = local_to_channel_.find(local_id);
+    Channel* ch = (it != local_to_channel_.end()) ? it->second : nullptr;
+    if (!ch || !ch->open_sent_ || ch->opened_) {
+        safe_destroy();  // JS: throw 'Invalid reject message'
+        return;
     }
+    ch->remote_close();  // JS session._close(true)
 }
 
+// JS _onclosesession (index.js:670-681).
 void Mux::handle_close(const uint8_t* data, size_t len) {
     const uint8_t* ptr = data;
     const uint8_t* end = data + len;
 
     uint64_t raw_id = varint_decode(ptr, end);
-    if (raw_id == 0 || raw_id > UINT32_MAX || ptr > end) return;  // C8
-    uint32_t remote_local_id = static_cast<uint32_t>(raw_id);
+    if (raw_id == 0 || raw_id > UINT32_MAX) return;  // JS: remoteId 0 → ignore
+    uint32_t remote_id = static_cast<uint32_t>(raw_id);
 
-    auto it = remote_to_channel_.find(remote_local_id);
-    if (it != remote_to_channel_.end()) {
-        it->second->remote_close();
-    }
+    auto it = remote_slots_.find(remote_id);
+    if (it == remote_slots_.end()) return;  // JS r === null → return
+    Channel* s = it->second.session;
+    if (s) s->remote_close();  // JS r.session._close(true)
 }
 
+// JS _onbatch (index.js:565-593): decode every message in the frame — the
+// frame's byte length is the only bound (no entry cap, finding protomux-5).
+// A multi-message batch is processed under a cork so any reply side-effects
+// coalesce back into a single batch frame (finding protomux-7).
 void Mux::handle_batch(const uint8_t* data, size_t len) {
-    // Batch format: [channelId][msg1_len][msg1][msg2_len][msg2]...[0][channelId2]...
     const uint8_t* ptr = data;
-    const uint8_t* end = data + len;
-    constexpr size_t MAX_BATCH_ENTRIES = 1024;  // M5: cap batch entries
-    size_t entries = 0;
+    const uint8_t* frame_end = data + len;
 
-    while (ptr < end) {
-        uint64_t channel_id = varint_decode(ptr, end);
-        if (channel_id > UINT32_MAX) return;  // C8: reject truncated IDs
+    uint32_t remote_id = static_cast<uint32_t>(varint_decode(ptr, frame_end));
+    bool corked = false;
 
-        while (ptr < end) {
-            if (++entries > MAX_BATCH_ENTRIES) return;  // M5
-
-            uint64_t msg_len = varint_decode(ptr, end);
-            if (msg_len == 0) break;  // End of this channel's messages
-
-            // C6: safe arithmetic — avoid ptr+msg_len wrap
-            size_t avail = static_cast<size_t>(end - ptr);
-            if (msg_len > avail) return;  // Truncated
-            size_t safe_len = static_cast<size_t>(msg_len);
-
-            // Each sub-message is a complete frame for this channel
-            if (channel_id == 0) {
-                // Control sub-message
-                if (safe_len > 0) {
-                    const uint8_t* sub = ptr;
-                    const uint8_t* sub_end = ptr + safe_len;
-                    uint64_t type = varint_decode(sub, sub_end);
-                    size_t remaining = static_cast<size_t>(sub_end - sub);
-                    switch (type) {
-                        case CONTROL_OPEN:   handle_open(sub, remaining); break;
-                        case CONTROL_REJECT: handle_reject(sub, remaining); break;
-                        case CONTROL_CLOSE:  handle_close(sub, remaining); break;
-                        default: break;
-                    }
-                }
-            } else {
-                handle_data(static_cast<uint32_t>(channel_id), ptr, safe_len);
-            }
-
-            ptr += safe_len;
+    while (ptr < frame_end && !destroyed_) {
+        uint64_t msg_len = varint_decode(ptr, frame_end);
+        if (msg_len == 0) {  // channel-switch marker
+            remote_id = static_cast<uint32_t>(varint_decode(ptr, frame_end));
+            continue;
         }
+
+        // C6: safe arithmetic — avoid ptr+msg_len wrap. Truncation is a decode
+        // error; JS throws → _safeDestroy (not a silent truncate).
+        size_t avail = static_cast<size_t>(frame_end - ptr);
+        if (msg_len > avail) { safe_destroy(); break; }
+
+        const uint8_t* msg = ptr;
+        const uint8_t* msg_end = ptr + static_cast<size_t>(msg_len);
+
+        // JS corks the first time a message doesn't consume the rest of the
+        // frame (i.e. the batch holds more than one message).
+        if (msg_end != frame_end && !corked) { cork(); corked = true; }
+
+        dispatch_frame(remote_id, msg, msg_end);
+        ptr = msg_end;
     }
+
+    if (corked && !destroyed_) uncork();
 }
 
-void Mux::handle_data(uint32_t channel_id, const uint8_t* data, size_t len) {
-    // channel_id is the remote's local ID — which is our "remote_id" for this channel
-    auto it = remote_to_channel_.find(channel_id);
-    if (it == remote_to_channel_.end()) return;
-
-    Channel* ch = it->second;
-    if (ch->destroyed_) return;
+// JS _decode data path (index.js:511-521): route a data frame to its remote
+// slot — ignore if the slot is gone, buffer if still pairing, else deliver.
+void Mux::handle_data(uint32_t remote_id, const uint8_t* data, size_t len) {
+    auto it = remote_slots_.find(remote_id);
+    if (it == remote_slots_.end()) return;  // JS r === null → ignore
+    RemoteSlot& slot = it->second;
 
     const uint8_t* ptr = data;
     const uint8_t* end = data + len;
-
     uint32_t type = static_cast<uint32_t>(varint_decode(ptr, end));
     size_t remaining = static_cast<size_t>(end - ptr);
 
-    if (!ch->opened_) {
-        // Buffer the message until channel is fully opened
-        // Enforce MAX_BUFFERED to prevent unbounded memory growth
-        if (buffered_bytes_ + remaining > MAX_BUFFERED) {
-            return;  // Drop message — backpressure exceeded
-        }
-        Channel::PendingMessage pm;
+    if (slot.buffering) {
+        // JS _bufferMessage (index.js:546-563): always buffer, then _pauseMaybe.
+        // We have no read-side pause hook (frames are pushed via on_data), so we
+        // buffer up to a documented cap and tear the mux down past it — never a
+        // silent drop (finding protomux-2).
+        BufferedMessage pm;
         pm.type = type;
         pm.data.assign(ptr, ptr + remaining);
-        buffered_bytes_ += remaining;
-        ch->pending_messages_.push_back(std::move(pm));
+        slot.pending.push_back(std::move(pm));
+        buffered_bytes_ += kBufferOverhead + remaining;
+        if (buffered_bytes_ > MAX_BUFFERED) {
+            // ponytail: no true stream-pause available here; teardown, not drop.
+            safe_destroy();
+        }
         return;
     }
 
-    ch->dispatch(type, ptr, remaining);
+    if (slot.session && !slot.session->destroyed_) {
+        slot.session->dispatch(type, ptr, remaining);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Pairing
+// Pairing / reject / teardown
 //
-// JS: .analysis/js/protomux/index.js:619-633 (the "outgoing.shift()" path
-//     in _onopensession — links a pending local channel to the freshly
-//     decoded remote slot and calls session._fullyOpen())
-//     .analysis/js/protomux/index.js:117-131 (_fullyOpen — wires the remote
-//     session pointer and decodes the remote handshake)
+// JS: .analysis/js/protomux/index.js:117-131 (_fullyOpen), :147-156 (_drain),
+//     :683-695 (_requestSession), :697-722 (_rejectSession).
 // ---------------------------------------------------------------------------
 
 Channel* Mux::find_by_pair_key(const std::string& key) {
@@ -760,13 +798,87 @@ Channel* Mux::find_by_pair_key(const std::string& key) {
     return nullptr;
 }
 
-void Mux::try_pair(Channel* local, const PendingOpen& remote) {
-    // Link: remote's local_id becomes our "remote_id" for sending
-    local->set_remote_id(remote.remote_local_id);
-    remote_to_channel_[remote.remote_local_id] = local;
+// A local channel that has opened (sent its OPEN) but is not yet paired —
+// JS info.outgoing membership.
+Channel* Mux::find_awaiting_local(const std::string& key) {
+    for (auto& ch : channels_) {
+        if (ch->destroyed_ || !ch->open_sent_ || ch->opened_ || ch->remote_id_ != 0)
+            continue;
+        for (const auto& k : ch->pair_keys_) {
+            if (k == key) return ch.get();
+        }
+    }
+    return nullptr;
+}
 
-    // Fully open with the remote's handshake
+void Mux::pair_with_remote(Channel* local, const PendingOpen& remote) {
+    uint32_t remote_id = remote.remote_local_id;
+    local->set_remote_id(remote_id);
+
+    RemoteSlot& slot = remote_slots_[remote_id];
+    bool was_buffering = slot.buffering;
+    slot.session = local;
+
+    // Fire on_open with the remote handshake (JS _fullyOpen)…
     local->fully_open(remote.handshake.data(), remote.handshake.size());
+
+    // …then replay any data buffered while we waited to pair (JS _drain).
+    auto pending = std::move(slot.pending);
+    slot.pending.clear();
+    slot.buffering = false;
+    if (was_buffering && remote_backlog_ > 0) remote_backlog_--;
+
+    for (auto& pm : pending) {
+        size_t sz = kBufferOverhead + pm.data.size();
+        buffered_bytes_ = buffered_bytes_ >= sz ? buffered_bytes_ - sz : 0;
+        if (!local->destroyed_) {
+            local->dispatch(pm.type, pm.data.data(), pm.data.size());
+        }
+    }
+}
+
+// JS _requestSession tail (index.js:688-694): the notify round is over
+// (synchronous here), so reject every incoming open for `key` that no local
+// channel claimed (finding protomux-3).
+void Mux::request_session(const std::string& key) {
+    auto it = incoming_.find(key);
+    if (it == incoming_.end()) return;
+    std::deque<PendingOpen> queue = std::move(it->second);
+    incoming_.erase(it);
+    for (const auto& pend : queue) {
+        reject_session(pend.remote_local_id);
+        if (destroyed_) return;
+    }
+}
+
+// JS _rejectSession (index.js:697-722): drop the remote slot (freeing any
+// buffered data) and emit a [0, 2, remoteId] control frame.
+void Mux::reject_session(uint32_t remote_id) {
+    if (remote_id > 0) {
+        auto it = remote_slots_.find(remote_id);
+        if (it != remote_slots_.end()) {
+            for (const auto& pm : it->second.pending) {
+                size_t sz = kBufferOverhead + pm.data.size();
+                buffered_bytes_ = buffered_bytes_ >= sz ? buffered_bytes_ - sz : 0;
+            }
+            if (it->second.buffering && remote_backlog_ > 0) remote_backlog_--;
+            remote_slots_.erase(it);
+        }
+    }
+
+    uint8_t frame[16];
+    uint8_t* p = frame;
+    p += varint_encode(p, 0);               // channelId = 0 (control)
+    p += varint_encode(p, CONTROL_REJECT);  // type = 2
+    p += varint_encode(p, remote_id);
+    write_frame(frame, static_cast<size_t>(p - frame));
+}
+
+void Mux::safe_destroy() {
+    // JS _safeDestroy → stream.destroy → _shutdown closes every session. The
+    // Mux owns no stream, so destroy() (close all channels, stop writing) is
+    // our equivalent teardown path.
+    destroy();
 }
 
 // ---------------------------------------------------------------------------
@@ -796,7 +908,14 @@ void Mux::unpair(const std::string& protocol, const std::vector<uint8_t>& id) {
     pair_notify_.erase(key);
 }
 
-void Mux::dispatch_notify(const std::string& protocol,
+// Returns true if a notify handler was actually invoked — i.e. the app got a
+// synchronous chance to claim this open. handle_open uses that to decide
+// whether to reject an unclaimed open: a declined notify → reject (JS
+// _requestSession); no handler at all → park it, because the app pairs by
+// pre-creating/opening its own channel (the live blind-relay path and the
+// symmetric loopback tests both rely on this). This is the C++ synchronous
+// analogue of JS's async notify round.
+bool Mux::dispatch_notify(const std::string& protocol,
                            const std::vector<uint8_t>& id,
                            const uint8_t* handshake, size_t hs_len) {
     // Check specific (protocol, id) first
@@ -807,7 +926,7 @@ void Mux::dispatch_notify(const std::string& protocol,
     auto it = pair_notify_.find(key);
     if (it != pair_notify_.end()) {
         it->second(protocol, id, handshake, hs_len);
-        return;
+        return true;
     }
 
     // Fall back to protocol-only (empty id)
@@ -815,13 +934,15 @@ void Mux::dispatch_notify(const std::string& protocol,
     it = pair_notify_.find(proto_key);
     if (it != pair_notify_.end()) {
         it->second(protocol, id, handshake, hs_len);
-        return;
+        return true;
     }
 
     // Global fallback
     if (on_notify_) {
         on_notify_(protocol, id, handshake, hs_len);
+        return true;
     }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -833,26 +954,31 @@ void Mux::dispatch_notify(const std::string& protocol,
 
 void Mux::on_stream_drain() {
     drained_ = true;
-    // Snapshot: callbacks may close channels, modifying channels_ vector
+    // JS _ondrain (index.js:492-498): fire ondrain on every non-null local
+    // session (i.e. every channel that has opened), opened-and-paired or not —
+    // not only fully-opened ones (finding protomux-9).
+    // Snapshot: callbacks may close channels, modifying channels_ vector.
     auto snapshot = std::vector<Channel*>();
     for (auto& ch : channels_) snapshot.push_back(ch.get());
     for (auto* ch : snapshot) {
-        if (ch->opened_ && !ch->destroyed_ && ch->on_drain) {
+        if (ch->open_sent_ && !ch->destroyed_ && ch->on_drain) {
             ch->on_drain();
         }
     }
 }
 
 void Mux::remove_channel(Channel* ch) {
-    // Remove from lookups
+    // Remove from lookups. JS _close nulls _remote[rid] and frees the local id.
     if (ch->remote_id_ != 0) {
-        remote_to_channel_.erase(ch->remote_id_);
+        remote_slots_.erase(ch->remote_id_);
     }
-    local_to_channel_.erase(ch->local_id_);
+    if (ch->open_sent_) {
+        local_to_channel_.erase(ch->local_id_);
+    }
 
-    // Remove from pending + last-channel map for every key we own.
+    // Remove from the last-channel map for every key we own. (incoming_ is
+    // drained synchronously in request_session, so it holds nothing for us.)
     for (const auto& k : ch->pair_keys_) {
-        pending_remote_.erase(k);
         auto it = last_channel_by_key_.find(k);
         if (it != last_channel_by_key_.end() && it->second == ch) {
             last_channel_by_key_.erase(it);
@@ -912,7 +1038,12 @@ void Mux::destroy() {
     }
 
     batch_.clear();
+    batch_size_ = 0;
     cork_count_ = 0;
+    remote_slots_.clear();
+    incoming_.clear();
+    remote_backlog_ = 0;
+    buffered_bytes_ = 0;
 }
 
 bool Mux::opened(const std::string& protocol,

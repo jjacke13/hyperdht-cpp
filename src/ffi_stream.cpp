@@ -4,6 +4,7 @@
 // deletion). uv_ip4_addr return value is checked. Zero-event polls rejected.
 #include "ffi_internal.hpp"
 #include "hyperdht/debug.hpp"
+#include "hyperdht/relay_upgrade.hpp"
 
 // ---------------------------------------------------------------------------
 // Encrypted streams — delegates to SecretStreamDuplex (see ffi_internal.hpp
@@ -131,14 +132,17 @@ hyperdht_stream_t* hyperdht_stream_open(
     s->on_close = on_close;
     s->userdata = userdata;
 
-    // Take ownership of the pool socket keepalive from the connection.
-    // This keeps the holepunch pool socket alive for the stream's lifetime.
+    // Take ownership of the pool socket keepalive + relay→direct upgrade handle
+    // from the connection. The keepalive keeps the holepunch pool socket alive;
+    // the upgrade handle (JS PR #266) is plumbed into the Duplex below so a later
+    // punch migrates this stream onto the direct path. Consuming here + nulling
+    // _internal stops the producer's post-callback cleanup from double-freeing.
+    std::shared_ptr<void> upgrade_handle;
     if (conn->_internal) {
-        s->socket_keepalive = std::move(
-            *static_cast<std::shared_ptr<void>*>(conn->_internal));
-        delete static_cast<std::shared_ptr<void>*>(conn->_internal);
-        // Cast away const to null the consumed pointer — prevents the
-        // connect callback's cleanup from double-freeing.
+        auto* extra = static_cast<FfiConnExtra*>(conn->_internal);
+        s->socket_keepalive = std::move(extra->socket_keepalive);
+        upgrade_handle = std::move(extra->upgrade);
+        delete extra;
         const_cast<hyperdht_connection_t*>(conn)->_internal = nullptr;
     }
 
@@ -178,6 +182,11 @@ hyperdht_stream_t* hyperdht_stream_open(
         DHT_LOG("  [ffi-stream] on_close: err=%d\n", err);
         stream_fire_close(s);
     });
+
+    // ---- 4b. Attach the relay→direct upgrade (JS PR #266), if any ----
+    // MUST happen before start() so the Duplex installs its firewall with the
+    // upgrade taps live. No-op when the connection wasn't relay-emitted.
+    hyperdht::relay_upgrade::attach_to_duplex(*s->duplex, upgrade_handle);
 
     // ---- 5. Fire off the header exchange ----
     DHT_LOG("  [ffi-stream] starting SecretStream header exchange (initiator=%d)\n",

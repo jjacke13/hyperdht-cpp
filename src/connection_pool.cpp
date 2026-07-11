@@ -6,6 +6,8 @@
 
 #include <cstring>
 
+#include "hyperdht/server.hpp"
+
 namespace hyperdht {
 namespace connection_pool {
 
@@ -56,12 +58,17 @@ AttachResult ConnectionPool::attach_stream(std::shared_ptr<ConnectionRef> ref,
     auto existing = get(ref->remote_public_key());
     if (existing) {
         if (should_keep_new(*existing, *ref)) {
-            // Keep new, destroy old
-            remove(existing->remote_public_key());
+            // dhttop-8: keep-new, but DEFER the swap. Destroy the old stream
+            // now; hold the new ref until the old ref's close is signalled
+            // (on_stream_closed). Do NOT remove/attach synchronously —
+            // matches JS connection-pool.js:37-55 where _attachStream(new)
+            // runs from the OLD stream's 'close' handler. The old ref stays
+            // in the pool (its own close removes it) until then.
+            pending_swaps_[hex] = PendingSwap{ref, opened};
             if (existing->on_destroy) existing->on_destroy();
-            // Fall through to attach new
+            return AttachResult::DUPLICATE_KEPT_NEW;
         } else {
-            // Keep old, destroy new
+            // Keep old, destroy new (synchronous — JS:56-58)
             if (ref->on_destroy) ref->on_destroy();
             return AttachResult::DUPLICATE_KEPT_OLD;
         }
@@ -69,11 +76,12 @@ AttachResult ConnectionPool::attach_stream(std::shared_ptr<ConnectionRef> ref,
 
     if (opened) {
         connections_[hex] = ref;
+        if (ref->on_emit) ref->on_emit();  // JS emit 'connection' (:74)
     } else {
         connecting_[hex] = ref;
     }
 
-    return existing ? AttachResult::DUPLICATE_KEPT_NEW : AttachResult::ATTACHED;
+    return AttachResult::ATTACHED;
 }
 
 void ConnectionPool::mark_opened(const std::array<uint8_t, 32>& remote_key) {
@@ -86,6 +94,66 @@ void ConnectionPool::mark_opened(const std::array<uint8_t, 32>& remote_key) {
     connections_[hex] = ref;
 
     if (ref->on_open) ref->on_open();
+    if (ref->on_emit) ref->on_emit();  // JS emit 'connection' on open (:92)
+}
+
+void ConnectionPool::on_stream_closed(const std::shared_ptr<ConnectionRef>& ref) {
+    if (!ref) return;
+    ref->mark_closed();
+    auto hex = key_hex(ref->remote_public_key());
+
+    // Case 1: the closing ref is the currently-attached connection. Remove it,
+    // then promote any deferred keep-new (dhttop-8 / JS:46-52).
+    auto attached = get(ref->remote_public_key());
+    if (attached && attached.get() == ref.get()) {
+        remove(ref->remote_public_key());
+        auto it = pending_swaps_.find(hex);
+        if (it != pending_swaps_.end()) {
+            PendingSwap pend = it->second;
+            pending_swaps_.erase(it);
+            // JS:47 — `if (closed) return`: skip the swap if the new stream
+            // already closed while the old one was tearing down.
+            if (!pend.ref->closed()) {
+                attach_stream(pend.ref, pend.opened);  // no existing → ATTACHED
+            }
+        }
+        if (ref->on_close) ref->on_close();
+        return;
+    }
+
+    // Case 2: the closing ref is a pending keep-new that died before the old
+    // one closed. Drop it so it is never resurrected (JS onclose flag).
+    auto it = pending_swaps_.find(hex);
+    if (it != pending_swaps_.end() && it->second.ref.get() == ref.get()) {
+        pending_swaps_.erase(it);
+    }
+    if (ref->on_close) ref->on_close();
+}
+
+// ---------------------------------------------------------------------------
+// attach_server — funnel a Server's inbound connections through the pool.
+//
+// JS: hyperdht/lib/connection-pool.js:15-27 (_attachServer). We chain a
+// listener onto the Server's connection callback (NOT replacing the user's),
+// build a dedup ref keyed by the peer's public key, run it through
+// attach_stream, and re-emit accepted connections via on_connection_.
+// ---------------------------------------------------------------------------
+
+void ConnectionPool::attach_server(server::Server& server) {
+    server::Server* sp = &server;
+    server.add_connection_listener(
+        [this, sp](const server::ConnectionInfo& info) {
+            ConnectionInfo cp;
+            cp.local_public_key = sp->public_key();
+            cp.remote_public_key = info.remote_public_key;
+            cp.is_initiator = info.is_initiator;  // false for a server
+            auto ref = std::make_shared<ConnectionRef>(cp);
+            // Emit the unified 'connection' event when this ref is attached.
+            ref->on_emit = [this, info]() {
+                if (on_connection_) on_connection_(info);
+            };
+            attach_stream(ref, /*opened=*/true);
+        });
 }
 
 void ConnectionPool::remove(const std::array<uint8_t, 32>& remote_key) {

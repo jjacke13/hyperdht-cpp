@@ -888,3 +888,331 @@ TEST(Protomux, ChannelAliasRegistersInLastChannelMap) {
     EXPECT_EQ(mux.a.get_last_channel("alt-2"), ch);
     EXPECT_EQ(mux.a.get_last_channel("unrelated"), nullptr);
 }
+
+// ===========================================================================
+// JS-parity fixes — protomux-1..10 (asymmetric ids, pre-pair buffering,
+// REJECT, sequence validation, unbounded batch, batch-reply coalescing,
+// drain-on-unpaired). Wire bytes derived by hand from the JS encoders.
+// ===========================================================================
+
+namespace {
+
+void put_varint(std::vector<uint8_t>& out, uint64_t v) {
+    uint8_t tmp[9];
+    size_t n = varint_encode(tmp, v);
+    out.insert(out.end(), tmp, tmp + n);
+}
+
+// Control OPEN frame: [0][1][remoteId][proto][id][handshake].
+std::vector<uint8_t> make_open(uint32_t remote_id, const std::string& proto) {
+    std::vector<uint8_t> f;
+    put_varint(f, 0);             // channelId (control)
+    put_varint(f, CONTROL_OPEN);  // type 1
+    put_varint(f, remote_id);
+    put_varint(f, proto.size());
+    f.insert(f.end(), proto.begin(), proto.end());
+    put_varint(f, 0);             // id (empty)
+    put_varint(f, 0);             // handshake (empty)
+    return f;
+}
+
+// Data frame: [channelId][type][payload].
+std::vector<uint8_t> make_data(uint32_t channel_id, uint32_t type,
+                               const std::vector<uint8_t>& payload) {
+    std::vector<uint8_t> f;
+    put_varint(f, channel_id);
+    put_varint(f, type);
+    f.insert(f.end(), payload.begin(), payload.end());
+    return f;
+}
+
+}  // namespace
+
+// (1) DATA frames carry the SENDER's local id; delivery must work when the two
+// endpoints assigned different local ids to the paired channel (protomux-1).
+TEST(ProtomuxParity, AsymmetricIdDataRoundTrip) {
+    LoopbackMux mux;
+
+    std::vector<uint8_t> b_from_a, a_from_b;
+    Channel* real_b = nullptr;
+
+    // B pairs only "real" via notify. The "dummy" opens below park on B (no
+    // channel/notify), skewing A's local ids above B's for the real channel.
+    mux.b.on_notify([&](const std::string& proto, const std::vector<uint8_t>&,
+                        const uint8_t*, size_t) {
+        if (proto != "real") return;
+        real_b = mux.b.create_channel("real");
+        real_b->add_message({[&](const uint8_t* d, size_t n) {
+            b_from_a.assign(d, d + n);
+        }});
+        real_b->open();
+    });
+
+    auto* d0 = mux.a.create_channel("d0"); d0->open();
+    auto* d1 = mux.a.create_channel("d1"); d1->open();
+    auto* d2 = mux.a.create_channel("d2"); d2->open();
+
+    auto* real_a = mux.a.create_channel("real");
+    real_a->add_message({[&](const uint8_t* d, size_t n) {
+        a_from_b.assign(d, d + n);
+    }});
+    real_a->open();
+
+    ASSERT_TRUE(real_a->is_open());
+    ASSERT_NE(real_b, nullptr);
+    ASSERT_TRUE(real_b->is_open());
+    ASSERT_NE(real_a->local_id(), real_b->local_id())
+        << "test proves nothing unless the ids are actually asymmetric";
+
+    std::vector<uint8_t> ab = {1, 2, 3};
+    std::vector<uint8_t> ba = {9, 8};
+    ASSERT_TRUE(real_a->send(0, ab.data(), ab.size()));
+    ASSERT_TRUE(real_b->send(0, ba.data(), ba.size()));
+
+    EXPECT_EQ(b_from_a, ab);
+    EXPECT_EQ(a_from_b, ba);
+}
+
+// (2) Data arriving between a remote OPEN and the local pair is buffered and
+// delivered on pairing — not dropped (protomux-2).
+TEST(ProtomuxParity, PrePairDataBufferedThenDelivered) {
+    Mux mux([](const uint8_t*, size_t) -> bool { return true; });
+
+    auto open_frame = make_open(1, "buf");
+    mux.on_data(open_frame.data(), open_frame.size());  // parked (no notify)
+
+    auto data_frame = make_data(1, 0, {'h', 'i'});
+    mux.on_data(data_frame.data(), data_frame.size());  // buffered, not dropped
+
+    std::vector<uint8_t> got;
+    auto* ch = mux.create_channel("buf");
+    ch->add_message({[&](const uint8_t* d, size_t n) { got.assign(d, d + n); }});
+    ch->open();  // claims the parked open → drains buffered data
+
+    ASSERT_EQ(got.size(), 2u);
+    EXPECT_EQ(got[0], 'h');
+    EXPECT_EQ(got[1], 'i');
+}
+
+// (3a) A remote OPEN on the control session (remoteId 0) is rejected with a
+// [0, 2, 0] frame (protomux-3).
+TEST(ProtomuxParity, ControlSessionOpenGetsReject) {
+    std::vector<std::vector<uint8_t>> frames;
+    Mux mux([&](const uint8_t* d, size_t n) -> bool {
+        frames.emplace_back(d, d + n);
+        return true;
+    });
+
+    auto f = make_open(0, "x");
+    mux.on_data(f.data(), f.size());
+
+    ASSERT_EQ(frames.size(), 1u);
+    EXPECT_EQ(frames[0], (std::vector<uint8_t>{0x00, 0x02, 0x00}));
+    EXPECT_FALSE(mux.is_destroyed());
+}
+
+// (3b) An OPEN that the notify round leaves unclaimed is rejected with a
+// [0, 2, remoteId] frame (protomux-3).
+TEST(ProtomuxParity, UnclaimedOpenAfterNotifyGetsReject) {
+    std::vector<std::vector<uint8_t>> frames;
+    Mux mux([&](const uint8_t* d, size_t n) -> bool {
+        frames.emplace_back(d, d + n);
+        return true;
+    });
+
+    bool notified = false;
+    mux.pair("decline", {}, [&](const std::string&, const std::vector<uint8_t>&,
+                                const uint8_t*, size_t) {
+        notified = true;  // handler runs but declines to create a channel
+    });
+
+    auto f = make_open(1, "decline");
+    mux.on_data(f.data(), f.size());
+
+    EXPECT_TRUE(notified);
+    ASSERT_EQ(frames.size(), 1u);
+    EXPECT_EQ(frames[0], (std::vector<uint8_t>{0x00, 0x02, 0x01}));
+}
+
+// (4) Out-of-sequence remote id (gap) → fatal mux teardown (protomux-4).
+TEST(ProtomuxParity, OutOfSequenceOpenTearsDown) {
+    Mux mux([](const uint8_t*, size_t) -> bool { return true; });
+    auto f = make_open(3, "x");  // rid=2 while _remote.length=0 → gap
+    mux.on_data(f.data(), f.size());
+    EXPECT_TRUE(mux.is_destroyed());
+}
+
+// (4) Reusing a still-live remote slot → fatal mux teardown (protomux-4).
+TEST(ProtomuxParity, DuplicateLiveSlotTearsDown) {
+    Mux mux([](const uint8_t*, size_t) -> bool { return true; });
+
+    auto f1 = make_open(1, "x");  // ok: creates a live (parked) slot for id 1
+    mux.on_data(f1.data(), f1.size());
+    ASSERT_FALSE(mux.is_destroyed());
+
+    auto f2 = make_open(1, "x");  // reuse live slot 1 → fatal
+    mux.on_data(f2.data(), f2.size());
+    EXPECT_TRUE(mux.is_destroyed());
+}
+
+// (5) A batch with far more than the old 1024-entry cap is fully processed
+// (protomux-5).
+TEST(ProtomuxParity, LargeBatchFullyProcessed) {
+    LoopbackMux mux;
+    int count = 0;
+
+    auto* ch_a = mux.a.create_channel("batch");
+    auto* ch_b = mux.b.create_channel("batch");
+    ch_a->add_message({});
+    ch_b->add_message({[&](const uint8_t*, size_t) { count++; }});
+    ch_a->open(); ch_b->open();
+    ASSERT_TRUE(ch_a->is_open());
+
+    const uint32_t rid = ch_a->local_id();  // sender's local id = B's slot key
+    const int N = 2000;
+    std::vector<uint8_t> frame;
+    put_varint(frame, 0);              // channelId (control)
+    put_varint(frame, CONTROL_BATCH);  // type 0
+    put_varint(frame, rid);            // first remote id
+    for (int i = 0; i < N; i++) {
+        put_varint(frame, 2);          // msg_len = [type][payload]
+        put_varint(frame, 0);          // type 0
+        frame.push_back(0x41);         // payload
+    }
+
+    mux.b.on_data(frame.data(), frame.size());
+    EXPECT_EQ(count, N) << "batch must process well past the old 1024 cap";
+}
+
+// (6) A multi-message batch is processed under a cork so the reply side-effects
+// coalesce into a single batch frame (protomux-7) — byte-level.
+TEST(ProtomuxParity, MultiMessageBatchRepliesCoalesce) {
+    std::vector<std::vector<uint8_t>> b_out;
+    bool capture = false;
+    Mux* a_ptr = nullptr;
+
+    Mux mux_b([&](const uint8_t* d, size_t n) -> bool {
+        if (capture) b_out.emplace_back(d, d + n);
+        if (a_ptr) a_ptr->on_data(d, n);
+        return true;
+    });
+    Mux mux_a([&](const uint8_t* d, size_t n) -> bool {
+        mux_b.on_data(d, n);
+        return true;
+    });
+    a_ptr = &mux_a;
+
+    auto* ch_a = mux_a.create_channel("coalesce");
+    auto* ch_b = mux_b.create_channel("coalesce");
+    ch_a->add_message({});
+    ch_b->add_message({[&](const uint8_t*, size_t) {
+        const uint8_t r = 'R';
+        ch_b->send(0, &r, 1);  // reply — must re-batch, not write separately
+    }});
+    ch_a->open(); ch_b->open();
+    ASSERT_TRUE(ch_b->is_open());
+
+    // Feed B a 2-message batch (as if ch_a had sent two messages).
+    std::vector<uint8_t> in;
+    put_varint(in, 0);
+    put_varint(in, CONTROL_BATCH);
+    put_varint(in, ch_a->local_id());
+    for (int i = 0; i < 2; i++) {
+        put_varint(in, 2);
+        put_varint(in, 0);
+        in.push_back('Q');
+    }
+
+    capture = true;
+    mux_b.on_data(in.data(), in.size());
+
+    // Expect exactly ONE outgoing frame: a batch [0,0, Lb, (2,0,'R')x2].
+    std::vector<uint8_t> expected;
+    expected.push_back(0x00);
+    expected.push_back(0x00);
+    put_varint(expected, ch_b->local_id());
+    put_varint(expected, 2); expected.push_back(0x00); expected.push_back('R');
+    put_varint(expected, 2); expected.push_back(0x00); expected.push_back('R');
+
+    ASSERT_EQ(b_out.size(), 1u) << "two replies must coalesce into one frame";
+    EXPECT_EQ(b_out[0], expected);
+}
+
+// (7) drain fires for an opened-but-unpaired channel, not just fully-opened
+// ones (protomux-9).
+TEST(ProtomuxParity, DrainFiresForOpenButUnpairedChannel) {
+    Mux mux([](const uint8_t*, size_t) -> bool { return true; });
+
+    auto* ch = mux.create_channel("drain");
+    bool fired = false;
+    ch->on_drain = [&]() { fired = true; };
+    ch->open();  // open_sent_, never paired (no remote)
+    ASSERT_FALSE(ch->is_open());
+
+    mux.on_stream_drain();
+    EXPECT_TRUE(fired);
+}
+
+// (8) REJECT for an awaiting-open channel closes just that channel; REJECT for
+// an already-opened channel is a fatal protocol error (protomux-10).
+TEST(ProtomuxParity, RejectForAwaitingOpenClosesChannel) {
+    Mux mux([](const uint8_t*, size_t) -> bool { return true; });
+
+    auto* ch = mux.create_channel("await");
+    bool closed = false;
+    ch->on_close = [&]() { closed = true; };
+    ch->open();  // open_sent_, !opened_ (awaiting pair)
+
+    std::vector<uint8_t> f;
+    put_varint(f, 0);
+    put_varint(f, CONTROL_REJECT);
+    put_varint(f, ch->local_id());
+    mux.on_data(f.data(), f.size());
+
+    EXPECT_TRUE(closed);
+    EXPECT_FALSE(mux.is_destroyed());
+}
+
+// (finding protomux-8) Two remote opens for the SAME (protocol,id) are both
+// preserved (queued), each buffering its own data, and both pair in FIFO order.
+TEST(ProtomuxParity, IncomingQueuePreservesMultipleSameKeyOpens) {
+    Mux mux([](const uint8_t*, size_t) -> bool { return true; });
+
+    auto o1 = make_open(1, "q");  auto o2 = make_open(2, "q");
+    mux.on_data(o1.data(), o1.size());   // parked slot 1
+    mux.on_data(o2.data(), o2.size());   // parked slot 2 (grow-by-one)
+
+    auto d1 = make_data(1, 0, {'A'});    auto d2 = make_data(2, 0, {'B'});
+    mux.on_data(d1.data(), d1.size());   // buffered under slot 1
+    mux.on_data(d2.data(), d2.size());   // buffered under slot 2
+
+    std::vector<uint8_t> got1, got2;
+    auto* ch1 = mux.create_channel("q", {}, false);
+    ch1->add_message({[&](const uint8_t* d, size_t n) { got1.assign(d, d + n); }});
+    ch1->open();  // claims queue front (id 1)
+
+    auto* ch2 = mux.create_channel("q", {}, false);
+    ch2->add_message({[&](const uint8_t* d, size_t n) { got2.assign(d, d + n); }});
+    ch2->open();  // claims next queued (id 2)
+
+    ASSERT_EQ(got1, (std::vector<uint8_t>{'A'}));
+    ASSERT_EQ(got2, (std::vector<uint8_t>{'B'}));
+}
+
+TEST(ProtomuxParity, RejectForOpenedChannelIsFatal) {
+    LoopbackMux mux;
+
+    auto* ch_a = mux.a.create_channel("op");
+    auto* ch_b = mux.b.create_channel("op");
+    ch_a->open(); ch_b->open();
+    ASSERT_TRUE(ch_a->is_open());
+
+    const uint32_t opened_id = ch_a->local_id();
+    std::vector<uint8_t> f;
+    put_varint(f, 0);
+    put_varint(f, CONTROL_REJECT);
+    put_varint(f, opened_id);
+    mux.a.on_data(f.data(), f.size());
+
+    EXPECT_TRUE(mux.a.is_destroyed());
+}

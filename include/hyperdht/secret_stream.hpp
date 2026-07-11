@@ -121,6 +121,13 @@ public:
     // Stop all timers (call before destroying the stream)
     void stop_timers();
 
+    // Refresh the inactivity timeout. JS refreshes on EVERY inbound raw
+    // chunk (_onrawdata), including header bytes and partial frames that
+    // don't yet complete a message — not just on fully-decrypted frames.
+    void refresh_timeout() {
+        if (timeout_timer_ != nullptr) uv_timer_again(timeout_timer_);
+    }
+
     // Current timer values
     uint64_t timeout() const { return timeout_ms_; }
     uint64_t keep_alive() const { return keep_alive_ms_; }
@@ -265,6 +272,32 @@ public:
     void set_timeout(uint64_t ms);
     void set_keep_alive(uint64_t ms);
 
+    // --- Relay→direct upgrade taps (JS PR #266 family) ---
+    //
+    // Optional attachment used ONLY by the relay→direct upgrade
+    // (relay_upgrade::UpgradeContext). Zero behaviour change when unset: the
+    // taps are null and the installed udx firewall callback just returns
+    // "accept". The emitted stream carries the upgrade machinery here so the
+    // firewall / remote-changed / raw-activity taps can reach it via
+    // stream->data → Duplex → context. See docs/RELAY-UPGRADE-PORT.md.
+    //
+    //   ctx             opaque owner kept alive for the Duplex's lifetime
+    //   on_raw_activity fired on ANY inbound data/message BEFORE framing —
+    //                   the doc's `ondirect` signal (direct-path arrival)
+    //   on_firewall     fired from the udx firewall callback (packet on a
+    //                   socket != the stream's) — isRelay / onsocket hook
+    //   on_close        fired when the stream is torn down — liveness gate
+    void attach_upgrade(
+        std::shared_ptr<void> ctx,
+        std::function<void()> on_raw_activity,
+        std::function<void(udx_socket_t*, const struct sockaddr*)> on_firewall,
+        std::function<void()> on_close);
+
+    // Raw pointer to the attached upgrade context (for the captureless udx
+    // remote-changed callback, which reaches it via stream->data → Duplex).
+    // Null when no upgrade is attached.
+    void* upgrade_ctx() const { return upgrade_attachment_.get(); }
+
     // State
     bool is_connected() const { return connected_; }
     bool is_destroyed() const { return destroyed_; }
@@ -337,6 +370,15 @@ private:
     OnCloseCb     on_close_;
     OnUdpMsgCb    on_udp_message_;
 
+    // Relay→direct upgrade attachment (see attach_upgrade). Null unless the
+    // stream was emitted over a relay with a pending direct upgrade. The
+    // shared_ptr keeps the upgrade context alive for the Duplex's lifetime;
+    // the taps capture the context by RAW pointer (no ownership cycle).
+    std::shared_ptr<void> upgrade_attachment_;
+    std::function<void()> on_raw_activity_;
+    std::function<void(udx_socket_t*, const struct sockaddr*)> on_upgrade_firewall_;
+    std::function<void()> on_upgrade_close_;
+
     // Liveness flag shared with async callbacks. Set to true in the
     // constructor, reset to false in the destructor. Write/send ack
     // callbacks capture a copy of this shared_ptr and check it before
@@ -364,6 +406,11 @@ private:
     static void on_udx_read(udx_stream_t* s, ssize_t nread, const uv_buf_t* buf);
     static void on_udx_close(udx_stream_t* s, int err);
     static void on_udx_recv_message(udx_stream_t* s, ssize_t nread, const uv_buf_t* buf);
+    // Relay→direct upgrade firewall (JS PR #266). Routes a socket-mismatched
+    // packet to the upgrade tap; returns 0 (accept) always — including when
+    // no upgrade is attached, matching prior no-firewall behaviour.
+    static int on_udx_firewall(udx_stream_t* s, udx_socket_t* sock,
+                               const struct sockaddr* from);
 };
 
 }  // namespace secret_stream

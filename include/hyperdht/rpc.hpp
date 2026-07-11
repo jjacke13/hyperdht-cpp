@@ -41,6 +41,10 @@ constexpr uint64_t DEFAULT_TIMEOUT_MS = 1000;
 constexpr uint64_t DRAIN_INTERVAL_MS = 750;
 constexpr int TOKEN_ROTATE_TICKS = 10;    // 10 * 750ms = 7.5s
 constexpr uint64_t BG_TICK_MS = 5000;     // Background tick interval
+// JS: dht-rpc/index.js:19 — SLEEPING_INTERVAL = 3 * TICK_INTERVAL. A
+// wall-clock gap between ticks larger than this means the process/device
+// slept; the next tick runs wakeup recovery instead of a normal bump.
+constexpr uint64_t SLEEPING_INTERVAL_MS = 3 * BG_TICK_MS;
 constexpr int REFRESH_TICKS = 60;         // 60 * 5s = 5 minutes
 constexpr int STABLE_TICKS_INIT = 240;    // 240 * 5s = 20 minutes
 constexpr int STABLE_TICKS_MORE = 720;    // 720 * 5s = 60 minutes
@@ -60,6 +64,10 @@ using OnRequestCallback = std::function<void(const messages::Request& req)>;
 using OnResponseCallback = std::function<void(const messages::Response& resp)>;
 using OnTimeoutCallback = std::function<void(uint16_t tid)>;
 using OnProbeCallback = std::function<void(const compact::Ipv4Address& from)>;
+// Fired once per request, on its first retry cycle (JS io.js:595-597 calls
+// `req.oncycle(req)` each cycle; the query resets it to noop so it fires once).
+// Used by the Query engine's `_slow` counter (query.js:312-316).
+using OnCycleCallback = std::function<void(uint16_t tid)>;
 
 // Filter for network-observed nodes (JS `_filterNode`). Return true to
 // accept, false to silently reject the peer before it enters our routing
@@ -106,6 +114,7 @@ struct InflightRequest {
     uint32_t command = 0;
     OnResponseCallback on_response;
     OnTimeoutCallback on_timeout;
+    OnCycleCallback on_cycle;  // fired once on first retry cycle (query _slow)
     int sent = 0;            // Total sends so far (1 after first transmission, timeout fires when sent > retries)
     int retries = DEFAULT_RETRIES;
     uint64_t sent_at = 0;   // Timestamp of last send (for RTT measurement)
@@ -114,6 +123,11 @@ struct InflightRequest {
     compact::Ipv4Address to;      // Destination for retry
     uv_timer_t timer;             // Per-request timeout timer
     bool destroyed = false;
+    // Congestion-queued: lives in BOTH inflight_ (for cancellation lookup) and
+    // pending_ (the drain queue), mirroring JS io.js:337 where createRequest
+    // pushes every request into io.inflight immediately. Cleared by
+    // drain_pending() when the request is finally sent.
+    bool queued = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -159,6 +173,25 @@ public:
                      int retries,
                      OnResponseCallback on_response,
                      OnTimeoutCallback on_timeout = nullptr);
+
+    // Overload that also registers a per-request oncycle callback, fired once
+    // on the first retry cycle. JS io.js:597 (`req.oncycle(req)`); the Query
+    // engine uses it to drive the `_slow` concurrency widening (query.js).
+    uint16_t request(const messages::Request& req,
+                     uint64_t timeout_override_ms,
+                     int retries,
+                     OnResponseCallback on_response,
+                     OnTimeoutCallback on_timeout,
+                     OnCycleCallback on_cycle);
+
+    // Emit a DOWN_HINT to `to`, telling it that `down` is unresponsive so it can
+    // re-check/evict. Fire-and-forget (internal CMD_DOWN_HINT, retries=3, no
+    // callbacks). Subject to a per-tick rate limit (JS dht._downHintsRateLimit,
+    // default 50, reset each background tick). Returns true if a hint was sent,
+    // false if the rate limit was hit or the socket is closing.
+    // JS: dht-rpc/lib/query.js:318-332 (_downHint) + index.js:86-88,451-452,797.
+    bool try_send_down_hint(const compact::Ipv4Address& to,
+                            const compact::Ipv4Address& down);
 
     // Cancel an in-flight request by transaction id. Fires neither
     // on_response nor on_timeout — the request is silently discarded
@@ -277,6 +310,23 @@ public:
     // JS: `firewalled: false` in `DHT.bootstrapper()` opts.
     void set_firewalled(bool v) { firewalled_ = v; }
 
+    // JS index.js:53 `adaptive` = `typeof opts.ephemeral !== 'boolean' &&
+    // opts.adaptive !== false`. When false (caller set opts.ephemeral explicitly,
+    // or opts.adaptive === false) the node runs neither the periodic
+    // ephemeral→persistent countdown (index.js:777) nor the wakeup ephemeral
+    // revert (index.js:560-570). JS also inits `_stableTicks = adaptive ?
+    // STABLE_TICKS : 0` (index.js:76).
+    void set_adaptive(bool v) { adaptive_ = v; stable_ticks_ = v ? STABLE_TICKS_INIT : 0; }
+    bool is_adaptive() const { return adaptive_; }
+
+    // JS index.js:51,71 — apply `opts.ephemeral`. A forced-persistent node
+    // (opts.ephemeral === false) starts non-ephemeral. Set at construction,
+    // before bind()/the first tick.
+    void set_ephemeral(bool v) { ephemeral_ = v; }
+
+    // JS index.js:70 `_quickFirewall = opts.quickFirewall !== false`.
+    void set_quick_firewall(bool v) { quick_firewall_ = v; }
+
     // Callbacks for state changes (caller wires these to query engine)
     using OnRefreshCallback = std::function<void()>;
     using OnStateCallback = std::function<void()>;
@@ -289,6 +339,19 @@ public:
     // caller wires this to `HyperDHT::fire_network_update()`.
     void on_health_change(OnStateCallback cb) { on_health_change_ = std::move(cb); }
 
+    // JS: dht-rpc/index.js:552-573 (_onwakeup) — fired after a sleep gap
+    // is detected between background ticks, or on start_tick() resume.
+    void on_wakeup(OnStateCallback cb) { on_wakeup_ = std::move(cb); }
+
+    // Run one background tick (normally driven by the internal 5s uv
+    // timer). Public so tests and embedded hosts can drive ticks manually.
+    void background_tick();
+
+    // Wall-clock (uv_now domain, ms) of the last background tick. The
+    // setter exists for tests that need to simulate a sleep gap.
+    uint64_t last_tick_ms() const { return last_tick_ms_; }
+    void set_last_tick_ms(uint64_t ms) { last_tick_ms_ = ms; }
+
     // Reset the refresh timer (called by query engine when queries are active)
     void reset_refresh_timer() { refresh_ticks_ = REFRESH_TICKS; }
 
@@ -300,6 +363,13 @@ public:
     void force_check_persistent() {
         do_persistent_transition();
     }
+
+    // Rebuild the routing table id from the ring sampler's confirmed address
+    // (BLAKE2b(host:port), JS peer.id). Used by HyperDHT::bootstrapper() to give
+    // a forced-persistent bootstrap node its address-based id at construction,
+    // and internally by do_persistent_transition(). No-op if the ring sampler
+    // has no address yet.
+    void adopt_address_id_from_ring();
 
     // Directly fire the `on_health_change_` callback. Test-only hook used
     // to verify §15 network-update wiring without driving four background
@@ -318,12 +388,26 @@ public:
     uint64_t timeout_for(const compact::Ipv4Address& peer) const;
     void record_rtt(const compact::Ipv4Address& peer, uint64_t rtt_ms);
 
+    // Adaptive-timeout opt-in. JS dht-rpc only builds an AdaptiveTimeout when
+    // the `adaptiveTimeout` option is passed (io.js:78), which hyperdht never
+    // does — so the deployed retransmit path is a flat `req.timeout || 1000`
+    // (io.js:457-459). We default to that flat 1000ms; enabling this flag opts
+    // into the per-peer EMA (timeout_for) as a C++ extension. record_rtt keeps
+    // collecting samples either way.
+    void set_adaptive_timeout(bool v) { adaptive_timeout_ = v; }
+    bool adaptive_timeout() const { return adaptive_timeout_; }
+
     // Access internals for testing
     const routing::RoutingTable& table() const { return table_; }
     routing::RoutingTable& table() { return table_; }
     tokens::TokenStore& token_store() { return tokens_; }
     nat::NatSampler& nat_sampler() { return nat_sampler_; }
     const nat::NatSampler& nat_sampler() const { return nat_sampler_; }
+    // dht-rpc `this._nat` role (JS index.js:69). The faithful ring sampler
+    // that drives our external host/port + the persistent-transition gate.
+    // Separate from nat_sampler_ (the hyperdht-Nat classifier).
+    nat::RingSampler& ring_sampler() { return ring_sampler_; }
+    const nat::RingSampler& ring_sampler() const { return ring_sampler_; }
     const CongestionWindow& congestion() const { return congestion_; }
     size_t inflight_count() const { return inflight_.size(); }
     size_t pending_count() const { return pending_.size(); }
@@ -369,6 +453,16 @@ public:
     // if it times out, the node is removed from the routing table.
     void check_node(const routing::Node& node);
 
+    // JS index.js:406-432 (`_bootstrap` ondata) — the quick-firewall heuristic.
+    // Fires ONE PING_NAT to the first bootstrap responder asking it to reply to
+    // our server socket. If the reply lands (cross-socket tid match on the
+    // server socket) the port is reachable, so we clear `firewalled` early — the
+    // JS `_updateNetworkState(onlyFirewall)` effect (index.js:824). The node
+    // stays ephemeral; the ephemeral→persistent transition still waits for the
+    // stable-ticks countdown. Guarded to fire at most once and only while
+    // `quick_firewall_ && firewalled_ && ephemeral_`. No-op on EMBEDDED.
+    void quick_firewall_ping(const compact::Ipv4Address& to);
+
 private:
     uv_loop_t* loop_;
     udx_t udx_;
@@ -381,6 +475,13 @@ private:
     routing::RoutingTable table_;
     tokens::TokenStore tokens_;
     nat::NatSampler nat_sampler_;
+    // dht-rpc `this._nat` (JS index.js:69). Drives external host/port and the
+    // persistent-transition gate; adapts to remaps (no source dedup).
+    nat::RingSampler ring_sampler_;
+    // Fresh sampler used only during a firewall probe, fed from the server
+    // socket's PING_NAT replies, then swapped into ring_sampler_ on success.
+    // JS: index.js:818,837-845 (`const natSampler = new NatSampler()` → swap).
+    nat::RingSampler probe_ring_;
     CongestionWindow congestion_;
 
     uint16_t next_tid_ = 0;
@@ -398,6 +499,12 @@ private:
     int refresh_ticks_ = REFRESH_TICKS;
     bool ephemeral_ = true;
     bool firewalled_ = true;
+    // JS index.js:53 `adaptive`. Gates the periodic ephemeral→persistent
+    // countdown (background_tick) and the wakeup ephemeral revert (do_wakeup).
+    bool adaptive_ = true;
+    // JS index.js:70 `_quickFirewall`. Drives the bootstrap-time firewall hint.
+    bool quick_firewall_ = true;
+    bool quick_firewall_done_ = false;
     int stable_ticks_ = STABLE_TICKS_INIT;
     std::string last_nat_host_;
 
@@ -405,8 +512,21 @@ private:
     uint32_t tick_responses_ = 0;
     uint32_t tick_timeouts_ = 0;
 
-    // Adaptive timeout: per-peer smoothed RTT (exponential moving average)
+    // DOWN_HINT emission rate limit (JS index.js:86-88 — `downHintsRateLimit`
+    // default 10*5=50; `_downHintsSentPerTick` reset each tick at index.js:797).
+    int down_hints_rate_limit_ = 50;
+    int down_hints_sent_this_tick_ = 0;
+
+    // Wall clock of the previous background tick (JS: _lastTick). 0 until
+    // the timer starts; the first tick never counts as a wakeup.
+    uint64_t last_tick_ms_ = 0;
+    OnStateCallback on_wakeup_;
+
+    // Adaptive timeout: per-peer smoothed RTT (exponential moving average).
+    // Only consulted for timeout selection when `adaptive_timeout_` is set;
+    // JS's deployed path is a flat 1000ms (see set_adaptive_timeout).
     std::unordered_map<std::string, uint64_t> peer_rtt_;
+    bool adaptive_timeout_ = false;
 
     // Max accepted delay for DELAYED_PING command (configurable per-instance).
     uint64_t max_ping_delay_ms_ = DEFAULT_MAX_PING_DELAY_MS;
@@ -438,6 +558,30 @@ private:
     // Generate next transaction ID
     uint16_t alloc_tid();
 
+    // JS dht-rpc's Session reaches directly into `io.congestion` on destroy
+    // (session.js:43). Friendship lets rpc::Session mirror that exactly.
+    friend class Session;
+
+public:
+    // Test-only hooks for the tid allocator (JS never overloads tid 0; C++
+    // reserves 0 as the request() failure sentinel, so alloc_tid must skip it).
+    void set_next_tid_for_test(uint16_t v) { next_tid_ = v; }
+    uint16_t alloc_tid_for_test() { return alloc_tid(); }
+
+    // JS seeds `_tick`/`_refreshTicks` with a random offset at construction
+    // (index.js:74-75). Tests that assert on absolute (tick & 7)/(tick & 63)
+    // schedules reset the tick to a known base.
+    void set_tick_for_test(uint32_t v) { tick_ = v; }
+    // Retries of the first inflight request, or -1 if none (tick-1: eviction
+    // PING must carry retries=3, JS _repingAndSwap/_check default).
+    int first_inflight_retries_for_test() const {
+        return inflight_.empty() ? -1 : inflight_.front()->retries;
+    }
+    // Construction-time random offset (tick-8 range assertions).
+    int refresh_ticks_for_test() const { return refresh_ticks_; }
+
+private:
+
     // Find inflight request by tid
     InflightRequest* find_inflight(uint16_t tid);
 
@@ -455,8 +599,11 @@ private:
     static void on_bg_tick(uv_timer_t* timer);
     static void on_request_timeout(uv_timer_t* timer);
 
-    // Background tick: health, refresh, ephemeral/persistent
-    void background_tick();
+    // Background tick internals (background_tick itself is public).
+    // JS: _onwakeup (index.js:552-573) and _pingSome (index.js:715-735).
+    void do_wakeup();
+    void ping_some();
+    void trigger_refresh();
     void check_persistent();
     void do_persistent_transition();
 

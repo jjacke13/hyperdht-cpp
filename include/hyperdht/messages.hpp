@@ -60,6 +60,10 @@ constexpr uint32_t CMD_IMMUTABLE_GET = 9;
 
 // HyperDHT error codes (used in response error field)
 constexpr uint32_t ERR_NONE = 0;
+// dht-rpc IO-layer error codes. JS: dht-rpc/lib/errors.js — UNKNOWN_COMMAND=1,
+// INVALID_TOKEN=2. Sent by the IO layer before command dispatch (io.js:94-101).
+constexpr uint32_t ERR_UNKNOWN_COMMAND = 1;
+constexpr uint32_t ERR_INVALID_TOKEN = 2;
 constexpr uint32_t ERR_SEQ_REUSED = 16;    // Mutable: same seq, different value
 constexpr uint32_t ERR_SEQ_TOO_LOW = 17;   // Mutable: seq goes backwards
 

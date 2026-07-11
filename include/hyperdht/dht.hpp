@@ -73,7 +73,15 @@ struct DhtOptions {
     uint16_t port = 0;
     std::string host = "0.0.0.0";
 
-    // Bootstrap node addresses (JS: opts.bootstrap). Empty = use public defaults.
+    // Bootstrap node addresses (JS: opts.bootstrap).
+    //
+    // DELIBERATE DIVERGENCE (dhttop-3): JS defaults `opts.bootstrap` to the 3
+    // public BOOTSTRAP_NODES (constants.js) and auto-joins the public network
+    // at construction. C++ leaves this EMPTY by default and does NOT
+    // auto-bootstrap — embedded / library targets must not silently join the
+    // public DHT. Empty here means "no bootstrap walk". Callers who want JS's
+    // default behaviour must opt in explicitly:
+    //   opts.bootstrap = HyperDHT::default_bootstrap_nodes();
     std::vector<compact::Ipv4Address> bootstrap;
 
     // Known-good bootstrap hints pre-seeded into the routing table.
@@ -151,9 +159,28 @@ struct DhtOptions {
     uint64_t max_age_ms = 20 * 60 * 1000;
     uint64_t storage_ttl_ms = 48ULL * 60 * 60 * 1000;  // 48h (JS default)
 
-    // Ephemeral mode (JS: opts.ephemeral). Ephemeral nodes are never
-    // announced as persistent and are evicted more aggressively.
-    bool ephemeral = true;
+    // Ephemeral mode (JS: opts.ephemeral). Ephemeral nodes hold no routing-table
+    // id and never advertise one; a persistent node does. Left UNSET by default
+    // (adaptive: start ephemeral, transition to persistent once the firewall
+    // probe confirms reachability). Set explicitly to force it:
+    //   ephemeral = false → JS `_forcePersistent`: start non-ephemeral, hold id,
+    //                       and (with adaptive computed false) skip the periodic
+    //                       re-check + wakeup revert.
+    //   ephemeral = true  → force ephemeral: never transition (adaptive false).
+    // JS index.js:53 — `adaptive = typeof opts.ephemeral !== 'boolean' &&
+    // opts.adaptive !== false`. Setting `ephemeral` at all makes the node
+    // non-adaptive; leaving it unset keeps `adaptive` (below) in effect.
+    std::optional<bool> ephemeral;
+
+    // JS index.js:53 `opts.adaptive` (rarely set). Only consulted when
+    // `ephemeral` is unset; `adaptive = false` disables the persistent
+    // transition + wakeup revert for an otherwise-default node.
+    bool adaptive = true;
+
+    // JS index.js:70 `opts.quickFirewall` (default on). Fires a PING_NAT to the
+    // first bootstrap responder to clear `firewalled` early instead of waiting
+    // the full stable-ticks countdown.
+    bool quick_firewall = true;
 };
 
 // ---------------------------------------------------------------------------
@@ -174,6 +201,15 @@ struct ConnectResult {
     // Keeps the pool socket alive for the UDX stream's lifetime. Caller must
     // hold this as long as the stream is using udx_socket.
     std::shared_ptr<void> socket_keepalive;
+
+    // Relay→direct upgrade handle (JS PR #266). Set ONLY when the connection
+    // was emitted over a blind relay with a holepunch still in flight — carries
+    // the relay control connection + the confirmDirectUpgrade state machine
+    // (relay_upgrade::UpgradeContext, opaque here). The consumer plumbs it into
+    // the emitted stream's Duplex via relay_upgrade::attach_to_duplex() so a
+    // later punch migrates the SAME live stream onto the direct path. Empty on
+    // every non-relay path.
+    std::shared_ptr<void> upgrade;
 };
 
 // ---------------------------------------------------------------------------
@@ -580,9 +616,28 @@ public:
         query::OnReplyCallback on_reply,
         query::OnDoneCallback on_done);
 
+    // JS `announce(target, keyPair, relayAddresses, opts)` (index.js:244): a
+    // value-less LOOKUP walk whose commit signs a fresh ANNOUNCE record per
+    // closest node. `keypair` signs; `relay_addresses` are embedded in the
+    // signed peer record (usually empty for a bare DHT announce); `bump` is the
+    // relay-port bump signal.
     std::shared_ptr<query::Query> announce(
         const routing::NodeId& target,
-        const std::vector<uint8_t>& value,
+        const noise::Keypair& keypair,
+        const std::vector<compact::Ipv4Address>& relay_addresses,
+        uint64_t bump,
+        query::OnDoneCallback on_done);
+
+    // dhttop-6: announce with clear=true. Runs lookup+unannounce (removing our
+    // stale records for this key) before committing the new ANNOUNCE.
+    // JS: hyperdht/index.js:244-264 with `opts.clear`. `clear_keypair` signs
+    // the per-node UNANNOUNCE (typically the same keypair as `keypair`).
+    std::shared_ptr<query::Query> announce(
+        const routing::NodeId& target,
+        const noise::Keypair& keypair,
+        const std::vector<compact::Ipv4Address>& relay_addresses,
+        uint64_t bump,
+        const noise::Keypair& clear_keypair,
         query::OnDoneCallback on_done);
 
     // --- DHT Operations (continued) ---
@@ -724,8 +779,14 @@ public:
 
     // --- Connection Pool ---
 
-    // Create a new connection pool (JS: dht.pool())
-    connection_pool::ConnectionPool pool();
+    // Create a new connection pool bound to this DHT (JS: dht.pool()).
+    //
+    // Returns a pointer to a pool OWNED by the HyperDHT (stable for the DHT's
+    // lifetime), NOT a detached copy. The previous by-value return handed back
+    // a copy the caller could never wire into connect()/attach_server() — the
+    // pointer form matches create_server()'s ownership style and is what
+    // ConnectOptions::pool expects. dhttop-2.
+    connection_pool::ConnectionPool* pool();
 
     // --- Lifecycle ---
 
@@ -905,6 +966,10 @@ private:
     holepunch::PunchStats punch_stats_;
     RelayingStats relay_stats_;
     std::unique_ptr<socket_pool::SocketPool> socket_pool_;
+
+    // Connection pools created via pool(), owned here so the pointer returned
+    // to callers stays valid for the DHT's lifetime (dhttop-2).
+    std::vector<std::unique_ptr<connection_pool::ConnectionPool>> pools_;
 
     // §2 bootstrap walk state. `bootstrap_query_` holds a strong reference
     // so the shared_ptr<Query> stays alive until its on_done fires.

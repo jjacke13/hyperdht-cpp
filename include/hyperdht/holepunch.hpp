@@ -460,7 +460,13 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        OnHolepunchCallback on_done,
                        bool fast_open = true,
                        udx_socket_t** pool_handle_out = nullptr,
-                       std::shared_ptr<void>* pool_keepalive_out = nullptr);
+                       std::shared_ptr<void>* pool_keepalive_out = nullptr,
+                       // JS: dht._socketPool + dht-level random-punch counters.
+                       // The puncher needs the pool to open birthday sockets
+                       // (RANDOM+CONSISTENT) and the stats to serialize random
+                       // punches (throttle). Null = no birthday / no throttle.
+                       socket_pool::SocketPool* birthday_pool = nullptr,
+                       PunchStats* stats = nullptr);
 
 // ---------------------------------------------------------------------------
 // Utility functions (JS: Holepuncher.localAddresses, Holepuncher.matchAddress)

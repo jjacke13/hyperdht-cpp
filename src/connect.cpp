@@ -16,6 +16,7 @@
 #include "hyperdht/holepunch.hpp"
 #include "hyperdht/peer_connect.hpp"
 #include "hyperdht/protomux.hpp"
+#include "hyperdht/relay_upgrade.hpp"
 #include "hyperdht/secret_stream.hpp"
 
 // Context stored in client rawStream->data during handshake->connection window.
@@ -96,6 +97,13 @@ struct ConnState {
     // correct teardown order regardless of destruction path.
     struct RelayState {
         bool paired = false;
+        // Terminal: relay pairing has reached a final state (paired OR
+        // failed/aborted/timed-out). Until then the relay is "in flight" and
+        // an error completion from a sibling path (holepunch fail, passive
+        // timeout) must hold off — the relay is a valid fallback that may
+        // still complete. JS: maybeDestroyEncryptedSocket checks c.relaySocket
+        // (connect.js:721) which is non-null until onabort nulls it.
+        bool terminal = false;
         std::unique_ptr<async_utils::UvTimer> timeout;
         // Connection resources in dependency order (destroyed bottom-up):
         std::unique_ptr<blind_relay::BlindRelayClient> client;
@@ -112,6 +120,13 @@ struct ConnState {
         }
     };
     std::unique_ptr<RelayState> relay;
+
+    // Relay→direct upgrade (JS PR #266). Created when the connection is emitted
+    // over the relay; a subsequent punch success migrates the SAME live stream
+    // onto the direct path via this context's on_socket(). Held here so the
+    // holepunch callback can reach it, AND handed to the consumer (via
+    // ConnectResult::upgrade) so the emitted Duplex keeps it alive.
+    std::shared_ptr<relay_upgrade::UpgradeContext> upgrade;
 
     ~ConnState() {
         // Clean up rawStream if not transferred to ConnectResult.
@@ -144,6 +159,25 @@ struct ConnState {
         auto cb = std::move(on_done);
         on_done = nullptr;
         if (cb) cb(err, result);
+    }
+
+    // JS: maybeDestroyEncryptedSocket (connect.js:718-725). An error
+    // completion (holepunch failed, no addresses, passive-wait timeout) must
+    // NOT tear the connection down while a relay pairing is still in flight —
+    // relayThrough is a fallback path and may still complete. Mirrors JS's
+    // early-return when c.relaySocket is set. The relay's own terminal-failure
+    // paths re-invoke this so the caller's callback still fires if BOTH paths
+    // fail (matching JS onabort → maybeDestroyEncryptedSocket).
+    bool relay_in_flight() const {
+        return relay && !relay->terminal;
+    }
+    // True while holepunch_connect is running (JS: c.puncher && !destroyed).
+    bool holepunch_in_flight = false;
+    void complete_error(int err) {
+        if (completed) return;
+        if (relay_in_flight()) return;    // JS: waiting for the relay
+        if (holepunch_in_flight) return;  // JS: waiting for the puncher
+        complete(err);
     }
 
     // Transfer rawStream ownership to result, cleaning up firewall ctx
@@ -321,7 +355,7 @@ static void start_find_peer(std::shared_ptr<ConnState> state) {
         // on_done: handle "nothing found" or let check_exhaustion detect
         // all-failed. Both try_next_relay and on_done call check_exhaustion
         // to prevent termination gaps regardless of interleaving.
-        [state](const std::vector<query::QueryReply>&) {
+        [state](int /*error*/, const std::vector<query::QueryReply>&) {
             state->query.reset();
             state->query_done = true;
             if (state->completed) return;
@@ -646,7 +680,7 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
             state->take_raw_stream(result);
             state->complete(0, result);
         } else {
-            state->complete(ConnectError::NO_ADDRESSES);
+            state->complete_error(ConnectError::NO_ADDRESSES);
         }
         return;
     }
@@ -687,9 +721,9 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
         state->passive_timer = std::make_unique<async_utils::UvTimer>(
             state->socket->loop());
         state->passive_timer->start([state]() {
-            if (!state->completed) {
-                state->complete(ConnectError::HOLEPUNCH_TIMEOUT);
-            }
+            // JS connect.js:225 onabort → maybeDestroyEncryptedSocket. Hold
+            // off if a relay pairing is still in flight.
+            state->complete_error(ConnectError::HOLEPUNCH_TIMEOUT);
         }, 10000);
         return;
     }
@@ -766,12 +800,35 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
     }
     // --- end §6 LAN shortcut ------------------------------
 
+    state->holepunch_in_flight = true;
     holepunch::holepunch_connect(*state->socket, hs,
         hp_relay, hp_peer, hp_info.id, fw, addrs,
         [state](const holepunch::HolepunchResult& hp) {
-            if (state->completed) return;  // rawStream firewall already connected
+            state->holepunch_in_flight = false;  // puncher reached a terminal state
+            if (state->completed) {
+                // JS PR #266 — the relay already won and we emitted the stream,
+                // but the punch just landed. Instead of dropping it (which would
+                // release the punched pool socket and starve a JS peer that
+                // migrates unilaterally), migrate the SAME live stream onto the
+                // direct path. on_socket() is one-shot + tolerates a since-closed
+                // stream, so this is safe even if the user already tore it down.
+                if (state->upgrade && hp.success && hp.socket) {
+                    struct sockaddr_in da{};
+                    da.sin_family = AF_INET;
+                    uv_ip4_addr(hp.address.host_string().c_str(),
+                                hp.address.port, &da);
+                    // Take over the pool socket keepalive (doc hazard 3) so the
+                    // punched socket stays pinned for the stream's life.
+                    state->upgrade->set_socket_keepalive(hp.socket_keepalive);
+                    state->upgrade->on_socket(
+                        hp.socket, reinterpret_cast<const struct sockaddr*>(&da));
+                }
+                return;  // rawStream firewall / relay already connected
+            }
             if (state->alive.expired() || !hp.success) {
-                state->complete(ConnectError::HOLEPUNCH_FAILED);
+                // JS: maybeDestroyEncryptedSocket — hold off if a relay
+                // pairing is still in flight (relayThrough fallback).
+                state->complete_error(ConnectError::HOLEPUNCH_FAILED);
                 return;
             }
             ConnectResult result;
@@ -792,7 +849,12 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
         },
         state->fast_open,
         &state->pool_socket_handle,
-        &state->pool_socket_keepalive);
+        &state->pool_socket_keepalive,
+        // JS: dht._socketPool + dht-level random-punch throttle counters.
+        // Enables the RANDOM+CONSISTENT birthday-paradox strategy (256 pool
+        // sockets) and serializes random punches across connections.
+        state->dht ? state->dht->socket_pool() : nullptr,
+        state->dht ? &state->dht->punch_stats() : nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -829,6 +891,11 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
                 state->dht->relay_stats().aborts++;
             }
         }
+        // Relay is terminal — re-run the error path so the caller's callback
+        // fires if the holepunch path also failed while we were holding off.
+        // JS: relay onabort (connect.js:787) → maybeDestroyEncryptedSocket.
+        if (state->relay) state->relay->terminal = true;
+        state->complete_error(ConnectError::RELAY_FAILED);
     }, blind_relay::RELAY_TIMEOUT_MS);
 
     // Step 1: Connect to the relay node via normal DHT connect.
@@ -840,7 +907,10 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
         if (err != 0 || !relay_result.success) {
             DHT_LOG("  [connect] Relay connect to relay node failed: %d\n", err);
             if (state->dht) state->dht->relay_stats().aborts++;
-            return;  // Holepunch path may still succeed
+            // Relay terminal — let the (possibly held-off) error path fire.
+            if (state->relay) state->relay->terminal = true;
+            state->complete_error(ConnectError::RELAY_FAILED);
+            return;
         }
 
         DHT_LOG("  [connect] Connected to relay node, setting up Protomux\n");
@@ -905,6 +975,8 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
         if (!channel) {
             DHT_LOG("  [connect] Failed to create blind-relay channel\n");
             if (state->dht) state->dht->relay_stats().aborts++;
+            if (state->relay) state->relay->terminal = true;
+            state->complete_error(ConnectError::RELAY_FAILED);
             return;
         }
 
@@ -926,6 +998,7 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
                 state->relay->timeout.reset();
 
                 state->relay->paired = true;
+                state->relay->terminal = true;  // relay reached a final state
                 if (state->dht) state->dht->relay_stats().successes++;
 
                 // Step 6: Wire our rawStream through the relay.
@@ -962,6 +1035,32 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
                         state->hs_result.remote_payload.udx->id;
                 }
                 state->take_raw_stream(result);
+
+                // JS PR #266 — the connection is emitted over the relay, but the
+                // holepunch is still in flight. Build the upgrade context that
+                // owns the relay control connection (doc hazard 2) and can later
+                // migrate THIS live stream onto the direct path. Move the relay
+                // state out of ConnState (which dies once the puncher resolves)
+                // into the context so it survives to the upgrade window.
+                if (result.raw_stream) {
+                    auto upgrade = std::make_shared<relay_upgrade::UpgradeContext>(
+                        result.raw_stream, result.remote_udx_id, relay_socket);
+                    std::shared_ptr<ConnState::RelayState> relay_refs(
+                        std::move(state->relay));
+                    relay_upgrade::RelayOwner owner;
+                    owner.refs = relay_refs;
+                    owner.close = [relay_refs]() {
+                        if (relay_refs && relay_refs->duplex)
+                            relay_refs->duplex->end();  // graceful FIN to relay
+                    };
+                    owner.destroy = [relay_refs]() {
+                        if (relay_refs && relay_refs->duplex)
+                            relay_refs->duplex->destroy(0);
+                    };
+                    upgrade->set_relay_owner(std::move(owner));
+                    result.upgrade = upgrade;   // consumer plumbs into the Duplex
+                    state->upgrade = upgrade;   // holepunch callback triggers it
+                }
                 state->complete(0, result);
             },
             [state](int err) {
@@ -969,6 +1068,11 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
                 if (state->completed) return;
                 DHT_LOG("  [connect] Relay pairing failed: %d\n", err);
                 if (state->dht) state->dht->relay_stats().aborts++;
+                // Relay terminal — re-run the error path (holepunch may have
+                // already failed and been held off). JS: relayClient 'error'
+                // → onabort → maybeDestroyEncryptedSocket.
+                if (state->relay) state->relay->terminal = true;
+                state->complete_error(ConnectError::RELAY_FAILED);
             });
     });
 }

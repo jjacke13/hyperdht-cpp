@@ -30,6 +30,20 @@ namespace query {
 constexpr int DEFAULT_CONCURRENCY = 10;
 constexpr int SLOWDOWN_CONCURRENCY = 3;
 
+// JS dht-rpc/lib/query.js:28-29 — a query command's request retries default to
+// 5 (DOWN_HINT walks use 3). io.js oncycle resends until `sent > retries`, i.e.
+// 6 transmissions to a silent node. Callers may lower this (tests, or the
+// seeded-reconnect findPeer path in connect.js which uses retries=1).
+constexpr int QUERY_RETRIES = 5;
+
+// Commit-phase error codes passed as OnDoneCallback's first arg (0 = success).
+// JS query.js:211-248 (`_endAfterCommit`): an empty commit set OR all-failed
+// commits reject the query ('Too few nodes responded'); tokenless closest
+// replies count as failed commits (autoCommit rejects, query.js:392-403).
+// Non-commit queries (plain lookup/get) always end with success.
+constexpr int QUERY_OK = 0;
+constexpr int QUERY_ERR_TOO_FEW_NODES = 1;
+
 // ---------------------------------------------------------------------------
 // Query result — a response from a node during the query
 // ---------------------------------------------------------------------------
@@ -49,13 +63,22 @@ struct QueryReply {
 // Called for each reply during the query
 using OnReplyCallback = std::function<void(const QueryReply& reply)>;
 
-// Called when the query completes (with the k closest replies)
-using OnDoneCallback = std::function<void(const std::vector<QueryReply>& closest)>;
+// Called when the query completes. `error` is 0 on success, or a QUERY_ERR_*
+// code when the commit phase failed (empty/all-failed commit set). JS surfaces
+// this via `query.finished()` rejecting; announce/put callers must observe it
+// (query.js:225-248, hyperdht/index.js awaits query.finished()). Non-commit
+// queries always report success. `closest` is the k closest replies collected.
+using OnDoneCallback =
+    std::function<void(int error, const std::vector<QueryReply>& closest)>;
 
-// Called during commit phase for each of the k closest nodes
-// Should send the ANNOUNCE/store request with the provided token
+// Called during commit phase for each of the k closest nodes. Should send
+// the ANNOUNCE/store request with the provided token, wiring BOTH callbacks
+// into RpcSocket::request so the query settles on a response OR a timeout.
+// A commit that only handles the response wedges the query when a single
+// store packet is lost (JS decrements on both ondone/onerror, query.js:236).
 using OnCommitCallback = std::function<void(const QueryReply& node,
-                                            rpc::OnResponseCallback on_done)>;
+                                            rpc::OnResponseCallback on_response,
+                                            rpc::OnTimeoutCallback on_timeout)>;
 
 // ---------------------------------------------------------------------------
 // Query — iterative DHT walk
@@ -73,6 +96,16 @@ public:
     void set_concurrency(int c) { concurrency_ = c; }
     void set_commit(OnCommitCallback cb) { on_commit_ = std::move(cb); }
     void set_internal(bool b) { internal_ = b; }
+
+    // Per-visit request retry count (JS `opts.retries`, query.js:28-29,380).
+    // Defaults to QUERY_RETRIES (5). Tests use a low value to avoid waiting the
+    // full retry budget on deliberately-dead loopback nodes.
+    void set_retries(int r) { retries_ = r; }
+
+    // JS `opts.onlyClosestNodes` (query.js:41,69,141): when set, the walk visits
+    // ONLY the seeded frontier and never expands from responses' closerNodes.
+    // Must be set before start() (mirrors JS setting the flag after seeding).
+    void set_only_closest_nodes(bool b) { only_closest_nodes_ = b; }
 
     // Callbacks
     void on_reply(OnReplyCallback cb) { on_reply_ = std::move(cb); }
@@ -142,11 +175,25 @@ private:
     uint32_t command_;
     std::optional<std::vector<uint8_t>> value_;
     int concurrency_ = DEFAULT_CONCURRENCY;
+    int retries_ = QUERY_RETRIES;   // per-visit request retries (JS opts.retries)
     bool internal_ = false;
+    bool only_closest_nodes_ = false;  // JS opts.onlyClosestNodes (query-4)
     bool done_ = false;
     bool committing_ = false;
+    int commit_success_ = 0;  // commits that got a response (vs timeout/drop)
     int inflight_ = 0;
     int commit_inflight_ = 0;
+    // JS `_slow` (query.js:32,250-257,312-316) — count of in-flight requests
+    // that have retried at least once (fired their oncycle). Effective
+    // concurrency = (slowdown?3:concurrency) + slow_, so slow peers don't
+    // starve the frontier, and the flush can start early once every remaining
+    // in-flight request is slow and we already hold k closest replies.
+    int slow_ = 0;
+    // Set true only while start() re-inserts the caller's pre-seeds so the
+    // onlyClosestNodes gate (which blocks table-seeds and closerNodes) does not
+    // also block the seeds. JS adds seeds in the constructor BEFORE the flag is
+    // set (query.js:51-69), so seeds are always admitted.
+    bool seeding_pre_ = false;
 
     // Re-entrancy state for destroy() / on_done_ scheduling.
     //   dispatching_reply_   : true while on_visit_response is inside
@@ -202,6 +249,13 @@ private:
     enum class NodeState { PENDING, DONE, DOWN };
     std::unordered_map<std::string, NodeState> seen_;
 
+    // Referrers per seen address (JS overloads `_seen` to hold the refs array).
+    // `refs_[addr]` = the addresses of nodes that told us about `addr`. When
+    // `addr` later times out we emit a DOWN_HINT to each referrer so they can
+    // re-check and evict it (JS query.js:140-169,298-332). Downhint emission +
+    // rate limiting live on the RpcSocket (JS dht._downHints*).
+    std::unordered_map<std::string, std::vector<compact::Ipv4Address>> refs_;
+
     OnReplyCallback on_reply_;
     OnDoneCallback on_done_;
     OnCommitCallback on_commit_;
@@ -209,8 +263,11 @@ private:
     // Add nodes from local routing table
     void seed_from_table();
 
-    // Add a node to the pending list (if not already seen)
-    void add_pending(const routing::NodeId& id, const compact::Ipv4Address& addr);
+    // Add a node to the pending list (if not already seen). `ref`, when set, is
+    // the address of the node that referred us to `addr` (JS `_addPending`'s
+    // `ref` arg = `m.from`); it is recorded for DOWN_HINT gossip on timeout.
+    void add_pending(const routing::NodeId& id, const compact::Ipv4Address& addr,
+                     const compact::Ipv4Address* ref = nullptr);
 
     // Try to send more queries (up to concurrency limit)
     void read_more();
@@ -241,8 +298,9 @@ private:
 
     // Idempotent on_done_ dispatch. All completion paths (maybe_finish,
     // do_commit, destroy) go through this so on_done_ fires AT MOST once
-    // across the lifetime of a Query.
-    void fire_done_once();
+    // across the lifetime of a Query. `error` is 0 on success or a QUERY_ERR_*
+    // code (only the commit-phase paths ever pass non-zero).
+    void fire_done_once(int error);
 };
 
 }  // namespace query

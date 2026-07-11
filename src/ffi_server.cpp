@@ -45,7 +45,15 @@ int hyperdht_server_listen(hyperdht_server_t* srv,
                             info.local_udx_id, info.is_initiator);
             conn.raw_stream = info.raw_stream;
             conn.udx_socket = info.udx_socket;
+            // Carry the relay→direct upgrade handle (JS PR #266) to the user's
+            // stream_open so the emitted relayed stream can migrate to direct.
+            conn._internal = info.upgrade
+                ? new FfiConnExtra{nullptr, info.upgrade}
+                : nullptr;
             srv->cb(&conn, srv->userdata);
+            if (conn._internal) {
+                delete static_cast<FfiConnExtra*>(conn._internal);
+            }
         });
     sodium_memzero(cpp_kp.secret_key.data(), 64);  // C10
 

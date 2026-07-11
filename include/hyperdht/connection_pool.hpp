@@ -22,6 +22,16 @@
 #include <unordered_map>
 
 namespace hyperdht {
+
+// Forward declarations — attach_server() binds the pool to a Server without
+// dragging the full server.hpp include into this header (impl in
+// connection_pool.cpp). server::ConnectionInfo is the inbound-connection
+// payload delivered to the pool's on_connection event.
+namespace server {
+class Server;
+struct ConnectionInfo;
+}  // namespace server
+
 namespace connection_pool {
 
 // ---------------------------------------------------------------------------
@@ -63,9 +73,20 @@ public:
     // Caller sets this — fires when connection closes
     std::function<void()> on_close;
 
+    // Pool sets this — fires the pool's unified 'connection' event once this
+    // ref is attached-and-opened (JS connection-pool.js:74,92 emit('connection')).
+    std::function<void()> on_emit;
+
+    // Close bookkeeping for the deferred keep-new swap (dhttop-8). The pool
+    // flips this via on_stream_closed(); the deferred attach checks it so a
+    // new stream that died before the old one closed is not resurrected.
+    void mark_closed() { closed_ = true; }
+    bool closed() const { return closed_; }
+
 private:
     ConnectionInfo info_;
     int refs_ = 0;
+    bool closed_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -88,13 +109,43 @@ public:
 
     // Attach an outbound connection (not yet open).
     // Returns ATTACHED if new, or DUPLICATE_KEPT_* if dedup occurred.
+    //
+    // dhttop-8: on DUPLICATE_KEPT_NEW the new ref is NOT inserted yet. The
+    // existing ref is destroyed (on_destroy) and the new ref is held in
+    // pending_swaps_ until the old ref's close is signalled via
+    // on_stream_closed() — mirrors JS connection-pool.js:37-55 keepNew.
     AttachResult attach_stream(std::shared_ptr<ConnectionRef> ref, bool opened);
 
     // Mark a connecting stream as now open (moves from connecting → connected).
     void mark_opened(const std::array<uint8_t, 32>& remote_key);
 
+    // Signal that a ref's underlying stream has closed. Drives the deferred
+    // keep-new swap: when the closing ref is the currently-attached one, it is
+    // removed and any pending keep-new ref is promoted (unless it too has
+    // closed). JS: connection-pool.js 'close' handlers.
+    void on_stream_closed(const std::shared_ptr<ConnectionRef>& ref);
+
     // Remove a connection (on close/error).
     void remove(const std::array<uint8_t, 32>& remote_key);
+
+    // Bind an inbound-connection source (a listening Server) to the pool.
+    // Inbound streams are deduped against outbound streams by remote public
+    // key, then re-emitted through the pool's on_connection event. Chains onto
+    // the Server's connection callback (Server::add_connection_listener) — it
+    // does NOT replace the user's own on_connection handler. JS: pool()
+    // ._attachServer (connection-pool.js:15-27).
+    //
+    // NOTE: the pool tracks dedup state and fires on_connection for accepted
+    // connections; tearing down the losing stream of a rejected duplicate is
+    // the consumer's responsibility (the pool does not own the
+    // SecretStreamDuplex wrapping the raw stream). Wire ConnectionRef::on_destroy
+    // if teardown is needed.
+    void attach_server(server::Server& server);
+
+    // The pool's unified 'connection' event — fires once per accepted
+    // (deduplicated) inbound connection. JS: pool.on('connection', ...).
+    using OnConnectionCb = std::function<void(const server::ConnectionInfo&)>;
+    void set_on_connection(OnConnectionCb cb) { on_connection_ = std::move(cb); }
 
     // Check if we have a connection (connecting or connected) to a peer.
     bool has(const std::array<uint8_t, 32>& remote_key) const;
@@ -114,6 +165,16 @@ public:
 private:
     ConnectionMap connecting_;
     ConnectionMap connections_;
+
+    // dhttop-8: keep-new swaps awaiting the old ref's close, keyed by remote
+    // pubkey hex. The held ref is attached once the old one closes.
+    struct PendingSwap {
+        std::shared_ptr<ConnectionRef> ref;
+        bool opened = false;
+    };
+    std::unordered_map<std::string, PendingSwap> pending_swaps_;
+
+    OnConnectionCb on_connection_;
 
     static std::string key_hex(const std::array<uint8_t, 32>& key);
 

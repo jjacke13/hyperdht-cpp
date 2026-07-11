@@ -25,6 +25,7 @@ static void make_persistent(rpc::RpcSocket& socket) {
         auto from = compact::Ipv4Address::from_string(
             "10.0.0." + std::to_string(i), 49737);
         socket.nat_sampler().add(our_addr, from);
+        socket.ring_sampler().add(our_addr.host_string(), our_addr.port);
     }
     socket.force_check_persistent();
 }
@@ -762,11 +763,12 @@ TEST(HyperDHT, Pool) {
     uv_loop_init(&loop);
 
     HyperDHT dht(&loop);
-    auto pool = dht.pool();
+    auto* pool = dht.pool();  // dhttop-2: bound handle, DHT-owned
 
     // Pool starts empty
-    EXPECT_EQ(pool.connected_count(), 0u);
-    EXPECT_EQ(pool.connecting_count(), 0u);
+    ASSERT_NE(pool, nullptr);
+    EXPECT_EQ(pool->connected_count(), 0u);
+    EXPECT_EQ(pool->connecting_count(), 0u);
 
     dht.destroy();
     uv_run(&loop, UV_RUN_DEFAULT);
@@ -1370,7 +1372,8 @@ TEST(HyperDHT, NotConnectableWhenSuspended) {
 // §2 — bootstrap walk activation.
 //
 // Tests cover four cases:
-//   1. Empty `opts.bootstrap` → no walk, `is_bootstrapped()` stays false.
+//   1. Empty `opts.bootstrap` → walk still runs (empty frontier) and flips
+//      `is_bootstrapped()` (tick-3, JS _bootstrap flips it even with no seeds).
 //   2. Loopback bootstrap server → walk runs, flag flips, callback fires.
 //   3. `on_bootstrapped` installed AFTER completion → fires immediately.
 //   4. `default_bootstrap_nodes()` returns the 3 canonical public peers.
@@ -1380,22 +1383,101 @@ TEST(HyperDHT, NotConnectableWhenSuspended) {
 // .analysis/js/hyperdht/lib/constants.js:16-20 (BOOTSTRAP_NODES).
 // ---------------------------------------------------------------------------
 
-TEST(HyperDHT, BootstrapWalkSkippedWhenBootstrapEmpty) {
+TEST(HyperDHT, EmptyBootstrapStillBecomesBootstrapped) {
     uv_loop_t loop;
     uv_loop_init(&loop);
 
-    // Default DhtOptions has empty bootstrap — C++ must NOT start a walk.
+    // tick-3: even with an empty bootstrap list the walk runs — its frontier is
+    // empty so it completes immediately, but its on_done still flips the flag.
+    // JS `_bootstrap` (index.js:379-404) sets `bootstrapped = true` regardless of
+    // the seed list. A node stuck un-bootstrapped never runs the background tick
+    // (ping_some / refresh / NAT recheck / persistent transition).
     HyperDHT dht(&loop);
     EXPECT_EQ(dht.bind(), 0);
 
-    // Give the loop a tick for any stray callback to fire (there shouldn't
-    // be one, but we want the assertion to catch a regression).
-    uv_run(&loop, UV_RUN_NOWAIT);
-
-    EXPECT_FALSE(dht.is_bootstrapped())
-        << "no walk should run when opts.bootstrap is empty";
+    // The empty walk completes synchronously during bind(), so the flag is
+    // already set here. This does NOT auto-join the public network (dhttop-3):
+    // an empty list contacts nobody, it just un-gates the tick.
+    EXPECT_TRUE(dht.is_bootstrapped())
+        << "empty bootstrap must still flip bootstrapped (JS _bootstrap)";
 
     dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// tick-5 — opts.ephemeral + the adaptive gate.
+//
+// JS index.js:53 — `adaptive = typeof opts.ephemeral !== 'boolean' &&
+// opts.adaptive !== false`; :71 `_forcePersistent = opts.ephemeral === false`.
+// ---------------------------------------------------------------------------
+
+TEST(HyperDHT, DefaultNodeStartsEphemeralAndAdaptive) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);  // default opts: ephemeral unset
+    EXPECT_TRUE(dht.socket().is_ephemeral());
+    EXPECT_TRUE(dht.socket().is_adaptive());
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, ForcedPersistentStartsNonEphemeralNonAdaptive) {
+    // opts.ephemeral=false (JS _forcePersistent): start non-ephemeral so the
+    // node holds/advertises a stable id, and non-adaptive so it skips the
+    // periodic re-check + wakeup revert.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    DhtOptions opts;
+    opts.ephemeral = false;
+    HyperDHT dht(&loop, opts);
+    EXPECT_FALSE(dht.socket().is_ephemeral());
+    EXPECT_FALSE(dht.socket().is_adaptive());
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, ForcedEphemeralIsNonAdaptive) {
+    // Explicit opts.ephemeral=true → adaptive false (JS index.js:53): the node
+    // stays ephemeral, never running the persistent transition.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    DhtOptions opts;
+    opts.ephemeral = true;
+    HyperDHT dht(&loop, opts);
+    EXPECT_TRUE(dht.socket().is_ephemeral());
+    EXPECT_FALSE(dht.socket().is_adaptive());
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(HyperDHT, BootstrapperHoldsAddressBasedId) {
+    // tick-5 + sweep-miss-b: a forced-persistent bootstrapper finalises its
+    // address-based id (BLAKE2b(host:port)) at construction so its own requests
+    // advertise the id peers expect via validateId.
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    auto dht = HyperDHT::bootstrapper(&loop, 49737, "1.2.3.4");
+    ASSERT_NE(dht, nullptr);
+    EXPECT_FALSE(dht->socket().is_ephemeral());
+
+    auto expected = rpc::compute_peer_id(
+        compact::Ipv4Address::from_string("1.2.3.4", 49737));
+    EXPECT_EQ(dht->socket().table().id(), expected)
+        << "bootstrapper id must be BLAKE2b(host:port), not the random ctor id";
+
+    dht->destroy();
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }

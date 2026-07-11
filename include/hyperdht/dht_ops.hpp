@@ -56,10 +56,49 @@ std::shared_ptr<query::Query> lookup(rpc::RpcSocket& socket,
 // a shared_ptr<Query>.
 // ---------------------------------------------------------------------------
 
+// JS `announce(target, keyPair, relayAddresses, opts)` (index.js:244-264):
+// walk = CMD_LOOKUP (value-less — the walk must NOT carry a token-less ANNOUNCE,
+// which JS persistent nodes silently drop). The commit signs a FRESH announce
+// record PER closest reply, over (target, reply.token, reply.from.id, peer) via
+// `announce_sig::sign_announce` — a single pre-signed value cannot verify at any
+// node because the signable covers that node's per-request token + id.
+//
+// `keypair`   — signs each per-node ANNOUNCE (JS keyPair).
+// `relay_addresses` — the peer's relay addresses embedded in the signed record
+//                     (JS `relayAddresses`; typically empty for a bare DHT
+//                     announce — the server-side Announcer path is separate).
+// `bump`      — relay-port bump signal (JS `opts.bump`, default 0).
+// `clear_keypair`: dhttop-6. When non-null, the walk runs through
+//   lookup+unannounce (JS `opts.clear` → lookupAndUnannounce, index.js:250) so
+//   stale records for our key are removed BEFORE the new ANNOUNCE lands.
 std::shared_ptr<query::Query> announce(rpc::RpcSocket& socket,
                                         const routing::NodeId& target,
-                                        const std::vector<uint8_t>& value,
-                                        query::OnDoneCallback on_done);
+                                        const noise::Keypair& keypair,
+                                        const std::vector<compact::Ipv4Address>& relay_addresses,
+                                        uint64_t bump,
+                                        query::OnDoneCallback on_done,
+                                        const noise::Keypair* clear_keypair = nullptr);
+
+// ---------------------------------------------------------------------------
+// lookup_and_unannounce — LOOKUP walk that, per reply, removes OUR old
+// announcement from any node still holding it, then runs an optional commit.
+//
+// JS: hyperdht/index.js:197-238 (lookupAndUnannounce). The per-reply `map`
+// decodes the lookup reply and, when our key is present (or the node is at
+// the 20-record cap), fires a signed UNANNOUNCE to that node. The query's
+// commit awaits ALL in-flight unannounces (Promise.all) before running the
+// user commit — so on_done never fires until the unannounces settle.
+//
+// `user_commit`: the announce commit for the clear-announce path (dhttop-6),
+// or nullptr for a plain unannounce (JS noop commit). `on_reply` forwards
+// each raw reply to the caller (may be nullptr).
+std::shared_ptr<query::Query> lookup_and_unannounce(
+    rpc::RpcSocket& socket,
+    const routing::NodeId& target,
+    const noise::Keypair& keypair,
+    query::OnReplyCallback on_reply,
+    query::OnCommitCallback user_commit,
+    query::OnDoneCallback on_done);
 
 // ---------------------------------------------------------------------------
 // immutablePut — store a value at target = BLAKE2b(value)

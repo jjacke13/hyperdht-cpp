@@ -16,6 +16,7 @@ namespace dht_messages {
 using compact::State;
 using compact::Uint;
 using compact::Buffer;
+using compact::Raw;
 using compact::Fixed32;
 using compact::Fixed64;
 using compact::Ipv4Addr;
@@ -270,15 +271,26 @@ std::vector<uint8_t> encode_mutable_signable(uint64_t seq, const uint8_t* value,
 
 // ---------------------------------------------------------------------------
 // LookupRawReply
+//
+// JS: hyperdht/lib/messages.js:315-334. Encode side is `rawPeers =
+// c.array(c.raw)` — varint(count) followed by each pre-encoded peer
+// record's bytes concatenated with NO per-element length prefix (each
+// record is self-delimiting: fixed32 publicKey + ipv4Array relayAddresses),
+// then `c.uint bump`. Decode side is `peers = c.array(peer)` (parses each
+// self-delimiting record) then `bump: state.start < state.end ? uint : 0`.
+//
+// NOTE the earlier C++ used length-prefixed `Buffer` per element, which is
+// NOT wire-compatible with JS. Fixed here; old C++-encoded lookup replies
+// are no longer parseable (intended — no back-compat shim).
 // ---------------------------------------------------------------------------
 
 std::vector<uint8_t> encode_lookup_reply(const LookupRawReply& r) {
     State state;
 
-    // Array of raw buffers: varint(count) + [buffer, buffer, ...]
+    // rawPeers: varint(count) + concat(each peer record's raw bytes)
     Uint::preencode(state, static_cast<uint64_t>(r.peers.size()));
     for (const auto& peer : r.peers) {
-        Buffer::preencode(state, peer.data(), peer.size());
+        Raw::preencode(state, peer.data(), peer.size());
     }
     Uint::preencode(state, r.bump);
 
@@ -288,7 +300,7 @@ std::vector<uint8_t> encode_lookup_reply(const LookupRawReply& r) {
 
     Uint::encode(state, static_cast<uint64_t>(r.peers.size()));
     for (const auto& peer : r.peers) {
-        Buffer::encode(state, peer.data(), peer.size());
+        Raw::encode(state, peer.data(), peer.size());
     }
     Uint::encode(state, r.bump);
 
@@ -303,12 +315,15 @@ LookupRawReply decode_lookup_reply(const uint8_t* data, size_t len) {
     if (state.error || count > 1024) return r;  // Cap at 1024 (20 per target * safety margin)
     r.peers.reserve(static_cast<size_t>(count));
 
+    // Each record is self-delimiting (fixed32 + ipv4Array). Decode its fields
+    // to advance the cursor, then slice out the raw record bytes.
     for (uint64_t i = 0; i < count && !state.error; i++) {
-        auto buf = Buffer::decode(state);
-        if (state.error) return r;
-        if (!buf.is_null()) {
-            r.peers.emplace_back(buf.data, buf.data + buf.len);
-        }
+        size_t rec_start = state.start;
+        Fixed32::decode(state);                              // publicKey
+        if (state.error) { r.peers.clear(); return r; }
+        Array<Ipv4Addr, Ipv4Address>::decode(state);         // relayAddresses
+        if (state.error) { r.peers.clear(); return r; }
+        r.peers.emplace_back(data + rec_start, data + state.start);
     }
 
     // bump is optional — 0 if past end

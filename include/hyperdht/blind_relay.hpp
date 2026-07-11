@@ -37,8 +37,8 @@
 // BlindRelayClient                      BlindRelayClient               283-437
 //   ::pair                              Client.pair()                   358-386
 //   ::unpair                            Client.unpair()                 388-401
-//   ::on_pair_response                  Client._onpair()               320-342
-//   ::on_unpair_response                Client._onunpair()             344-356
+//   ::on_pair_response                  Client._onpair()               372-381
+//   (no inbound unpair handler)         Client._unpair (send-only)     319-321
 // BlindRelayServer                      BlindRelayServer               11-47
 // BlindRelaySession                     BlindRelaySession              49-243
 //   ::on_pair                           Session._onpair()              137-186
@@ -51,6 +51,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -98,13 +99,16 @@ struct UnpairMessage {
     Token token{};
 };
 
-// Encode/decode Pair message
+// Encode/decode Pair message.
+// decode returns std::nullopt on a truncated/malformed buffer — the JS
+// decoder (compact-encoding) throws in that case, which tears the protomux
+// connection down. Callers must mirror that: never act on a partial message.
 std::vector<uint8_t> encode_pair(const PairMessage& m);
-PairMessage decode_pair(const uint8_t* data, size_t len);
+std::optional<PairMessage> decode_pair(const uint8_t* data, size_t len);
 
-// Encode/decode Unpair message
+// Encode/decode Unpair message (same failure contract as decode_pair).
 std::vector<uint8_t> encode_unpair(const UnpairMessage& m);
-UnpairMessage decode_unpair(const uint8_t* data, size_t len);
+std::optional<UnpairMessage> decode_unpair(const uint8_t* data, size_t len);
 
 // Generate a random 32-byte token (JS: relay.token())
 Token generate_token();
@@ -184,9 +188,12 @@ private:
     };
     std::unordered_map<std::string, PairRequest> requests_;
 
-    // Message handlers
+    // Message handlers.
+    // Note: there is no on_unpair handler. Like JS (index.js:319-321), the
+    // client registers the unpair message type for SENDING only and ignores
+    // any inbound unpair. The type is still registered (keeping message index
+    // 1) so unpair sends have a stable wire index.
     void on_pair_response(const uint8_t* data, size_t len);
-    void on_unpair_response(const uint8_t* data, size_t len);
 };
 
 // ---------------------------------------------------------------------------
@@ -201,8 +208,45 @@ private:
 // Forward declaration
 class BlindRelaySession;
 
-// Factory for creating relay UDX streams
-using CreateStreamFn = std::function<udx_stream_t*()>;
+// Per relay-stream context, stored in udx_stream_t::data. Carries the peer's
+// UDX stream id so the firewall callback can connect() on the first inbound
+// packet (JS BlindRelayLink.remoteId), plus a back-reference so the close
+// callback can drop the stream from its session's map. Allocated when a relay
+// stream is created in on_pair; freed by relay_stream_close_cb.
+struct RelayStreamCtx {
+    std::weak_ptr<bool> session_alive;   // guards `session` against UAF
+    BlindRelaySession* session = nullptr;
+    std::string key;                     // token hex — key into streams_
+    uint32_t remote_id = 0;              // peer's UDX stream id (connect target)
+};
+
+// udx firewall callback for a relay stream. On the first inbound packet from
+// an unknown remote it connects the stream to that source using the peer's
+// stream id, then returns 0 so the packet is accepted and relayed.
+//
+// Mirrors JS BlindRelayLink._onfirewall (index.js:276-280): connect(), then
+// `return false`. libudx's firewall contract: a non-zero return DROPS the
+// packet (process_packet `return 1`), a zero return ACCEPTS it (falls through
+// to relay_packet). JS `return false` therefore maps to returning 0 here —
+// the freshly-connected stream then relays the very packet that connected it.
+int relay_firewall_cb(udx_stream_t* stream, udx_socket_t* socket,
+                      const struct sockaddr* from);
+
+// udx close callback for a relay stream. Drops the stream from its session's
+// streams_ map and frees the RelayStreamCtx. Mirrors JS
+// `stream.on('close', () => session._streams.delete(keyString))`
+// (index.js:166). udx folds stream errors into close(status<0), so this one
+// callback also covers JS's separate `.on('error', session._onerror)`.
+void relay_stream_close_cb(udx_stream_t* stream, int status);
+
+// Factory for creating relay UDX streams. The relay node owns the udx_t and
+// socket, so it — not blind-relay — allocates the udx_stream_t. blind-relay
+// supplies the close callback (so it observes close, per finding above) and a
+// user_data pointer (the RelayStreamCtx) that the factory must store in
+// stream->data. The factory owns the stream's MEMORY via its own finalize_cb.
+// Mirrors JS `_createStream({ firewall })` where the DHT provides the stream.
+using CreateStreamFn =
+    std::function<udx_stream_t*(udx_stream_close_cb close_cb, void* user_data)>;
 
 class BlindRelayServer {
 public:
@@ -216,8 +260,20 @@ public:
     BlindRelaySession* accept(protomux::Mux* mux,
                               const std::vector<uint8_t>& channel_id = {});
 
-    // Close all sessions
+    // Graceful close (JS index.js:36-46). Marks the server closing and asks
+    // each session to end(); a session with in-flight pairings drains via its
+    // pending_close_/endMaybe machinery and removes itself once its channel
+    // actually closes. on_closed (if set) fires when the last session is gone.
+    // The destructor performs a hard destroy of anything still live.
     void close();
+
+    // Fired once the last session has drained after close(). Optional.
+    std::function<void()> on_closed;
+
+    // Called by a session when its channel closes, so the server can drop it.
+    // Safe to call from within the session's own close path — the session's
+    // owning unique_ptr is moved aside (not freed) and reaped later.
+    void notify_session_closed(BlindRelaySession* session);
 
     // Pairing state — shared across all sessions
     struct RelayPair {
@@ -233,7 +289,8 @@ public:
         bool has(bool is_initiator) const { return links[is_initiator ? 1 : 0].session != nullptr; }
         bool paired() const { return links[0].session != nullptr && links[1].session != nullptr; }
         Link& remote(bool is_initiator) { return links[is_initiator ? 0 : 1]; }
-        // H25: creation time for TTL eviction of unpaired entries
+        // H25: creation time for TTL eviction of unpaired entries.
+        // (C++ anti-DoS hardening; JS blind-relay has no TTL and no cap.)
         std::chrono::steady_clock::time_point created_at = std::chrono::steady_clock::now();
     };
 
@@ -247,8 +304,16 @@ public:
     CreateStreamFn create_stream_fn;
 
 private:
+    // Reap sessions moved aside by notify_session_closed(). Called at safe
+    // points (accept/close), never while a session method is on the stack.
+    void reap_zombies() { zombies_.clear(); }
+
     std::unordered_map<std::string, RelayPair> pairings_;
     std::vector<std::unique_ptr<BlindRelaySession>> sessions_;
+    // Sessions that closed themselves; kept alive here until reaped so the
+    // self-removal in notify_session_closed() never frees a session mid-call.
+    std::vector<std::unique_ptr<BlindRelaySession>> zombies_;
+    bool closing_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -278,6 +343,12 @@ public:
     using OnPairCb = std::function<void(bool is_initiator, const Token& token,
                                         udx_stream_t* stream, uint32_t remote_id)>;
     OnPairCb on_pair_event;
+
+    // Drop a relay stream from streams_ once udx has closed it. Invoked by
+    // relay_stream_close_cb. Mirrors JS `session._streams.delete(keyString)`
+    // (index.js:166). Erase-only — no endMaybe here (JS ties endMaybe to
+    // _pairing, not _streams).
+    void on_stream_closed(const std::string& key);
 
 private:
     BlindRelayServer& server_;

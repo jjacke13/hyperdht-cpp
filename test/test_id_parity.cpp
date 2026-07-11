@@ -32,6 +32,7 @@ static void make_persistent(RpcSocket& socket) {
         auto from = Ipv4Address::from_string(
             "10.0.0." + std::to_string(i), 49737);
         socket.nat_sampler().add(our_addr, from);
+        socket.ring_sampler().add(our_addr.host_string(), our_addr.port);
     }
     socket.force_check_persistent();
 }
@@ -219,6 +220,84 @@ TEST(IdParity, PersistentIncludesIdInResponse) {
     ASSERT_TRUE(ctx.received_id.has_value());
     EXPECT_EQ(*ctx.received_id, server.table().id())
         << "Response ID must match server's table ID";
+
+    uv_loop_close(&loop);
+}
+
+// ===========================================================================
+// sweep-miss-b: outgoing REQUESTS carry our id only when persistent AND on the
+// server socket (JS io.js:521 — `ephemeral === false && socket === serverSocket`).
+// ===========================================================================
+
+// Drive one internal PING from `client` to a bare server that captures req.id,
+// and report whether the request advertised an id.
+static bool outgoing_request_has_id(uv_loop_t& loop, RpcSocket& client) {
+    NodeId sid{};
+    sid.fill(0x5A);
+    RpcSocket server(&loop, sid);
+    server.bind(0);
+
+    struct Ctx { bool got = false; bool has_id = false; RpcSocket* s; RpcSocket* c; };
+    Ctx ctx{false, false, &server, &client};
+    server.on_request([&ctx](const Request& req) {
+        ctx.has_id = req.id.has_value();
+        ctx.got = true;
+        ctx.s->close();
+        ctx.c->close();
+    });
+
+    Request ping;
+    ping.to.addr = Ipv4Address::from_string("127.0.0.1", server.port());
+    ping.command = CMD_PING;
+    ping.internal = true;
+    client.request(ping, [](const Response&) {}, [](uint16_t) {});
+
+    uv_timer_t t;
+    uv_timer_init(&loop, &t);
+    t.data = &ctx;
+    uv_timer_start(&t, [](uv_timer_t* t) {
+        auto* c = static_cast<Ctx*>(t->data);
+        c->s->close();
+        c->c->close();
+        uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
+    }, 2000, 0);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_TRUE(ctx.got) << "server should have received the PING";
+    return ctx.has_id;
+}
+
+TEST(IdParity, PersistentRequestCarriesId) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    NodeId cid{};
+    cid.fill(0x66);
+    RpcSocket client(&loop, cid);
+    client.bind(0);
+    make_persistent(client);  // !ephemeral_ && !firewalled_ → egress server socket
+    ASSERT_FALSE(client.is_ephemeral());
+
+    EXPECT_TRUE(outgoing_request_has_id(loop, client))
+        << "persistent node MUST advertise its id on server-socket requests "
+           "(JS io.js:521) so peers add it via validateId";
+
+    uv_loop_close(&loop);
+}
+
+TEST(IdParity, EphemeralRequestOmitsId) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    NodeId cid{};
+    cid.fill(0x77);
+    RpcSocket client(&loop, cid);
+    client.bind(0);
+    ASSERT_TRUE(client.is_ephemeral());  // egress client socket, no id
+
+    EXPECT_FALSE(outgoing_request_has_id(loop, client))
+        << "ephemeral node MUST NOT advertise an id on outgoing requests "
+           "(JS io.js:521 gate `ephemeral === false`)";
 
     uv_loop_close(&loop);
 }
@@ -444,7 +523,7 @@ TEST(IdParity, ValidateIdAcceptsCorrectId) {
 // Gap 5: Storage commands must be dropped when ephemeral
 // ===========================================================================
 
-TEST(IdParity, EphemeralDropsStorageCommands) {
+TEST(IdParity, EphemeralRepliesUnknownCommandForStorage) {
     uv_loop_t loop;
     uv_loop_init(&loop);
 
@@ -468,6 +547,7 @@ TEST(IdParity, EphemeralDropsStorageCommands) {
         RpcSocket* c;
         bool done = false;
         bool got_response = false;
+        std::optional<uint32_t> error;
     };
     Ctx ctx{&server, &client};
 
@@ -481,14 +561,14 @@ TEST(IdParity, EphemeralDropsStorageCommands) {
     req.target = target;
 
     client.request(req,
-        [&ctx](const Response&) {
+        [&ctx](const Response& resp) {
             ctx.got_response = true;
+            ctx.error = resp.error;
             ctx.done = true;
             ctx.s->close();
             ctx.c->close();
         },
         [&ctx](uint16_t) {
-            // Timeout = server dropped the request (expected!)
             ctx.got_response = false;
             ctx.done = true;
             ctx.s->close();
@@ -508,9 +588,15 @@ TEST(IdParity, EphemeralDropsStorageCommands) {
     uv_run(&loop, UV_RUN_DEFAULT);
 
     ASSERT_TRUE(ctx.done);
-    EXPECT_FALSE(ctx.got_response)
-        << "Ephemeral server MUST drop storage commands (FIND_PEER, ANNOUNCE, etc.) — "
-           "JS: hyperdht/index.js:404 'if (this._persistent === null) return false'";
+    // JS parity: an ephemeral node does NOT silently drop storage commands — it
+    // replies with UNKNOWN_COMMAND. hyperdht/index.js:404 returns false while
+    // ephemeral (`this._persistent === null`), and dht-rpc index.js:684-685
+    // turns that false into `req.sendReply(UNKNOWN_COMMAND, ...)`. The querier
+    // gets a definitive error instead of timing out.
+    EXPECT_TRUE(ctx.got_response)
+        << "Ephemeral server must REPLY (UNKNOWN_COMMAND), not drop storage commands";
+    ASSERT_TRUE(ctx.error.has_value());
+    EXPECT_EQ(*ctx.error, ERR_UNKNOWN_COMMAND);
 
     uv_loop_close(&loop);
 }

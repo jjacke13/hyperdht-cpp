@@ -252,6 +252,10 @@ void SecretStream::start_timeout_timer() {
     timeout_timer_->data = this;
     // Single-fire: fires once after timeout_ms_, repeat=timeout_ms_ for uv_timer_again
     uv_timer_start(timeout_timer_, on_timeout_cb, timeout_ms_, timeout_ms_);
+    // JS parity (@hyperswarm/secret-stream unrefs both timers): the stream's
+    // UDX socket handle keeps the loop alive while the connection is real, so
+    // these bookkeeping timers must not hold the loop open by themselves.
+    uv_unref(reinterpret_cast<uv_handle_t*>(timeout_timer_));
 }
 
 void SecretStream::start_keepalive_timer() {
@@ -260,6 +264,7 @@ void SecretStream::start_keepalive_timer() {
     keepalive_timer_->data = this;
     // Repeating: fires every keep_alive_ms_ of idle
     uv_timer_start(keepalive_timer_, on_keepalive_cb, keep_alive_ms_, keep_alive_ms_);
+    uv_unref(reinterpret_cast<uv_handle_t*>(keepalive_timer_));  // JS unrefs — see above
 }
 
 void SecretStream::stop_timer(uv_timer_t*& timer) {
@@ -362,6 +367,16 @@ SecretStreamDuplex::~SecretStreamDuplex() {
     // bails out before touching `owner`.
     *alive_ = false;
 
+    // If we're being deleted without a close having fired (e.g. a bare
+    // reset() of a relay control stream), still release the upgrade owner so
+    // it stops referencing this stream. fire_close() clears the tap, so this
+    // never double-fires on the normal close path.
+    if (on_upgrade_close_) {
+        auto tap = std::move(on_upgrade_close_);
+        on_upgrade_close_ = nullptr;
+        tap();
+    }
+
     // Stop timers if destroy() wasn't called first. The timers use async
     // uv_close — their on_timer_close callback frees the timer handle
     // on the next uv_run iteration. We null timer->data so the callback
@@ -452,6 +467,14 @@ void SecretStreamDuplex::start() {
     if (opts_.enable_send) {
         udx_stream_recv_start(raw_stream_, on_udx_recv_message);
     }
+
+    // Install our own firewall callback (JS PR #266). It routes a
+    // socket-mismatched packet to the upgrade tap and always accepts.
+    // Installed unconditionally so any stale firewall from the connect /
+    // server rawStream setup (whose ctx we just replaced with `this`) can
+    // never fire with a mismatched context type — a latent type-confusion
+    // that predates the upgrade. Fires nothing when no upgrade is attached.
+    udx_stream_firewall(raw_stream_, on_udx_firewall);
 
     // Send our 59-byte header frame first.
     send_header_frame();
@@ -579,6 +602,11 @@ void SecretStreamDuplex::end() {
     if (ended_ || destroyed_) return;
     ended_ = true;
 
+    // JS _final clears the keepalive timer on graceful shutdown. Without
+    // this the timer keeps firing after end(); its callback's write() is a
+    // no-op (ended_), but the wakeups are pure waste — stop it now.
+    crypto_.set_keep_alive(0, nullptr);
+
     // udx_stream_write_sizeof requires nwbufs > 0 even when no buffers are
     // actually passed; test_udx.cpp uses sizeof(1) + (nullptr, 0).
     auto* wreq = static_cast<udx_stream_write_t*>(
@@ -620,7 +648,40 @@ void SecretStreamDuplex::destroy(int error) {
 void SecretStreamDuplex::fire_close(int err) {
     if (on_close_fired_) return;
     on_close_fired_ = true;
+    // Release the relay→direct upgrade owner FIRST — it must null its emitted-
+    // stream pointer before the raw udx struct is finalized (hazard 8), so any
+    // in-flight upgrade hop (punch-success onsocket, deferred remote-changed,
+    // nudge completion) degrades to a no-op instead of touching a dead stream.
+    if (on_upgrade_close_) {
+        auto tap = std::move(on_upgrade_close_);
+        on_upgrade_close_ = nullptr;
+        tap();
+    }
     if (on_close_) on_close_(err);
+}
+
+// ---------------------------------------------------------------------------
+// attach_upgrade — install the relay→direct upgrade taps (JS PR #266)
+// ---------------------------------------------------------------------------
+
+void SecretStreamDuplex::attach_upgrade(
+    std::shared_ptr<void> ctx,
+    std::function<void()> on_raw_activity,
+    std::function<void(udx_socket_t*, const struct sockaddr*)> on_firewall,
+    std::function<void()> on_close) {
+    upgrade_attachment_    = std::move(ctx);
+    on_raw_activity_       = std::move(on_raw_activity);
+    on_upgrade_firewall_   = std::move(on_firewall);
+    on_upgrade_close_      = std::move(on_close);
+}
+
+int SecretStreamDuplex::on_udx_firewall(udx_stream_t* s, udx_socket_t* sock,
+                                        const struct sockaddr* from) {
+    auto* self = static_cast<SecretStreamDuplex*>(s->data);
+    if (self && self->on_upgrade_firewall_) {
+        self->on_upgrade_firewall_(sock, from);
+    }
+    return 0;  // accept — JS uses the firewall purely as a wire-up signal
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +708,11 @@ void SecretStreamDuplex::fire_close(int err) {
 void SecretStreamDuplex::process_incoming_bytes(const uint8_t* data, size_t len) {
     if (len == 0) return;
     raw_bytes_read_ += len;
+    // JS parity: refresh the inactivity timeout on the raw chunk, before
+    // parsing — so a peer trickling sub-frame chunks or sending only its
+    // header then pausing is kept alive (decrypt() alone refreshes only on
+    // complete data frames).
+    crypto_.refresh_timeout();
     recv_buf_.insert(recv_buf_.end(), data, data + len);
 
     // Extract as many complete frames as possible.
@@ -886,6 +952,12 @@ void SecretStreamDuplex::on_udx_read(udx_stream_t* s, ssize_t nread,
     auto* self = static_cast<SecretStreamDuplex*>(s->data);
     if (!self) return;
 
+    // Relay→direct upgrade: any inbound reliable data is a raw-activity signal
+    // (the doc's `ondirect`). Fire BEFORE framing, and before EOF/error checks
+    // — a keepalive frame arriving on the direct path is what confirms the
+    // migration to a 6.29.1 peer that never sends an explicit nudge (#266).
+    if (nread > 0 && self->on_raw_activity_) self->on_raw_activity_();
+
     if (nread == UV_EOF) {
         if (self->on_end_) self->on_end_();
         return;
@@ -917,7 +989,15 @@ void SecretStreamDuplex::on_udx_close(udx_stream_t* s, int err) {
 void SecretStreamDuplex::on_udx_recv_message(udx_stream_t* s, ssize_t nread,
                                              const uv_buf_t* buf) {
     auto* self = static_cast<SecretStreamDuplex*>(s->data);
-    if (!self || !self->send_state_ready_) return;
+    if (!self) return;
+
+    // Relay→direct upgrade `ondirect` signal — fire on ANY inbound unordered
+    // message, including the zero-length nudge (nread == 0), BEFORE the
+    // send-state / length guards below. This is how the peer's direct-path
+    // nudge confirms the migration (#266).
+    if (self->on_raw_activity_) self->on_raw_activity_();
+
+    if (!self->send_state_ready_) return;
     if (nread <= 0) return;
 
     std::vector<uint8_t> plain;

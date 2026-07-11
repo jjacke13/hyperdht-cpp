@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <set>
 #include <string>
 
 #include <sodium.h>
 
 #include "hyperdht/holepunch.hpp"
+#include "hyperdht/socket_pool.hpp"
 
 using namespace hyperdht::holepunch;
 using namespace hyperdht::compact;
@@ -716,6 +718,110 @@ TEST(Holepuncher, RandomConsistentNeedsPool) {
     EXPECT_FALSE(started);
 
     hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// h-3: JS coerceFirewall (holepuncher.js:333-335) leaves UNKNOWN as UNKNOWN,
+// which matches NO punchable branch → punch() returns false (JS requires
+// `local === CONSISTENT`). The old C++ coerced UNKNOWN into CONSISTENT and
+// punched blindly — reachable on the server, whose classification is UNKNOWN
+// until enough samples land.
+TEST(Holepuncher, UnknownLocalFirewallDoesNotPunch) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, true);
+    hp.set_local_firewall(FIREWALL_UNKNOWN);
+    hp.set_remote_firewall(FIREWALL_CONSISTENT);
+    hp.update_remote({Ipv4Address::from_string("10.0.0.1", 3000)}, "10.0.0.1");
+
+    EXPECT_FALSE(hp.punch()) << "UNKNOWN local must not punch (JS coerceFirewall)";
+    EXPECT_FALSE(hp.is_punching());
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// h-5: JS holepuncher.js:194 gates BOTH random branches on a verified remote
+// address. CONSISTENT+RANDOM with only an unverified address must not punch.
+TEST(Holepuncher, RandomRemoteRequiresVerifiedAddress) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    Holepuncher hp(&loop, true);
+    hp.set_local_firewall(FIREWALL_CONSISTENT);
+    hp.set_remote_firewall(FIREWALL_RANDOM);
+    // set_remote_addresses marks addrs UNVERIFIED (verified=false)
+    hp.set_remote_addresses({Ipv4Address::from_string("10.0.0.1", 3000)});
+
+    EXPECT_FALSE(hp.punch()) << "random branch requires a verified remote addr";
+    EXPECT_FALSE(hp.is_punching());
+
+    hp.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// h-1: RANDOM+CONSISTENT birthday paradox — each acquired holder socket must
+// punch its OWN NAT hole, i.e. egress from its own source port. The old code
+// sent every probe from one shared pool socket (a single source port); this
+// asserts multiple distinct source ports arrive at the target. (A full
+// cross-NAT birthday e2e is impossible on loopback — this checks the
+// per-socket egress mechanism only.)
+TEST(Holepuncher, BirthdayEgressPerSocket) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    udx_t udx;
+    udx_init(&loop, &udx, nullptr);
+
+    // Target socket on loopback that records the source port of each probe.
+    std::set<uint16_t> src_ports;
+    udx_socket_t recv_sock;
+    udx_socket_init(&udx, &recv_sock, [](udx_socket_t*) {});
+    recv_sock.data = &src_ports;
+    struct sockaddr_in raddr;
+    uv_ip4_addr("127.0.0.1", 0, &raddr);
+    udx_socket_bind(&recv_sock,
+                    reinterpret_cast<const struct sockaddr*>(&raddr), 0);
+    udx_socket_recv_start(
+        &recv_sock,
+        [](udx_socket_t* s, ssize_t n, const uv_buf_t*,
+           const struct sockaddr* a) {
+            if (n <= 0 || !a) return;
+            auto* sp = static_cast<std::set<uint16_t>*>(s->data);
+            auto* sin = reinterpret_cast<const struct sockaddr_in*>(a);
+            sp->insert(ntohs(sin->sin_port));
+        });
+
+    struct sockaddr_in bound;
+    int blen = sizeof(bound);
+    uv_udp_getsockname(reinterpret_cast<uv_udp_t*>(&recv_sock),
+                       reinterpret_cast<struct sockaddr*>(&bound), &blen);
+    uint16_t recv_port = ntohs(bound.sin_port);
+
+    hyperdht::socket_pool::SocketPool pool(&loop, &udx);
+    PunchStats stats;
+    Holepuncher hp(&loop, true, &pool, &stats);
+    hp.set_local_firewall(FIREWALL_RANDOM);
+    hp.set_remote_firewall(FIREWALL_CONSISTENT);
+    hp.update_remote({Ipv4Address::from_string("127.0.0.1", recv_port)},
+                     "127.0.0.1");
+
+    EXPECT_TRUE(hp.punch()) << "RANDOM+CONSISTENT with a wired pool must punch";
+
+    // Drive the loop until several distinct holder source ports have arrived.
+    for (int i = 0; i < 4000 && src_ports.size() < 3; i++) {
+        uv_run(&loop, UV_RUN_NOWAIT);
+    }
+    EXPECT_GE(src_ports.size(), 3u)
+        << "each birthday holder must egress from its own socket";
+
+    hp.destroy();
+    hp.close();
+    pool.destroy();
+    udx_socket_close(&recv_sock);
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }

@@ -8,6 +8,7 @@
 
 #include <cstring>
 
+#include "hyperdht/announce.hpp"
 #include "hyperdht/announce_sig.hpp"
 #include "hyperdht/dht_messages.hpp"
 
@@ -85,49 +86,209 @@ std::shared_ptr<query::Query> lookup(rpc::RpcSocket& socket,
 }
 
 // ---------------------------------------------------------------------------
-// announce — LOOKUP walk + commit phase that sends ANNOUNCE to each
-// closest node with the issued token.
+// make_announce_commit — the per-closest-reply ANNOUNCE commit. Builds and
+// signs a FRESH announce record for the replying node, over that node's issued
+// token + id, then sends CMD_ANNOUNCE with the token. Shared by the plain
+// announce and the clear-announce (dhttop-6) paths. Mirrors the server-side
+// Announcer::commit (announcer.cpp) — the in-repo per-node-signing reference.
 //
-// JS: .analysis/js/hyperdht/index.js:244-264 (announce — wraps lookup with
-//     a commit fn that calls _requestAnnounce)
-//     .analysis/js/hyperdht/index.js:_requestAnnounce (signed `m.announce`
-//     payload — target/token/id signed with NS.ANNOUNCE)
+// JS: .analysis/js/hyperdht/index.js:464-488 (_requestAnnounce).
 //
-// C++ diffs from JS:
-//   - JS builds the signed `m.announce` payload (peer + signature + bump)
-//     inside `_requestAnnounce` and uses Persistent.signAnnounce. This
-//     C++ wrapper is intentionally low-level: callers pass the already-
-//     encoded `value` and we send it as-is. Higher-level signing lives
-//     in `announce_sig.cpp` / `dht_messages.cpp`.
-//   - JS optionally routes through `lookupAndUnannounce` when `opts.clear`
-//     is set (index.js:250). Not yet ported — see docs/JS-PARITY-GAPS.md.
+// The socket + keypair are captured; the LIFETIME contract (see header)
+// requires the socket to outlive the query.
 // ---------------------------------------------------------------------------
 
-std::shared_ptr<query::Query> announce(rpc::RpcSocket& socket,
-                                        const routing::NodeId& target,
-                                        const std::vector<uint8_t>& value,
-                                        query::OnDoneCallback on_done) {
-    auto q = query::Query::create(socket, target, messages::CMD_ANNOUNCE, &value);
-    q->on_done(std::move(on_done));
-
-    // Commit phase: use weak_ptr to Query for lifetime-safe socket access
-    auto q_weak = std::weak_ptr<query::Query>(q);
-    q->set_commit([q_weak, target, value](
+static query::OnCommitCallback make_announce_commit(
+    rpc::RpcSocket& socket,
+    const routing::NodeId& target,
+    const noise::Keypair& keypair,
+    const std::vector<compact::Ipv4Address>& relay_addresses,
+    uint64_t bump) {
+    return [&socket, target, keypair, relay_addresses, bump](
             const query::QueryReply& node,
-            rpc::OnResponseCallback commit_done) {
-        auto q_locked = q_weak.lock();
-        if (!q_locked) return;
+            rpc::OnResponseCallback on_response,
+            rpc::OnTimeoutCallback on_timeout) {
+        // do_commit maps EVERY closest reply (JS query.js:220-228); a tokenless
+        // node cannot be signed for, so settle it as a FAILED commit — exactly
+        // JS autoCommit's reject on a reply with no token (query.js:392-393).
+        if (!node.token.has_value()) { on_timeout(0); return; }
+
+        // JS _requestAnnounce: ann = { peer:{publicKey, relayAddresses}, bump },
+        // signed over (target, token, from.id, ann) with NS.ANNOUNCE.
+        dht_messages::AnnounceMessage ann;
+        dht_messages::PeerRecord peer;
+        peer.public_key = keypair.public_key;
+        peer.relay_addresses = relay_addresses;
+        ann.peer = peer;
+        ann.bump = bump;
+        ann.signature = announce_sig::sign_announce(
+            target, node.from_id,
+            node.token->data(), node.token->size(), ann, keypair);
+
         messages::Request req;
         req.to.addr = node.from_addr;
         req.command = messages::CMD_ANNOUNCE;
         req.target = target;
-        if (node.token.has_value()) {
-            req.token = *node.token;
+        req.token = *node.token;
+        req.value = dht_messages::encode_announce_msg(ann);
+        uint16_t tid = socket.request(req, std::move(on_response), on_timeout);
+        // Dropped by the congestion queue → neither callback will fire.
+        // Settle the commit now so the query can't hang.
+        if (tid == 0) on_timeout(0);
+    };
+}
+
+// ---------------------------------------------------------------------------
+// announce — LOOKUP walk (value-less) + commit phase that signs and sends a
+// per-node ANNOUNCE to each closest node with its issued token. With
+// `clear_keypair`, first removes our stale records (dhttop-6).
+//
+// JS: .analysis/js/hyperdht/index.js:244-264 (announce — wraps lookup, or
+//     lookupAndUnannounce when opts.clear, with a commit fn calling
+//     _requestAnnounce).
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<query::Query> announce(rpc::RpcSocket& socket,
+                                        const routing::NodeId& target,
+                                        const noise::Keypair& keypair,
+                                        const std::vector<compact::Ipv4Address>& relay_addresses,
+                                        uint64_t bump,
+                                        query::OnDoneCallback on_done,
+                                        const noise::Keypair* clear_keypair) {
+    auto commit = make_announce_commit(socket, target, keypair,
+                                       relay_addresses, bump);
+
+    // dhttop-6: clear path (JS index.js:250 `opts.clear ? lookupAndUnannounce
+    // : lookup`). The announce commit becomes the user commit folded in after
+    // the unannounces settle.
+    if (clear_keypair) {
+        return lookup_and_unannounce(
+            socket, target, *clear_keypair,
+            /*on_reply=*/nullptr,
+            std::move(commit),
+            std::move(on_done));
+    }
+
+    // JS walk = CMD_LOOKUP with NO value (persistent nodes drop token-less
+    // ANNOUNCE walk requests, so the old CMD_ANNOUNCE walk never landed).
+    auto q = query::Query::create(socket, target, messages::CMD_LOOKUP);
+    q->on_done(std::move(on_done));
+    q->set_commit(std::move(commit));
+
+    add_default_bootstrap(*q, socket);
+    q->start();
+    return q;
+}
+
+// ---------------------------------------------------------------------------
+// lookup_and_unannounce — see header. LOOKUP walk; per-reply map fires signed
+// UNANNOUNCE for our stale records; commit awaits the unannounces then runs
+// the user commit (announce for clear, noop for plain unannounce).
+//
+// JS: .analysis/js/hyperdht/index.js:197-238 (lookupAndUnannounce),
+//     :490-512 (_requestUnannounce).
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<query::Query> lookup_and_unannounce(
+    rpc::RpcSocket& socket,
+    const routing::NodeId& target,
+    const noise::Keypair& keypair,
+    query::OnReplyCallback on_reply,
+    query::OnCommitCallback user_commit,
+    query::OnDoneCallback on_done) {
+
+    auto q = query::Query::create(socket, target, messages::CMD_LOOKUP);
+
+    // Shared state: in-flight UNANNOUNCE requests + commits deferred until they
+    // settle. Mirrors JS `unannounces` array + `await Promise.all(unannounces)`.
+    struct Tracker {
+        int inflight = 0;
+        std::vector<std::function<void()>> deferred;
+        void settle() {
+            if (inflight > 0) --inflight;
+            if (inflight == 0 && !deferred.empty()) {
+                auto pending = std::move(deferred);
+                deferred.clear();
+                for (auto& fn : pending) fn();
+            }
         }
-        req.value = value;
-        q_locked->socket().request(req, std::move(commit_done));
+    };
+    auto tracker = std::make_shared<Tracker>();
+    const auto our_pk = keypair.public_key;
+
+    // map (per reply): unannounce our stale record. JS index.js:216-237.
+    q->on_reply([&socket, target, keypair, our_pk, tracker, on_reply](
+                    const query::QueryReply& reply) {
+        if (on_reply) on_reply(reply);
+
+        // JS: `if (!data.token) return`; `if (!data.from.id) return`.
+        if (!reply.token.has_value()) return;
+        routing::NodeId zero_id{};
+        if (reply.from_id == zero_id) return;
+        if (!reply.value.has_value() || reply.value->empty()) return;
+
+        // found = ≥20 records OR our key present (JS index.js:221-224).
+        auto parsed = dht_messages::decode_lookup_reply(
+            reply.value->data(), reply.value->size());
+        bool found = parsed.peers.size() >= announce::MAX_PEERS_PER_TARGET;
+        for (size_t i = 0; !found && i < parsed.peers.size(); ++i) {
+            auto pr = dht_messages::decode_peer_record(
+                parsed.peers[i].data(), parsed.peers[i].size());
+            if (pr.public_key == our_pk) found = true;
+        }
+        if (!found) return;
+
+        // Build + sign the UNANNOUNCE (JS _requestUnannounce, index.js:490-512):
+        // empty relay list, NS.UNANNOUNCE signature over (target, token,
+        // replying node id, peer).
+        dht_messages::AnnounceMessage unann;
+        dht_messages::PeerRecord peer;
+        peer.public_key = our_pk;
+        unann.peer = peer;
+        unann.signature = announce_sig::sign_unannounce(
+            target, reply.from_id,
+            reply.token->data(), reply.token->size(),
+            unann, keypair);
+
+        messages::Request req;
+        req.to.addr = reply.from_addr;
+        req.command = messages::CMD_UNANNOUNCE;
+        req.target = target;
+        req.token = *reply.token;
+        req.value = dht_messages::encode_announce_msg(unann);
+
+        ++tracker->inflight;
+        uint16_t tid = socket.request(req,
+            [tracker](const messages::Response&) { tracker->settle(); },
+            [tracker](uint16_t) { tracker->settle(); });
+        if (tid == 0) tracker->settle();  // dropped → settle now, can't hang
     });
 
+    // commit (per closest reply): await outstanding unannounces (JS
+    // index.js:211-214 `await Promise.all(unannounces)`), then run user_commit.
+    // Deferring the send until unannounces settle prevents a fresh ANNOUNCE
+    // from racing a late UNANNOUNCE to the same node.
+    q->set_commit([tracker, user_commit](
+            const query::QueryReply& node,
+            rpc::OnResponseCallback on_response,
+            rpc::OnTimeoutCallback on_timeout) {
+        auto run = [node, user_commit, on_response, on_timeout]() mutable {
+            if (user_commit) {
+                user_commit(node, std::move(on_response), std::move(on_timeout));
+            } else {
+                // Plain unannounce: JS userCommit is noop → resolve success.
+                messages::Response empty;
+                on_response(empty);
+            }
+        };
+        if (tracker->inflight == 0) {
+            run();
+        } else {
+            tracker->deferred.push_back(std::move(run));
+        }
+    });
+
+    q->on_done(std::move(on_done));
     add_default_bootstrap(*q, socket);
     q->start();
     return q;
@@ -155,7 +316,8 @@ std::shared_ptr<query::Query> immutable_put(rpc::RpcSocket& socket,
     auto q_weak = std::weak_ptr<query::Query>(q);
     q->set_commit([q_weak, target_id, value](
             const query::QueryReply& node,
-            rpc::OnResponseCallback commit_done) {
+            rpc::OnResponseCallback on_response,
+            rpc::OnTimeoutCallback on_timeout) {
         auto q_locked = q_weak.lock();
         if (!q_locked) return;
         messages::Request req;
@@ -164,7 +326,9 @@ std::shared_ptr<query::Query> immutable_put(rpc::RpcSocket& socket,
         req.target = target_id;
         if (node.token.has_value()) req.token = *node.token;
         req.value = value;
-        q_locked->socket().request(req, std::move(commit_done));
+        uint16_t tid = q_locked->socket().request(
+            req, std::move(on_response), on_timeout);
+        if (tid == 0) on_timeout(0);
     });
 
     add_default_bootstrap(*q, socket);
@@ -269,7 +433,8 @@ std::shared_ptr<query::Query> mutable_put(rpc::RpcSocket& socket,
     auto q_weak = std::weak_ptr<query::Query>(q);
     q->set_commit([q_weak, target_id, encoded](
             const query::QueryReply& node,
-            rpc::OnResponseCallback commit_done) {
+            rpc::OnResponseCallback on_response,
+            rpc::OnTimeoutCallback on_timeout) {
         auto q_locked = q_weak.lock();
         if (!q_locked) return;
         messages::Request req;
@@ -278,7 +443,9 @@ std::shared_ptr<query::Query> mutable_put(rpc::RpcSocket& socket,
         req.target = target_id;
         if (node.token.has_value()) req.token = *node.token;
         req.value = encoded;
-        q_locked->socket().request(req, std::move(commit_done));
+        uint16_t tid = q_locked->socket().request(
+            req, std::move(on_response), on_timeout);
+        if (tid == 0) on_timeout(0);
     });
 
     add_default_bootstrap(*q, socket);

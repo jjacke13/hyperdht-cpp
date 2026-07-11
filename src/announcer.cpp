@@ -255,7 +255,7 @@ void Announcer::update() {
             if (auto a = weak.lock(); !a || !*a) return;
             commit(reply);
         },
-        [weak, this](const std::vector<query::QueryReply>&) {
+        [weak, this](int /*error*/, const std::vector<query::QueryReply>&) {
             if (auto a = weak.lock(); !a || !*a) return;
             updating_ = false;
             current_query_.reset();

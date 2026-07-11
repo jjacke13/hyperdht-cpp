@@ -17,6 +17,7 @@
 #include "hyperdht/holepunch.hpp"
 #include "hyperdht/noise_wrap.hpp"
 #include "hyperdht/peer_connect.hpp"
+#include "hyperdht/relay_upgrade.hpp"
 
 namespace hyperdht {
 namespace server_connection {
@@ -73,6 +74,12 @@ struct ServerConnection {
 
     // Phase E: blind-relay token (set when relay is active)
     std::array<uint8_t, 32> relay_token{};
+
+    // JS PR #266: set when the connection was already emitted over the blind
+    // relay. A later punch success must migrate that live stream via
+    // upgrade->on_socket() instead of emitting a second connection. Shared
+    // with the emitted stream's Duplex (which owns the other reference).
+    std::shared_ptr<relay_upgrade::UpgradeContext> upgrade;
 };
 
 // ---------------------------------------------------------------------------

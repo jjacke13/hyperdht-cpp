@@ -201,5 +201,96 @@ void NatSampler::update_addresses() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RingSampler — line-faithful port of .analysis/js/nat-sampler/index.js
+//
+// Comments cite the JS line each block mirrors. Fidelity notes:
+//   - `_a`/`_b` best-pointers are only REPLACED by a strictly-higher-hits
+//     sample (JS `this._a.hits < a.hits`). They can go stale after a ring
+//     eviction decrements their hits — replicated, not "improved".
+//   - A stale best-pointer's hits can drop below the threshold, sending
+//     host() back to "" (JS null). Intended.
+//   - shared_ptr<Sample> preserves the JS object aliasing between `_samples`
+//     and `_a`/`_b`, so evicting decrements the SAME object `bump` returned.
+// ---------------------------------------------------------------------------
+
+void RingSampler::reset() {
+    host_.clear();
+    port_ = 0;
+    size_ = 0;
+    a_.reset();
+    b_.reset();
+    threshold_ = 0;
+    top_ = 0;
+    samples_.clear();
+}
+
+// JS: index.js:52-63 (_bump)
+std::shared_ptr<Sample> RingSampler::bump(const std::string& host,
+                                          uint16_t port, int inc) {
+    for (int i = 0; i < 4; i++) {
+        // JS: index.js:54 — `(this._top - inc - (2 * i)) & 31`. In C++20 int
+        // is two's complement and `& 31` keeps the low 5 bits, so a negative
+        // intermediate yields the same slot index as JS's 32-bit `&`.
+        int j = (top_ - inc - (2 * i)) & 31;
+        // JS: index.js:55 — index past the current fill → brand-new sample.
+        if (static_cast<size_t>(j) >= samples_.size()) {
+            return std::make_shared<Sample>(Sample{host, port, 1});
+        }
+        auto& s = samples_[j];
+        if (s->port == port && s->host == host) {
+            s->hits++;  // JS: index.js:58
+            return s;   // JS: index.js:59 — return the shared object
+        }
+    }
+    return std::make_shared<Sample>(Sample{host, port, 1});  // JS: index.js:62
+}
+
+// JS: index.js:14-50 (add)
+int RingSampler::add(const std::string& host, uint16_t port) {
+    // JS: index.js:15-16
+    auto a = bump(host, port, 2);
+    auto b = bump(host, 0, 1);
+
+    if (samples_.size() < 32) {
+        // JS: index.js:19-22 — grow the ring, recompute the dynamic threshold.
+        size_++;
+        threshold_ = size_ - (size_ < 4 ? 0 : size_ < 8 ? 1 : size_ < 12 ? 2 : 3);
+        samples_.push_back(a);
+        samples_.push_back(b);
+        top_ += 2;
+    } else {
+        // JS: index.js:24-32 — overwrite the oldest pair, decrementing the
+        // evicted samples' hits.
+        if (top_ == 32) top_ = 0;
+
+        auto oa = samples_[top_];
+        samples_[top_++] = a;
+        oa->hits--;
+
+        auto ob = samples_[top_];
+        samples_[top_++] = b;
+        ob->hits--;
+    }
+
+    // JS: index.js:35-36 — best-pointers replaced only on strictly higher hits.
+    if (!a_ || a_->hits < a->hits) a_ = a;
+    if (!b_ || b_->hits < b->hits) b_ = b;
+
+    // JS: index.js:38-47 — three publish states.
+    if (a_->hits >= threshold_) {
+        host_ = a_->host;
+        port_ = a_->port;
+    } else if (b_->hits >= threshold_) {
+        host_ = b_->host;
+        port_ = 0;
+    } else {
+        host_.clear();  // JS `this.host = null`
+        port_ = 0;
+    }
+
+    return a->hits;  // JS: index.js:49
+}
+
 }  // namespace nat
 }  // namespace hyperdht

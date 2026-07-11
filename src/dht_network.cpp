@@ -44,10 +44,17 @@ void HyperDHT::on_bootstrapped(BootstrappedCallback cb) {
 //   - JS uses the async-iterator `_resolveBootstrapNodes()` to DNS-resolve
 //     hostnames and fall back between pinned IP / DNS lookup. C++ expects
 //     pre-resolved IPs in `opts_.bootstrap`; no async resolve step.
-//   - JS's `_bootstrap` also drives the quick NAT heuristic (PING_NAT on
-//     the first responder) and loops up to twice if NAT sampling is
-//     pending. C++ currently runs a single pass — NAT detection is a §15
-//     follow-up.
+//   - JS's `_bootstrap` (index.js:379-433) runs up to TWO passes and, per pass,
+//     calls `_updateNetworkState(onlyFirewall=true)` to clear `firewalled`
+//     early. C++ runs a single Query pass. tick-7 ports the QUICK-FIREWALL
+//     HEURISTIC only: on the first response we PING_NAT that responder
+//     (quick_firewall_ping) and, on reply, clear `firewalled` early — the
+//     observable `onlyFirewall` effect, which is what shaves up to ~20 min off
+//     firewall determination for a reachable node. DEFERRED (reported): the full
+//     2-pass loop and the `testNat`-gated second `_updateNetworkState`. The
+//     ephemeral→persistent transition itself still runs through the existing
+//     stable-ticks → RingSampler firewall-probe path (that separate, later probe
+//     is NOT touched here).
 // ---------------------------------------------------------------------------
 
 void HyperDHT::start_bootstrap_walk() {
@@ -78,10 +85,21 @@ void HyperDHT::start_bootstrap_walk() {
     DHT_LOG("  [dht] bootstrap: walking with %zu seed node(s), concurrency=%d\n",
             opts_.bootstrap.size(), background_concurrency);
 
-    // Capture alive sentinel so the on_done lambda is a no-op if the DHT
-    // has been destroyed by the time the walk finishes.
+    // Capture alive sentinel so the callbacks are no-ops if the DHT has been
+    // destroyed by the time they fire.
     std::weak_ptr<bool> weak_alive = alive_;
-    q->on_done([this, weak_alive](const std::vector<query::QueryReply>& closest) {
+
+    // tick-7: quick-firewall heuristic. On each reply, poke the responder with a
+    // PING_NAT toward our server socket; quick_firewall_ping() self-guards to
+    // fire exactly once (first responder) and only while firewalled + ephemeral.
+    // JS: index.js:406-432 (`_bootstrap` ondata).
+    q->on_reply([this, weak_alive](const query::QueryReply& reply) {
+        if (weak_alive.expired()) return;
+        socket_->quick_firewall_ping(reply.from_addr);
+    });
+
+    q->on_done([this, weak_alive](int /*error*/,
+                                  const std::vector<query::QueryReply>& closest) {
         if (weak_alive.expired()) return;
         // JS `_bootstrap:402` — flip the flag, then emit `ready`.
         socket_->set_bootstrapped(true);
@@ -149,7 +167,8 @@ void HyperDHT::refresh() {
     // when it finishes. Using a raw Query* here is safe because the shared
     // ptr is owned by refresh_queries_ for the duration.
     query::Query* q_raw = q.get();
-    q->on_done([this, weak_alive, q_raw](const std::vector<query::QueryReply>&) {
+    q->on_done([this, weak_alive, q_raw](int /*error*/,
+                                         const std::vector<query::QueryReply>&) {
         // Belt-and-suspenders: both the alive sentinel and the explicit
         // destroyed_ flag must allow the erase. If the DHT has been
         // destroyed mid-refresh, `refresh_queries_` has already been

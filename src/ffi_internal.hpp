@@ -128,16 +128,28 @@ inline hyperdht_query_t* make_query_handle(hyperdht_done_cb done_cb,
 // `hyperdht_query_free()` can detach by nulling them — a late
 // completion after free becomes silent.
 template <class Result>
-inline std::function<void(const Result&)>
+inline std::function<void(int, const Result&)>
 make_done_fn(std::shared_ptr<QueryState> state) {
-    return [state](const Result&) {
+    return [state](int error, const Result&) {
         state->done = true;
         if (state->done_cb) {
-            int err = state->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
+            // A cancelled query wins; otherwise surface the query's own error
+            // (0 = success, or a QUERY_ERR_* code for a failed commit phase).
+            int err = state->cancelled ? HYPERDHT_ERR_CANCELLED : error;
             state->done_cb(err, state->userdata);
         }
     };
 }
+
+// Opaque payload carried on hyperdht_connection_t::_internal across the connect
+// / server callback. Bundles the pool-socket keepalive (direct paths) and the
+// relay→direct upgrade handle (relay path, JS PR #266). The producer heap-
+// allocates it before the user callback and frees it after — unless the
+// consumer (hyperdht_stream_open) moved the fields out and nulled _internal.
+struct FfiConnExtra {
+    std::shared_ptr<void> socket_keepalive;
+    std::shared_ptr<void> upgrade;
+};
 
 // Fill hyperdht_connection_t from C++ ConnectionInfo fields.
 inline void fill_connection(hyperdht_connection_t* out,
@@ -212,11 +224,11 @@ inline void dispatch_connect_result(hyperdht_connect_cb cb, void* userdata,
                     result.local_udx_id, is_initiator);
     conn.raw_stream = result.raw_stream;
     conn.udx_socket = result.udx_socket;
-    conn._internal = result.socket_keepalive
-        ? new std::shared_ptr<void>(result.socket_keepalive)
+    conn._internal = (result.socket_keepalive || result.upgrade)
+        ? new FfiConnExtra{result.socket_keepalive, result.upgrade}
         : nullptr;
     cb(0, &conn, userdata);
     if (conn._internal) {
-        delete static_cast<std::shared_ptr<void>*>(conn._internal);
+        delete static_cast<FfiConnExtra*>(conn._internal);
     }
 }

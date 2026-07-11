@@ -111,13 +111,33 @@ HyperDHT::HyperDHT(uv_loop_t* loop, DhtOptions opts)
 
     socket_ = std::make_unique<rpc::RpcSocket>(loop_, our_id);
 
+    // tick-5: apply opts.ephemeral + the adaptive gate to the socket.
+    // JS index.js:53 — `adaptive = typeof opts.ephemeral !== 'boolean' &&
+    // opts.adaptive !== false`. When the caller pins `ephemeral` explicitly the
+    // node is non-adaptive (no periodic re-check, no wakeup revert). A
+    // forced-persistent node (ephemeral == false, JS `_forcePersistent`) also
+    // starts non-ephemeral so it holds and advertises a stable id — the
+    // bootstrapper's address-based id is finalised in bootstrapper() below.
+    const bool adaptive = !opts_.ephemeral.has_value() && opts_.adaptive;
+    socket_->set_adaptive(adaptive);
+    socket_->set_quick_firewall(opts_.quick_firewall);
+    if (opts_.ephemeral.has_value()) {
+        socket_->set_ephemeral(*opts_.ephemeral);
+    }
+
     // filterNode: install the JS hardcoded testnet blocklist
     // (hyperdht/index.js:585-592) plus any caller-provided filter. Both
-    // must pass (AND semantics) — matches JS where the built-in filter
-    // replaces opts.filterNode unless the caller opted in explicitly via
-    // dht-rpc's lower-level surface. Bundling them here ensures every
-    // HyperDHT instance ignores the known-bad testnet nodes without a
-    // caller having to know they exist.
+    // must pass (AND semantics).
+    //
+    // ACCEPTED DIVERGENCE (dhttop-4): JS `super({ ...opts, filterNode })`
+    // (index.js:32) OVERWRITES the caller's `opts.filterNode` with the
+    // built-in blocklist — the user's filter is silently discarded, never
+    // composed. C++ deliberately keeps BOTH: the built-in blocklist AND the
+    // caller's filter, requiring both to pass. This is strictly more correct
+    // (the user's filter is honoured), so we keep it rather than copy JS's
+    // drop. Bundling the blocklist here ensures every HyperDHT instance
+    // ignores the known-bad testnet nodes without a caller having to know
+    // they exist.
     //
     // Matching uses the packed 4-byte host + uint16 port directly — no
     // `host_string()` allocations — because this lambda is on the hot
@@ -213,12 +233,13 @@ HyperDHT::~HyperDHT() {
 //     .analysis/js/dht-rpc/index.js:965-979 (`_backgroundQuery`).
 //
 // C++ diffs from JS:
-//   - JS DHT auto-bootstraps at construction against the built-in public
-//     BOOTSTRAP_NODES unless the caller passes `opts.bootstrap === false`.
-//     C++ instead keeps the bootstrap list empty by default (preserving
-//     the contract that existing offline tests rely on) and only runs the
-//     walk when `opts.bootstrap` is non-empty. Callers who want JS's
-//     default behaviour pass `opts.bootstrap =
+//   - DELIBERATE DIVERGENCE (dhttop-3): JS DHT auto-bootstraps at construction
+//     against the built-in public BOOTSTRAP_NODES unless the caller passes
+//     `opts.bootstrap === false`. C++ instead keeps the bootstrap list empty
+//     by default and only runs the walk when `opts.bootstrap` is non-empty —
+//     embedded / library targets must not silently auto-join the public
+//     network (and existing offline tests rely on this). Callers who want JS's
+//     default behaviour opt in with `opts.bootstrap =
 //     HyperDHT::default_bootstrap_nodes()` explicitly.
 //   - JS runs up to two bootstrap passes to drive NAT detection in the
 //     same flow. C++ runs exactly one; NAT detection is the separate §15
@@ -273,12 +294,17 @@ int HyperDHT::bind() {
             "(from %zu enumerated)\n",
             validated_local_addresses_.size(), raw_locals.size());
 
-    // §2: kick off the initial bootstrap walk if we have seeds. The walk
-    // runs in the background; callers that need a barrier can install an
-    // `on_bootstrapped()` callback.
-    if (!opts_.bootstrap.empty()) {
-        start_bootstrap_walk();
-    }
+    // §2 / tick-3: kick off the initial bootstrap walk UNCONDITIONALLY. JS
+    // `_bootstrap` (index.js:379-404) runs the background FIND_NODE walk and
+    // flips `bootstrapped = true` even with an empty bootstrap list (seed node,
+    // self-run bootstrapper, isolated first node). With no seeds the walk's
+    // frontier is empty, so it completes immediately and its on_done still sets
+    // `bootstrapped_` — which is what un-gates the whole background tick
+    // (ping_some, refresh, NAT recheck, persistent transition). Gating the walk
+    // on a non-empty seed list left such nodes stuck un-bootstrapped forever.
+    // This does NOT auto-join the public network (dhttop-3 divergence stands):
+    // an empty list still contacts nobody.
+    start_bootstrap_walk();
 
     return 0;
 }
@@ -393,6 +419,20 @@ std::unique_ptr<HyperDHT> HyperDHT::bootstrapper(
     auto self_addr = compact::Ipv4Address::from_string(host, port);
     if (dht->socket_) {
         dht->socket_->nat_sampler().add(self_addr, self_addr);
+        // JS: index.js:118 — `dht._nat.add(host, port)` seeds the dht-rpc ring
+        // sampler too, so the bootstrapper reports a consistent host/port
+        // immediately and can compute its address-based id.
+        dht->socket_->ring_sampler().add(self_addr.host_string(),
+                                         self_addr.port);
+        // tick-5: the bootstrapper is forced-persistent (opts.ephemeral=false →
+        // set_ephemeral(false) in the ctor), so do_persistent_transition never
+        // runs to rebuild the table id. Finalise the address-based id here from
+        // the just-seeded ring sampler. JS: the bootstrapper goes persistent
+        // during _bootstrap via _updateNetworkState → peer.id(host,port)
+        // (index.js:831). Combined with the outgoing-id gate (sweep-miss-b), a
+        // non-firewalled bootstrapper now advertises the correct id in its own
+        // requests, so peers add it to their routing tables.
+        dht->socket_->adopt_address_id_from_ring();
     }
 
     return dht;
@@ -635,8 +675,14 @@ server::Server* HyperDHT::create_server() {
 // pool
 // ---------------------------------------------------------------------------
 
-connection_pool::ConnectionPool HyperDHT::pool() {
-    return connection_pool::ConnectionPool{};
+connection_pool::ConnectionPool* HyperDHT::pool() {
+    // Own the pool so the returned pointer stays valid for the DHT's lifetime
+    // (JS `dht.pool()` returns a fresh pool bound to the dht). Callers pass
+    // this pointer into ConnectOptions::pool / attach_server. dhttop-2.
+    auto p = std::make_unique<connection_pool::ConnectionPool>();
+    auto* ptr = p.get();
+    pools_.push_back(std::move(p));
+    return ptr;
 }
 
 // ---------------------------------------------------------------------------

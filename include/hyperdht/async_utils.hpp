@@ -151,7 +151,27 @@ private:
 
     static void on_timer(uv_timer_t* t) {
         auto* self = static_cast<UvTimer*>(t->data);
-        if (self && self->cb_) self->cb_();
+        if (!self || !self->cb_) return;
+
+        // A one-shot timer (repeat == 0) will never fire cb_ again, so hold
+        // onto it forever leaks whatever the callback captured. When the
+        // callback captures a shared_ptr back to the object that owns this
+        // timer (e.g. a ConnState owning its own connect-timeout UvTimer),
+        // that is a reference cycle: the one-shot fires but the ConnState —
+        // and its raw udx_stream + DHT/socket pointers — is never freed.
+        // Release the callback after firing to break the cycle.
+        //
+        // Reentrancy: move cb_ out and null it BEFORE invoking, so a
+        // callback that destroys this timer (or re-arms it via start())
+        // does not race a dangling std::function. After invoking we must
+        // not touch `self` — the callback may have freed it.
+        if (uv_timer_get_repeat(t) == 0) {
+            Callback cb = std::move(self->cb_);
+            self->cb_ = nullptr;
+            cb();
+        } else {
+            self->cb_();
+        }
     }
 };
 

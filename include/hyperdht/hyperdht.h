@@ -773,9 +773,24 @@ HYPERDHT_API int hyperdht_lookup(hyperdht_t* dht,
                                   hyperdht_done_cb on_done,
                                   void* userdata);
 
+/** Announce this keypair at `target`. Matches JS `announce(target, keyPair,
+ *  relayAddresses)`: a value-less LOOKUP walk whose commit signs a FRESH
+ *  ANNOUNCE record for each closest node (over that node's per-request token +
+ *  id), so it verifies everywhere — unlike the old pre-signed `value` form,
+ *  which could not verify at any node.
+ *
+ *  kp:              keypair that signs each per-node ANNOUNCE (required).
+ *  relay_addresses: optional ipv4Array-encoded (compact-encoding-net) relay
+ *                   address list embedded in the signed record; NULL/0 for a
+ *                   bare announce (the common case).
+ *  bump:            relay-port bump signal (0 = none).
+ *  on_done:         fires with error=0 on success, or a nonzero query error
+ *                   (too few nodes responded / all commits failed). */
 HYPERDHT_API int hyperdht_announce(hyperdht_t* dht,
                                     const uint8_t target[32],
-                                    const uint8_t* value, size_t value_len,
+                                    const hyperdht_keypair_t* kp,
+                                    const uint8_t* relay_addresses, size_t relay_len,
+                                    uint64_t bump,
                                     hyperdht_done_cb on_done,
                                     void* userdata);
 

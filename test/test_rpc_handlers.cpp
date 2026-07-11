@@ -31,6 +31,9 @@ static void make_persistent(RpcSocket& socket) {
         auto from = Ipv4Address::from_string(
             "10.0.0." + std::to_string(i), 49737);
         socket.nat_sampler().add(our_addr, from);
+        // Feed the dht-rpc ring sampler too — do_persistent_transition now
+        // computes the node ID from it (JS index.js:831).
+        socket.ring_sampler().add(our_addr.host_string(), our_addr.port);
     }
     socket.force_check_persistent();
 }
@@ -119,7 +122,8 @@ TEST(RpcHandlers, PingReply) {
 
     EXPECT_TRUE(ctx.response_received) << "Should receive PING response";
     EXPECT_TRUE(ctx.has_id) << "PING response should include node ID";
-    EXPECT_TRUE(ctx.has_token) << "PING response should include token";
+    // JS index.js:641 — `req.sendReply(0, null, false, false)`: PING carries no token.
+    EXPECT_FALSE(ctx.has_token) << "PING reply must NOT include a token (JS parity)";
 
     uv_loop_close(&loop);
 }
@@ -189,8 +193,121 @@ TEST(RpcHandlers, FindNodeReply) {
 
     EXPECT_TRUE(ctx.response_received) << "Should receive FIND_NODE response";
     EXPECT_TRUE(ctx.has_id) << "Response should include node ID";
-    EXPECT_TRUE(ctx.has_token) << "Response should include token";
+    // JS index.js:660 — `req.sendReply(0, null, false, true)`: FIND_NODE returns
+    // closer nodes but NO token.
+    EXPECT_FALSE(ctx.has_token) << "FIND_NODE reply must NOT include a token (JS parity)";
     EXPECT_EQ(ctx.closer_count, 5u) << "Should return all 5 nodes";
+
+    uv_loop_close(&loop);
+}
+
+// ============================================================================
+// IO-layer INVALID_TOKEN — a request carrying a bad token is rejected at the
+// single dispatch choke point (RpcSocket::handle_message) BEFORE any command
+// handler runs, with an error reply that carries a fresh valid token and
+// closerNodes. JS: dht-rpc/lib/io.js:94-101 + _sendReply (io.js:485-518).
+// ============================================================================
+
+struct TokenErrCtx {
+    RpcSocket* server = nullptr;
+    RpcSocket* client = nullptr;
+    bool got_response = false;
+    std::optional<uint32_t> error;
+    bool has_token = false;
+    size_t closer_count = 0;
+    bool cleaning_up = false;
+    uv_timer_t* timer = nullptr;
+};
+
+static void tokenerr_cleanup(TokenErrCtx* ctx) {
+    if (ctx->cleaning_up) return;
+    ctx->cleaning_up = true;
+    ctx->server->close();
+    ctx->client->close();
+    if (ctx->timer) {
+        uv_close(reinterpret_cast<uv_handle_t*>(ctx->timer), on_close);
+        ctx->timer = nullptr;
+    }
+}
+
+TEST(RpcHandlers, InvalidTokenRejectedWithErrorReply) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    NodeId server_id{};
+    server_id.fill(0x11);
+    RpcSocket server(&loop, server_id);
+    server.bind(0);
+    make_persistent(server);
+
+    // Give the server a few table entries so closerNodes has something to
+    // return (the request carries a target → JS includes closerNodes).
+    for (int i = 1; i <= 3; i++) {
+        Node node;
+        node.id.fill(0x00);
+        node.id[0] = static_cast<uint8_t>(i);
+        node.host = "192.168.1." + std::to_string(i);
+        node.port = static_cast<uint16_t>(8000 + i);
+        server.table().add(node);
+    }
+
+    RpcHandlers handlers(server);
+    handlers.install();
+
+    NodeId client_id{};
+    client_id.fill(0x22);
+    RpcSocket client(&loop, client_id);
+    client.bind(0);
+
+    TokenErrCtx ctx;
+    ctx.server = &server;
+    ctx.client = &client;
+
+    // ANNOUNCE with a garbage token + a target. The IO layer must reject it
+    // with error=INVALID_TOKEN before handle_announce ever runs.
+    std::array<uint8_t, 32> target{};
+    target.fill(0xBB);
+    std::array<uint8_t, 32> bad_token{};
+    bad_token.fill(0xEE);
+
+    Request req;
+    req.to.addr = Ipv4Address::from_string("127.0.0.1", server.port());
+    req.command = CMD_ANNOUNCE;
+    req.internal = false;
+    req.target = target;
+    req.token = bad_token;
+    req.value = std::vector<uint8_t>{0x00};
+
+    client.request(req,
+        [&ctx](const Response& resp) {
+            ctx.got_response = true;
+            ctx.error = resp.error;
+            ctx.has_token = resp.token.has_value();
+            ctx.closer_count = resp.closer_nodes.size();
+            tokenerr_cleanup(&ctx);
+        },
+        [&ctx](uint16_t) { tokenerr_cleanup(&ctx); });
+
+    uv_timer_t timer;
+    uv_timer_init(&loop, &timer);
+    timer.data = &ctx;
+    ctx.timer = &timer;
+    uv_timer_start(&timer, [](uv_timer_t* t) {
+        auto* c = static_cast<TokenErrCtx*>(t->data);
+        c->timer = nullptr;
+        tokenerr_cleanup(c);
+    }, 3000, 0);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+
+    EXPECT_TRUE(ctx.got_response)
+        << "bad token must get an error reply, not a silent drop";
+    ASSERT_TRUE(ctx.error.has_value());
+    EXPECT_EQ(*ctx.error, ERR_INVALID_TOKEN);
+    EXPECT_TRUE(ctx.has_token)
+        << "INVALID_TOKEN reply must include a fresh valid token";
+    EXPECT_GT(ctx.closer_count, 0u)
+        << "request carried a target → closerNodes included";
 
     uv_loop_close(&loop);
 }
@@ -237,7 +354,12 @@ static void send_announce(AnnounceCtx* ctx, const std::vector<uint8_t>& value) {
     req.token = ctx->token;
     req.value = value;
 
-    ctx->client->request(req,
+    // retries=0: a rejected (silently-dropped) announce times out after a
+    // single flat 1000ms cycle (io-3 made the default timeout flat 1000ms
+    // instead of the old adaptive ~200ms), which fits inside the test
+    // watchdog. A valid announce gets a reply immediately, so retries are
+    // irrelevant to it.
+    ctx->client->request(req, /*timeout_override_ms=*/0, /*retries=*/0,
         [ctx](const Response& resp) {
             ctx->announce_done = true;
             ctx->announce_accepted = resp.id.has_value();  // Server replies with ID on success
@@ -263,7 +385,8 @@ static void send_unannounce(AnnounceCtx* ctx, const std::vector<uint8_t>& value)
     req.token = ctx->token;
     req.value = value;
 
-    ctx->client->request(req,
+    // retries=0 — see send_announce (fast rejection path under flat 1000ms).
+    ctx->client->request(req, /*timeout_override_ms=*/0, /*retries=*/0,
         [ctx](const Response& resp) {
             ctx->announce_done = true;
             ctx->announce_accepted = resp.id.has_value();
@@ -302,11 +425,17 @@ static std::vector<uint8_t> build_signed_announce(
 // Run the two-phase test: PING then action
 static void run_announce_test(AnnounceCtx& ctx, uv_loop_t& loop,
                                std::function<void(AnnounceCtx*)> on_token) {
-    // Phase 1: PING to get a token
+    // Phase 1: fetch a token. PING/FIND_NODE no longer carry a token (JS
+    // dht-rpc sendReply(0,null,false,...)); the token comes from a query
+    // reply (make_query_response), matching real hyperdht flow. FIND_PEER on
+    // the (persistent) server returns both token and id.
     Request ping;
     ping.to.addr = Ipv4Address::from_string("127.0.0.1", ctx.server->port());
-    ping.command = CMD_PING;
-    ping.internal = true;
+    ping.command = CMD_FIND_PEER;
+    ping.internal = false;
+    std::array<uint8_t, 32> tok_target{};
+    tok_target.fill(0x01);
+    ping.target = tok_target;
 
     ctx.client->request(ping,
         [&ctx, on_token](const Response& resp) {
@@ -638,7 +767,8 @@ static void send_storage_req(StorageCtx* ctx, uint32_t cmd,
     if (need_token) req.token = ctx->token;
     if (!value.empty()) req.value = value;
 
-    ctx->client->request(req,
+    // retries=0 — see send_announce (fast rejection path under flat 1000ms).
+    ctx->client->request(req, /*timeout_override_ms=*/0, /*retries=*/0,
         [ctx](const Response& resp) {
             ctx->op_done = true;
             ctx->op_accepted = !resp.error.has_value();
@@ -655,10 +785,16 @@ static void send_storage_req(StorageCtx* ctx, uint32_t cmd,
 
 static void run_storage_test(StorageCtx& ctx, uv_loop_t& loop,
                               std::function<void(StorageCtx*)> on_token) {
+    // Phase 1: fetch a token via a query command (PING no longer carries one —
+    // see run_announce_test). FIND_PEER on the persistent server returns
+    // token + id.
     Request ping;
     ping.to.addr = Ipv4Address::from_string("127.0.0.1", ctx.server->port());
-    ping.command = CMD_PING;
-    ping.internal = true;
+    ping.command = CMD_FIND_PEER;
+    ping.internal = false;
+    std::array<uint8_t, 32> tok_target{};
+    tok_target.fill(0x01);
+    ping.target = tok_target;
 
     ctx.client->request(ping,
         [&ctx, on_token](const Response& resp) {
@@ -1146,8 +1282,9 @@ TEST(PingAndSwap, EvictsWhenOldestTimesOut) {
     // PING will time out and we'll swap.
     client.table().add(new_node);
 
-    // Run the loop with a watchdog. Adaptive-default timeout is 1000 ms +
-    // retries=0, so swap should complete in ~1 s.
+    // Run the loop with a watchdog. Flat 1000 ms timeout + retries=3 (tick-1,
+    // JS _repingAndSwap default) = 4 transmissions, so the swap completes at
+    // ~4 s. Give it margin.
     bool cleanup_done = false;
     uv_timer_t watchdog;
     uv_timer_init(&loop, &watchdog);
@@ -1159,7 +1296,7 @@ TEST(PingAndSwap, EvictsWhenOldestTimesOut) {
         *w->done = true;
         w->c->close();
         uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
-    }, 2500, 0);
+    }, 4600, 0);
 
     uv_run(&loop, UV_RUN_DEFAULT);
 
@@ -1338,6 +1475,7 @@ TEST(PingAndSwap, RespectsRepingingCap) {
     // Before the ping fires, counter should be 1 (we scheduled one swap).
     EXPECT_EQ(client.repinging(), 1);
 
+    // retries=3 (tick-1) → eviction PING completes at ~4 s; give it margin.
     uv_timer_t watchdog;
     uv_timer_init(&loop, &watchdog);
     watchdog.data = &client;
@@ -1345,7 +1483,7 @@ TEST(PingAndSwap, RespectsRepingingCap) {
         auto* c = static_cast<RpcSocket*>(t->data);
         c->close();
         uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
-    }, 2500, 0);
+    }, 4600, 0);
     uv_run(&loop, UV_RUN_DEFAULT);
 
     EXPECT_EQ(client.repinging(), 0)
@@ -1471,11 +1609,13 @@ TEST(DownHint, EvictsTargetWhenItTimesOut) {
     uv_timer_init(&loop, &timer);
     timer.data = &ctx;
     ctx.timer = &timer;
+    // check_node() PING now uses retries=3 (tick-1, JS _check default), so the
+    // target is evicted at ~4 s (4 transmissions) rather than ~1 s.
     uv_timer_start(&timer, [](uv_timer_t* t) {
         auto* c = static_cast<DownHintCtx*>(t->data);
         c->timer = nullptr;
         down_hint_cleanup(c);
-    }, 2500, 0);
+    }, 4600, 0);
 
     uv_run(&loop, UV_RUN_DEFAULT);
 
@@ -1807,6 +1947,306 @@ TEST(Session, DestructorCancelsPending) {
 
     client.close();
     server.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ============================================================================
+// dhtrpc-io-2 — UNKNOWN_COMMAND error replies. An unrecognized command (or a
+// storage command received while ephemeral) is answered with error=1, not
+// silently dropped. JS dht-rpc index.js:679,685 —
+// `req.sendReply(UNKNOWN_COMMAND, null, false, req.target !== null)`:
+// no token, closerNodes only when the request carried a target.
+// ============================================================================
+
+TEST(RpcHandlers, UnknownInternalCommandRepliesUnknownCommand) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    NodeId server_id{};
+    server_id.fill(0x11);
+    RpcSocket server(&loop, server_id);
+    server.bind(0);
+    make_persistent(server);
+    RpcHandlers handlers(server);
+    handlers.install();
+
+    NodeId client_id{};
+    client_id.fill(0x22);
+    RpcSocket client(&loop, client_id);
+    client.bind(0);
+
+    TokenErrCtx ctx;
+    ctx.server = &server;
+    ctx.client = &client;
+
+    Request req;
+    req.to.addr = Ipv4Address::from_string("127.0.0.1", server.port());
+    req.command = 99;       // not a known internal command (PING..DELAYED_PING)
+    req.internal = true;    // no target
+
+    client.request(req,
+        [&ctx](const Response& resp) {
+            ctx.got_response = true;
+            ctx.error = resp.error;
+            ctx.has_token = resp.token.has_value();
+            ctx.closer_count = resp.closer_nodes.size();
+            tokenerr_cleanup(&ctx);
+        },
+        [&ctx](uint16_t) { tokenerr_cleanup(&ctx); });
+
+    uv_timer_t timer;
+    uv_timer_init(&loop, &timer);
+    timer.data = &ctx;
+    ctx.timer = &timer;
+    uv_timer_start(&timer, [](uv_timer_t* t) {
+        auto* c = static_cast<TokenErrCtx*>(t->data);
+        c->timer = nullptr;
+        tokenerr_cleanup(c);
+    }, 3000, 0);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+
+    EXPECT_TRUE(ctx.got_response)
+        << "unknown internal command must get an error reply, not silence";
+    ASSERT_TRUE(ctx.error.has_value());
+    EXPECT_EQ(*ctx.error, ERR_UNKNOWN_COMMAND);
+    EXPECT_FALSE(ctx.has_token) << "UNKNOWN_COMMAND reply carries no token";
+    EXPECT_EQ(ctx.closer_count, 0u) << "no target → no closer nodes";
+
+    uv_loop_close(&loop);
+}
+
+TEST(RpcHandlers, UnknownExternalCommandRepliesUnknownCommand) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    NodeId server_id{};
+    server_id.fill(0x11);
+    RpcSocket server(&loop, server_id);
+    server.bind(0);
+    make_persistent(server);
+
+    // Table entries so closerNodes has something to return for a targeted req.
+    for (int i = 1; i <= 3; i++) {
+        Node node;
+        node.id.fill(0x00);
+        node.id[0] = static_cast<uint8_t>(i);
+        node.host = "192.168.1." + std::to_string(i);
+        node.port = static_cast<uint16_t>(8000 + i);
+        server.table().add(node);
+    }
+
+    RpcHandlers handlers(server);
+    handlers.install();
+
+    NodeId client_id{};
+    client_id.fill(0x22);
+    RpcSocket client(&loop, client_id);
+    client.bind(0);
+
+    TokenErrCtx ctx;
+    ctx.server = &server;
+    ctx.client = &client;
+
+    std::array<uint8_t, 32> target{};
+    target.fill(0x03);
+
+    Request req;
+    req.to.addr = Ipv4Address::from_string("127.0.0.1", server.port());
+    req.command = 99;        // unknown external command (not PEER_* or storage)
+    req.internal = false;
+    req.target = target;
+
+    client.request(req,
+        [&ctx](const Response& resp) {
+            ctx.got_response = true;
+            ctx.error = resp.error;
+            ctx.has_token = resp.token.has_value();
+            ctx.closer_count = resp.closer_nodes.size();
+            tokenerr_cleanup(&ctx);
+        },
+        [&ctx](uint16_t) { tokenerr_cleanup(&ctx); });
+
+    uv_timer_t timer;
+    uv_timer_init(&loop, &timer);
+    timer.data = &ctx;
+    ctx.timer = &timer;
+    uv_timer_start(&timer, [](uv_timer_t* t) {
+        auto* c = static_cast<TokenErrCtx*>(t->data);
+        c->timer = nullptr;
+        tokenerr_cleanup(c);
+    }, 3000, 0);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+
+    EXPECT_TRUE(ctx.got_response)
+        << "unknown external command must get an error reply, not silence";
+    ASSERT_TRUE(ctx.error.has_value());
+    EXPECT_EQ(*ctx.error, ERR_UNKNOWN_COMMAND);
+    EXPECT_FALSE(ctx.has_token) << "UNKNOWN_COMMAND reply carries no token";
+    EXPECT_GT(ctx.closer_count, 0u)
+        << "request carried a target → closerNodes included";
+
+    uv_loop_close(&loop);
+}
+
+// ============================================================================
+// dhtrpc-io-5 — a congestion-queued request must be cancellable. JS io.js:337
+// pushes every created request into io.inflight immediately (even while
+// _pending-queued), so session.destroy() can find and destroy it. Without
+// that, a queued request drains + sends + fires its callback after the
+// session is torn down (UAF via captured self).
+// ============================================================================
+
+TEST(Session, DestroyCancelsCongestionQueuedRequest) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    NodeId cid{};
+    cid.fill(0x30);
+    RpcSocket client(&loop, cid);
+    client.bind(0);
+
+    auto dead = Ipv4Address::from_string("127.0.0.1", 1);  // nothing listens
+
+    // Fill the congestion window so the next request must be queued.
+    // is_full() triggers at window_[i] >= DEFAULT_MAX_WINDOW.
+    for (int i = 0; i < DEFAULT_MAX_WINDOW; i++) {
+        Request r;
+        r.to.addr = dead;
+        r.command = CMD_PING;
+        r.internal = true;
+        client.request(r, [](const Response&) {}, [](uint16_t) {});
+    }
+
+    // The next request is congestion-queued. Track it through a session.
+    Session session(client);
+    bool queued_fired = false;
+    Request q;
+    q.to.addr = dead;
+    q.command = CMD_PING;
+    q.internal = true;
+    uint16_t qtid = session.request(q,
+        [&](const Response&) { queued_fired = true; },
+        [&](uint16_t) { queued_fired = true; });
+
+    EXPECT_NE(qtid, 0);
+    EXPECT_EQ(client.pending_count(), 1u)
+        << "with the window full the extra request must be congestion-queued";
+    EXPECT_EQ(client.inflight_count(), static_cast<size_t>(DEFAULT_MAX_WINDOW) + 1)
+        << "a queued request is ALSO tracked in inflight_ so it can be cancelled";
+
+    // Destroy the session — must cancel the queued request too.
+    session.destroy();
+    EXPECT_EQ(client.pending_count(), 0u)
+        << "cancelled queued request must be removed from the pending queue";
+
+    // Pump past the 750ms drain tick: a leaked queued request would drain,
+    // send, then fire its callback after the session died (UAF). It must not.
+    uv_timer_t t;
+    uv_timer_init(&loop, &t);
+    t.data = &client;
+    uv_timer_start(&t, [](uv_timer_t* th) {
+        static_cast<RpcSocket*>(th->data)->close();
+        uv_close(reinterpret_cast<uv_handle_t*>(th), nullptr);
+    }, 800, 0);
+    uv_run(&loop, UV_RUN_DEFAULT);
+
+    EXPECT_FALSE(queued_fired)
+        << "a cancelled queued request must never fire its callback";
+
+    uv_loop_close(&loop);
+}
+
+// ============================================================================
+// dhtrpc-io-6 — the NAT sampler is also fed from INCOMING requests, not just
+// responses. JS dht-rpc index.js:632-635 — _onrequest calls
+// _addNodeFromNetwork(!external, req.from, req.to); the request's `to` (our
+// external address as the requester sees it) advances `this._nat`.
+// ============================================================================
+
+TEST(NatSamplerFeed, RequestPathAdvancesRingSampler) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    // Server persistent (firewalled_=false) so a request arriving on the
+    // server socket is on the EXPECTED socket for our state → sampled.
+    NodeId server_id{};
+    server_id.fill(0x11);
+    RpcSocket server(&loop, server_id);
+    server.bind(0);
+    make_persistent(server);
+    RpcHandlers handlers(server);
+    handlers.install();
+
+    // Client persistent too, so it transmits from a KNOWN port (client.port())
+    // and we can compute the id the server validates against.
+    NodeId client_id{};
+    client_id.fill(0x22);
+    RpcSocket client(&loop, client_id);
+    client.bind(0);
+    make_persistent(client);
+
+    const int before = server.ring_sampler().size();
+
+    // A request carrying a valid id — id = BLAKE2b(client's source addr as the
+    // server sees it) = compute_peer_id(127.0.0.1:client.port()). Only then
+    // does JS feed the sampler (req.from.id !== null).
+    Request req;
+    req.to.addr = Ipv4Address::from_string("127.0.0.1", server.port());
+    req.command = CMD_PING;
+    req.internal = true;
+    req.id = compute_peer_id(Ipv4Address::from_string("127.0.0.1", client.port()));
+
+    client.request(req, [](const Response&) {}, [](uint16_t) {});
+
+    struct Ctx { RpcSocket* s; RpcSocket* c; };
+    Ctx ctx{&server, &client};
+    uv_timer_t t;
+    uv_timer_init(&loop, &t);
+    t.data = &ctx;
+    uv_timer_start(&t, [](uv_timer_t* th) {
+        auto* c = static_cast<Ctx*>(th->data);
+        c->s->close();
+        c->c->close();
+        uv_close(reinterpret_cast<uv_handle_t*>(th), nullptr);
+    }, 400, 0);
+    uv_run(&loop, UV_RUN_DEFAULT);
+
+    EXPECT_GT(server.ring_sampler().size(), before)
+        << "an id-carrying request on the expected socket must feed the ring sampler";
+
+    uv_loop_close(&loop);
+}
+
+// ============================================================================
+// dhtrpc-io-7 — alloc_tid must never return 0 (the request() failure
+// sentinel). The random seed or the uint16 wrap can land on 0; the allocator
+// skips it. JS uses the full 0..65535 range; this is a C++-sentinel guard.
+// ============================================================================
+
+TEST(AllocTid, NeverReturnsZeroSentinel) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    NodeId id{};
+    id.fill(0x01);
+    RpcSocket s(&loop, id);
+    s.bind(0);
+
+    // Seed to 0 — pre-fix, the very first alloc would hand back the sentinel.
+    s.set_next_tid_for_test(0);
+
+    bool any_zero = false;
+    // > one full 65536 wrap so both the seed-0 case and the wrap-0 case run.
+    for (int i = 0; i < 70000; i++) {
+        if (s.alloc_tid_for_test() == 0) { any_zero = true; break; }
+    }
+    EXPECT_FALSE(any_zero)
+        << "alloc_tid must never return the 0 failure sentinel";
+
+    s.close();
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }

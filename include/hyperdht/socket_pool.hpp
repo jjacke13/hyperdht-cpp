@@ -137,6 +137,11 @@ public:
     // Remove a route
     void remove_route(const std::array<uint8_t, 32>& public_key);
 
+    // JS socket-pool.js:96-100 — a rawStream error marks its socket
+    // non-reusable and gc's any route backed by it. Call from a stream's
+    // error surface. (Socket close is handled automatically in remove().)
+    void on_stream_error(udx_socket_t* socket);
+
     // Number of active sockets
     size_t size() const { return sockets_.size(); }
 
@@ -161,6 +166,9 @@ private:
 
     void add(SocketRef* ref);
     void remove(SocketRef* ref);
+
+    // Drop every route whose socket == the given handle (route gc).
+    void gc_routes_for_socket(udx_socket_t* socket);
 
     static std::string key_hex(const std::array<uint8_t, 32>& key);
 };

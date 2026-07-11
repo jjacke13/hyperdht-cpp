@@ -117,7 +117,10 @@ TEST(ConnectionPool, GetPrefersConnected) {
 // Deduplication
 // ---------------------------------------------------------------------------
 
-TEST(ConnectionPool, DedupSameInitiatorKeepsNew) {
+// dhttop-8: keep-new is DEFERRED — the new stream is inserted only after the
+// old stream's close fires (JS connection-pool.js:37-55). The old ref is
+// destroyed immediately but stays "current" until its close is signalled.
+TEST(ConnectionPool, DedupSameInitiatorKeepsNewDeferred) {
     ConnectionPool pool;
 
     // Both are initiators → keep new
@@ -133,9 +136,38 @@ TEST(ConnectionPool, DedupSameInitiatorKeepsNew) {
     EXPECT_EQ(result, AttachResult::DUPLICATE_KEPT_NEW);
     EXPECT_TRUE(old_destroyed);
 
-    auto found = pool.get(new_ref->remote_public_key());
-    ASSERT_NE(found, nullptr);
-    EXPECT_EQ(found->id(), 2u);  // New one survived
+    // Deferred: new is NOT attached yet — old is still the current entry.
+    auto found_before = pool.get(new_ref->remote_public_key());
+    ASSERT_NE(found_before, nullptr);
+    EXPECT_EQ(found_before->id(), 1u) << "old must remain until its close fires";
+
+    // Old stream closes → swap completes, new is attached.
+    pool.on_stream_closed(old_ref);
+
+    auto found_after = pool.get(new_ref->remote_public_key());
+    ASSERT_NE(found_after, nullptr);
+    EXPECT_EQ(found_after->id(), 2u);  // New one survived
+    EXPECT_EQ(pool.connected_count(), 1u);
+}
+
+// dhttop-8: if the NEW stream closes before the old one, the swap is aborted —
+// nothing is left attached (JS `if (closed) return`).
+TEST(ConnectionPool, DedupKeepNewAbortsIfNewClosesFirst) {
+    ConnectionPool pool;
+
+    auto old_ref = make_ref(0xAA, 0xBB, true, 1);
+    auto new_ref = make_ref(0xAA, 0xBB, true, 2);
+
+    pool.attach_stream(old_ref, true);
+    pool.attach_stream(new_ref, true);  // deferred keep-new
+
+    // New dies first, then the old finishes tearing down.
+    pool.on_stream_closed(new_ref);
+    pool.on_stream_closed(old_ref);
+
+    EXPECT_EQ(pool.get(old_ref->remote_public_key()), nullptr)
+        << "new closed before old → swap aborted, nothing attached";
+    EXPECT_EQ(pool.connected_count(), 0u);
 }
 
 TEST(ConnectionPool, DedupDifferentInitiatorHighKeyKeepsNew) {
@@ -191,8 +223,17 @@ TEST(ConnectionPool, DedupConnectingVsConnected) {
 
     EXPECT_EQ(result, AttachResult::DUPLICATE_KEPT_NEW);
     EXPECT_TRUE(old_destroyed);
+    // dhttop-8: deferred — old still connecting, new held until old closes.
+    EXPECT_EQ(pool.connecting_count(), 1u);
+    EXPECT_EQ(pool.connected_count(), 0u);
+
+    // Old (connecting) closes → new (connected) attached.
+    pool.on_stream_closed(old_ref);
     EXPECT_EQ(pool.connecting_count(), 0u);
     EXPECT_EQ(pool.connected_count(), 1u);
+    auto found = pool.get(new_ref->remote_public_key());
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->id(), 2u);
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +282,46 @@ TEST(ConnectionPool, MultiplePeers) {
     pool.remove(ref2->remote_public_key());
     EXPECT_EQ(pool.connected_count(), 1u);
     EXPECT_FALSE(pool.has(ref2->remote_public_key()));
+}
+
+// ---------------------------------------------------------------------------
+// on_emit — the pool's 'connection' event (JS emit on open)
+// ---------------------------------------------------------------------------
+
+TEST(ConnectionPool, OnEmitFiresOnOpenedAttach) {
+    ConnectionPool pool;
+    auto ref = make_ref(0xAA, 0xBB, false, 1);
+    int emitted = 0;
+    ref->on_emit = [&]() { emitted++; };
+
+    pool.attach_stream(ref, true);  // opened → emit immediately
+    EXPECT_EQ(emitted, 1);
+}
+
+TEST(ConnectionPool, OnEmitFiresOnMarkOpened) {
+    ConnectionPool pool;
+    auto ref = make_ref(0xAA, 0xBB, true, 1);
+    int emitted = 0;
+    ref->on_emit = [&]() { emitted++; };
+
+    pool.attach_stream(ref, false);  // connecting → no emit yet
+    EXPECT_EQ(emitted, 0);
+    pool.mark_opened(ref->remote_public_key());  // open → emit
+    EXPECT_EQ(emitted, 1);
+}
+
+TEST(ConnectionPool, OnStreamClosedRemovesConnection) {
+    ConnectionPool pool;
+    auto ref = make_ref(0xAA, 0xBB, true, 1);
+    bool closed_fired = false;
+    ref->on_close = [&]() { closed_fired = true; };
+
+    pool.attach_stream(ref, true);
+    EXPECT_TRUE(pool.has(ref->remote_public_key()));
+
+    pool.on_stream_closed(ref);
+    EXPECT_FALSE(pool.has(ref->remote_public_key()));
+    EXPECT_TRUE(closed_fired);
 }
 
 TEST(ConnectionPool, NoDedupDifferentPeers) {

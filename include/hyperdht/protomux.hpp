@@ -23,6 +23,7 @@
 #include <any>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <string>
@@ -42,12 +43,19 @@ constexpr uint32_t CONTROL_REJECT = 2;
 constexpr uint32_t CONTROL_CLOSE = 3;
 
 constexpr size_t MAX_BUFFERED = 32768;  // 32KB backpressure threshold
+constexpr size_t MAX_BATCH = 8 * 1024 * 1024;  // JS MAX_BATCH — batch flush boundary
 
 // ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
 
 class Mux;
+
+// A message buffered before its channel is paired (JS `remote.pending` entry).
+struct BufferedMessage {
+    uint32_t type;
+    std::vector<uint8_t> data;
+};
 
 // ---------------------------------------------------------------------------
 // Message handler — registered per message type on a channel
@@ -129,20 +137,12 @@ private:
     // match incoming OPEN messages.
     std::vector<std::string> pair_keys_;
 
-    // Buffered messages received before channel is fully opened
-    struct PendingMessage {
-        uint32_t type;
-        std::vector<uint8_t> data;
-    };
-    std::vector<PendingMessage> pending_messages_;
-
     // Pairing key: "protocol##hex(id)"
     std::string pair_key() const;
 
     // Called by Mux when remote opens matching channel
     void set_remote_id(uint32_t id) { remote_id_ = id; }
     void fully_open(const uint8_t* remote_handshake, size_t len);
-    void drain_pending();  // Process buffered messages after open
     void remote_close();
     void destroy();
     void dispatch(uint32_t type, const uint8_t* data, size_t len);
@@ -255,8 +255,22 @@ private:
     uint32_t next_local_id_ = 1;
     std::vector<std::unique_ptr<Channel>> channels_;
 
-    // Remote ID → Channel* lookup (for incoming data messages)
-    std::unordered_map<uint32_t, Channel*> remote_to_channel_;
+    // Remote ID → slot (JS `_remote[]`). A slot is created the moment a remote
+    // OPEN arrives and buffers every data frame for that remote id until a local
+    // channel is paired, then routes data to that session. Buffering (rather
+    // than dropping) matches JS; the receiver has no read-side pause hook so a
+    // documented cap tears the mux down instead of dropping (see handle_data).
+    struct RemoteSlot {
+        Channel* session = nullptr;             // paired session, or null
+        std::vector<BufferedMessage> pending;   // buffered pre-pair data
+        bool buffering = true;                  // JS: remote.pending !== null
+    };
+    std::unordered_map<uint32_t, RemoteSlot> remote_slots_;
+
+    // Highest remote-id length seen (JS `_remote.length`) — for the grow-by-one
+    // sequence check in handle_open, and the count of still-buffering slots.
+    size_t remote_len_ = 0;
+    size_t remote_backlog_ = 0;                 // JS _remoteBacklog
 
     // Local ID → Channel* lookup (for incoming CLOSE/pairing)
     std::unordered_map<uint32_t, Channel*> local_to_channel_;
@@ -264,14 +278,16 @@ private:
     // Per-protocol notify callbacks (pair/unpair)
     std::unordered_map<std::string, NotifyFn> pair_notify_;
 
-    // Pending remote opens waiting for local pairing
+    // Incoming remote opens awaiting local pairing, keyed by pair-key.
+    // JS `info.incoming[]` — a queue (not a single slot) so several opens for
+    // the same (protocol,id) are all preserved rather than clobbered (finding 8).
     struct PendingOpen {
         uint32_t remote_local_id;   // The remote's local ID for this channel
         std::vector<uint8_t> handshake;
         std::string protocol;
         std::vector<uint8_t> id;
     };
-    std::unordered_map<std::string, PendingOpen> pending_remote_;
+    std::unordered_map<std::string, std::deque<PendingOpen>> incoming_;
 
     // Last-created channel per (protocol, id) key — for get_last_channel().
     std::unordered_map<std::string, Channel*> last_channel_by_key_;
@@ -301,6 +317,7 @@ private:
         std::vector<uint8_t> payload;
     };
     std::vector<BatchEntry> batch_;
+    size_t batch_size_ = 0;  // running encoded size (JS _batchState.end)
 
     // Backpressure state
     bool drained_ = true;
@@ -308,6 +325,10 @@ private:
 
     // Write a frame (respects cork, updates drained)
     void write_frame(const uint8_t* data, size_t len);
+    void flush_batch();  // encode + write the accumulated batch_, then reset it
+
+    // Frame dispatch (shared by on_data and handle_batch)
+    void dispatch_frame(uint32_t channel_id, const uint8_t* ptr, const uint8_t* end);
 
     // Control message handlers
     void handle_open(const uint8_t* data, size_t len);
@@ -316,12 +337,22 @@ private:
     void handle_batch(const uint8_t* data, size_t len);
     void handle_data(uint32_t channel_id, const uint8_t* data, size_t len);
 
+    // Emit a REJECT control frame ([0,2,remoteId]) and drop the remote slot.
+    void reject_session(uint32_t remote_id);
+    // After the (synchronous) notify round, reject every unclaimed incoming
+    // open for `key` (JS _requestSession tail).
+    void request_session(const std::string& key);
+    // Fatal protocol error → tear the whole mux down (JS _safeDestroy).
+    void safe_destroy();
+
     // Pairing
     Channel* find_by_pair_key(const std::string& key);
-    void try_pair(Channel* local, const PendingOpen& remote);
+    Channel* find_awaiting_local(const std::string& key);
+    void pair_with_remote(Channel* local, const PendingOpen& remote);
 
-    // Notify dispatch — checks pair map then global fallback
-    void dispatch_notify(const std::string& protocol,
+    // Notify dispatch — checks pair map then global fallback. Returns true if
+    // a handler was invoked (the app got a synchronous chance to pair).
+    bool dispatch_notify(const std::string& protocol,
                          const std::vector<uint8_t>& id,
                          const uint8_t* handshake, size_t hs_len);
 

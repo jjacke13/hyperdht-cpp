@@ -5,6 +5,7 @@
 #include <sodium.h>
 #include <uv.h>
 
+#include "hyperdht/connection_pool.hpp"
 #include "hyperdht/noise_wrap.hpp"
 #include "hyperdht/router.hpp"
 #include "hyperdht/rpc.hpp"
@@ -528,6 +529,56 @@ TEST(Server, DoubleListenNoop) {
 
     EXPECT_TRUE(srv.is_listening());
     EXPECT_EQ(router.size(), 1u);
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// dhttop-2: ConnectionPool::attach_server chains onto the Server's connection
+// callback WITHOUT clobbering the user's own callback. Both must fire.
+// ---------------------------------------------------------------------------
+
+TEST(Server, PoolAttachDoesNotStealUserConnectionCallback) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed seed{};
+    seed.fill(0x11);
+    auto kp = noise::generate_keypair(seed);
+
+    int user_count = 0;
+    srv.listen(kp, [&](const ConnectionInfo&) { user_count++; });
+
+    connection_pool::ConnectionPool pool;
+    int pool_count = 0;
+    std::array<uint8_t, 32> pool_remote{};
+    pool.set_on_connection([&](const ConnectionInfo& info) {
+        pool_count++;
+        pool_remote = info.remote_public_key;
+    });
+    pool.attach_server(srv);  // chains alongside the user callback
+
+    // Fire a synthetic connection.
+    ConnectionInfo info;
+    info.remote_public_key.fill(0xCD);
+    info.is_initiator = false;
+    srv.emit_connection_for_test(info);
+
+    EXPECT_EQ(user_count, 1) << "user's own on_connection must still fire";
+    EXPECT_EQ(pool_count, 1) << "pool must observe the connection too";
+    EXPECT_EQ(pool_remote[0], 0xCD) << "pool received the connection info";
+    EXPECT_EQ(pool.connected_count(), 1u) << "pool deduped-tracks the inbound";
 
     srv.close();
     socket.close();

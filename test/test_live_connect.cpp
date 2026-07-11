@@ -242,7 +242,7 @@ TEST(LiveConnect, FullPipeline) {
                        reply.from_addr.port);
             }
         },
-        [&](const std::vector<query::QueryReply>&) {
+        [&](int /*error*/, const std::vector<query::QueryReply>&) {
             state.find_done = true;
             if (!state.found_server) {
                 printf("  Server not found\n");

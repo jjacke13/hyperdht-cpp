@@ -137,6 +137,7 @@ add_library(hyperdht
     src/announcer.cpp
     src/server.cpp
     src/blind_relay.cpp
+    src/relay_upgrade.cpp
     src/dht.cpp
     src/connect.cpp
     src/dht_storage.cpp
@@ -319,10 +320,12 @@ if(HYPERDHT_BUILD_TESTS)
     add_unit_test(test_rpc_ping)
     add_unit_test(test_rpc_bootstrap)
     add_unit_test(test_rpc_handlers)
+    add_unit_test(test_tick)
     add_unit_test(test_id_parity)
     add_unit_test(test_announce)
     add_unit_test(test_query)
     add_unit_test(test_dht_ops)
+    add_unit_test(test_unannounce)
     add_unit_test(test_holepunch)
     add_unit_test(test_hyperdht)
     add_unit_test(test_server)
@@ -335,8 +338,10 @@ if(HYPERDHT_BUILD_TESTS)
     add_unit_test(test_protomux)
     add_unit_test(test_protomux_secretstream)
     add_unit_test(test_blind_relay)
+    add_unit_test(test_relay_upgrade)
     add_unit_test(test_health)
     add_unit_test(test_nat_sampler)
+    add_unit_test(test_ring_sampler)
     add_unit_test(test_socket_pool)
     add_unit_test(test_connection_pool)
     add_unit_test(test_async_utils)

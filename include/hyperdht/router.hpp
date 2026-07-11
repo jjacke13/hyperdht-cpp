@@ -11,6 +11,7 @@
 //   Server responds → Router sends back as REPLY to Client
 
 #include <functional>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -61,6 +62,13 @@ struct ForwardEntry {
     HandshakeFn on_peer_handshake;
     HolepunchFn on_peer_holepunch;
     std::vector<uint8_t> record;  // Encoded PeerRecord for FIND_PEER responses
+
+    // Address to relay PEER_HANDSHAKE/HOLEPUNCH toward when this entry has no
+    // local handlers (JS persistent.js:132 `relay: req.from`). Set on an
+    // announceSelf ANNOUNCE. ponytail: only the relay-forward else-branches
+    // (parity stage 2, not yet ported) consume this; stored now so that work
+    // has the data.
+    std::optional<compact::Ipv4Address> relay;
 };
 
 // ---------------------------------------------------------------------------
@@ -95,10 +103,19 @@ public:
     using ReplyFn = std::function<void(const messages::Response&)>;
     using RelayFn = std::function<void(const messages::Request&)>;
 
+    // Supplies the k closest routing-table nodes to a target. Used by the
+    // relay-forward FROM_CLIENT branch when no relay is known, to answer the
+    // client with `closerNodes` so it can route toward the target instead of
+    // timing out. JS: router.js:135 `req.reply(null, { closerNodes: true })`.
+    // Optional — when null, the closer-route reply carries no nodes.
+    using CloserNodesFn =
+        std::function<std::vector<compact::Ipv4Address>(const announce::TargetKey&)>;
+
     // Handle incoming PEER_HANDSHAKE request.
-    // Returns true if handled (target found in router), false if not our target.
+    // Returns true if handled (replied or relayed), false if we bailed (no-op).
     bool handle_peer_handshake(const messages::Request& req,
-                               ReplyFn reply, RelayFn relay);
+                               ReplyFn reply, RelayFn relay,
+                               CloserNodesFn closer_nodes = nullptr);
 
     // Handle incoming PEER_HOLEPUNCH request.
     // Returns true if handled, false if not our target.

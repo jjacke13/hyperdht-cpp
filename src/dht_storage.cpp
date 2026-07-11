@@ -37,23 +37,36 @@ std::shared_ptr<query::Query> HyperDHT::lookup(
 
 std::shared_ptr<query::Query> HyperDHT::announce(
     const routing::NodeId& target,
-    const std::vector<uint8_t>& value,
+    const noise::Keypair& keypair,
+    const std::vector<compact::Ipv4Address>& relay_addresses,
+    uint64_t bump,
     query::OnDoneCallback on_done) {
     ensure_bound();
-    return dht_ops::announce(*socket_, target, value, std::move(on_done));
+    return dht_ops::announce(*socket_, target, keypair, relay_addresses, bump,
+                             std::move(on_done));
+}
+
+std::shared_ptr<query::Query> HyperDHT::announce(
+    const routing::NodeId& target,
+    const noise::Keypair& keypair,
+    const std::vector<compact::Ipv4Address>& relay_addresses,
+    uint64_t bump,
+    const noise::Keypair& clear_keypair,
+    query::OnDoneCallback on_done) {
+    // dhttop-6: clear-announce. JS `announce(..., { clear: true })` routes
+    // through lookupAndUnannounce (index.js:250) so stale records for our key
+    // are removed before the new ANNOUNCE lands.
+    ensure_bound();
+    return dht_ops::announce(*socket_, target, keypair, relay_addresses, bump,
+                             std::move(on_done), &clear_keypair);
 }
 
 // ---------------------------------------------------------------------------
-// lookupAndUnannounce
+// lookupAndUnannounce (dhttop-1)
 //
-// JS: .analysis/js/hyperdht/index.js:197-238 (lookupAndUnannounce — does
-//     a LOOKUP query with a commit fn that signs and sends UNANNOUNCE to
-//     each replying node)
-//
-// C++ diffs from JS:
-//   - Not yet fully ported: C++ currently delegates to plain `dht_ops::lookup`
-//     and the unannounce commit happens in `dht_ops` (TODO). A proper port
-//     would sign an UNANNOUNCE payload per-reply via a commit callback.
+// JS: .analysis/js/hyperdht/index.js:197-238 (lookupAndUnannounce — a LOOKUP
+//     query whose per-reply map signs + sends UNANNOUNCE to each node still
+//     holding our record; the commit awaits all in-flight unannounces).
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<query::Query> HyperDHT::lookup_and_unannounce(
@@ -62,17 +75,35 @@ std::shared_ptr<query::Query> HyperDHT::lookup_and_unannounce(
     query::OnReplyCallback on_reply,
     query::OnDoneCallback on_done) {
     ensure_bound();
-    // JS: lookupAndUnannounce does a lookup query and sends UNANNOUNCE
-    // to nodes that have our old announcement. For now, delegate to
-    // a standard lookup — the unannounce commit happens in dht_ops.
-    return dht_ops::lookup(*socket_,
-        [&]() {
-            routing::NodeId target{};
-            crypto_generichash(target.data(), 32,
-                               public_key.data(), 32, nullptr, 0);
-            return target;
-        }(),
-        std::move(on_reply), std::move(on_done));
+    // target = BLAKE2b(public_key) — the self-announce topic (matches the
+    // existing C++ convention; JS callers pass `target` directly).
+    routing::NodeId target{};
+    crypto_generichash(target.data(), 32, public_key.data(), 32, nullptr, 0);
+
+    // JS index.js:203-206 — if this node is itself a persistent store, unlink
+    // our own local record before hitting the network
+    // (`this._persistent.unannounce(target, keyPair.publicKey)`,
+    // persistent.js:45-51). Our target IS BLAKE2b(publicKey), so this is
+    // always the self-announce case: drop the relay-only router entry that a
+    // self-ANNOUNCE created (persistent.js:49 `_router.delete`). Never clobber
+    // a live local Server's entry (it owns its own lifecycle via Server::close).
+    // (JS also removes from the records cache keyed by pubkey; the C++
+    // AnnounceStore is keyed by sender address, so a by-pubkey removal has no
+    // clean analog and stale self-records are left to TTL expiry.)
+    if (socket_ && !socket_->is_ephemeral()) {
+        announce::TargetKey tk{};
+        std::copy(target.begin(), target.end(), tk.begin());
+        auto* entry = router_.get(tk);
+        if (entry && !entry->on_peer_handshake) {
+            router_.remove(tk);
+        }
+    }
+
+    return dht_ops::lookup_and_unannounce(
+        *socket_, target, keypair,
+        std::move(on_reply),
+        /*user_commit=*/nullptr,  // plain unannounce → noop commit (JS)
+        std::move(on_done));
 }
 
 // ---------------------------------------------------------------------------
@@ -88,7 +119,7 @@ void HyperDHT::unannounce(const noise::PubKey& public_key,
                            std::function<void()> on_done) {
     lookup_and_unannounce(public_key, keypair,
         [](const query::QueryReply&) {},
-        [on_done](const std::vector<query::QueryReply>&) {
+        [on_done](int /*error*/, const std::vector<query::QueryReply>&) {
             if (on_done) on_done();
         });
 }
@@ -168,7 +199,7 @@ std::shared_ptr<query::Query> HyperDHT::immutable_put(
 
     return dht_ops::immutable_put(*socket_, value,
         [on_done = std::move(on_done), result = std::move(result)](
-                const std::vector<query::QueryReply>& closest) mutable {
+                int /*error*/, const std::vector<query::QueryReply>& closest) mutable {
             DHT_LOG("  [dht] immutable_put done: %zu closest nodes\n",
                     closest.size());
             result.closest_nodes = closest;
@@ -211,7 +242,7 @@ std::shared_ptr<query::Query> HyperDHT::immutable_get(
             }
         },
         [on_done = std::move(on_done), result](
-                const std::vector<query::QueryReply>&) {
+                int /*error*/, const std::vector<query::QueryReply>&) {
             DHT_LOG("  [dht] immutable_get done: found=%d\n",
                     result->found ? 1 : 0);
             if (on_done) on_done(*result);
@@ -246,7 +277,7 @@ std::shared_ptr<query::Query> HyperDHT::mutable_put(
 
     return dht_ops::mutable_put(*socket_, keypair, value, seq,
         [on_done = std::move(on_done), result = std::move(result)](
-                const std::vector<query::QueryReply>& closest) mutable {
+                int /*error*/, const std::vector<query::QueryReply>& closest) mutable {
             DHT_LOG("  [dht] mutable_put done: %zu closest nodes\n",
                     closest.size());
             result.closest_nodes = closest;
@@ -317,7 +348,7 @@ std::shared_ptr<query::Query> HyperDHT::mutable_get(
             }
         },
         [on_done = std::move(on_done), result](
-                const std::vector<query::QueryReply>&) {
+                int /*error*/, const std::vector<query::QueryReply>&) {
             DHT_LOG("  [dht] mutable_get done: found=%d seq=%llu\n",
                     result->found ? 1 : 0,
                     static_cast<unsigned long long>(result->seq));

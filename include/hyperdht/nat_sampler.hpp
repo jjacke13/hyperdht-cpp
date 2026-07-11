@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -98,6 +99,62 @@ private:
 
     void update_firewall();
     void update_addresses();
+};
+
+// ---------------------------------------------------------------------------
+// RingSampler — line-faithful port of the `nat-sampler` npm package
+// (.analysis/js/nat-sampler/index.js, the whole 64-line class).
+//
+// This is a DIFFERENT sampler from NatSampler above. dht-rpc uses this one as
+// `this._nat` (dht-rpc/index.js:69) purely to decide our external host/port
+// and the "port random" signal. It is a 32-slot ring with NO source dedup:
+// the same node re-observing us counts again, so the sampler keeps adapting to
+// NAT remaps instead of freezing. Winner selection is threshold-gated, so a
+// consistent host with random ports publishes (host, port=0).
+//
+// NatSampler (hyperdht/lib/nat.js) is a separate, source-deduped classifier
+// that layers a firewall ladder on top; keep using that for holepunch/server/
+// connect. Use RingSampler only for the dht-rpc host/port + persistence gate.
+// ---------------------------------------------------------------------------
+
+class RingSampler {
+public:
+    RingSampler() = default;
+
+    // JS: index.js:14-50 (add). Returns the current hit count of the
+    // host+port sample (JS `return a.hits`).
+    int add(const std::string& host, uint16_t port);
+
+    // JS getters: index.js:3-4. host() == "" mirrors JS `this.host === null`.
+    const std::string& host() const { return host_; }
+    uint16_t port() const { return port_; }
+
+    // JS `this.size` (index.js:5) — number of samples added, capped at the
+    // 16 pairs that fill the 32-slot ring.
+    int size() const { return size_; }
+
+    // JS `this._threshold` (index.js:9). Exposed read-only for parity tests.
+    int threshold() const { return threshold_; }
+
+    void reset();
+
+private:
+    // JS: index.js:52-63 (_bump). Scans the 4 most-recent slots of matching
+    // parity; on a hit increments and returns the shared sample, otherwise
+    // returns a brand-new sample. shared_ptr preserves JS object aliasing:
+    // the same object lives in `_samples` and in `_a`/`_b`, so an eviction
+    // hit-decrement affects the exact object a previous _bump returned.
+    std::shared_ptr<Sample> bump(const std::string& host, uint16_t port,
+                                 int inc);
+
+    std::string host_;                              // JS this.host ("" == null)
+    uint16_t port_ = 0;                             // JS this.port
+    int size_ = 0;                                  // JS this.size
+    std::shared_ptr<Sample> a_;                     // JS this._a (host+port best)
+    std::shared_ptr<Sample> b_;                     // JS this._b (host-only best)
+    int threshold_ = 0;                             // JS this._threshold
+    int top_ = 0;                                   // JS this._top
+    std::vector<std::shared_ptr<Sample>> samples_;  // JS this._samples
 };
 
 }  // namespace nat

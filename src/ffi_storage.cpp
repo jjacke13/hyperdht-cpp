@@ -236,8 +236,8 @@ int hyperdht_find_peer(hyperdht_t* dht,
                          host.c_str(), reply.from_addr.port, userdata);
             }
         },
-        [on_done, userdata](const std::vector<hyperdht::query::QueryReply>&) {
-            if (on_done) on_done(0, userdata);
+        [on_done, userdata](int error, const std::vector<hyperdht::query::QueryReply>&) {
+            if (on_done) on_done(error, userdata);
         });
     return 0;
 }
@@ -260,27 +260,47 @@ int hyperdht_lookup(hyperdht_t* dht,
                          host.c_str(), reply.from_addr.port, userdata);
             }
         },
-        [on_done, userdata](const std::vector<hyperdht::query::QueryReply>&) {
-            if (on_done) on_done(0, userdata);
+        [on_done, userdata](int error, const std::vector<hyperdht::query::QueryReply>&) {
+            if (on_done) on_done(error, userdata);
         });
     return 0;
 }
 
+// JS `announce(target, keyPair, relayAddresses)` — the old pre-signed-`value`
+// FFI could not verify at any node (the announce signable covers each node's
+// per-request token+id, so one fixed blob is invalid everywhere). The commit
+// now signs per node, so the FFI must take the KEYPAIR. relay_addresses are
+// carried as an ipv4Array-encoded blob (compact-encoding-net), or NULL/0 for a
+// bare announce (the common case); `bump` is the relay-port bump signal.
 int hyperdht_announce(hyperdht_t* dht,
                        const uint8_t target[32],
-                       const uint8_t* value, size_t value_len,
+                       const hyperdht_keypair_t* kp,
+                       const uint8_t* relay_addresses, size_t relay_len,
+                       uint64_t bump,
                        hyperdht_done_cb on_done,
                        void* userdata) {
-    if (!dht || !dht->dht || !target || !value || value_len == 0) return -1;
+    if (!dht || !dht->dht || !target || !kp) return -1;
 
     hyperdht::routing::NodeId t{};
     memcpy(t.data(), target, 32);
-    std::vector<uint8_t> val(value, value + value_len);
 
-    dht->dht->announce(t, val,
-        [on_done, userdata](const std::vector<hyperdht::query::QueryReply>&) {
-            if (on_done) on_done(0, userdata);
+    hyperdht::noise::Keypair cpp_kp;
+    memcpy(cpp_kp.public_key.data(), kp->public_key, 32);
+    memcpy(cpp_kp.secret_key.data(), kp->secret_key, 64);
+
+    // Optional relay addresses: ipv4Array (compact-encoding-net) — same wire
+    // form the PeerRecord uses. Absent → empty list.
+    std::vector<hyperdht::compact::Ipv4Address> relays;
+    if (relay_addresses && relay_len > 0) {
+        auto s = hyperdht::compact::State::for_decode(relay_addresses, relay_len);
+        relays = hyperdht::compact::Ipv4Array::decode(s);
+    }
+
+    dht->dht->announce(t, cpp_kp, relays, bump,
+        [on_done, userdata](int error, const std::vector<hyperdht::query::QueryReply>&) {
+            if (on_done) on_done(error, userdata);
         });
+    sodium_memzero(cpp_kp.secret_key.data(), 64);  // C10
     return 0;
 }
 

@@ -184,6 +184,55 @@ TEST_F(SocketPoolTest, RemoveRoute) {
     run_loop();
 }
 
+// h-6: JS socket-pool.js:79-91 gc's a route when its socket closes
+// (`socket.on('close', gc)`). C++ had no hook — get_route() handed back a dead
+// socket forever. Closing the socket must drop the route.
+TEST_F(SocketPoolTest, RouteGcOnSocketClose) {
+    SocketPool pool(&loop_, &udx_);
+
+    std::array<uint8_t, 32> pk{};
+    pk.fill(0xAB);
+    auto addr = compact::Ipv4Address::from_string("10.0.0.1", 4242);
+
+    auto* ref = pool.acquire();
+    pool.add_route(pk, ref->socket(), addr);
+    ASSERT_NE(pool.get_route(pk), nullptr);
+
+    // Close the socket → SocketPool::remove() must gc the route.
+    ref->release();
+    run_loop();
+
+    EXPECT_EQ(pool.get_route(pk), nullptr)
+        << "route must be gc'd when its socket closes";
+
+    pool.destroy();
+    run_loop();
+}
+
+// h-6: JS socket-pool.js:96-100 — a rawStream error marks its socket
+// non-reusable and gc's the route so it is never handed out again.
+TEST_F(SocketPoolTest, RouteGcOnStreamError) {
+    SocketPool pool(&loop_, &udx_);
+
+    std::array<uint8_t, 32> pk{};
+    pk.fill(0xCD);
+    auto addr = compact::Ipv4Address::from_string("10.0.0.2", 5252);
+
+    auto* ref = pool.acquire();
+    pool.add_route(pk, ref->socket(), addr);  // sets reusable = true
+    ASSERT_NE(pool.get_route(pk), nullptr);
+    EXPECT_TRUE(ref->reusable);
+
+    pool.on_stream_error(ref->socket());
+
+    EXPECT_EQ(pool.get_route(pk), nullptr) << "stream error must gc the route";
+    EXPECT_FALSE(ref->reusable) << "stream error must mark socket non-reusable";
+
+    ref->release();
+    pool.destroy();
+    run_loop();
+}
+
 TEST_F(SocketPoolTest, AddRouteSetsReusable) {
     SocketPool pool(&loop_, &udx_);
 

@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -18,6 +19,7 @@
 #include "hyperdht/dht.hpp"
 #include "hyperdht/peer_connect.hpp"
 #include "hyperdht/protomux.hpp"
+#include "hyperdht/udx.hpp"
 
 using namespace hyperdht;
 using namespace hyperdht::blind_relay;
@@ -37,10 +39,11 @@ TEST(BlindRelayPair, EncodeDecodeRoundTrip) {
     ASSERT_GT(encoded.size(), 33u);  // flags(1) + token(32) + id + seq
 
     auto decoded = decode_pair(encoded.data(), encoded.size());
-    EXPECT_TRUE(decoded.is_initiator);
-    EXPECT_EQ(decoded.token, msg.token);
-    EXPECT_EQ(decoded.id, 42u);
-    EXPECT_EQ(decoded.seq, 0u);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_TRUE(decoded->is_initiator);
+    EXPECT_EQ(decoded->token, msg.token);
+    EXPECT_EQ(decoded->id, 42u);
+    EXPECT_EQ(decoded->seq, 0u);
 }
 
 TEST(BlindRelayPair, EncodeDecodeNonInitiator) {
@@ -53,10 +56,11 @@ TEST(BlindRelayPair, EncodeDecodeNonInitiator) {
     auto encoded = encode_pair(msg);
     auto decoded = decode_pair(encoded.data(), encoded.size());
 
-    EXPECT_FALSE(decoded.is_initiator);
-    EXPECT_EQ(decoded.token, msg.token);
-    EXPECT_EQ(decoded.id, 9999u);
-    EXPECT_EQ(decoded.seq, 0u);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_FALSE(decoded->is_initiator);
+    EXPECT_EQ(decoded->token, msg.token);
+    EXPECT_EQ(decoded->id, 9999u);
+    EXPECT_EQ(decoded->seq, 0u);
 }
 
 TEST(BlindRelayPair, EncodeDecodeLargeId) {
@@ -69,22 +73,32 @@ TEST(BlindRelayPair, EncodeDecodeLargeId) {
     auto encoded = encode_pair(msg);
     auto decoded = decode_pair(encoded.data(), encoded.size());
 
-    EXPECT_EQ(decoded.id, 0xFFFFFFFFu);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->id, 0xFFFFFFFFu);
 }
 
 TEST(BlindRelayPair, DecodeEmptyBuffer) {
-    PairMessage decoded = decode_pair(nullptr, 0);
-    // Should return default values without crashing
-    EXPECT_FALSE(decoded.is_initiator);
-    EXPECT_EQ(decoded.id, 0u);
+    // Truncated/empty buffer must signal failure (nullopt), not a zero struct —
+    // JS decode throws here, tearing the connection down (finding blind-relay-6).
+    auto decoded = decode_pair(nullptr, 0);
+    EXPECT_FALSE(decoded.has_value());
 }
 
 TEST(BlindRelayPair, DecodeTruncatedBuffer) {
-    // Only flags byte, no token
+    // Only flags byte, no token → nullopt.
     uint8_t buf[1] = {1};
-    PairMessage decoded = decode_pair(buf, 1);
-    EXPECT_TRUE(decoded.is_initiator);
-    // Token should be zeros (not enough data)
+    auto decoded = decode_pair(buf, 1);
+    EXPECT_FALSE(decoded.has_value());
+}
+
+TEST(BlindRelayPair, DecodeTruncatedMissingSeq) {
+    // flags + token + id but no seq → nullopt (all four fields required).
+    std::vector<uint8_t> data;
+    data.push_back(0x01);
+    for (uint8_t i = 1; i <= 32; i++) data.push_back(i);
+    data.push_back(42);  // id, but no seq byte
+    auto decoded = decode_pair(data.data(), data.size());
+    EXPECT_FALSE(decoded.has_value());
 }
 
 // ===========================================================================
@@ -99,13 +113,14 @@ TEST(BlindRelayUnpair, EncodeDecodeRoundTrip) {
     EXPECT_EQ(encoded.size(), 33u);  // flags(1) + token(32)
 
     auto decoded = decode_unpair(encoded.data(), encoded.size());
-    EXPECT_EQ(decoded.token, msg.token);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->token, msg.token);
 }
 
 TEST(BlindRelayUnpair, DecodeEmptyBuffer) {
-    UnpairMessage decoded = decode_unpair(nullptr, 0);
-    Token zero{};
-    EXPECT_EQ(decoded.token, zero);
+    // Truncated → nullopt (finding blind-relay-6).
+    auto decoded = decode_unpair(nullptr, 0);
+    EXPECT_FALSE(decoded.has_value());
 }
 
 // ===========================================================================
@@ -285,10 +300,11 @@ TEST(BlindRelayClient, PairAfterDestroyFails) {
 
 TEST(BlindRelayServer, CreateAndAccept) {
     int streams_created = 0;
-    BlindRelayServer server([&streams_created]() -> udx_stream_t* {
-        streams_created++;
-        return nullptr;  // Can't create real streams without libuv
-    });
+    BlindRelayServer server(
+        [&streams_created](udx_stream_close_cb, void*) -> udx_stream_t* {
+            streams_created++;
+            return nullptr;  // Can't create real streams without libuv
+        });
 
     // Without a real Mux we can't fully test accept(), but we can test
     // the pairing data structures directly.
@@ -323,7 +339,8 @@ TEST(BlindRelayServer, CreateAndAccept) {
 }
 
 TEST(BlindRelayServer, RemovePair) {
-    BlindRelayServer server([]() -> udx_stream_t* { return nullptr; });
+    BlindRelayServer server(
+        [](udx_stream_close_cb, void*) -> udx_stream_t* { return nullptr; });
 
     Token token;
     token.fill(0xBB);
@@ -337,7 +354,8 @@ TEST(BlindRelayServer, RemovePair) {
 }
 
 TEST(BlindRelayServer, RemovePairByKey) {
-    BlindRelayServer server([]() -> udx_stream_t* { return nullptr; });
+    BlindRelayServer server(
+        [](udx_stream_close_cb, void*) -> udx_stream_t* { return nullptr; });
 
     Token token;
     token.fill(0xCC);
@@ -547,12 +565,13 @@ TEST(BlindRelayPair, DecodeKnownVector) {
     data.push_back(0);     // seq as varint
 
     auto decoded = decode_pair(data.data(), data.size());
-    EXPECT_TRUE(decoded.is_initiator);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_TRUE(decoded->is_initiator);
     for (int i = 0; i < 32; i++) {
-        EXPECT_EQ(decoded.token[i], static_cast<uint8_t>(i + 1));
+        EXPECT_EQ(decoded->token[i], static_cast<uint8_t>(i + 1));
     }
-    EXPECT_EQ(decoded.id, 42u);
-    EXPECT_EQ(decoded.seq, 0u);
+    EXPECT_EQ(decoded->id, 42u);
+    EXPECT_EQ(decoded->seq, 0u);
 }
 
 TEST(BlindRelayUnpair, DecodeKnownVector) {
@@ -563,9 +582,10 @@ TEST(BlindRelayUnpair, DecodeKnownVector) {
     for (int i = 0; i < 32; i++) data.push_back(0xFF);
 
     auto decoded = decode_unpair(data.data(), data.size());
+    ASSERT_TRUE(decoded.has_value());
     Token expected;
     expected.fill(0xFF);
-    EXPECT_EQ(decoded.token, expected);
+    EXPECT_EQ(decoded->token, expected);
 }
 
 // ===========================================================================
@@ -579,4 +599,318 @@ TEST(BlindRelayConstants, ProtocolName) {
 TEST(BlindRelayConstants, Timeouts) {
     EXPECT_EQ(RELAY_TIMEOUT_MS, 15000u);
     EXPECT_EQ(RELAY_KEEP_ALIVE_MS, 5000u);
+}
+
+// ===========================================================================
+// finding blind-relay-1 — end-to-end relay DATA over real udx sockets.
+//
+// Two peers each connect a raw stream to a relay stream id; the relay streams
+// learn each peer's UDP source via relay_firewall_cb (connect-on-first-packet,
+// return 0 = accept + relay). Bytes written on peer A arrive at peer B and
+// vice-versa — the real proof that the firewall/connect wiring works.
+// ===========================================================================
+
+namespace {
+
+struct RelayData {
+    std::string a_recv;   // bytes peer A received (originated by B)
+    std::string b_recv;   // bytes peer B received (originated by A)
+    int peers_closed = 0;
+    int relays_closed = 0;
+    hyperdht::udx::UdxSocket* sockA = nullptr;
+    hyperdht::udx::UdxSocket* sockR = nullptr;
+    hyperdht::udx::UdxSocket* sockB = nullptr;
+    hyperdht::udx::UdxStream* relayA = nullptr;
+    hyperdht::udx::UdxStream* relayB = nullptr;
+};
+
+RelayData* g_rd = nullptr;
+
+sockaddr_in rd_loopback(uint16_t port) {
+    sockaddr_in a{};
+    uv_ip4_addr("127.0.0.1", port, &a);
+    return a;
+}
+
+sockaddr_in rd_bound(hyperdht::udx::UdxSocket& s) {
+    sockaddr_in a{};
+    int len = sizeof(a);
+    s.getsockname(reinterpret_cast<sockaddr*>(&a), &len);
+    return a;
+}
+
+void rd_on_read_a(udx_stream_t*, ssize_t n, const uv_buf_t* buf) {
+    if (n > 0) g_rd->a_recv.append(buf->base, static_cast<size_t>(n));
+}
+void rd_on_read_b(udx_stream_t*, ssize_t n, const uv_buf_t* buf) {
+    if (n > 0) g_rd->b_recv.append(buf->base, static_cast<size_t>(n));
+}
+
+void rd_on_relay_close(udx_stream_t* s, int) {
+    // The relay stream carries a heap RelayStreamCtx (as production would).
+    delete static_cast<RelayStreamCtx*>(s->data);
+    s->data = nullptr;
+    if (++g_rd->relays_closed == 2) {
+        g_rd->sockA->close();
+        g_rd->sockR->close();
+        g_rd->sockB->close();
+    }
+}
+
+void rd_on_peer_close(udx_stream_t*, int) {
+    // Once both peer streams have fully closed (mutual write_end), tear down
+    // the relay streams so the loop can drain.
+    if (++g_rd->peers_closed == 2) {
+        g_rd->relayA->destroy();
+        g_rd->relayB->destroy();
+    }
+}
+
+}  // namespace
+
+TEST(BlindRelayData, RelaysBytesThroughFirewallConnect) {
+    using namespace hyperdht::udx;
+
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    Udx udx(&loop);
+
+    UdxSocket sockA(udx), sockR(udx), sockB(udx);
+    auto a0 = rd_loopback(0), r0 = rd_loopback(0), b0 = rd_loopback(0);
+    ASSERT_EQ(sockA.bind(reinterpret_cast<sockaddr*>(&a0)), 0);
+    ASSERT_EQ(sockR.bind(reinterpret_cast<sockaddr*>(&r0)), 0);
+    ASSERT_EQ(sockB.bind(reinterpret_cast<sockaddr*>(&b0)), 0);
+    auto relay_addr = rd_bound(sockR);
+
+    // Relay streams (ids 100/200). Each carries a ctx with the PEER's stream id
+    // so relay_firewall_cb connects it back to that peer, then relays.
+    auto* ctxA = new RelayStreamCtx{};
+    ctxA->remote_id = 1;  // peer A's stream id
+    auto* ctxB = new RelayStreamCtx{};
+    ctxB->remote_id = 2;  // peer B's stream id
+
+    UdxStream relayA(udx, 100, rd_on_relay_close, nullptr);
+    UdxStream relayB(udx, 200, rd_on_relay_close, nullptr);
+    relayA.handle()->data = ctxA;
+    relayB.handle()->data = ctxB;
+    ASSERT_EQ(relayA.firewall(relay_firewall_cb), 0);
+    ASSERT_EQ(relayB.firewall(relay_firewall_cb), 0);
+    ASSERT_EQ(relayA.relay_to(relayB), 0);
+    ASSERT_EQ(relayB.relay_to(relayA), 0);
+
+    // Peer streams (ids 1/2), each connected to its relay stream id.
+    UdxStream peerA(udx, 1, rd_on_peer_close, nullptr);
+    UdxStream peerB(udx, 2, rd_on_peer_close, nullptr);
+    ASSERT_EQ(peerA.connect(sockA, 100, reinterpret_cast<sockaddr*>(&relay_addr)), 0);
+    ASSERT_EQ(peerB.connect(sockB, 200, reinterpret_cast<sockaddr*>(&relay_addr)), 0);
+    ASSERT_EQ(peerA.read_start(rd_on_read_a), 0);
+    ASSERT_EQ(peerB.read_start(rd_on_read_b), 0);
+
+    RelayData rd;
+    rd.sockA = &sockA;
+    rd.sockR = &sockR;
+    rd.sockB = &sockB;
+    rd.relayA = &relayA;
+    rd.relayB = &relayB;
+    g_rd = &rd;
+
+    // Write in both directions, then signal end-of-writes.
+    std::string mA = "A2B", mB = "B2A";
+    uv_buf_t bufA = uv_buf_init(mA.data(), 3);
+    uv_buf_t bufB = uv_buf_init(mB.data(), 3);
+    auto* wA = static_cast<udx_stream_write_t*>(
+        malloc(static_cast<size_t>(udx_stream_write_sizeof(1))));
+    auto* wB = static_cast<udx_stream_write_t*>(
+        malloc(static_cast<size_t>(udx_stream_write_sizeof(1))));
+    auto* eA = static_cast<udx_stream_write_t*>(
+        malloc(static_cast<size_t>(udx_stream_write_sizeof(1))));
+    auto* eB = static_cast<udx_stream_write_t*>(
+        malloc(static_cast<size_t>(udx_stream_write_sizeof(1))));
+    ASSERT_GE(peerA.write(wA, &bufA, 1, nullptr), 0);
+    ASSERT_GE(peerB.write(wB, &bufB, 1, nullptr), 0);
+    ASSERT_GE(peerA.write_end(eA, nullptr, 0, nullptr), 0);
+    ASSERT_GE(peerB.write_end(eB, nullptr, 0, nullptr), 0);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+
+    EXPECT_EQ(rd.b_recv, "A2B");  // A → relay → B
+    EXPECT_EQ(rd.a_recv, "B2A");  // B → relay → A
+    EXPECT_EQ(rd.peers_closed, 2);
+    EXPECT_EQ(rd.relays_closed, 2);
+
+    free(wA);
+    free(wB);
+    free(eA);
+    free(eB);
+    g_rd = nullptr;
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+}
+
+// ===========================================================================
+// finding blind-relay-5 — the client ignores an inbound unpair.
+// A relay that (mis)sends an unpair to a client with a pending request must
+// NOT cancel that request (JS registers unpair for sending only).
+// ===========================================================================
+
+TEST(BlindRelayClient, InboundUnpairIsIgnored) {
+    MuxPair mux;
+    auto* chA = mux.mux_a.create_channel(PROTOCOL_NAME);
+    BlindRelayClient client(chA);
+    client.open();
+
+    // Bare peer channel on the other side, paired with the client channel.
+    auto* chB = mux.mux_b.create_channel(PROTOCOL_NAME);
+    chB->open();
+    mux.flush();
+
+    Token token;
+    token.fill(0x42);
+    bool err_fired = false;
+    bool paired = false;
+    client.pair(true, token, 100,
+                [&](uint32_t) { paired = true; },
+                [&](int) { err_fired = true; });
+    mux.flush();
+
+    // Peer sends an inbound unpair (message index 1) for the pending token.
+    UnpairMessage um;
+    um.token = token;
+    auto enc = encode_unpair(um);
+    ASSERT_TRUE(chB->send(1, enc.data(), enc.size()));
+    mux.flush();
+
+    EXPECT_FALSE(err_fired);  // request NOT cancelled
+    EXPECT_FALSE(paired);     // and not spuriously paired
+}
+
+// ===========================================================================
+// finding blind-relay-6 — a truncated pair message tears the session down
+// instead of pairing a zero token.
+// ===========================================================================
+
+TEST(BlindRelaySession, TruncatedPairTearsDown) {
+    MuxPair mux;
+    BlindRelayServer server(
+        [](udx_stream_close_cb, void*) -> udx_stream_t* { return nullptr; });
+
+    auto* session = server.accept(&mux.mux_b);
+    ASSERT_NE(session, nullptr);
+
+    auto* chA = mux.mux_a.create_channel(PROTOCOL_NAME);
+    chA->open();
+    mux.flush();
+    ASSERT_FALSE(session->is_closed());
+
+    // Pair message (index 0) with only the flags byte — no token/id/seq.
+    uint8_t truncated[1] = {0x01};
+    ASSERT_TRUE(chA->send(0, truncated, sizeof(truncated)));
+    mux.flush();
+
+    EXPECT_TRUE(session->is_closed());  // torn down, not paired
+}
+
+// ===========================================================================
+// finding blind-relay-3 — graceful close drains an in-flight pairing.
+// server.close() with a session mid-pairing must NOT destroy it immediately;
+// on_closed fires only once the pairing resolves (here via unpair).
+// ===========================================================================
+
+TEST(BlindRelayServer, GracefulCloseDrainsInFlightPairing) {
+    MuxPair mux;
+    BlindRelayServer server(
+        [](udx_stream_close_cb, void*) -> udx_stream_t* { return nullptr; });
+    bool closed_fired = false;
+    server.on_closed = [&]() { closed_fired = true; };
+
+    auto* chA = mux.mux_a.create_channel(PROTOCOL_NAME);
+    BlindRelayClient client(chA);
+    client.open();
+    auto* session = server.accept(&mux.mux_b);
+    ASSERT_NE(session, nullptr);
+    mux.flush();
+
+    Token token;
+    token.fill(0x77);
+    client.pair(true, token, 100, [](uint32_t) {}, [](int) {});
+    mux.flush();  // session now has an in-flight (unmatched) pairing
+
+    // Graceful close: the in-flight session must keep draining, not vanish.
+    server.close();
+    EXPECT_FALSE(closed_fired);
+
+    // Resolve the pairing → the session ends → last session gone → on_closed.
+    client.unpair(token);
+    mux.flush();
+    EXPECT_TRUE(closed_fired);
+}
+
+// ===========================================================================
+// finding blind-relay-2 — the pair confirmation is sent BEFORE a pending-close
+// session's channel closes. A session that end()s while its pairing is in
+// flight must still deliver its confirmation to its client.
+// ===========================================================================
+
+TEST(BlindRelayServer, ConfirmationSentBeforeSessionCloses) {
+    using namespace hyperdht::udx;
+
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    Udx udx(&loop);
+
+    // Real relay streams handed out by the factory (one pairing → two streams).
+    udx_stream_t s0{}, s1{};
+    udx_stream_t* slots[2] = {&s0, &s1};
+    int handed = 0;
+
+    // muxes declared BEFORE server so the server (and its sessions) destruct
+    // first — sessions reference channels the muxes own.
+    MuxPair mpA, mpB;
+
+    BlindRelayServer server(
+        [&](udx_stream_close_cb cb, void* ud) -> udx_stream_t* {
+            if (handed >= 2) return nullptr;
+            udx_stream_t* s = slots[handed++];
+            udx_stream_init(udx.handle(), s, 1000u + handed, cb, nullptr);
+            s->data = ud;
+            return s;
+        });
+
+    auto* chA = mpA.mux_a.create_channel(PROTOCOL_NAME);
+    auto* chB = mpB.mux_a.create_channel(PROTOCOL_NAME);
+    BlindRelayClient clientA(chA), clientB(chB);
+    clientA.open();
+    clientB.open();
+    auto* sessionA = server.accept(&mpA.mux_b);
+    auto* sessionB = server.accept(&mpB.mux_b);
+    ASSERT_NE(sessionA, nullptr);
+    ASSERT_NE(sessionB, nullptr);
+    mpA.flush();
+    mpB.flush();
+
+    Token token;
+    token.fill(0x33);
+    bool paired_a = false, paired_b = false;
+
+    // Client A pairs as INITIATOR (→ pair.links[1], processed last in pass 3,
+    // so its endMaybe close cascade doesn't disturb B's earlier confirmation).
+    clientA.pair(true, token, 10, [&](uint32_t) { paired_a = true; }, nullptr);
+    mpA.flush();  // sessionA in-flight
+
+    // sessionA ends while its pairing is in flight (pending_close_).
+    sessionA->close();
+
+    clientB.pair(false, token, 20, [&](uint32_t) { paired_b = true; }, nullptr);
+    mpB.flush();  // sessionB matches → confirmations sent
+
+    mpA.flush();  // deliver sessionA's confirmation to client A
+    mpB.flush();  // deliver sessionB's confirmation to client B
+
+    EXPECT_TRUE(paired_a);  // finding-2: confirmation not dropped on close
+    EXPECT_TRUE(paired_b);
+
+    // Teardown: make sure both relay streams are destroyed, then drain.
+    udx_stream_destroy(&s0);
+    udx_stream_destroy(&s1);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
 }

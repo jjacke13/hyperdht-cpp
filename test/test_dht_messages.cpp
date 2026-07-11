@@ -254,3 +254,113 @@ TEST(LookupReply, Empty) {
     EXPECT_TRUE(decoded.peers.empty());
     EXPECT_EQ(decoded.bump, 0u);
 }
+
+// ---------------------------------------------------------------------------
+// Byte-exact wire vectors (hand-derived from JS hyperdht/lib/messages.js).
+//
+// lookupRawReply = rawPeers(peers) + uint(bump), where
+//   rawPeers = c.array(c.raw): varint(count) followed by each peer record's
+//   raw bytes concatenated with NO per-element length prefix. Each record is
+//   self-delimiting: fixed32(publicKey) + ipv4Array(relayAddresses), and
+//   ipv4Array = varint(relayCount) + relayCount * 6 bytes (4 host + 2 port LE).
+//
+// Derivation:
+//   count           = 0x02
+//   peer0           = pk(0x01 * 32) + relays: varint(0)=0x00              (33 B)
+//   peer1           = pk(0x02 * 32) + relays: varint(1)=0x01
+//                       + 1.2.3.4:5000 = 01 02 03 04 | 88 13 (5000 LE)    (39 B)
+//   bump = 42       = 0x2A
+// Total = 1 + 33 + 39 + 1 = 74 bytes. The OLD (buggy) length-prefixed encoder
+// would have inserted a varint(33)/varint(39) before each record — this
+// vector fails against that, which is the point.
+// ---------------------------------------------------------------------------
+TEST(LookupReply, ByteExactWireFormat) {
+    PeerRecord p0;
+    p0.public_key.fill(0x01);
+
+    PeerRecord p1;
+    p1.public_key.fill(0x02);
+    p1.relay_addresses.push_back(Ipv4Address::from_string("1.2.3.4", 5000));
+
+    LookupRawReply r;
+    r.peers.push_back(encode_peer_record(p0));
+    r.peers.push_back(encode_peer_record(p1));
+    r.bump = 42;
+
+    std::vector<uint8_t> expected;
+    expected.push_back(0x02);                              // count
+    for (int i = 0; i < 32; i++) expected.push_back(0x01); // peer0 pk
+    expected.push_back(0x00);                              // peer0 relays: 0
+    for (int i = 0; i < 32; i++) expected.push_back(0x02); // peer1 pk
+    expected.push_back(0x01);                              // peer1 relays: 1
+    expected.insert(expected.end(),
+                    {0x01, 0x02, 0x03, 0x04, 0x88, 0x13}); // 1.2.3.4:5000
+    expected.push_back(0x2A);                              // bump = 42
+
+    auto encoded = encode_lookup_reply(r);
+    EXPECT_EQ(encoded, expected);
+    EXPECT_EQ(encoded.size(), 74u);
+
+    // Round-trips back through the JS-shaped decoder.
+    auto decoded = decode_lookup_reply(encoded.data(), encoded.size());
+    ASSERT_EQ(decoded.peers.size(), 2u);
+    EXPECT_EQ(decoded.bump, 42u);
+    auto d0 = decode_peer_record(decoded.peers[0].data(), decoded.peers[0].size());
+    auto d1 = decode_peer_record(decoded.peers[1].data(), decoded.peers[1].size());
+    EXPECT_EQ(d0.public_key[0], 0x01);
+    EXPECT_TRUE(d0.relay_addresses.empty());
+    EXPECT_EQ(d1.public_key[0], 0x02);
+    ASSERT_EQ(d1.relay_addresses.size(), 1u);
+    EXPECT_EQ(d1.relay_addresses[0].host_string(), "1.2.3.4");
+    EXPECT_EQ(d1.relay_addresses[0].port, 5000u);
+}
+
+// bump=0 emits a single trailing 0x00 (uint 0) and no per-peer prefixes.
+// Derivation: count=1, peer0 = pk(0xAB*32)+varint(0), bump=varint(0)=0x00.
+// Total = 1 + 33 + 1 = 35 bytes.
+TEST(LookupReply, ByteExactSinglePeerZeroBump) {
+    PeerRecord p0;
+    p0.public_key.fill(0xAB);
+
+    LookupRawReply r;
+    r.peers.push_back(encode_peer_record(p0));
+    r.bump = 0;
+
+    std::vector<uint8_t> expected;
+    expected.push_back(0x01);                              // count
+    for (int i = 0; i < 32; i++) expected.push_back(0xAB); // pk
+    expected.push_back(0x00);                              // relays: 0
+    expected.push_back(0x00);                              // bump = 0
+
+    EXPECT_EQ(encode_lookup_reply(r), expected);
+    EXPECT_EQ(expected.size(), 35u);
+}
+
+// AnnounceMessage byte-exact: peer(no relays) + bump=300 (multi-byte varint).
+// Derivation:
+//   flags = peer(1) | bump(8) = 0x09
+//   peer  = pk(0x03*32) + relays varint(0)=0x00
+//   bump  = 300 = 0x012C -> varint 0xFD 2C 01 (0xFD prefix + uint16 LE)
+// Total = 1 + 32 + 1 + 3 = 37 bytes.
+TEST(AnnounceMessage, ByteExactPeerPlusBump) {
+    AnnounceMessage m;
+    PeerRecord peer;
+    peer.public_key.fill(0x03);
+    m.peer = peer;
+    m.bump = 300;
+
+    std::vector<uint8_t> expected;
+    expected.push_back(0x09);                              // flags: peer|bump
+    for (int i = 0; i < 32; i++) expected.push_back(0x03); // pk
+    expected.push_back(0x00);                              // relays: 0
+    expected.insert(expected.end(), {0xFD, 0x2C, 0x01});   // bump = 300
+
+    auto encoded = encode_announce_msg(m);
+    EXPECT_EQ(encoded, expected);
+    EXPECT_EQ(encoded.size(), 37u);
+
+    auto decoded = decode_announce_msg(encoded.data(), encoded.size());
+    ASSERT_TRUE(decoded.peer.has_value());
+    EXPECT_EQ(decoded.peer->public_key[0], 0x03);
+    EXPECT_EQ(decoded.bump, 300u);
+}

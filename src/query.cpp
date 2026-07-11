@@ -27,9 +27,9 @@ namespace query {
 //     and exposes a `finished()` Promise. C++ uses three explicit callbacks
 //     (on_reply / on_done / on_commit) and `maybe_finish()` is the
 //     equivalent of JS's `_flush` / "drain to end" logic.
-//   - JS's `_seen` map tracks DONE/DOWN/[refs]; C++ uses a NodeState enum
-//     and does NOT track refs (no DOWN_HINT propagation yet — see the
-//     gaps doc).
+//   - JS's `_seen` map overloads its value to hold DONE/DOWN sentinels OR the
+//     refs array; C++ uses a NodeState enum plus a parallel `refs_` map. Both
+//     drive DOWN_HINT gossip on timeout (downhint-1).
 //   - JS holds an explicit `_session` (with auto-destroy); C++ has none —
 //     the RpcSocket layer owns request lifecycles.
 // ---------------------------------------------------------------------------
@@ -60,10 +60,13 @@ Query::Query(rpc::RpcSocket& socket, const routing::NodeId& target,
 // bootstrap resolution. See docs/JS-PARITY-GAPS.md bootstrap-walk note.
 void Query::start() {
     // JS query.js:50-62: caller seeds are pushed in reverse so the closest
-    // entry ends up on top of the LIFO pending stack.
+    // entry ends up on top of the LIFO pending stack. seeding_pre_ lets these
+    // seeds bypass the onlyClosestNodes gate (JS sets that flag AFTER seeding).
+    seeding_pre_ = true;
     for (auto it = pre_seeds_.rbegin(); it != pre_seeds_.rend(); ++it) {
         add_pending(it->id, it->addr);
     }
+    seeding_pre_ = false;
     pre_seeds_.clear();
 
     if (pending_.size() < routing::K) {
@@ -124,13 +127,34 @@ void Query::seed_from_table() {
 //
 // C++ diffs from JS:
 //   - C++ does the closeness check inside read_more() instead of inside
-//     add_pending(); add_pending here only does the seen-set + filter check.
-//   - The DOWN/refs path is not implemented (no DOWN_HINT yet).
+//     add_pending(); add_pending here does the seen-set + filter check plus the
+//     refs/DOWN dispatch (records referrers, DOWN_HINTs a re-seen dead node).
 // ---------------------------------------------------------------------------
 
-void Query::add_pending(const routing::NodeId& id, const compact::Ipv4Address& addr) {
+void Query::add_pending(const routing::NodeId& id, const compact::Ipv4Address& addr,
+                        const compact::Ipv4Address* ref) {
+    // JS query.js:141 — onlyClosestNodes queries never expand the frontier.
+    // The caller's pre-seeds bypass this (seeding_pre_), matching JS which sets
+    // the flag only after the constructor seeds are added.
+    if (only_closest_nodes_ && !seeding_pre_) return;
+
     std::string key = addr.host_string() + ":" + std::to_string(addr.port);
-    if (seen_.count(key) > 0) return;  // Already seen
+
+    // JS query.js:144-159 — dispatch on the existing _seen state.
+    auto it = seen_.find(key);
+    if (it != seen_.end()) {
+        if (it->second == NodeState::DOWN) {
+            // Already known-dead: gossip a fresh DOWN_HINT to the new referrer
+            // (JS query.js:151-154 `_downHint(ref, node)`).
+            if (ref) socket_.try_send_down_hint(*ref, addr);
+        } else if (it->second == NodeState::PENDING) {
+            // Still queued: just record the extra referrer (JS query.js:156-159).
+            if (ref) refs_[key].push_back(*ref);
+        }
+        // DONE: nothing to do. Never re-add (dedup).
+        return;
+    }
+
     constexpr size_t MAX_SEEN = 4096;  // C13: cap to prevent heap exhaustion
     if (seen_.size() >= MAX_SEEN) return;
 
@@ -138,6 +162,7 @@ void Query::add_pending(const routing::NodeId& id, const compact::Ipv4Address& a
     if (!socket_.filter_accept(id, addr)) return;
 
     seen_[key] = NodeState::PENDING;
+    if (ref) refs_[key].push_back(*ref);
     pending_.push_back({id, addr});
 }
 
@@ -151,34 +176,39 @@ void Query::add_pending(const routing::NodeId& id, const compact::Ipv4Address& a
 //     this.dht._request with the visit/error callbacks and a configurable
 //     retry count)
 //
-// C++ diffs from JS:
-//   - JS implements a "slowdown" optimisation: after the first readMore tick
-//     it caps concurrency at 3 until the first node replies, to give the
-//     true closest node a head start. C++ does NOT implement this — every
-//     iteration uses the static `concurrency_` value.
-//   - JS retries failed visits up to opts.retries (default 5). C++ relies on
-//     the RpcSocket-level retry policy and treats any timeout as a single
-//     failure.
-//   - JS marks unresponsive nodes DOWN and propagates a DOWN_HINT back to
-//     the original ref. C++ marks DOWN but does not gossip the hint.
+// C++ parity with JS:
+//   - Cold-start "slowdown" (query.js:189-191): caps concurrency at 3 until the
+//     first reply on a caller-seeded query — implemented via slowdown_.
+//   - Retries default 5 (query.js:28-29): plumbed through retries_ → the
+//     RpcSocket per-request retry count (query-1).
+//   - Unresponsive nodes are marked DOWN and gossiped via DOWN_HINT to every
+//     referrer (query.js:298-332) — see on_visit_timeout (downhint-1).
 // ---------------------------------------------------------------------------
 
 // JS: dht-rpc/lib/query.js:176-209 — `_readMore` applies the cold-start
-// slowdown, drains pending up to the effective concurrency, engages the
-// slowdown flag on the very first tick when the caller pre-seeded the
-// frontier, and — once pending is empty and no requests are in flight —
-// either retries from the routing table (if most of the cached nodes
+// slowdown, drains pending up to the effective concurrency (widened by the
+// `_slow` retry count), engages the slowdown flag on the very first tick when
+// the caller pre-seeded the frontier, and — once pending is empty and either
+// nothing is in flight OR every remaining request is slow with k already
+// satisfied — either retries from the routing table (if most cached nodes
 // failed) or flushes the query.
 //
 // C++ diffs from JS:
-//   - The additive `_slow` oncycle counter is NOT ported: RpcSocket does not
-//     expose a per-retry hook. Tracked as a follow-up in docs/JS-PARITY-GAPS.
+//   - The additive `_slow` counter IS ported (query-3): visit() registers a
+//     per-request oncycle hook on the RpcSocket that widens concurrency and
+//     enables the early flush.
 //   - C++ has no streamx Readable backpressure, so there is no equivalent of
 //     `this.push(data)` returning false to pause iteration.
 void Query::read_more() {
-    if (done_) return;
+    // JS query.js:177 — `if (this.destroying || this._commiting) return`. Once
+    // the commit phase has begun the walk must not fan out again (a late slow
+    // reply landing mid-commit would otherwise re-enter here).
+    if (done_ || committing_) return;
 
-    const int effective_concurrency = slowdown_ ? SLOWDOWN_CONCURRENCY : concurrency_;
+    // JS query.js:179 — effective concurrency widens by _slow so that requests
+    // still waiting on a retry don't hold back new fan-out.
+    const int base = slowdown_ ? SLOWDOWN_CONCURRENCY : concurrency_;
+    const int effective_concurrency = base + slow_;
 
     while (inflight_ < effective_concurrency && !pending_.empty()) {
         auto next = pending_.back();
@@ -205,14 +235,13 @@ void Query::read_more() {
 
     if (!pending_.empty()) return;
 
-    // JS query.js:196-199 also allows entering the flush/retry path when
-    //   `_slow === inflight && closestReplies.length >= k`
-    // (i.e. every remaining in-flight request has been marked slow by the
-    // oncycle hook and we already have a full result set). C++ does NOT
-    // implement the oncycle counter — see the `_slow` deferral note in
-    // docs/JS-PARITY-GAPS.md. Consequence: flush is delayed until all
-    // in-flight requests finalise. Latency gap only; final result matches.
-    if (inflight_ > 0) return;
+    // JS query.js:196-199 — enter the flush/retry path when either there is
+    // nothing in flight OR every remaining in-flight request is slow (has
+    // retried) and we already hold a full k-result set. The latter lets the
+    // commit start without waiting out the slow peers' full retry budgets.
+    const bool all_slow_and_full =
+        slow_ == inflight_ && closest_replies_.size() >= routing::K;
+    if (inflight_ > 0 && !all_slow_and_full) return;
 
     // JS query.js:200-205: once the frontier drains and everything in flight
     // has resolved, if we were running on caller-provided seeds and most of
@@ -254,14 +283,36 @@ void Query::visit(const PendingNode& node) {
     auto self = shared_from_this();
     auto captured_node = node;
 
+    // JS `_slow` bookkeeping (query.js:250-257,312-316): a per-request oncycle
+    // hook fires once — on the request's first retry cycle — marking it "slow".
+    // `cycled` mirrors JS `req.oncycle === noop`: set when the hook fired, and
+    // drives the matching `_slow--` when the request finally settles.
+    auto cycled = std::make_shared<bool>(false);
+    auto dec_slow = [self, cycled]() {
+        if (*cycled) self->slow_--;
+    };
+
+    // JS query.js:28-29,380 — query-walk requests retry `retries_` times
+    // (default 5 → 6 transmissions to a silent node) and register the oncycle
+    // hook. Both plumb through the RpcSocket's per-request request() overload.
     socket_.request(req,
-        [self, captured_node](const messages::Response& resp) {
+        /*timeout_override_ms=*/0, retries_,
+        [self, captured_node, dec_slow](const messages::Response& resp) {
             self->inflight_--;
+            dec_slow();
             self->on_visit_response(captured_node, resp);
         },
-        [self, captured_node](uint16_t) {
+        [self, captured_node, dec_slow](uint16_t) {
             self->inflight_--;
+            dec_slow();
             self->on_visit_timeout(captured_node);
+        },
+        [self, cycled](uint16_t) {  // oncycle — first retry marks the req slow
+            if (self->done_) return;
+            if (*cycled) return;    // fire once (JS resets req.oncycle to noop)
+            *cycled = true;
+            self->slow_++;
+            self->read_more();
         });
 }
 
@@ -281,6 +332,10 @@ void Query::on_visit_response(const PendingNode& node, const messages::Response&
     // Mark as done
     std::string key = node.addr.host_string() + ":" + std::to_string(node.addr.port);
     seen_[key] = NodeState::DONE;
+
+    // JS query.js:265 — a reply that lands after the commit phase has begun
+    // still marks the node DONE but does no further walk/push work.
+    if (committing_) return;
 
     // JS query.js:267-268 — error code 0 counts as a success, anything else
     // counts towards the error budget. The counters feed both the cold-start
@@ -325,13 +380,15 @@ void Query::on_visit_response(const PendingNode& node, const messages::Response&
 
     // Add closer nodes to pending. Compute the id from the address so we
     // can apply the filter, deduplicate correctly, and rank honestly in
-    // `closest_replies_`. Matches JS `query.js:273-280`.
+    // `closest_replies_`. Matches JS `query.js:273-280`. The responding node's
+    // address (node.addr = JS `m.from`) is recorded as the referrer so a later
+    // timeout on any of these can gossip a DOWN_HINT back to it.
     for (const auto& closer : resp.closer_nodes) {
         if (closer.port == 0) continue;  // H13: skip port 0 addresses
         auto closer_id = rpc::compute_peer_id(closer);
         // Skip if equal to our own id.
         if (closer_id == socket_.table().id()) continue;
-        add_pending(closer_id, closer);
+        add_pending(closer_id, closer, &node.addr);
     }
 
     // JS query.js:283-285 — once we have heard back from the initial cohort
@@ -340,26 +397,26 @@ void Query::on_visit_response(const PendingNode& node, const messages::Response&
         slowdown_ = false;
     }
 
-    // Notify caller. Set `dispatching_reply_` so that a `destroy()`
-    // call from inside this callback defers its on_done_ firing to
-    // after `read_more()` unwinds below. That keeps the completion
-    // hook off the same call stack as an in-progress visit — JS-style
-    // event-loop semantics without needing a timer.
-    if (on_reply_) {
+    // Notify caller. JS query.js:287-294 — error replies (m.error !== 0) are
+    // NOT surfaced to the consumer (map/push); they still contributed
+    // closerNodes + success/error bookkeeping above. Only success replies are
+    // dispatched. dispatching_reply_ defers a destroy()-from-on_reply so its
+    // on_done_ fires after read_more() unwinds.
+    if (is_success && on_reply_) {
         dispatching_reply_ = true;
         on_reply_(reply);
         dispatching_reply_ = false;
     }
 
-    // Continue iterating. read_more() checks `done_` and no-ops if
-    // destroy() ran during on_reply_.
+    // Continue iterating. read_more() checks `done_`/`committing_` and no-ops
+    // if destroy() ran during on_reply_.
     read_more();
 
-    // If destroy() was deferred from inside on_reply_, fire on_done_
-    // now that we're about to unwind past this frame.
+    // If destroy() was deferred from inside on_reply_, fire on_done_ now that
+    // we're about to unwind past this frame (destroy = success, error 0).
     if (pending_done_) {
         pending_done_ = false;
-        fire_done_once();
+        fire_done_once(QUERY_OK);
     }
 }
 
@@ -376,7 +433,19 @@ void Query::on_visit_timeout(const PendingNode& node) {
     if (done_) return;  // destroy()'d — suppress late timeouts
 
     std::string key = node.addr.host_string() + ":" + std::to_string(node.addr.port);
+
+    // JS query.js:302-305 — on REQUEST_TIMEOUT mark the node DOWN and gossip a
+    // DOWN_HINT to every node that referred us to it, so those referrers can
+    // re-check and evict the dead node. RpcSocket applies the per-tick rate
+    // limit (JS dht._downHintsRateLimit). A C++ RPC timeout is always the
+    // retry-exhausted case, i.e. JS's REQUEST_TIMEOUT.
     seen_[key] = NodeState::DOWN;
+    auto it = refs_.find(key);
+    if (it != refs_.end()) {
+        for (const auto& ref : it->second) {
+            socket_.try_send_down_hint(ref, node.addr);
+        }
+    }
 
     // JS query.js:308 — a timeout counts towards the error budget so the
     // <k/4-success table-retry path can trip when the cold cache was bad.
@@ -457,29 +526,35 @@ int Query::compare(const routing::NodeId& a, const routing::NodeId& b) const {
 //     .analysis/js/dht-rpc/lib/query.js:392-403 (autoCommit — the default
 //     commit fn: re-issues the original command with the per-reply token)
 //
-// C++ diffs from JS:
-//   - C++'s do_commit() hands a continuation callback to the caller's
-//     on_commit_, fires on_done_ when commit_inflight_ reaches zero. JS uses
-//     Promise.all over the per-reply commit promises and either push(null)s
-//     or destroy()s on failure.
-//   - JS treats "no nodes responded" (`!ps.length`) as a destroy error;
-//     C++ treats an empty closest set as success and fires on_done_ with
-//     an empty vector.
-//   - JS's commit only triggers when `this._commit !== null`. C++ behaves
-//     identically by guarding on `if (on_commit_)`.
+// C++ parity with JS (commit-1):
+//   - do_commit() hands a continuation callback to the caller's on_commit_ and
+//     fires on_done_ when commit_inflight_ reaches zero, mirroring JS's
+//     Promise.all over the per-reply commit promises.
+//   - An empty closest set OR all-failed commits report QUERY_ERR_TOO_FEW_NODES
+//     via on_done_'s error arg (JS destroy('Too few nodes responded')). A
+//     tokenless closest reply counts as a failed commit (JS autoCommit rejects).
+//   - A commit only triggers when on_commit_ is set (JS `_commit !== null`);
+//     otherwise a plain lookup/get ends with success.
 // ---------------------------------------------------------------------------
 
 void Query::maybe_finish() {
     if (done_ || committing_) return;
-    if (inflight_ > 0) return;
     if (!pending_.empty()) return;
+
+    // Mirror read_more's flush gate: proceed when nothing is in flight OR every
+    // remaining request is slow and we already hold a full k-result set.
+    const bool all_slow_and_full =
+        slow_ == inflight_ && closest_replies_.size() >= routing::K;
+    if (inflight_ > 0 && !all_slow_and_full) return;
 
     // Query iteration complete
     if (on_commit_) {
         do_commit();
     } else {
+        // JS query.js:215-218 — no commit fn ⇒ push(null): a plain lookup/get
+        // ends successfully regardless of how many nodes replied.
         done_ = true;
-        fire_done_once();
+        fire_done_once(QUERY_OK);
     }
 }
 
@@ -506,45 +581,63 @@ void Query::destroy() {
     if (dispatching_reply_) {
         pending_done_ = true;
     } else {
-        fire_done_once();
+        // destroy() is the "found what I wanted" / caller teardown path — a
+        // successful early exit (JS destroy() with no error). error = 0.
+        fire_done_once(QUERY_OK);
     }
 }
 
-void Query::fire_done_once() {
+void Query::fire_done_once(int error) {
     if (!pending_done_fired_ && on_done_) {
         pending_done_fired_ = true;
-        on_done_(closest_replies_);
+        on_done_(error, closest_replies_);
     }
 }
 
 void Query::do_commit() {
     committing_ = true;
-    commit_inflight_ = 0;
+    commit_success_ = 0;
 
+    // JS query.js:220-228 — `ps` is EVERY closest reply mapped through the
+    // commit fn. An empty closest set means no node responded → destroy the
+    // query with 'Too few nodes responded'.
     if (closest_replies_.empty()) {
         done_ = true;
-        fire_done_once();
+        fire_done_once(QUERY_ERR_TOO_FEW_NODES);
         return;
     }
 
+    // Pending counter covers the FULL closest set (not just tokened replies),
+    // and is set before dispatching any commit so a synchronously-settling
+    // commit (tokenless reply, or a store dropped by a full congestion queue)
+    // cannot drive it to zero before every commit is issued.
+    commit_inflight_ = static_cast<int>(closest_replies_.size());
+    auto self = shared_from_this();
+
+    // JS _endAfterCommit (query.js:238-247): succeed if ANY commit resolved,
+    // otherwise reject with the last error. Settles exactly once per commit —
+    // RpcSocket guarantees exactly one of on_response/on_timeout fires; the
+    // drop path (request() == 0) is turned into a timeout by the commit sender.
+    auto finish = [self](bool ok) {
+        if (ok) self->commit_success_++;
+        if (--self->commit_inflight_ == 0) {
+            self->done_ = true;
+            self->fire_done_once(self->commit_success_ > 0
+                                     ? QUERY_OK
+                                     : QUERY_ERR_TOO_FEW_NODES);
+        }
+    };
+
     for (const auto& reply : closest_replies_) {
-        if (!reply.token.has_value()) continue;
-
-        commit_inflight_++;
-        auto self = shared_from_this();
-        on_commit_(reply, [self](const messages::Response&) {
-            self->commit_inflight_--;
-            if (self->commit_inflight_ == 0) {
-                self->done_ = true;
-                self->fire_done_once();
-            }
-        });
-    }
-
-    // If no commits were sent (no tokens), finish immediately
-    if (commit_inflight_ == 0) {
-        done_ = true;
-        fire_done_once();
+        if (!reply.token.has_value()) {
+            // JS autoCommit (query.js:392-393): a tokenless closest reply
+            // rejects — a FAILED commit. on_commit_ can't run without a token.
+            finish(false);
+            continue;
+        }
+        on_commit_(reply,
+            [finish](const messages::Response&) { finish(true); },
+            [finish](uint16_t) { finish(false); });
     }
 }
 

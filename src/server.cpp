@@ -84,6 +84,7 @@
 
 #include "hyperdht/blind_relay.hpp"
 #include "hyperdht/dht.hpp"  // §16: Server reads validated_local_addresses() from HyperDHT
+#include "hyperdht/relay_upgrade.hpp"
 
 #include <sodium.h>
 
@@ -94,6 +95,16 @@
 // Context stored in rawStream->data during handshake→connection window
 struct RawStreamCtx {
     hyperdht::server::Server* server;
+};
+
+// Owns the relay control connection after a relay emit (JS PR #266, hazard 2).
+// Members are destroyed in reverse declaration order — client, then mux, then
+// duplex — which is the correct teardown order (client depends on mux, mux on
+// duplex). Handed to relay_upgrade::UpgradeContext via a RelayOwner.
+struct ServerRelayHold {
+    std::shared_ptr<hyperdht::secret_stream::SecretStreamDuplex> duplex;
+    std::shared_ptr<hyperdht::protomux::Mux> mux;
+    std::shared_ptr<hyperdht::blind_relay::BlindRelayClient> client;
 };
 
 // Firewall callback for pre-created rawStreams. Fires when the client's
@@ -819,10 +830,17 @@ void Server::on_handshake_result(
                         }
                     }
 
-                    // Clean up session BEFORE emitting connection —
-                    // prevents the session timer from destroying the stream
-                    // the caller is about to use.
-                    self->clear_session(hp_id);
+                    // JS PR #266 — DO NOT clear the session here. The relay
+                    // connection is emitted, but the holepunch must keep running
+                    // so a later direct nudge from the client can migrate this
+                    // live stream onto the direct path. JS keeps the handshake
+                    // state alive via `_clearLater`; our session timer already
+                    // re-arms to the punch_clear_wait backstop while a relay is
+                    // engaged, so the session (and puncher) is GC'd there — the
+                    // 2dfa977 semantics are preserved, we only stop the EARLY
+                    // clear. The emitted stream was already detached from the
+                    // session (raw_stream = nullptr above), so the backstop's
+                    // ~ServerConnection never touches it.
 
                     // Emit connection
                     // JS: server.js:670-672
@@ -831,7 +849,8 @@ void Server::on_handshake_result(
                     auto peer_addr = compact::Ipv4Address::from_string(
                         host, ntohs(relay_addr->sin_port));
 
-                    if (self->on_connection_) {
+                    if (self->on_connection_ ||
+                        !self->connection_listeners_.empty()) {
                         ConnectionInfo info;
                         info.tx_key = relay_hs_tx;
                         info.rx_key = relay_hs_rx;
@@ -843,7 +862,37 @@ void Server::on_handshake_result(
                         info.is_initiator = false;
                         info.raw_stream = relay_raw;
                         info.udx_socket = relay_socket;
-                        self->on_connection_(info);
+
+                        // Build the upgrade context that owns the relay control
+                        // connection (hazard 2) and will migrate this stream when
+                        // the client's direct nudge fires the Duplex firewall tap.
+                        if (relay_raw) {
+                            auto hold = std::make_shared<ServerRelayHold>();
+                            hold->duplex = relay_duplex;
+                            hold->mux    = relay_mux;
+                            hold->client = relay_client;
+                            relay_upgrade::RelayOwner owner;
+                            owner.refs = hold;
+                            owner.close = [hold]() {
+                                if (hold->duplex) hold->duplex->end();
+                            };
+                            owner.destroy = [hold]() {
+                                if (hold->duplex) hold->duplex->destroy(0);
+                            };
+                            auto upgrade =
+                                std::make_shared<relay_upgrade::UpgradeContext>(
+                                    relay_raw, relay_remote_udx_id, relay_socket);
+                            upgrade->set_relay_owner(std::move(owner));
+                            info.upgrade = upgrade;
+                            // Also store on the kept-alive session so the
+                            // puncher's on_connect migrates THIS stream
+                            // instead of emitting a second connection.
+                            auto cit2 = self->connections_.find(hp_id);
+                            if (cit2 != self->connections_.end() && cit2->second) {
+                                cit2->second->upgrade = upgrade;
+                            }
+                        }
+                        self->emit_connection(info);
                     }
                 },
                 [self, dht_ptr, weak_alive, hp_id](int err) {
@@ -888,7 +937,28 @@ void Server::on_handshake_result(
     // Per-session timeout (RAII) — JS: server.js:445-462 (_clearLater + _clear)
     auto session_timer = std::make_unique<async_utils::UvTimer>(socket_.loop());
     session_timer->start([this, hp_id]() {
-        if (!closed_) clear_session(hp_id);
+        if (closed_) return;
+        // Finding #1: a blind-relay pairing runs findPeer + handshake +
+        // pair on the relay node, which routinely exceeds handshake_clear_wait
+        // (10s). If this timer fires mid-pairing it would clear_session →
+        // ~ServerConnection destroys the raw_stream the pending relay
+        // callback still holds (relay_raw) → UAF / emit-of-destroyed-stream.
+        // Defer to the relay backstop; the relay success/fail callback owns
+        // the clear in that case (JS decouples _clear from rawStream
+        // destruction for the same reason). By punch_clear_wait the relay's
+        // own bounded timeouts (findPeer + RELAY_TIMEOUT) have resolved, so
+        // the deferred clear is a no-op on success and a clean destroy on
+        // fail. This changes only WHEN the clear runs, never WHO destroys.
+        if (session_relay_engaged(hp_id)) {
+            auto tit = session_timers_.find(hp_id);
+            if (tit != session_timers_.end()) {
+                tit->second->start([this, hp_id]() {
+                    if (!closed_) clear_session(hp_id);
+                }, punch_clear_wait);
+            }
+            return;
+        }
+        clear_session(hp_id);
     }, handshake_clear_wait);
     session_timers_[hp_id] = std::move(session_timer);
 
@@ -1070,7 +1140,14 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
         }
 
         if (!conn.puncher) {
-            conn.puncher = std::make_shared<holepunch::Holepuncher>(socket_.loop(), false);
+            // JS: hs.puncher = new Holepuncher(dht, ...) — wired to dht._socketPool
+            // (birthday sockets for RANDOM+CONSISTENT) and dht._randomPunches
+            // (throttle). Without the pool, a RANDOM-local server could never
+            // punch a CONSISTENT client (the symmetric-CGNAT-server case).
+            conn.puncher = std::make_shared<holepunch::Holepuncher>(
+                socket_.loop(), false,
+                dht_ ? dht_->socket_pool() : nullptr,
+                dht_ ? &dht_->punch_stats() : nullptr);
             auto weak = std::weak_ptr<bool>(alive_);  // H10: sentinel
             conn.puncher->set_send_fn([weak, this](const compact::Ipv4Address& addr) {
                 if (auto a = weak.lock(); !a || !*a) return;
@@ -1101,32 +1178,67 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
 
                 DHT_LOG("  [server] Puncher detected connection from %s:%u\n",
                         hp.address.host_string().c_str(), hp.address.port);
+
+                // JS PR #266: the connection was already emitted over the
+                // blind relay. Migrate that live stream onto the direct path
+                // instead of emitting a second connection (onsocket branch
+                // on rawStream.connected — server.js:305-342).
+                if (conn_ptr->upgrade) {
+                    struct sockaddr_in da{};
+                    da.sin_family = AF_INET;
+                    uv_ip4_addr(hp.address.host_string().c_str(),
+                                hp.address.port, &da);
+                    udx_socket_t* direct =
+                        hp.socket ? hp.socket : socket_.socket_handle();
+                    conn_ptr->upgrade->on_socket(
+                        direct, reinterpret_cast<const struct sockaddr*>(&da));
+                    return;
+                }
+                // Session kept alive past emit but the stream is gone
+                // (detached at relay emit, no upgrade) — nothing to emit.
+                if (!conn_ptr->raw_stream) return;
+
                 on_socket(*conn_ptr, hp.address, hp.socket);
             });
 
-            // Wire puncher→abort so a FAILED punch clears its session as
-            // soon as the probe schedule exhausts, instead of lingering
-            // until punch_clear_wait (45s). Without this, every failed
-            // punch on symmetric CGNAT sits for 45s; during a client
-            // reconnect storm the dead sessions pile up, hit
-            // MAX_PENDING_HANDSHAKES (256, ~line 583), and the server then
-            // silently drops new handshakes with no reply — the client
-            // sees -3 "all relay handshakes failed" and can't recover.
-            // JS relies on puncher.onabort for exactly this cleanup.
+            // Wire puncher→abort so a FAILED punch clears its session,
+            // bounding the dead-session pileup that hits
+            // MAX_PENDING_HANDSHAKES (256) during a symmetric-CGNAT
+            // reconnect storm (the original 2dfa977 motivation).
+            //
+            // BUT the clear must not be immediate. JS onabort
+            // (server.js:401-412) never erases the session directly: it
+            // destroys the raw stream and the session is GC'd via the
+            // stream's close → _clearLater → handshakeClearWait (10s).
+            // That 10s post-schedule window is the landing pad for a
+            // client that is still punching after the server's own probe
+            // schedule ended (CGNAT clients retry rounds late; findPeer
+            // alone can take 20s+). Clearing at +1ms starved those late
+            // rounds — on_peer_holepunch drops unknown sessions silently
+            // — so a symmetric-CGNAT client could only connect after a
+            // fresh handshake cycle (regression 2dfa977, fixed here).
+            //
+            // JS also skips the teardown entirely while a relay is
+            // engaged (hs.relayToken !== null): the blind-relay pairing
+            // may still complete after the puncher gives up. Mirror that
+            // with the relay_token check; the punch_clear_wait (45s)
+            // backstop timer still owns that case.
             //
             // Reentrancy: on_abort fires from inside Holepuncher::destroy()
             // (driven by the punch timer). Clearing the session here would
             // erase the ServerConnection that owns this puncher, destroying
-            // it inside its own callback (UAF). Defer by re-arming the
-            // session timer to run clear_session on the next tick — the
-            // same proven-safe path the timeout already uses.
+            // it inside its own callback (UAF). Defer via the session
+            // timer — the same proven-safe path the timeout already uses.
             conn.puncher->on_abort([this, session_id]() {
                 if (closed_) return;
+                // Relay pairing in flight — leave the session to the relay
+                // completion / 45s backstop (JS: relayToken gate).
+                if (session_relay_engaged(session_id)) return;
                 auto tit = session_timers_.find(session_id);
                 if (tit != session_timers_.end()) {
                     tit->second->start([this, session_id]() {
                         if (!closed_) clear_session(session_id);
-                    }, 1);
+                    }, handshake_clear_wait);
                 }
             });
         }
@@ -1181,7 +1293,7 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
 void Server::on_socket(server_connection::ServerConnection& conn,
                        const compact::Ipv4Address& peer_addr,
                        udx_socket_t* udx_sock) {
-    if (!on_connection_) return;
+    if (!on_connection_ && connection_listeners_.empty()) return;
 
     ConnectionInfo info;
     info.tx_key = conn.tx_key;
@@ -1214,7 +1326,7 @@ void Server::on_socket(server_connection::ServerConnection& conn,
             to_hex(conn.remote_public_key.data(), 8).c_str(),
             info.local_udx_id, info.remote_udx_id);
 
-    on_connection_(info);
+    emit_connection(info);
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,6 +1334,14 @@ void Server::on_socket(server_connection::ServerConnection& conn,
 //
 // JS: .analysis/js/hyperdht/lib/server.js:450-462 (_clear)
 // ---------------------------------------------------------------------------
+
+bool Server::session_relay_engaged(uint32_t hp_id) const {
+    auto it = connections_.find(hp_id);
+    if (it == connections_.end() || !it->second) return false;
+    const auto& tok = it->second->relay_token;
+    return std::any_of(tok.begin(), tok.end(),
+                       [](uint8_t b) { return b != 0; });
+}
 
 void Server::clear_session(uint32_t hp_id) {
     auto it = connections_.find(hp_id);

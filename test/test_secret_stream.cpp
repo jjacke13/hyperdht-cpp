@@ -362,7 +362,19 @@ TEST(SecretStreamTimeout, FiresOnInactivity) {
 
     EXPECT_EQ(ss_r->timeout(), 50u);
 
-    // Run loop — timeout should fire after ~50ms
+    // The timeout timer is uv_unref'd (JS parity — the stream's UDX socket
+    // is what keeps the loop alive, not the bookkeeping timer). This unit
+    // test has no real socket, so add a ref'd keeper handle to model that
+    // liveness; without it UV_RUN_DEFAULT would exit before the unref'd
+    // timeout fires.
+    uv_timer_t keeper;
+    uv_timer_init(&loop, &keeper);
+    uv_timer_start(&keeper, [](uv_timer_t* t) {
+        uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
+    }, 200, 0);
+
+    // Run loop — timeout should fire after ~50ms (keeper holds the loop
+    // open until 200ms, then closes itself).
     uv_run(&loop, UV_RUN_DEFAULT);
 
     EXPECT_TRUE(timed_out);

@@ -57,6 +57,14 @@ struct ConnectionInfo {
     bool is_initiator = false;       // Server is always responder
     udx_stream_t* raw_stream = nullptr;  // Pre-created during handshake (like JS rawStream)
     udx_socket_t* udx_socket = nullptr; // Socket that received the probe (JS: ref.socket)
+
+    // Relay→direct upgrade handle (JS PR #266). Set only on the blind-relay
+    // emit path; carries the relay control connection + confirmDirectUpgrade
+    // state machine (relay_upgrade::UpgradeContext, opaque). The consumer plumbs
+    // it into the emitted stream's Duplex via relay_upgrade::attach_to_duplex()
+    // so the client's direct nudge migrates this live stream onto the direct
+    // path. Empty on the holepunch / direct emit paths.
+    std::shared_ptr<void> upgrade;
 };
 
 // ---------------------------------------------------------------------------
@@ -124,6 +132,23 @@ public:
     // A later listen() / close()+listen() cycle re-arms the hook.
     using OnListeningCb = std::function<void()>;
     void on_listening(OnListeningCb cb) { on_listening_cb_ = std::move(cb); }
+
+    // Add an ADDITIONAL connection listener without disturbing the user's own
+    // on_connection callback (set via listen()). Every listener plus the
+    // primary callback receive each established connection. Used by
+    // ConnectionPool::attach_server() to observe connections alongside the
+    // user (JS pools listen on the server's 'connection' event — the user's
+    // own listener still fires). Listeners persist across close()/listen().
+    void add_connection_listener(OnConnectionCb cb) {
+        connection_listeners_.push_back(std::move(cb));
+    }
+
+    // Test hook: fire the connection fan-out (user callback + listeners)
+    // without driving a full handshake/holepunch. Mirrors
+    // HyperDHT::fire_network_change_for_test.
+    void emit_connection_for_test(const ConnectionInfo& info) {
+        emit_connection(info);
+    }
 
     // Stop listening: stop announcer, remove from router, clean up
     // connections.
@@ -248,10 +273,22 @@ private:
     std::array<uint8_t, 32> target_{};
     std::unique_ptr<announcer::Announcer> announcer_;
     OnConnectionCb on_connection_;
+    // Additional connection observers (e.g. ConnectionPool). Fired alongside
+    // on_connection_ via emit_connection(); never replaces it.
+    std::vector<OnConnectionCb> connection_listeners_;
     FirewallCb firewall_;
     AsyncFirewallCb firewall_async_;
     HolepunchCb holepunch_cb_;
     OnListeningCb on_listening_cb_;
+
+    // Deliver an established connection to the user's callback AND every
+    // registered listener. Single funnel for both emit sites.
+    void emit_connection(const ConnectionInfo& info) {
+        if (on_connection_) on_connection_(info);
+        for (auto& l : connection_listeners_) {
+            if (l) l(info);
+        }
+    }
 
     bool listening_ = false;
     bool closed_ = false;
@@ -298,6 +335,14 @@ private:
     // Per-session cleanup — uses configurable handshake_clear_wait
     std::unordered_map<uint32_t, std::unique_ptr<async_utils::UvTimer>> session_timers_;
     void clear_session(uint32_t hp_id);
+
+    // True while a session's blind-relay pairing is still in flight
+    // (relay_token set, connection present). While engaged, session
+    // teardown must be deferred to the relay callback so ~ServerConnection
+    // doesn't destroy the raw_stream the pending relay still holds. JS
+    // gates the equivalent teardown on `hs.relayToken !== null`
+    // (server.js onabort / _clear). See docs/RELAY-UPGRADE-PORT.md.
+    bool session_relay_engaged(uint32_t hp_id) const;
 
     // Router callbacks
     void on_peer_handshake(const std::vector<uint8_t>& noise,

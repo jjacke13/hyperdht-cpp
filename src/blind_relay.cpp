@@ -95,27 +95,31 @@ std::vector<uint8_t> encode_pair(const PairMessage& m) {
     return buf;
 }
 
-PairMessage decode_pair(const uint8_t* data, size_t len) {
+// Returns std::nullopt on truncation. JS m.pair.decode reads flags + fixed32
+// token + uint id + uint seq; compact-encoding throws (→ protomux teardown) if
+// any field underflows. We require all four to be present.
+std::optional<PairMessage> decode_pair(const uint8_t* data, size_t len) {
     PairMessage m;
     const uint8_t* ptr = data;
     const uint8_t* end = data + len;
 
-    if (ptr >= end) return m;
-
     // Flags
+    if (ptr >= end) return std::nullopt;
     uint8_t flags = *ptr++;
     m.is_initiator = (flags & 1) != 0;
 
-    // Token
-    if (ptr + 32 > end) return m;
+    // Token (fixed 32 bytes)
+    if (end - ptr < 32) return std::nullopt;
     std::memcpy(m.token.data(), ptr, 32);
     ptr += 32;
 
-    // ID
-    if (ptr < end) m.id = static_cast<uint32_t>(varint_decode(ptr, end));
+    // ID (varint must be present)
+    if (ptr >= end) return std::nullopt;
+    m.id = static_cast<uint32_t>(varint_decode(ptr, end));
 
-    // Seq
-    if (ptr < end) m.seq = static_cast<uint32_t>(varint_decode(ptr, end));
+    // Seq (varint must be present)
+    if (ptr >= end) return std::nullopt;
+    m.seq = static_cast<uint32_t>(varint_decode(ptr, end));
 
     return m;
 }
@@ -135,20 +139,20 @@ std::vector<uint8_t> encode_unpair(const UnpairMessage& m) {
     return buf;
 }
 
-UnpairMessage decode_unpair(const uint8_t* data, size_t len) {
+// Returns std::nullopt on truncation. JS m.unpair.decode reads flags + fixed32
+// token; a short buffer throws (→ protomux teardown).
+std::optional<UnpairMessage> decode_unpair(const uint8_t* data, size_t len) {
     UnpairMessage m;
     const uint8_t* ptr = data;
     const uint8_t* end = data + len;
 
-    if (ptr >= end) return m;
-
-    // Skip flags
+    // Flags
+    if (ptr >= end) return std::nullopt;
     ptr++;
 
-    // Token
-    if (ptr + 32 <= end) {
-        std::memcpy(m.token.data(), ptr, 32);
-    }
+    // Token (fixed 32 bytes)
+    if (end - ptr < 32) return std::nullopt;
+    std::memcpy(m.token.data(), ptr, 32);
 
     return m;
 }
@@ -173,12 +177,11 @@ BlindRelayClient::BlindRelayClient(protomux::Channel* channel)
         }
     });
 
-    unpair_msg_type_ = channel_->add_message({
-        [this, weak_alive](const uint8_t* data, size_t len) {
-            if (weak_alive.expired()) return;
-            on_unpair_response(data, len);
-        }
-    });
+    // JS index.js:319-321 — the client registers the unpair message with NO
+    // onmessage: inbound unpair is ignored (the type exists only for sending).
+    // We register an empty handler to keep the wire message index (1) stable;
+    // Channel::dispatch skips handlers whose on_message is empty.
+    unpair_msg_type_ = channel_->add_message({});
 
     // Set up channel lifecycle callbacks
     channel_->on_close = [this, weak_alive]() {
@@ -282,7 +285,13 @@ void BlindRelayClient::destroy() {
 
 // JS: client._onpair(msg) — relay responds with our assigned stream ID
 void BlindRelayClient::on_pair_response(const uint8_t* data, size_t len) {
-    auto msg = decode_pair(data, len);
+    auto decoded = decode_pair(data, len);
+    if (!decoded) {
+        // Malformed message. JS: the decode throw tears the connection down.
+        channel_->close();
+        return;
+    }
+    const auto& msg = *decoded;
     auto key = token_hex(msg.token);
 
     auto it = requests_.find(key);
@@ -304,20 +313,6 @@ void BlindRelayClient::on_pair_response(const uint8_t* data, size_t len) {
     if (on_paired) on_paired(msg.id);
 }
 
-// JS: client._onunpair(msg)
-void BlindRelayClient::on_unpair_response(const uint8_t* data, size_t len) {
-    auto msg = decode_unpair(data, len);
-    auto key = token_hex(msg.token);
-
-    auto it = requests_.find(key);
-    if (it == requests_.end()) return;
-
-    auto req = std::move(it->second);
-    requests_.erase(it);
-
-    if (req.on_error) req.on_error(RelayError::PAIRING_CANCELLED);  // PAIRING_CANCELLED
-}
-
 // ---------------------------------------------------------------------------
 // BlindRelayServer
 // ---------------------------------------------------------------------------
@@ -326,11 +321,18 @@ BlindRelayServer::BlindRelayServer(CreateStreamFn create_stream)
     : create_stream_fn(std::move(create_stream)) {}
 
 BlindRelayServer::~BlindRelayServer() {
-    close();
+    // Hard destroy: drop every session immediately. ~BlindRelaySession resets
+    // its alive_ sentinel first, so relay stream close callbacks become no-ops
+    // and cannot re-enter a half-destroyed session or the server.
+    sessions_.clear();
+    zombies_.clear();
+    pairings_.clear();
 }
 
 BlindRelaySession* BlindRelayServer::accept(protomux::Mux* mux,
                                              const std::vector<uint8_t>& channel_id) {
+    reap_zombies();  // safe point — no session method on the stack
+
     auto* channel = mux->create_channel(PROTOCOL_NAME, channel_id, false);
     if (!channel) return nullptr;
 
@@ -341,12 +343,48 @@ BlindRelaySession* BlindRelayServer::accept(protomux::Mux* mux,
     return ptr;
 }
 
+// JS index.js:36-46 — graceful: end() every session and let each drain via its
+// pending_close_/endMaybe machinery; clear pairings once they're all gone.
 void BlindRelayServer::close() {
-    for (auto& session : sessions_) {
-        session->close();
+    reap_zombies();
+    closing_ = true;
+
+    if (sessions_.empty()) {
+        pairings_.clear();
+        auto cb = on_closed;
+        if (cb) cb();
+        return;
     }
-    sessions_.clear();
-    pairings_.clear();
+
+    // Snapshot raw pointers: a synchronously-draining session self-removes via
+    // notify_session_closed (mutating sessions_), so we cannot iterate it live.
+    std::vector<BlindRelaySession*> snapshot;
+    snapshot.reserve(sessions_.size());
+    for (auto& s : sessions_) snapshot.push_back(s.get());
+    for (auto* s : snapshot) s->close();
+
+    // Sessions with no in-flight pairing have drained and removed themselves;
+    // any left have in-flight pairings and drain later. When the last one goes,
+    // notify_session_closed() clears pairings_ and fires on_closed.
+}
+
+void BlindRelayServer::notify_session_closed(BlindRelaySession* session) {
+    for (auto it = sessions_.begin(); it != sessions_.end(); ++it) {
+        if (it->get() == session) {
+            // Move (do not free) the owning unique_ptr aside — the session is
+            // often still on the call stack here. reap_zombies() frees it at a
+            // later safe point.
+            zombies_.push_back(std::move(*it));
+            sessions_.erase(it);
+            break;
+        }
+    }
+
+    if (closing_ && sessions_.empty()) {
+        pairings_.clear();
+        auto cb = on_closed;
+        if (cb) cb();
+    }
 }
 
 BlindRelayServer::RelayPair& BlindRelayServer::get_or_create_pair(const Token& token) {
@@ -411,14 +449,32 @@ BlindRelaySession::BlindRelaySession(BlindRelayServer& server,
         for (const auto& key : pairing_tokens_) {
             server_.remove_pair_by_key(key);
         }
-        // Destroy all active streams
-        for (auto& [key, stream] : streams_) {
+        pairing_tokens_.clear();
+        // Destroy all active relay streams. Move the map aside first: a destroy
+        // can synchronously fire relay_stream_close_cb → on_stream_closed(key),
+        // which erases from streams_ — mutating a map we'd otherwise iterate.
+        auto streams = std::move(streams_);
+        streams_.clear();
+        for (auto& [key, stream] : streams) {
             if (stream) {
                 udx_stream_destroy(stream);
             }
         }
-        pairing_tokens_.clear();
-        streams_.clear();
+        // The channel is closing — it must never be touched again (the Mux
+        // frees it after this returns). Null it BEFORE notify_session_closed
+        // so neither the zombie-reap path nor ~BlindRelaySession dereferences
+        // a dangling Channel* (ASAN heap-UAF, found 2026-07-11).
+        channel_ = nullptr;
+        // Remove ourselves from the server (JS _onclose: _sessions.delete(this)).
+        server_.notify_session_closed(this);
+    };
+
+    // Destroy-without-close path (Mux teardown): same dangling-pointer
+    // protection as the client session's on_destroy (see ctor above).
+    channel_->on_destroy = [this, weak_alive]() {
+        if (weak_alive.expired()) return;
+        destroyed_ = true;
+        channel_ = nullptr;
     };
 }
 
@@ -464,21 +520,28 @@ void BlindRelaySession::destroy() {
 void BlindRelaySession::on_pair(const uint8_t* data, size_t len) {
     if (closed_) return;
 
-    auto msg = decode_pair(data, len);
+    auto decoded = decode_pair(data, len);
+    if (!decoded) {
+        // Malformed message. JS: the compact-encoding decode throws, which
+        // propagates through protomux and tears the connection down. Mirror it.
+        channel_->close();
+        return;
+    }
+    const auto& msg = *decoded;
     auto key = token_hex(msg.token);
 
     DHT_LOG("  [blind-relay-session] Pair request: initiator=%d, token=%s, id=%u\n",
             msg.is_initiator, key.substr(0, 8).c_str(), msg.id);
 
-    // H25: reject if too many unpaired entries to prevent DoS
+    // H25: anti-DoS cap on unpaired entries (JS blind-relay has no cap).
     constexpr size_t MAX_PAIRINGS = 1024;
     if (server_.pairing_count() >= MAX_PAIRINGS) {
-        auto existing_key = token_hex(msg.token);
-        if (!server_.has_pair(existing_key)) return;
+        if (!server_.has_pair(key)) return;
     }
     auto& pair = server_.get_or_create_pair(msg.token);
 
     // Check if this initiator slot is already taken
+    // JS index.js:145 — `else if (pair.links[+isInitiator]) return`
     if (pair.has(msg.is_initiator)) {
         DHT_LOG("  [blind-relay-session] Duplicate initiator=%d for token, ignoring\n",
                 msg.is_initiator);
@@ -501,27 +564,39 @@ void BlindRelaySession::on_pair(const uint8_t* data, size_t len) {
 
     DHT_LOG("  [blind-relay-session] Both sides arrived, setting up relay\n");
 
-    // Remove from server pairings (no longer needed for matching)
-    // We take a copy since remove_pair invalidates the reference
+    // Remove from server pairings (no longer needed for matching).
+    // Copy BEFORE remove — remove_pair invalidates the `pair` reference.
     auto pair_copy = pair;
     server_.remove_pair(pair_copy.token);
 
-    // Pass 1: Create relay streams
-    // JS: blind-relay/index.js:155-158
+    // Pass 1 (JS index.js:155-158 + BlindRelayLink.createStream/_onfirewall):
+    // create the relay stream for each link and install the firewall so the
+    // relay learns each peer's UDP source on the first inbound packet.
     for (auto& link : pair_copy.links) {
-        if (!server_.create_stream_fn) {
-            DHT_LOG("  [blind-relay-session] No create_stream_fn!\n");
+        if (!link.session || !server_.create_stream_fn) {
+            for (auto& l : pair_copy.links) {
+                if (l.stream) udx_stream_destroy(l.stream);
+            }
+            DHT_LOG("  [blind-relay-session] No session/create_stream_fn!\n");
             return;
         }
-        link.stream = server_.create_stream_fn();
+        auto* ctx = new RelayStreamCtx{link.session->alive_, link.session,
+                                       key, link.remote_id};
+        link.stream = server_.create_stream_fn(&relay_stream_close_cb, ctx);
         if (!link.stream) {
+            delete ctx;  // factory failed before taking ownership of ctx
+            for (auto& l : pair_copy.links) {
+                if (l.stream) udx_stream_destroy(l.stream);
+            }
             DHT_LOG("  [blind-relay-session] Failed to create relay stream\n");
             return;
         }
+        udx_stream_firewall(link.stream, &relay_firewall_cb);
     }
 
-    // Pass 2: Wire bidirectional relay via udx_stream_relay_to()
-    // JS: blind-relay/index.js:160-171 — stream.relayTo(remote.stream)
+    // Pass 2 (JS index.js:160-171): wire bidirectional relay and move each link
+    // from pending-pairing to active-streams. (Close/error handlers were wired
+    // at stream creation via the udx close callback — see finding blind-relay-4.)
     auto* stream_a = pair_copy.links[0].stream;
     auto* stream_b = pair_copy.links[1].stream;
 
@@ -536,22 +611,20 @@ void BlindRelaySession::on_pair(const uint8_t* data, size_t len) {
         return;
     }
 
-    // Track streams in both sessions and check for deferred close
     for (auto& link : pair_copy.links) {
-        if (link.session) {
-            link.session->pairing_tokens_.erase(key);
-            link.session->streams_[key] = link.stream;
-            // JS: session._endMaybe() — close channel when all pairings complete
-            if (link.session->pending_close_ && link.session->pairing_tokens_.empty()) {
-                link.session->channel_->close();
-            }
-        }
+        if (!link.session) continue;
+        link.session->pairing_tokens_.erase(key);
+        link.session->streams_[key] = link.stream;
     }
 
-    // Pass 3: Send pair confirmations back to both peers
-    // JS: blind-relay/index.js:173-185
+    // Pass 3 (JS index.js:173-185): per link — SEND the confirmation, THEN
+    // end-maybe (close the channel if end() was requested), THEN emit. The send
+    // must precede the close or the confirmation is dropped on a closed channel
+    // (finding blind-relay-2). The closed_ guard covers the degenerate case
+    // where both links belong to the same session (a sibling may have closed
+    // it, freeing channel_).
     for (auto& link : pair_copy.links) {
-        if (!link.session || !link.stream) continue;
+        if (!link.session || !link.stream || link.session->closed_) continue;
 
         PairMessage response;
         response.is_initiator = link.is_initiator;
@@ -567,7 +640,13 @@ void BlindRelaySession::on_pair(const uint8_t* data, size_t len) {
                 "initiator=%d, relay_stream_id=%u, peer_id=%u\n",
                 link.is_initiator, link.stream->local_id, link.remote_id);
 
-        // Emit pair event
+        // JS session._endMaybe(): now that this session's pairing completed,
+        // close its channel if end() was requested. AFTER the send above.
+        if (link.session->pending_close_ && link.session->pairing_tokens_.empty()) {
+            link.session->channel_->close();  // may free channel_; don't touch it below
+        }
+
+        // Emit pair event (JS emits after endMaybe).
         if (link.session->on_pair_event) {
             link.session->on_pair_event(
                 link.is_initiator, pair_copy.token,
@@ -576,12 +655,19 @@ void BlindRelaySession::on_pair(const uint8_t* data, size_t len) {
     }
 }
 
-// JS: session._onunpair(msg)
+// JS: session._onunpair(msg) — index.js:188-211
 void BlindRelaySession::on_unpair(const uint8_t* data, size_t len) {
-    auto msg = decode_unpair(data, len);
+    auto decoded = decode_unpair(data, len);
+    if (!decoded) {
+        // Malformed — mirror the JS decode-throw teardown.
+        channel_->close();
+        return;
+    }
+    const auto& msg = *decoded;
     auto key = token_hex(msg.token);
 
-    // Remove from pairing (if still pending)
+    // Cancel a still-pending pairing (JS index.js:191-199) and return, matching
+    // JS. Returning also avoids touching channel_ after a possible close().
     if (pairing_tokens_.count(key)) {
         pairing_tokens_.erase(key);
         server_.remove_pair(msg.token);
@@ -589,18 +675,60 @@ void BlindRelaySession::on_unpair(const uint8_t* data, size_t len) {
         if (pending_close_ && pairing_tokens_.empty()) {
             channel_->close();
         }
+        DHT_LOG("  [blind-relay-session] Unpair (pending): token=%s\n",
+                key.substr(0, 8).c_str());
+        return;
     }
 
-    // Destroy active stream (if already paired)
+    // Destroy an active relay stream (JS index.js:201-210). Erase from streams_
+    // BEFORE destroy: destroy can synchronously fire relay_stream_close_cb →
+    // on_stream_closed(key), which would invalidate an iterator we still hold.
     auto it = streams_.find(key);
     if (it != streams_.end()) {
-        if (it->second) {
-            udx_stream_destroy(it->second);
-        }
+        auto* stream = it->second;
         streams_.erase(it);
+        if (stream) {
+            udx_stream_destroy(stream);
+        }
     }
 
     DHT_LOG("  [blind-relay-session] Unpair: token=%s\n", key.substr(0, 8).c_str());
+}
+
+// JS: stream.on('close', () => session._streams.delete(keyString)) (index.js:166)
+void BlindRelaySession::on_stream_closed(const std::string& key) {
+    streams_.erase(key);
+}
+
+// ---------------------------------------------------------------------------
+// Relay stream udx callbacks (JS BlindRelayLink._onfirewall + stream handlers)
+// ---------------------------------------------------------------------------
+
+// JS BlindRelayLink._onfirewall (index.js:276-280): on the first inbound packet
+// from an unknown remote, connect the relay stream to that source using the
+// peer's stream id, then accept the packet so it is relayed.
+int relay_firewall_cb(udx_stream_t* stream, udx_socket_t* socket,
+                      const struct sockaddr* from) {
+    auto* ctx = static_cast<RelayStreamCtx*>(stream->data);
+    if (ctx) {
+        udx_stream_connect(stream, socket, ctx->remote_id, from);
+    }
+    // libudx: non-zero return DROPS the packet, zero ACCEPTS it (relays it).
+    // JS returns false → accept. Return 0.
+    return 0;
+}
+
+// JS stream 'close'/'error' handlers (index.js:164-167). udx folds errors into
+// close(status), so this single callback covers both. Drops the stream from its
+// session's map and frees the per-stream context.
+void relay_stream_close_cb(udx_stream_t* stream, int /*status*/) {
+    auto* ctx = static_cast<RelayStreamCtx*>(stream->data);
+    if (!ctx) return;
+    if (!ctx->session_alive.expired() && ctx->session) {
+        ctx->session->on_stream_closed(ctx->key);
+    }
+    stream->data = nullptr;
+    delete ctx;
 }
 
 }  // namespace blind_relay

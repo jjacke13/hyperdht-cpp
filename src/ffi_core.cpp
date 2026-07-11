@@ -94,7 +94,14 @@ hyperdht_t* hyperdht_create(uv_loop_t* loop, const hyperdht_opts_t* opts) {
     hyperdht::DhtOptions cpp_opts;
     if (opts) {
         cpp_opts.port = opts->port;
-        cpp_opts.ephemeral = (opts->ephemeral != 0);
+        // C API only expresses two states: the default (ephemeral != 0) maps to
+        // JS "unset" → adaptive (start ephemeral, transition to persistent once
+        // the firewall probe confirms reachability); ephemeral == 0 maps to JS
+        // `ephemeral: false` → forced-persistent (non-adaptive). Leaving the
+        // C++ optional unset in the default case preserves the adaptive path.
+        if (opts->ephemeral == 0) {
+            cpp_opts.ephemeral = false;
+        }
 
         // Bootstrap precedence: explicit `nodes[]` wins; otherwise
         // `use_public_bootstrap` seeds the canonical 3-node list.
@@ -325,8 +332,8 @@ int hyperdht_connect_and_open_stream(
                             result.local_udx_id, true);
             conn.raw_stream = result.raw_stream;
             conn.udx_socket = result.udx_socket;
-            conn._internal = result.socket_keepalive
-                ? new std::shared_ptr<void>(result.socket_keepalive)
+            conn._internal = (result.socket_keepalive || result.upgrade)
+                ? new FfiConnExtra{result.socket_keepalive, result.upgrade}
                 : nullptr;
 
             // Open stream NOW — conn is still alive on the stack
@@ -334,7 +341,7 @@ int hyperdht_connect_and_open_stream(
                 dht, &conn, on_open, on_data, on_close, userdata);
 
             if (conn._internal) {
-                delete static_cast<std::shared_ptr<void>*>(conn._internal);
+                delete static_cast<FfiConnExtra*>(conn._internal);
             }
 
             on_connect(stream ? 0 : -1, stream, userdata);

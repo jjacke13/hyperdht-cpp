@@ -101,6 +101,13 @@ private:
     // Build a response with closer nodes to the target
     messages::Response make_query_response(const messages::Request& req);
 
+    // Reply with error=UNKNOWN_COMMAND for an unrecognized command (or a
+    // storage command received while ephemeral). Mirrors JS dht-rpc
+    // `req.sendReply(UNKNOWN_COMMAND, null, false, req.target !== null)`
+    // (index.js:679,685): no token, closerNodes only when the request
+    // carried a target, id only when persistent + on the server socket.
+    void send_unknown_command_reply(const messages::Request& req);
+
     // Mutable/immutable storage — LRU caches. Max entries split in half
     // between the two caches to match JS `hyperdht/index.js:610-615`.
     static constexpr uint64_t GC_INTERVAL_MS = 60000;  // 1 minute
@@ -110,6 +117,22 @@ private:
     LruCache<std::string, std::vector<uint8_t>> mutables_;
     LruCache<std::string, std::vector<uint8_t>> immutables_;
     uv_timer_t* gc_timer_ = nullptr;
+
+    // Per-target relay-port "bump" values (JS persistent.js `this.bumps`,
+    // a maxAge Cache). Fed by handle_announce's gate, returned by
+    // handle_lookup. `created_at` is uv_now (monotonic) for GC only — the
+    // drift gate uses wall-clock, matching JS `Date.now()`.
+    struct BumpEntry {
+        uint64_t value = 0;
+        uint64_t created_at = 0;  // uv_now ms, for GC
+    };
+    std::unordered_map<announce::TargetKey, BumpEntry, announce::KeyHash> bumps_;
+    static constexpr uint64_t MAX_BUMP_DRIFT_MS = 60000;  // JS persistent.js:14
+
+    uint64_t bump_for(const announce::TargetKey& target) const {
+        auto it = bumps_.find(target);
+        return it == bumps_.end() ? 0 : it->second.value;
+    }
 
     // DELAYED_PING pending replies: one heap-allocated struct per scheduled reply.
     // Timer is embedded; on fire we send the reply and uv_close the timer (the close

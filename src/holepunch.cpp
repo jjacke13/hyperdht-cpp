@@ -79,6 +79,34 @@ using compact::Ipv4Addr;
 using compact::Ipv4Address;
 using compact::Array;
 
+namespace {
+// Send a 1-byte holepunch probe (0x00) from a SPECIFIC udx socket with a TTL.
+// JS: holepunch(socket, addr, lowTTL) — socket.send([0], port, host,
+//     lowTTL ? HOLEPUNCH_TTL : DEFAULT_TTL) (holepuncher.js:325-327). The
+//     birthday-paradox strategy relies on each of the 256 holder sockets
+//     punching its OWN NAT hole, so egress MUST come from holders_[i]->socket()
+//     — not one shared pool socket. libudx restores the socket's default TTL
+//     after a specific-TTL send (udx.c:2084-2090), so no manual restore.
+void send_probe_from_socket(udx_socket_t* socket,
+                            const compact::Ipv4Address& to, int ttl) {
+    if (!socket) return;
+    struct SendCtx {
+        udx_socket_send_t req{};
+        uint8_t buf = 0x00;
+    };
+    auto* ctx = new SendCtx;
+    ctx->req.data = ctx;
+    uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(&ctx->buf), 1);
+    struct sockaddr_in dest{};
+    uv_ip4_addr(to.host_string().c_str(), to.port, &dest);
+    udx_socket_send_ttl(&ctx->req, socket, &uv_buf, 1,
+                        reinterpret_cast<const struct sockaddr*>(&dest), ttl,
+                        [](udx_socket_send_t* r, int) {
+                            delete static_cast<SendCtx*>(r->data);
+                        });
+}
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // SecurePayload — XSalsa20-Poly1305 envelope for the holepunch payload,
 // keyed by `holepunchSecret = BLAKE2b(NS_PEER_HOLEPUNCH, handshake_hash)`.
@@ -324,14 +352,30 @@ bool Holepuncher::punch() {
 
     if (connected_) return true;
 
-    // Determine strategy based on firewall combo.
-    // Treat UNKNOWN as CONSISTENT — we don't know our NAT type yet, but
-    // the standard 10-round probe is the safest default.
-    bool local_consistent = (local_firewall_ != FIREWALL_RANDOM);
-    bool remote_consistent = (remote_firewall_ != FIREWALL_RANDOM);
+    // JS: holepuncher.js:161-164 — `if (!this._punching) this._punching =
+    // this._punch()`. punch() is called once per incoming punching round
+    // (server.cpp on_peer_holepunch); without this guard every round
+    // resets punch_round_ / the random budget, so the schedule never
+    // exhausts and on_abort never fires — sessions then linger until the
+    // 45s backstop instead of clearing at schedule end + grace.
+    if (punching_) return true;
 
-    if (local_consistent && remote_consistent) {
-        // CONSISTENT+CONSISTENT or OPEN+CONSISTENT: 10 rounds, 1s apart
+    // JS coerceFirewall (holepuncher.js:333-335): OPEN→CONSISTENT, everything
+    // else unchanged. UNKNOWN(0) stays UNKNOWN — it matches NO punchable branch
+    // (JS requires `local === CONSISTENT` in every branch, holepuncher.js:188,
+    // 196, 203), so punch() returns false. The old code coerced UNKNOWN into
+    // CONSISTENT and punched blindly — reachable on the server (server.cpp calls
+    // punch() from our sampler classification, which is UNKNOWN until enough
+    // samples land).
+    auto coerce = [](uint32_t fw) {
+        return fw == FIREWALL_OPEN ? FIREWALL_CONSISTENT : fw;
+    };
+    const uint32_t local = coerce(local_firewall_);
+    const uint32_t remote = coerce(remote_firewall_);
+
+    if (local == FIREWALL_CONSISTENT && remote == FIREWALL_CONSISTENT) {
+        // CONSISTENT+CONSISTENT: 10 rounds, 1s apart. JS holepuncher.js:188 —
+        // does NOT require a verified remote address.
         if (stats_) stats_->punches_consistent++;
         punching_ = true;
         punch_round_ = 0;
@@ -339,8 +383,14 @@ bool Holepuncher::punch() {
         return true;
     }
 
-    if (local_consistent && remote_firewall_ == FIREWALL_RANDOM) {
-        // CONSISTENT+RANDOM: 1750 probes to random ports
+    // JS holepuncher.js:194 — both random branches gate on a verified remote
+    // address (and pass it to the probe strategy). Without it, we'd spray
+    // unverified/stale addresses.
+    const RemoteAddr* vr = verified_remote();
+    if (!vr) return false;
+
+    if (local == FIREWALL_CONSISTENT && remote >= FIREWALL_RANDOM) {
+        // CONSISTENT+RANDOM: 1750 probes to random ports on the verified host.
         // JS: roundPunch rate-limits random punches
         if (stats_ && !stats_->can_random_punch(uv_now(loop_))) {
             DHT_LOG("  [hp] Random punch throttled (active=%d, limit=%d)\n",
@@ -355,10 +405,10 @@ bool Holepuncher::punch() {
         return true;
     }
 
-    if (local_firewall_ == FIREWALL_RANDOM && remote_consistent) {
-        // RANDOM+CONSISTENT: birthday paradox — acquire up to 256 sockets
-        auto* vr = verified_remote();
-        if (!vr || !pool_) return false;
+    if (local >= FIREWALL_RANDOM && remote == FIREWALL_CONSISTENT) {
+        // RANDOM+CONSISTENT: birthday paradox — acquire up to 256 sockets, each
+        // punching its own NAT hole toward the verified remote.
+        if (!pool_) return false;
 
         // JS: roundPunch rate-limits random punches
         if (stats_ && !stats_->can_random_punch(uv_now(loop_))) {
@@ -373,7 +423,7 @@ bool Holepuncher::punch() {
         return true;
     }
 
-    // RANDOM+RANDOM: impossible
+    // RANDOM+RANDOM (or any UNKNOWN): impossible
     return false;
 }
 
@@ -408,9 +458,15 @@ void Holepuncher::on_message(const compact::Ipv4Address& from,
             from.host_string().c_str(), from.port);
     if (connected_ || destroyed_) return;
 
-    // JS: non-initiator echoes probe back, does NOT set connected (holepuncher.js:125-128)
+    // JS: non-initiator echoes probe back, does NOT set connected
+    // (holepuncher.js:125-128 — `holepunch(ref.socket, addr, false)`). The
+    // echo MUST leave the SAME socket the probe arrived on, so the initiator
+    // sees the reply from the address it targeted. For a birthday holder that
+    // is the holder's own socket; only fall back to send_fn_ (main socket)
+    // when no per-socket ref was supplied.
     if (!is_initiator_) {
-        send_probe(from);
+        if (recv_socket) send_probe_from_socket(recv_socket, from, DEFAULT_TTL);
+        else send_probe(from);
         return;
     }
 
@@ -506,14 +562,17 @@ void Holepuncher::random_probes() {
         return;
     }
 
-    // Send probe to a random port on the remote host
-    if (!remote_addresses_.empty()) {
-        auto addr = remote_addresses_[0].addr;
-        // Random port between 1000-65535
-        uint16_t random_port = static_cast<uint16_t>(1000 + randombytes_uniform(64536));
-        auto probe_addr = Ipv4Address::from_string(addr.host_string(), random_port);
-        send_probe(probe_addr);
+    // Send probe to a random port on the VERIFIED remote host.
+    // JS holepuncher.js:199,234-238 — _randomProbes(remoteVerifiedAddress).
+    auto* vr = verified_remote();
+    if (!vr) {
+        punching_ = false;
+        return;
     }
+    // Random port between 1000-65535
+    uint16_t random_port = static_cast<uint16_t>(1000 + randombytes_uniform(64536));
+    auto probe_addr = Ipv4Address::from_string(vr->addr.host_string(), random_port);
+    send_probe(probe_addr);
 
     random_probes_left_--;
 
@@ -629,6 +688,7 @@ void Holepuncher::destroy() {
     send_ttl_fn_ = nullptr;
     on_connect_ = nullptr;
     on_abort_ = nullptr;
+    on_reset_ = nullptr;  // holepunch_connect wires this capturing PunchState
 }
 
 // ---------------------------------------------------------------------------
@@ -665,10 +725,13 @@ void Holepuncher::open_birthday_sockets() {
                 };
             holders_.push_back(ref);
 
-            // Send low-TTL probe from this new socket (JS: holepuncher.js:273-275)
-            if (send_ttl_fn_) {
-                send_ttl_fn_(vr->addr, HOLEPUNCH_TTL);
-            }
+            // Send low-TTL probe from THIS new socket (JS: holepuncher.js:273-275
+            // `holepunch(ref.socket, remoteAddr, HOLEPUNCH_TTL)`). Each holder
+            // punches its own NAT hole — the whole point of the birthday paradox.
+            // Previously this used send_ttl_fn_ which egresses from the single
+            // shared pool socket → all 256 sends left one source port → no
+            // birthday effect.
+            send_probe_from_socket(ref->socket(), vr->addr, HOLEPUNCH_TTL);
         }
     }
 
@@ -711,14 +774,13 @@ void Holepuncher::keep_alive_random_nat() {
         if (low_ttl_rounds_ > 0) low_ttl_rounds_--;
     }
 
-    // Send probe from current birthday socket
+    // Send probe from the current birthday socket's OWN socket (JS:
+    // holepuncher.js:264 `holepunch(this._allHolders[i++].socket, ...)`).
     auto* ref = holders_[birthday_index_++];
     if (ref && !ref->is_closed()) {
-        if (send_ttl_fn_) {
-            // JS: first full cycle uses low TTL, subsequent use default
-            int ttl = (low_ttl_rounds_ > 0) ? HOLEPUNCH_TTL : DEFAULT_TTL;
-            send_ttl_fn_(vr->addr, ttl);
-        }
+        // JS: first full cycle uses low TTL, subsequent use default
+        int ttl = (low_ttl_rounds_ > 0) ? HOLEPUNCH_TTL : DEFAULT_TTL;
+        send_probe_from_socket(ref->socket(), vr->addr, ttl);
     }
 
     random_probes_left_--;
@@ -1222,6 +1284,17 @@ struct PunchState {
     // to gate the analyze() / Round-2 dispatch — JS parity for
     // `await this.nat.analyzing` (holepuncher.js:86).
     bool pool_sampling_done = false;
+    // Set by the puncher's on_reset_ (JS _reopen): a reopen was kicked off, so
+    // proceed() must defer instead of aborting — the resample's run_round1
+    // re-entry takes over. Cleared before each analyze() cycle.
+    bool reopening = false;
+    // JS connect.js:698-701 — a TRY_LATER reply re-runs roundPunch after a
+    // jittered 10-20s sleep. `round2_fn` holds send_round2 so its own response
+    // handler can re-invoke it; bounded by `trylater_retries` so a permanently
+    // busy server can't pin us forever. Reset in complete() to break the
+    // round2_fn → state capture cycle.
+    std::shared_ptr<std::function<void()>> round2_fn;
+    int trylater_retries = 0;
 
     void complete(const HolepunchResult& result) {
         if (completed) return;
@@ -1237,6 +1310,10 @@ struct PunchState {
         // Cancel sleeper timers
         if (sleeper) sleeper->cancel();
         if (wait_sampler) wait_sampler->cancel();
+
+        // Break the round2_fn → state capture cycle (JS: c has no such cycle;
+        // our shared functor needs an explicit reset).
+        round2_fn = nullptr;
 
         // Close pool socket on FAILURE only. On success, the caller needs the
         // pool socket alive for udx_stream_connect — the HolepunchResult.socket
@@ -1312,7 +1389,9 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        OnHolepunchCallback on_done,
                        bool fast_open,
                        udx_socket_t** pool_handle_out,
-                       std::shared_ptr<void>* pool_keepalive_out) {
+                       std::shared_ptr<void>* pool_keepalive_out,
+                       socket_pool::SocketPool* birthday_pool,
+                       PunchStats* stats) {
 
     // Derive holepunchSecret from handshake hash
     // holepunchSecret = BLAKE2b-256(NS_PEER_HOLEPUNCH, key=handshake_hash)
@@ -1350,7 +1429,8 @@ void holepunch_connect(rpc::RpcSocket& socket,
     // before the fast-open probe so it can catch the echo. When the
     // server has a public IP, the TTL=5 probe arrives, the server echoes
     // it, and the puncher detects it → connected without holepunch rounds.
-    auto puncher = std::make_shared<Holepuncher>(socket.loop(), true);
+    auto puncher = std::make_shared<Holepuncher>(socket.loop(), true,
+                                                 birthday_pool, stats);
     puncher->set_local_firewall(local_firewall);
     puncher->set_send_fn([state](const Ipv4Address& addr) {
         if (state->pool) state->pool->send_probe(addr);
@@ -1360,6 +1440,13 @@ void holepunch_connect(rpc::RpcSocket& socket,
     });
     puncher->on_connect([state](const HolepunchResult& result) {
         auto augmented = result;
+        // ponytail: for the common (non-birthday) win the echo arrives on
+        // state->pool, so pinning it is correct. For a RANDOM+CONSISTENT
+        // birthday win, result.socket is a socket_pool::SocketRef (not
+        // state->pool) and the winning ref must be kept alive instead — that
+        // path is cross-NAT-only, untestable on loopback, and needs live CGNAT
+        // validation. Upgrade path: hand the winning SocketRef to the result as
+        // its keepalive when result.socket != state->pool->socket_handle().
         augmented.socket_keepalive = state->pool;
         state->complete(augmented);
     });
@@ -1618,13 +1705,40 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
                 // JS parity (connect.js:600-621): analyze() stability check.
                 // Synchronous in C++ (sampling completion is gated above, so
                 // by this point pool_fw_now reflects the final classification).
+                //
+                // JS _reopen (holepuncher.js:104-116,152-159): on an unstable
+                // NAT, release the socket, acquire a fresh one, resample, and
+                // re-run probeRound (connect.js:608). We wire on_reset_ to
+                // reset() the sampler (clears the per-source dedup so the same
+                // relay/routing nodes yield fresh samples) and re-run Round 1 —
+                // on the SAME pool socket. We deliberately do NOT acquire a
+                // fresh socket: the caller's pool_socket_handle/keepalive (the
+                // relay→direct upgrade port) is pinned to this socket. That
+                // recovers the common UNKNOWN cause (a lossy carrier that didn't
+                // land ≥4 samples); the rarer "need a fresh NAT mapping" case is
+                // flagged for live CGNAT validation.
+                state->puncher->on_reset([state, ctx]() mutable {
+                    if (state->completed) return;
+                    DHT_LOG("  [hp] reopen: reset sampler + re-run Round 1\n");
+                    state->reopening = true;
+                    state->pool_sampling_done = false;
+                    state->pool->nat_sampler().reset();
+                    discover_pool_addresses(*state->pool, state->socket->table(),
+                        ctx.relay_addr, [state, ctx](bool) mutable {
+                            state->pool_sampling_done = true;
+                            if (state->completed) return;
+                            run_round1(state, std::move(ctx));
+                        });
+                });
+
                 bool stable_ok = false;
+                state->reopening = false;
                 state->puncher->analyze(false, [&stable_ok](bool s) { stable_ok = s; });
                 if (!stable_ok) {
                     state->puncher->analyze(true, [&stable_ok](bool s) { stable_ok = s; });
-                    // TODO(parity): JS connect.js:608 — `if (stable) return
-                    // probeRound(c, ..., false)` restarts Round 1 after a
-                    // successful reopen. Our reopen path is unwired today.
+                    // analyze(true) fired on_reset_ → reopen kicked off; defer
+                    // to the run_round1 re-entry instead of aborting now.
+                    if (state->reopening) return;
                 }
                 if (!stable_ok) {
                     DHT_LOG("  [hp] NAT unstable after analyze() — abort\n");
@@ -1735,6 +1849,46 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
                                         r2_pay.connected ? 1 : 0,
                                         r2_pay.addresses.size());
 
+                                    if (r2_pay.error == peer_connect::ERROR_TRY_LATER) {
+                                        // JS connect.js:527-533,698-701 — server
+                                        // is throttling random punches. Wait a
+                                        // jittered 10-20s (JS tryLater,
+                                        // connect.js:713-716) and re-send Round 2.
+                                        // Bounded so a permanently-busy server
+                                        // can't pin us; cancelled by
+                                        // state->completed (abort/upgrade).
+                                        // NOTE (JS discrepancy): JS gates this on
+                                        // c.relayToken (relayThrough only) and is
+                                        // otherwise fatal. We retry unconditionally
+                                        // — the C++ server keeps the session alive
+                                        // on TRY_LATER (does not _abort like JS
+                                        // without a relayToken), so a bounded retry
+                                        // is the more-robust, internally-consistent
+                                        // choice for the symmetric-CGNAT goal.
+                                        constexpr int MAX_TRYLATER_RETRIES = 3;
+                                        if (state->trylater_retries <
+                                                MAX_TRYLATER_RETRIES &&
+                                            state->round2_fn) {
+                                            state->trylater_retries++;
+                                            uint64_t delay =
+                                                10000 + randombytes_uniform(10000);
+                                            DHT_LOG("  [hp] Round 2: TRY_LATER — "
+                                                    "retry %d in %llums\n",
+                                                    state->trylater_retries,
+                                                    static_cast<unsigned long long>(
+                                                        delay));
+                                            auto fn = state->round2_fn;
+                                            state->sleeper->pause(delay,
+                                                [state, fn]() {
+                                                    if (state->completed) return;
+                                                    (*fn)();
+                                                });
+                                            return;
+                                        }
+                                        state->complete({});
+                                        return;
+                                    }
+
                                     if (r2_pay.error != peer_connect::ERROR_NONE) {
                                         state->complete({});
                                         return;
@@ -1769,8 +1923,11 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
                 // loop for ~analyze duration. During that yield the post-Round1
                 // probe echo may arrive and complete the connection, skipping
                 // Round 2. Approximate that with a 500ms delay before Round 2.
-                auto sr2 = std::make_shared<std::function<void()>>(
+                // Store send_round2 on state so its own Round-2 response handler
+                // can re-invoke it on a TRY_LATER reply (JS roundPunch recursion).
+                state->round2_fn = std::make_shared<std::function<void()>>(
                     std::move(send_round2));
+                auto sr2 = state->round2_fn;
                 state->sleeper->pause(500, [state, sr2]() {
                     if (state->completed) return;  // Probe connected us!
                     (*sr2)();

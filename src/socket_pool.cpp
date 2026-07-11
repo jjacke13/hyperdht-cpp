@@ -206,9 +206,32 @@ void SocketPool::add(SocketRef* ref) {
 }
 
 void SocketPool::remove(SocketRef* ref) {
+    // JS socket-pool.js:79-82,91 — a route is gc'd when its socket closes
+    // (`socket.on('close', gc)`). Otherwise get_route() hands back a dead
+    // socket forever (routes are never otherwise removed by live code). Drop
+    // any route backed by this closing socket.
+    gc_routes_for_socket(&ref->socket_);
+
     sockets_.erase(&ref->socket_);
     lingering_.erase(ref);
     delete ref;
+}
+
+void SocketPool::gc_routes_for_socket(udx_socket_t* socket) {
+    for (auto it = routes_.begin(); it != routes_.end();) {
+        if (it->second.socket == socket) {
+            it = routes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void SocketPool::on_stream_error(udx_socket_t* socket) {
+    // JS socket-pool.js:96-100 — a rawStream 'error' marks its socket
+    // non-reusable and gc's the route so it's never handed out again.
+    set_reusable(socket, false);
+    gc_routes_for_socket(socket);
 }
 
 // ---------------------------------------------------------------------------

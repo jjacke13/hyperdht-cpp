@@ -35,6 +35,7 @@
 #include "hyperdht/rpc_handlers.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <cstring>
 
 #include <sodium.h>
@@ -45,6 +46,16 @@
 
 namespace hyperdht {
 namespace rpc {
+
+// Wall-clock milliseconds — for the bump drift gate, which mirrors JS
+// `Date.now()` (the announcer stamps bump with wall-clock time). Must NOT be
+// uv_now (monotonic loop time), or the `bump <= now + drift` check misbehaves.
+static uint64_t wall_clock_ms() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
 
 RpcHandlers::RpcHandlers(RpcSocket& socket, router::Router* router,
                          StorageCacheConfig cache_config)
@@ -99,6 +110,16 @@ void RpcHandlers::on_gc_tick(uv_timer_t* timer) {
     self->mutables_.gc(now, self->storage_ttl_ms_);
     self->immutables_.gc(now, self->storage_ttl_ms_);
     self->store_.gc(now);
+
+    // Expire stale bump entries, same TTL as the announce store (JS bumps
+    // Cache uses maxAge = opts.maxAge, same as the records cache).
+    for (auto it = self->bumps_.begin(); it != self->bumps_.end();) {
+        if (now - it->second.created_at > self->ann_ttl_ms_) {
+            it = self->bumps_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void RpcHandlers::install() {
@@ -121,7 +142,8 @@ void RpcHandlers::handle(const messages::Request& req) {
             case messages::CMD_FIND_NODE:    handle_find_node(req); break;
             case messages::CMD_DOWN_HINT:    handle_down_hint(req); break;
             case messages::CMD_DELAYED_PING: handle_delayed_ping(req); break;
-            default: break;
+            // JS index.js:679 — unknown internal command → UNKNOWN_COMMAND reply.
+            default: send_unknown_command_reply(req); break;
         }
     } else {
         DHT_LOG( "  [handlers] ext cmd=%u from %s:%u\n",
@@ -139,6 +161,18 @@ void RpcHandlers::handle(const messages::Request& req) {
                         [this](const messages::Request& req) {
                             auto buf = messages::encode_request(req);
                             socket_.udp_send(buf, req.to.addr);
+                        },
+                        // Closer-nodes provider for the no-relay FROM_CLIENT
+                        // reply (JS router.js:135). Same table.closest() the
+                        // query responses use (make_query_response above).
+                        [this](const announce::TargetKey& target)
+                            -> std::vector<compact::Ipv4Address> {
+                            std::vector<compact::Ipv4Address> out;
+                            for (const auto* node : socket_.table().closest(target)) {
+                                out.push_back(compact::Ipv4Address::from_string(
+                                    node->host, node->port));
+                            }
+                            return out;
                         });
                 }
                 return;
@@ -163,8 +197,13 @@ void RpcHandlers::handle(const messages::Request& req) {
         // JS: hyperdht/index.js:404 — `if (this._persistent === null) return false`
         // Announce signatures include our node ID; accepting them while ephemeral
         // (random ID) would produce signatures that become invalid when the ID
-        // changes at the persistent transition.
-        if (socket_.is_ephemeral()) return;
+        // changes at the persistent transition. dht-rpc turns that `false` into
+        // an UNKNOWN_COMMAND reply (index.js:684-685), so an ephemeral node
+        // answers storage queries with an error instead of silently timing out.
+        if (socket_.is_ephemeral()) {
+            send_unknown_command_reply(req);
+            return;
+        }
 
         switch (req.command) {
             case messages::CMD_FIND_PEER:     handle_find_peer(req); break;
@@ -175,7 +214,8 @@ void RpcHandlers::handle(const messages::Request& req) {
             case messages::CMD_MUTABLE_GET:   handle_mutable_get(req); break;
             case messages::CMD_IMMUTABLE_PUT: handle_immutable_put(req); break;
             case messages::CMD_IMMUTABLE_GET: handle_immutable_get(req); break;
-            default: break;
+            // JS index.js:684-685 — onrequest returned false → UNKNOWN_COMMAND.
+            default: send_unknown_command_reply(req); break;
         }
     }
 }
@@ -215,6 +255,34 @@ messages::Response RpcHandlers::make_query_response(const messages::Request& req
     return resp;
 }
 
+// JS: dht-rpc/index.js:679,685 — `req.sendReply(UNKNOWN_COMMAND, null, false,
+// req.target !== null)`. sendReply(error, value, token, hasCloserNodes) →
+// _sendReply (io.js:485-518): error=UNKNOWN_COMMAND, value=null, token=false
+// (no token bytes), closerNodes only when the request carried a target
+// (hasCloserNodes == target !== null), id only when
+// `!ephemeral && socket === serverSocket`.
+void RpcHandlers::send_unknown_command_reply(const messages::Request& req) {
+    messages::Response resp;
+    resp.tid = req.tid;
+    resp.from.addr = req.from.addr;
+    resp.error = messages::ERR_UNKNOWN_COMMAND;
+    // id only when persistent AND on the server socket (JS io.js:488).
+    if (!socket_.is_ephemeral() && req.from_server) {
+        resp.id = socket_.table().id();
+    }
+    // closerNodes only when the request carried a target (JS io.js:489-490).
+    if (req.target.has_value()) {
+        routing::NodeId target{};
+        std::copy(req.target->begin(), req.target->end(), target.begin());
+        for (const auto* node : socket_.table().closest(target)) {
+            resp.closer_nodes.push_back(
+                compact::Ipv4Address::from_string(node->host, node->port));
+        }
+    }
+    // Note: no token (JS token=false).
+    socket_.reply(resp, req.from_server);
+}
+
 // ---------------------------------------------------------------------------
 // PING — reply with our node ID and a token for the sender
 //
@@ -223,7 +291,10 @@ messages::Response RpcHandlers::make_query_response(const messages::Request& req
 
 void RpcHandlers::handle_ping(const messages::Request& req) {
     auto resp = make_query_response(req);
-    resp.closer_nodes.clear();  // PING doesn't return closer nodes
+    // JS index.js:641 — `req.sendReply(0, null, false, false)`: PING carries
+    // neither a token nor closer nodes. make_query_response set both; strip them.
+    resp.token.reset();
+    resp.closer_nodes.clear();
     socket_.reply(resp, req.from_server);
 }
 
@@ -265,6 +336,9 @@ void RpcHandlers::handle_find_node(const messages::Request& req) {
     if (find_node_rate_.size() > 8192) find_node_rate_.clear();  // cap map growth
 
     auto resp = make_query_response(req);
+    // JS index.js:660 — `req.sendReply(0, null, false, true)`: FIND_NODE returns
+    // closer nodes but NO token. make_query_response set a token; strip it.
+    resp.token.reset();
     socket_.reply(resp, req.from_server);
 }
 
@@ -422,9 +496,11 @@ void RpcHandlers::on_delayed_ping_fire(uv_timer_t* timer) {
 // FIND_PEER — return a single stored peer record for the target
 //
 // JS: .analysis/js/hyperdht/lib/persistent.js:39-43 (onfindpeer)
-//     JS only checks `dht._router.get(target).record`. C++ also falls
-//     back to the AnnounceStore so we can return any cached peer record
-//     even if no Server is locally listening for `target`.
+//     `req.reply(fwd ? fwd.record : null)` — router ONLY, no announce-store
+//     fallback. A findPeer only resolves a self-announced server (the router
+//     entry populated by handle_announce's announceSelf branch); relayed
+//     announcements live in the records cache and surface via LOOKUP, not
+//     FIND_PEER. The prior store fallback diverged from JS and is removed.
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_find_peer(const messages::Request& req) {
@@ -432,24 +508,12 @@ void RpcHandlers::handle_find_peer(const messages::Request& req) {
 
     auto resp = make_query_response(req);
 
-    // Look up the target in our announce store
     announce::TargetKey target{};
     std::copy(req.target->begin(), req.target->end(), target.begin());
 
-    // Check Router first (self-announcing servers)
     if (router_) {
         const auto* rec = router_->record(target);
-        if (rec) {
-            resp.value = *rec;
-            socket_.reply(resp, req.from_server);
-            return;
-        }
-    }
-
-    // Fall back to announce store
-    auto peers = store_.get(target);
-    if (!peers.empty()) {
-        resp.value = peers.back().value;
+        if (rec) resp.value = *rec;
     }
 
     socket_.reply(resp, req.from_server);
@@ -459,9 +523,14 @@ void RpcHandlers::handle_find_peer(const messages::Request& req) {
 // LOOKUP — return all stored peer records for the target (up to 20)
 //
 // JS: .analysis/js/hyperdht/lib/persistent.js:26-37 (onlookup)
-//     JS uses `records.get(k, 20)` from the record-cache package and
-//     wraps in `lookupRawReply { peers, bump }`. We don't track bumps;
-//     value is just a varint count + length-prefixed peer records.
+//     records = this.records.get(k, 20); bump = this.bumps.get(k) || 0;
+//     fwd = this.dht._router.get(k); if (fwd && records.length < 20)
+//     records.push(fwd.record); reply = records.length
+//     ? c.encode(m.lookupRawReply, { peers: records, bump }) : null.
+//
+//     Each stored record is a bare m.peer (see handle_announce), so the
+//     shared encode_lookup_reply concatenates them raw — wire-identical to
+//     the JS `rawPeers = c.array(c.raw)` encode path.
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_lookup(const messages::Request& req) {
@@ -477,27 +546,25 @@ void RpcHandlers::handle_lookup(const messages::Request& req) {
         peers.resize(announce::MAX_PEERS_PER_TARGET);
     }
 
-    if (!peers.empty()) {
-        // Encode all peer values as a length-prefixed array.
-        // Format: varint(count) + [varint(len) + value_bytes]...
-        compact::State state;
-        compact::Uint::preencode(state, static_cast<uint64_t>(peers.size()));
-        for (const auto& p : peers) {
-            compact::Buffer::preencode(state, p.value.data(), p.value.size());
-        }
+    dht_messages::LookupRawReply reply;
+    reply.peers.reserve(peers.size() + 1);
+    for (const auto& p : peers) {
+        reply.peers.push_back(p.value);  // bare m.peer record
+    }
 
-        std::vector<uint8_t> buf(state.end);
-        state.buffer = buf.data();
-        state.start = 0;
-
-        compact::Uint::encode(state, static_cast<uint64_t>(peers.size()));
-        for (const auto& p : peers) {
-            compact::Buffer::encode(state, p.value.data(), p.value.size());
+    // JS persistent.js:34 — push the router's forward record (a self-announced
+    // server for this target) when we have room under the 20 cap.
+    if (router_ && reply.peers.size() < announce::MAX_PEERS_PER_TARGET) {
+        if (const auto* rec = router_->record(target)) {
+            reply.peers.push_back(*rec);
         }
+    }
 
-        if (!state.error) {
-            resp.value = std::move(buf);
-        }
+    reply.bump = bump_for(target);
+
+    // JS persistent.js:36 — reply null when there are no records at all.
+    if (!reply.peers.empty()) {
+        resp.value = dht_messages::encode_lookup_reply(reply);
     }
 
     socket_.reply(resp, req.from_server);
@@ -510,12 +577,11 @@ void RpcHandlers::handle_lookup(const messages::Request& req) {
 //     .analysis/js/hyperdht/lib/persistent.js:269-284 (annSignable)
 //
 // C++ diffs from JS:
-//   - No `bumps` cache (JS:140-142). We just store the announcement.
 //   - No `refresh` cache plumbing (JS:145-147). The refresh-only path
 //     replies but doesn't yet hook up `_onrefresh`.
-//   - JS treats announceSelf (TMP == target, persistent.js:128) by
-//     populating `_router`; C++ uses the AnnounceStore unconditionally.
 //   - Relay-address cap of 3 matches JS:121-123.
+//   - Bump tracking + announceSelf router population + bare-record storage
+//     now mirror JS (persistent.js:121-143). See body.
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_announce(const messages::Request& req) {
@@ -548,15 +614,14 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
         return;
     }
 
-    // Cap relay addresses at 3 (matches JS persistent.js)
-    if (ann.peer->relay_addresses.size() > 3) {
-        ann.peer->relay_addresses.resize(3);
-    }
-
     // Signature is required when peer is present
     if (!ann.signature.has_value()) return;
 
     // Verify Ed25519 signature: signable = NS_ANNOUNCE + BLAKE2b(target || nodeId || token || peer || refresh)
+    // NOTE: verify against the announce AS SIGNED (untrimmed) — JS computes
+    // annSignable at persistent.js:106, BEFORE the relay trim at :121-123.
+    // Trimming first would re-encode a different m.peer and reject any
+    // legitimate announce carrying >3 relay addresses.
     auto node_id = socket_.table().id();
     bool valid = announce_sig::verify_announce(
         dht_messages::ns_announce(),
@@ -567,22 +632,74 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
 
     if (!valid) return;  // Silently drop invalid signatures
 
+    // Cap relay addresses at 3 for the stored/served record — AFTER the
+    // signature check (JS persistent.js:121-123).
+    if (ann.peer->relay_addresses.size() > 3) {
+        ann.peer->relay_addresses.resize(3);
+    }
+
     announce::TargetKey target{};
     std::copy(req.target->begin(), req.target->end(), target.begin());
 
-    // Store the announcement. `ann_ttl_ms_` is plumbed from
-    // `DhtOptions::max_age_ms` via `StorageCacheConfig`, matching the JS
-    // `persistent.records: { maxAge: opts.maxAge }` pattern in
-    // `hyperdht/index.js:607,599`. Defaults to 20 min when the caller
-    // leaves the option at its default value.
-    assert(socket_.loop() != nullptr);
-    announce::PeerAnnouncement stored;
-    stored.from = req.from.addr;
-    stored.value = *req.value;
-    stored.created_at = uv_now(socket_.loop());
-    stored.ttl = ann_ttl_ms_;
+    // The stored record is the BARE re-encoded m.peer (relays already trimmed
+    // to <=3 above), NOT the full announce message. JS persistent.js:129
+    // `record = encodeUnslab(m.peer, peer)`. This is exactly the byte string
+    // that LOOKUP/FIND_PEER hand back (self-delimiting in the raw peers array).
+    auto record = dht_messages::encode_peer_record(*ann.peer);
 
-    store_.put(target, stored);
+    // announceSelf = BLAKE2b(peer.publicKey) === req.target (a server
+    // announcing itself). JS persistent.js:125-128.
+    std::array<uint8_t, 32> pk_hash{};
+    crypto_generichash(pk_hash.data(), 32,
+                       ann.peer->public_key.data(),
+                       ann.peer->public_key.size(),
+                       nullptr, 0);
+    const bool announce_self = (pk_hash == *req.target);
+
+    assert(socket_.loop() != nullptr);
+
+    if (announce_self) {
+        // JS persistent.js:131-138 — the record is served via the router
+        // (relay = req.from, no connection handlers) and removed from the
+        // records cache. handle_find_peer resolves it from here.
+        if (router_) {
+            auto* existing = router_->get(target);
+            if (existing && existing->on_peer_handshake) {
+                // A locally-listening Server owns this target — keep its
+                // handlers, just refresh the served record + relay hint.
+                existing->record = std::move(record);
+                existing->relay = req.from.addr;
+            } else {
+                router::ForwardEntry entry;
+                entry.record = std::move(record);
+                entry.relay = req.from.addr;
+                router_->set(target, std::move(entry));
+            }
+        }
+        store_.remove(target, req.from.addr);
+    } else {
+        // JS persistent.js:140-142 — bump gate. currentBump defaults 0; a
+        // bump only sticks if it's strictly greater AND within the wall-clock
+        // drift window (guards against a peer stamping a far-future value).
+        const uint64_t current_bump = bump_for(target);
+        const uint64_t now_wall = wall_clock_ms();
+        if (ann.bump > current_bump &&
+            ann.bump <= now_wall + MAX_BUMP_DRIFT_MS) {
+            bumps_[target] = {ann.bump, uv_now(socket_.loop())};
+        }
+
+        // Store the bare record. `ann_ttl_ms_` is plumbed from
+        // `DhtOptions::max_age_ms` via `StorageCacheConfig`, matching the JS
+        // `persistent.records: { maxAge: opts.maxAge }` pattern in
+        // `hyperdht/index.js:607,599`. Defaults to 20 min when the caller
+        // leaves the option at its default value.
+        announce::PeerAnnouncement stored;
+        stored.from = req.from.addr;
+        stored.value = std::move(record);
+        stored.created_at = uv_now(socket_.loop());
+        stored.ttl = ann_ttl_ms_;
+        store_.put(target, stored);
+    }
 
     // Reply (JS: { token: false, closerNodes: false })
     messages::Response resp;
@@ -601,10 +718,10 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
 // JS: .analysis/js/hyperdht/lib/persistent.js:53-70 (onunannounce)
 //     .analysis/js/hyperdht/lib/persistent.js:45-51 (unannounce helper)
 //
-// C++ diffs from JS:
-//   - JS removes from `dht._router` if the announcer is the publisher
-//     (TMP equals target). C++ only removes from AnnounceStore — the
-//     Router entry is removed by Server::close().
+// Mirrors JS: removes the AnnounceStore record for this sender AND, when the
+// unannouncing key hashes to the target (a self-announce), the relay-only
+// router entry that handle_announce created. A locally-listening Server's
+// router entry is left untouched (it owns its lifecycle via Server::close()).
 // ---------------------------------------------------------------------------
 
 void RpcHandlers::handle_unannounce(const messages::Request& req) {
@@ -639,6 +756,25 @@ void RpcHandlers::handle_unannounce(const messages::Request& req) {
 
     announce::TargetKey target{};
     std::copy(req.target->begin(), req.target->end(), target.begin());
+
+    // JS persistent.js:45-51 (unannounce helper): if the unannouncing key
+    // hashes to the target it was a self-announce — drop the router entry
+    // that handle_announce created for it. Guard: never remove a locally
+    // listening Server's entry (it owns its own lifecycle via Server::close);
+    // only relay-only announce entries (no handlers) are cleared here.
+    if (router_) {
+        std::array<uint8_t, 32> pk_hash{};
+        crypto_generichash(pk_hash.data(), 32,
+                           ann.peer->public_key.data(),
+                           ann.peer->public_key.size(),
+                           nullptr, 0);
+        if (pk_hash == *req.target) {
+            auto* existing = router_->get(target);
+            if (existing && !existing->on_peer_handshake) {
+                router_->remove(target);
+            }
+        }
+    }
 
     // Remove the announcement from this sender
     store_.remove(target, req.from.addr);

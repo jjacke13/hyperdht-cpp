@@ -75,16 +75,27 @@ pub(crate) struct ImmutableGetCtx {
 // ---------------------------------------------------------------------------
 
 impl crate::dht::Dht {
-    /// Store an opaque value at the DHT target. Multiple peers can
+    /// Announce `kp` at the DHT target (JS `announce(target, keyPair, [])`).
+    ///
+    /// The commit signs a fresh record for each closest node over that node's
+    /// per-request token+id, so this takes the keypair (not a pre-signed value)
+    /// — a single fixed value cannot verify at any node. Multiple peers can
     /// announce at the same target; `lookup` returns all of them.
-    pub async fn announce(&self, target: [u8; 32], value: &[u8]) -> Result<()> {
+    pub async fn announce(&self, target: [u8; 32], kp: &Keypair) -> Result<()> {
         if self.is_destroyed() {
             return Err(HyperDhtError::DhtClosed);
         }
+        // SAFETY: copy the keypair bytes synchronously before crossing the
+        // channel (mirrors mutable_put).
+        let (pk_bytes, sk_bytes) = unsafe {
+            let kp_ffi = &*kp.as_ffi();
+            (kp_ffi.public_key, kp_ffi.secret_key)
+        };
         let (tx, rx) = oneshot::channel();
         self.send_command_internal(Command::Announce {
             target,
-            value: value.to_vec(),
+            public_key: pk_bytes,
+            secret_key: sk_bytes,
             response: tx,
         })?;
         rx.await?

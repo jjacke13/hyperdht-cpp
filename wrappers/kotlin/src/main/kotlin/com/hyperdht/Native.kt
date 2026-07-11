@@ -128,8 +128,11 @@ internal object Native {
         handle: Long, target: ByteArray,
         onReply: PeerCallback?, onDone: DoneCallback?,
     ): Int
+    // Per-node-signed announce (JS `announce(target, keyPair, [])`): takes the
+    // keypair (pk 32 + sk 64), not a pre-signed value — the commit signs a
+    // fresh record for each node.
     external fun announce(
-        handle: Long, target: ByteArray, value: ByteArray,
+        handle: Long, target: ByteArray, pk: ByteArray, sk: ByteArray,
         onDone: DoneCallback?,
     ): Int
     external fun unannounce(

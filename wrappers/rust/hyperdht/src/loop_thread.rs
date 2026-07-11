@@ -278,10 +278,12 @@ pub(crate) enum Command {
         response: oneshot::Sender<Result<Option<(String, u16)>>>,
     },
 
-    /// Store a value at a target on the DHT.
+    /// Announce a keypair at a target on the DHT. The commit signs a fresh
+    /// record per node, so this carries the keypair (not a pre-signed value).
     Announce {
         target: [u8; 32],
-        value: Vec<u8>,
+        public_key: [u8; 32],
+        secret_key: [u8; 64],
         response: oneshot::Sender<Result<()>>,
     },
 
@@ -876,20 +878,28 @@ fn dispatch_command(
 
         Command::Announce {
             target,
-            value,
+            public_key,
+            secret_key,
             response,
         } => {
             use crate::dht_ops::PutCtx;
+            let kp = hyperdht_keypair_t {
+                public_key,
+                secret_key,
+            };
             let ctx = Box::new(PutCtx {
                 response: Mutex::new(Some(response)),
             });
             let userdata = Box::into_raw(ctx) as *mut c_void;
+            // No relay addresses / bump for a bare DHT announce.
             let rc = unsafe {
                 hyperdht_announce(
                     dht,
                     target.as_ptr(),
-                    value.as_ptr(),
-                    value.len(),
+                    &kp,
+                    std::ptr::null(),
+                    0,
+                    0,
                     Some(on_put_done_cb),
                     userdata,
                 )

@@ -750,14 +750,19 @@ class HyperDHT:
     def announce(
         self,
         target: bytes,
-        value: bytes,
+        keypair: KeyPair,
         on_done: Callable | None = None,
     ) -> None:
-        """Announce on the DHT."""
+        """Announce `keypair` at `target` (JS `announce(target, keyPair, [])`).
+
+        The commit signs a fresh ANNOUNCE record per node, so this takes the
+        keypair (not a pre-signed value). `on_done(error)` reports 0 on success
+        or a nonzero query error (too few nodes / all commits failed).
+        """
         if len(target) != 32:
             raise ValueError("target must be 32 bytes")
         t = (ctypes.c_uint8 * 32)(*target)
-        buf = (ctypes.c_uint8 * len(value))(*value)
+        c_kp = keypair._to_c()
 
         @DONE_CB
         def cb(error, ud):
@@ -765,8 +770,10 @@ class HyperDHT:
                 on_done(error)
 
         self._callbacks.append(cb)
+        # No relay addresses / bump for a bare DHT announce.
         rc = _lib.hyperdht_announce(
-            self._handle, t, buf, len(value), cb, None)
+            self._handle, t, ctypes.byref(c_kp), None, 0, 0, cb, None)
+        _lib.hyperdht_keypair_zero(ctypes.byref(c_kp))
         if rc != 0:
             raise RuntimeError(f"announce failed: {rc}")
 

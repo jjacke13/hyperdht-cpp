@@ -511,9 +511,10 @@ mod tests {
         assert!(lookup.is_ok(), "lookup returned err: {:?}", lookup);
 
         // Announce with no DHT → completes (might be Ok with 0 peers reached, or err).
+        let announce_kp = crate::keypair::Keypair::generate();
         let announce = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            dht.announce(target, b"hello"),
+            dht.announce(target, &announce_kp),
         )
         .await
         .expect("announce did not hang");

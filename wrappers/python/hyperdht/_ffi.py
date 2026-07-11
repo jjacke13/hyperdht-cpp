@@ -356,9 +356,15 @@ lib.hyperdht_lookup.argtypes = [
     PEER_CB, DONE_CB, ctypes.c_void_p]
 lib.hyperdht_lookup.restype = ctypes.c_int
 
+# announce(dht, target, kp, relay_addresses, relay_len, bump, on_done, ud):
+# per-node-signed announce — the commit signs a fresh record for each node, so
+# it needs the KEYPAIR (not a pre-signed value). relay_addresses is an optional
+# ipv4Array-encoded blob (NULL for a bare announce); bump is the port-bump.
 lib.hyperdht_announce.argtypes = [
     ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),
+    ctypes.POINTER(Keypair),
     ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+    ctypes.c_uint64,
     DONE_CB, ctypes.c_void_p]
 lib.hyperdht_announce.restype = ctypes.c_int
 

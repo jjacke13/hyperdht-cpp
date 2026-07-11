@@ -1089,16 +1089,20 @@ Java_com_hyperdht_Native_lookup(
 extern "C" JNIEXPORT jint JNICALL
 Java_com_hyperdht_Native_announce(
     JNIEnv* env, jobject, jlong h, jbyteArray jtarget,
-    jbyteArray jval, jobject jDoneCb)
+    jbyteArray jpk, jbyteArray jsk, jobject jDoneCb)
 {
+    // Per-node-signed announce: the commit signs a fresh record per node, so it
+    // takes the KEYPAIR (not a pre-signed value). No relay addresses / bump for
+    // a bare DHT announce.
     uint8_t target[32];
     env->GetByteArrayRegion(jtarget, 0, 32, (jbyte*)target);
-    jsize len = env->GetArrayLength(jval);
-    jbyte* data = env->GetByteArrayElements(jval, nullptr);
+    hyperdht_keypair_t kp;
+    env->GetByteArrayRegion(jpk, 0, 32, (jbyte*)kp.public_key);
+    env->GetByteArrayRegion(jsk, 0, 64, (jbyte*)kp.secret_key);
     auto* ctx = new DoneCtx{env->NewGlobalRef(jDoneCb)};
-    int rc = hyperdht_announce((hyperdht_t*)h, target,
-        (const uint8_t*)data, (size_t)len, jni_done_cb, ctx);
-    env->ReleaseByteArrayElements(jval, data, JNI_ABORT);
+    int rc = hyperdht_announce((hyperdht_t*)h, target, &kp,
+        nullptr, 0, 0, jni_done_cb, ctx);
+    hyperdht_keypair_zero(&kp);  // C10
     if (rc != 0) { env->DeleteGlobalRef(ctx->callback); delete ctx; }
     return rc;
 }

@@ -28,6 +28,45 @@ keep it rather than regress to JS — "as close to JS as possible" means matchin
 behavior that matters (wire bytes, connectivity, correctness), not copying a
 weaker algorithm.
 
+## REMAINING OPEN — honest tally (updated 2026-07-11)
+
+Of the **91 confirmed findings**: **all 12 HIGH closed**; ~70/91 addressed
+(fixed or accepted-divergence); **~21 MED/LOW still OPEN**, concentrated in the
+three subsystems that were only touched for their HIGH relay-upgrade/wire
+findings. This is the resume worklist — NOT "the sweep is done."
+
+- **connect — 8 open** (done: connect-1/2/11): connect-3 reusableSocket ignored;
+  connect-4 route-shortcut handshake omits firewall+addresses; connect-5
+  direct-connect bogon filter + serverAddress fallback; connect-6 LAN same-NAT
+  runs parallel (JS exclusive); connect-7 opts.holepunch veto callback unused;
+  **connect-8 handshake reply under-validated (no mode===REPLY / from-match) —
+  SECURITY**; connect-9 findPeer not seeded closestNodes/onlyClosestNodes/retries;
+  connect-10 relay 15s timeout is a no-op.
+- **server — 8 open** (done: server-5): **server-1 ERROR_ABORTED Noise reply on
+  firewall reject (JS sends nothing)**; **server-2 holepunch reply committed
+  before veto/punch-start**; **server-3 handshake dedup not synchronous on
+  async-firewall path** (all three correctness); server-4 MAX_PENDING_HANDSHAKES
+  256 cap silent drop (ACCEPT candidate — anti-DoS); server-6 neverPunch
+  (opts.holepunch===false) unimplemented; server-8 relay pairing no 15s abort;
+  server-9 server-side same-host LAN match; server-11 OPEN-client shortcut
+  targets self-reported addr[0] with null socket.
+- **router-announce — 4 open** (done: announce-1/2/3): announce-4 announcer
+  embeds relay addresses in the SIGNED record (JS announces empty list);
+  announce-5 FROM_SECOND_RELAY reply sent to req.from not the embedded
+  relayAddress; announce-6 holepunch server handler invoked for all modes;
+  announce-7 refresh-chain announce not honored (refresh token never stored).
+- **secret-stream — 1 open**: connect-1 (connect gated on BOTH headers) —
+  deferred, needs a live JS cross-test not a batch edit.
+
+Do connect-8 + server-1/2/3 first (correctness/security). server-4 and a few
+others are likely ACCEPT-as-divergence (anti-DoS), decide per-finding.
+
+Committed 2026-07-11 (branch fix/relay-direct-upgrade, NOT pushed): f266b35
+deps, 88b8022 compact/routing, 5460cfa core sweep + relay upgrade, f37ef1d
+wrappers, 86353db docs.
+
+---
+
 Everything below is the original sweep report.
 
 ---

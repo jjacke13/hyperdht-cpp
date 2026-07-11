@@ -57,3 +57,11 @@ perf.data
 perf.data.old
 massif.out.*
 callgrind.out.*
+
+# Nix build outputs
+result
+result-*
+
+# Session / agent scratch
+.claude/
+asan_rust/

@@ -269,7 +269,25 @@ static void fire_handshake(std::shared_ptr<ConnState> state,
                 try_next_relay(state);  // bails immediately on the new guard
                 return;
             }
-            if (state->alive.expired() || !hs.success) {
+            if (state->alive.expired()) {
+                try_next_relay(state);
+                return;
+            }
+            // connect-8 — JS connect.js:425-436: a Noise-authenticated
+            // reply carrying version!=1 / error!=NONE / missing udx is
+            // TERMINAL (maybeDestroyEncryptedSocket) — fail the whole
+            // connect, do NOT try other relays. Pre-decode garbage
+            // (router.js:63-71 BAD_HANDSHAKE_REPLY) stays per-attempt
+            // and falls through to try_next_relay below.
+            // complete_error, not complete: mirrors maybeDestroy's
+            // relay/puncher holdoff. Both are always idle at this point
+            // today, but if the pipeline ever starts a speculative relay
+            // before the handshake settles, this must not kill it.
+            if (hs.terminal) {
+                state->complete_error(ConnectError::SERVER_ERROR);
+                return;
+            }
+            if (!hs.success) {
                 try_next_relay(state);
                 return;
             }
@@ -858,6 +876,31 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
 }
 
 // ---------------------------------------------------------------------------
+// abort_relay_chain — JS: connect.js:787-794 (onabort).
+//
+// Marks the relay terminal and destroys the relay control chain.
+// duplex->destroy() first so the relay control raw stream is torn down
+// like JS `socket.destroy()` (a bare RelayState reset only detaches it);
+// then ~RelayState resets client → mux → duplex in dependency order. The
+// client's destructor drops its pending pair request WITHOUT firing
+// callbacks, which breaks the pair-callback ↔ ConnState shared_ptr cycle
+// that otherwise keeps the chain (and ConnState) alive forever when the
+// relay never answers.
+//
+// Only call from a clean frame (a timer callback or the dht->connect
+// continuation) — never from inside a relay-chain callback. The
+// pair-error path defers here via a 0ms re-arm of the pairing watchdog.
+// Destroying the watchdog UvTimer from inside its own callback is safe
+// (async_utils.hpp).
+// ---------------------------------------------------------------------------
+static void abort_relay_chain(const std::shared_ptr<ConnState>& state) {
+    if (!state->relay) return;
+    state->relay->terminal = true;
+    if (state->relay->duplex) state->relay->duplex->destroy(0);
+    state->relay.reset();
+}
+
+// ---------------------------------------------------------------------------
 // start_relay_path — blind relay connection chain.
 //
 // dht.connect(relay_pk) -> SecretStream -> Protomux -> BlindRelayClient ->
@@ -891,10 +934,13 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
                 state->dht->relay_stats().aborts++;
             }
         }
-        // Relay is terminal — re-run the error path so the caller's callback
-        // fires if the holepunch path also failed while we were holding off.
-        // JS: relay onabort (connect.js:787) → maybeDestroyEncryptedSocket.
-        if (state->relay) state->relay->terminal = true;
+        // connect-10 — JS: onabort (connect.js:787-794) destroys
+        // c.relaySocket. Destroy the chain (runs even when `completed`:
+        // JS's relayTimeout also reaps the relay after a holepunch win),
+        // then re-run the error path so the caller's callback fires if
+        // the holepunch also failed while we were holding off.
+        // JS: onabort → maybeDestroyEncryptedSocket.
+        abort_relay_chain(state);
         state->complete_error(ConnectError::RELAY_FAILED);
     }, blind_relay::RELAY_TIMEOUT_MS);
 
@@ -904,11 +950,22 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
         [state, is_initiator, relay_token](
             int err, const ConnectResult& relay_result) {
         if (state->completed || state->alive.expired()) return;
+        // connect-10 — the watchdog fired (abort_relay_chain nulled
+        // state->relay, like JS onabort nulling c.relaySocket) while this
+        // connect was in flight. Drop the fresh relay connection and bail.
+        if (!state->relay) {
+            if (relay_result.raw_stream) {
+                udx_stream_destroy(relay_result.raw_stream);
+            }
+            return;
+        }
         if (err != 0 || !relay_result.success) {
             DHT_LOG("  [connect] Relay connect to relay node failed: %d\n", err);
             if (state->dht) state->dht->relay_stats().aborts++;
-            // Relay terminal — let the (possibly held-off) error path fire.
-            if (state->relay) state->relay->terminal = true;
+            // connect-10 — JS onabort: destroy the chain (only the
+            // watchdog timer exists at this point), then let the
+            // (possibly held-off) error path fire.
+            abort_relay_chain(state);
             state->complete_error(ConnectError::RELAY_FAILED);
             return;
         }
@@ -975,7 +1032,10 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
         if (!channel) {
             DHT_LOG("  [connect] Failed to create blind-relay channel\n");
             if (state->dht) state->dht->relay_stats().aborts++;
-            if (state->relay) state->relay->terminal = true;
+            // connect-10 — JS onabort: destroy the partial chain
+            // (duplex + mux built, no client). Clean frame — we are in
+            // the dht->connect continuation, not a chain callback.
+            abort_relay_chain(state);
             state->complete_error(ConnectError::RELAY_FAILED);
             return;
         }
@@ -990,11 +1050,13 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
             [state](uint32_t remote_id) {
                 // Pair success!
                 if (state->completed || state->alive.expired()) return;
+                if (!state->relay) return;  // aborted (defensive — see onabort)
 
                 DHT_LOG("  [connect] Relay pairing succeeded! remote_id=%u\n",
                         remote_id);
 
                 // Cancel timeout (RAII handles cleanup)
+                // JS: connect.js:770 — clearRelayTimeout(c) FIRST on 'data'.
                 state->relay->timeout.reset();
 
                 state->relay->paired = true;
@@ -1072,6 +1134,17 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
                 // already failed and been held off). JS: relayClient 'error'
                 // → onabort → maybeDestroyEncryptedSocket.
                 if (state->relay) state->relay->terminal = true;
+                // connect-10 — JS onabort also destroys c.relaySocket.
+                // This frame is inside a BlindRelayClient callback:
+                // destroying the chain here would free the client
+                // mid-callback. Defer to a clean timer frame by re-arming
+                // the pairing watchdog to 0ms (its 15s shot is otherwise
+                // the only reaper, leaving the chain to linger).
+                if (state->relay && state->relay->timeout) {
+                    state->relay->timeout->start([state]() {
+                        abort_relay_chain(state);
+                    }, 0);
+                }
                 state->complete_error(ConnectError::RELAY_FAILED);
             });
     });

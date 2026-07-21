@@ -495,6 +495,17 @@ void Holepuncher::on_message(const compact::Ipv4Address& from,
         result.address = from;
         result.firewall = remote_firewall_;
         result.socket = recv_socket;  // JS: onconnect(ref.socket, port, host)
+        if (ref) {
+            // Birthday win: the stream will live on this holder's socket,
+            // not the caller's PoolSocket. JS keeps the winning ref alive as
+            // _allHolders[0] (holepuncher.js:136-142) and hands ref.socket to
+            // onconnect (holepuncher.js:145). Our destroy() releases every
+            // holder, so pin the winner separately: active() now, inactive()
+            // when the consumer drops HolepunchResult.socket_keepalive.
+            ref->active();
+            result.socket_keepalive = std::shared_ptr<void>(
+                ref, [](socket_pool::SocketRef* p) { p->inactive(); });
+        }
         cb(result);
     }
 }
@@ -1440,14 +1451,15 @@ void holepunch_connect(rpc::RpcSocket& socket,
     });
     puncher->on_connect([state](const HolepunchResult& result) {
         auto augmented = result;
-        // ponytail: for the common (non-birthday) win the echo arrives on
-        // state->pool, so pinning it is correct. For a RANDOM+CONSISTENT
-        // birthday win, result.socket is a socket_pool::SocketRef (not
-        // state->pool) and the winning ref must be kept alive instead — that
-        // path is cross-NAT-only, untestable on loopback, and needs live CGNAT
-        // validation. Upgrade path: hand the winning SocketRef to the result as
-        // its keepalive when result.socket != state->pool->socket_handle().
-        augmented.socket_keepalive = state->pool;
+        // Common (non-birthday) win: the echo arrives on state->pool, so pin
+        // it. RANDOM+CONSISTENT birthday win: the puncher already pinned the
+        // winning SocketRef into result.socket_keepalive (see
+        // Holepuncher::on_message) — keep that ref so the socket under the
+        // UDX stream outlives destroy()'s holder release. Server-side
+        // birthday stream COMPLETION remains a separate, live-CGNAT-only
+        // concern.
+        augmented.socket_keepalive =
+            result.socket_keepalive ? result.socket_keepalive : state->pool;
         state->complete(augmented);
     });
     // JS holepuncher.js fires the abort callback when _autoDestroy() runs

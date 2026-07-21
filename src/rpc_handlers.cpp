@@ -27,8 +27,8 @@
 // C++ diffs from JS:
 //   - JS Persistent has separate caches for `bumps`, `refreshes`,
 //     `mutables`, `immutables` (record-cache + xache packages).
-//     C++ uses simpler `RecordCache` for mutables/immutables and
-//     `AnnounceStore` for the record cache. No bump/refresh handling.
+//     C++ uses `LruCache` for mutables/immutables/refreshes, a plain map
+//     for bumps and `AnnounceStore` for the record cache.
 //   - Mutable/immutable size split is half-and-half (matches JS,
 //     persistent.js constructor).
 
@@ -66,7 +66,9 @@ RpcHandlers::RpcHandlers(RpcSocket& socket, router::Router* router,
       // JS: index.js:610-615 — mutable/immutable each get maxSize/2 entries.
       // Guard against max_size=0 by using at least 1 entry per cache.
       mutables_(std::max<size_t>(1, cache_config.max_size / 2)),
-      immutables_(std::max<size_t>(1, cache_config.max_size / 2)) {
+      immutables_(std::max<size_t>(1, cache_config.max_size / 2)),
+      // JS index.js:608 — refreshes gets the FULL maxSize (not halved).
+      refreshes_(std::max<size_t>(1, cache_config.max_size)) {
     start_gc_timer();
 }
 
@@ -110,6 +112,9 @@ void RpcHandlers::on_gc_tick(uv_timer_t* timer) {
     self->mutables_.gc(now, self->storage_ttl_ms_);
     self->immutables_.gc(now, self->storage_ttl_ms_);
     self->store_.gc(now);
+
+    // JS index.js:608 — refreshes maxAge = opts.maxAge, same as records.
+    self->refreshes_.gc(now, self->ann_ttl_ms_);
 
     // Expire stale bump entries, same TTL as the announce store (JS bumps
     // Cache uses maxAge = opts.maxAge, same as the records cache).
@@ -577,8 +582,8 @@ void RpcHandlers::handle_lookup(const messages::Request& req) {
 //     .analysis/js/hyperdht/lib/persistent.js:269-284 (annSignable)
 //
 // C++ diffs from JS:
-//   - No `refresh` cache plumbing (JS:145-147). The refresh-only path
-//     replies but doesn't yet hook up `_onrefresh`.
+//   - Refresh cache plumbing (JS:145-147) stores into `refreshes_`; the
+//     refresh-only path dispatches to handle_refresh (JS _onrefresh).
 //   - Relay-address cap of 3 matches JS:121-123.
 //   - Bump tracking + announceSelf router population + bare-record storage
 //     now mirror JS (persistent.js:121-143). See body.
@@ -599,18 +604,11 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
     auto ann = dht_messages::decode_announce_msg(
         req.value->data(), req.value->size());
 
-    // Refresh-only (no peer) — skip signature check (JS: _onrefresh)
+    // Refresh-only (no peer) — the value is a refresh-chain PREIMAGE, no
+    // signature involved (JS persistent.js:109-113 → _onrefresh).
     if (!ann.peer.has_value()) {
         if (!ann.refresh.has_value()) return;
-        // TODO: implement full refresh token handling (_onrefresh)
-        // For now, reply so the client doesn't time out
-        messages::Response resp;
-        resp.tid = req.tid;
-        resp.from.addr = req.from.addr;
-        if (!socket_.is_ephemeral() && req.from_server) {
-            resp.id = socket_.table().id();
-        }
-        socket_.reply(resp, req.from_server);
+        handle_refresh(*ann.refresh, req);
         return;
     }
 
@@ -657,6 +655,19 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
     const bool announce_self = (pk_hash == *req.target);
 
     assert(socket_.loop() != nullptr);
+
+    // JS persistent.js:145-147 — remember the refresh hash so a later
+    // peer-null announce presenting its preimage can re-add this record
+    // without a signature (handle_refresh). Stored before the branches
+    // below because they consume `record` by move; same bytes either way.
+    if (ann.refresh.has_value()) {
+        RefreshEntry entry;
+        entry.target = target;
+        entry.record = record;  // copy
+        entry.announce_self = announce_self;
+        refreshes_.put(to_hex_key(*ann.refresh), std::move(entry),
+                       uv_now(socket_.loop()));
+    }
 
     if (announce_self) {
         // JS persistent.js:131-138 — the record is served via the router
@@ -709,6 +720,83 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
         resp.id = socket_.table().id();
     }
 
+    socket_.reply(resp, req.from_server);
+}
+
+// ---------------------------------------------------------------------------
+// ANNOUNCE (refresh-only) — peer-null announce presenting a refresh-chain
+// preimage.
+//
+// JS: .analysis/js/hyperdht/lib/persistent.js:72-98 (_onrefresh)
+//     .analysis/js/hyperdht/lib/refresh-chain.js (block[i] = H(block[i+1]))
+//
+//   activeRefresh = BLAKE2b(token); r = refreshes.get(activeRefresh)
+//   miss → return (silent drop, no reply — the client times out)
+//   hit  → re-add the record (router.set for announceSelf, records.add
+//          otherwise), rotate the cache entry to key = hex(token) so the
+//          NEXT chain link can refresh again, and reply
+//          { token: false, closerNodes: false }.
+//
+// No signature: presenting the preimage of the stored hash proves the
+// refresher is the original announcer. Runs behind the same req.token
+// validation as a full announce (handle_announce dispatches here).
+// ---------------------------------------------------------------------------
+
+void RpcHandlers::handle_refresh(const std::array<uint8_t, 32>& token,
+                                 const messages::Request& req) {
+    // JS persistent.js:73-77 — look up under BLAKE2b(presented preimage).
+    std::array<uint8_t, 32> hash{};
+    crypto_generichash(hash.data(), 32, token.data(), token.size(),
+                       nullptr, 0);
+
+    const auto active_key = to_hex_key(hash);
+    const auto* found = refreshes_.get(active_key);
+    if (!found) return;  // JS: silent drop
+
+    // Copy — the remove() below invalidates `found`.
+    RefreshEntry entry = *found;
+
+    if (entry.announce_self) {
+        // JS persistent.js:82-89 — repopulate the router forward entry
+        // (relay = req.from) and drop the record-cache copy. Same
+        // local-Server guard as handle_announce: never clobber a locally
+        // listening Server's handlers, only refresh record + relay hint.
+        if (router_) {
+            auto* existing = router_->get(entry.target);
+            if (existing && existing->on_peer_handshake) {
+                existing->record = entry.record;
+                existing->relay = req.from.addr;
+            } else {
+                router::ForwardEntry fwd;
+                fwd.record = entry.record;
+                fwd.relay = req.from.addr;
+                router_->set(entry.target, std::move(fwd));
+            }
+        }
+        store_.remove(entry.target, req.from.addr);
+    } else {
+        // JS persistent.js:91 — records.add(k, publicKey, record).
+        announce::PeerAnnouncement stored;
+        stored.from = req.from.addr;
+        stored.value = entry.record;
+        stored.created_at = uv_now(socket_.loop());
+        stored.ttl = ann_ttl_ms_;
+        store_.put(entry.target, stored);
+    }
+
+    // JS persistent.js:94-95 — rotate: consume the presented link, re-key
+    // the entry under the preimage (which is BLAKE2b of the next link).
+    refreshes_.remove(active_key);
+    refreshes_.put(to_hex_key(token), std::move(entry),
+                   uv_now(socket_.loop()));
+
+    // JS persistent.js:97 — reply { token: false, closerNodes: false }
+    messages::Response resp;
+    resp.tid = req.tid;
+    resp.from.addr = req.from.addr;
+    if (!socket_.is_ephemeral() && req.from_server) {
+        resp.id = socket_.table().id();
+    }
     socket_.reply(resp, req.from_server);
 }
 

@@ -312,6 +312,82 @@ HandshakeMessage decode_handshake_msg(const uint8_t* data, size_t len) {
 //     we always emit `MODE_FROM_CLIENT`.
 // ---------------------------------------------------------------------------
 
+// Validate a PEER_HANDSHAKE reply. Shared by both peer_handshake overloads.
+// Mirrors the JS validation chain:
+//   router.js:63-71  — reply rejected (BAD_HANDSHAKE_REPLY) unless
+//     hs.mode === REPLY && to.host === res.from.host &&
+//     to.port === res.from.port && hs.noise
+//   connect.js:425-436 — after Noise completes: version !== 1 →
+//     SERVER_INCOMPATIBLE, error !== NONE → SERVER_ERROR, !udx →
+//     SERVER_ERROR. All three are TERMINAL (whole connect fails, no
+//     relay retry); the router.js checks above are per-attempt.
+static HandshakeResult validate_handshake_response(
+        const messages::Response& resp,
+        const compact::Ipv4Address& relay_addr,
+        noise::NoiseIK& noise_ik,
+        const noise::PubKey& remote_pubkey) {
+    HandshakeResult result;  // success=false, terminal=false
+
+    if (!resp.value.has_value() || resp.value->empty()) return result;
+
+    // Decode errors leave mode=MODE_FROM_CLIENT / empty noise, so they
+    // fall into the checks below (JS `!hs` → BAD_HANDSHAKE_REPLY).
+    auto hs_resp = decode_handshake_msg(resp.value->data(), resp.value->size());
+
+    // JS router.js:65 — hs.mode !== REPLY.
+    if (hs_resp.mode != MODE_REPLY) return result;
+
+    // JS router.js:66-67 — the reply must come from the exact address we
+    // sent the request to. The RPC layer matches responses to inflight
+    // requests by tid ONLY (rpc.cpp find_inflight) — it never compares the
+    // UDP source against the request's destination, so any host that
+    // guesses the 16-bit tid could answer. resp.remote_addr is the actual
+    // UDP source (transport-layer field set by the receive path); note
+    // resp.from is the wire `to` field — the responder's view of OUR
+    // address — not the sender's address.
+    if (resp.remote_addr != relay_addr) return result;
+
+    // JS router.js:68 — !hs.noise.
+    if (hs_resp.noise.empty()) return result;
+
+    auto decrypted = noise_ik.recv(hs_resp.noise.data(), hs_resp.noise.size());
+    if (!decrypted.has_value() || !noise_ik.is_complete()) return result;
+
+    result.remote_payload = decode_noise_payload(
+        decrypted->data(), decrypted->size());
+
+    // From here on the payload came from the Noise-authenticated server —
+    // failures are terminal (JS destroys the connect, no relay retry).
+    // JS connect.js:425-428 — payload.version !== 1 → SERVER_INCOMPATIBLE.
+    if (result.remote_payload.version != 1) {
+        result.terminal = true;
+        return result;
+    }
+    // JS connect.js:429-432 — payload.error !== NONE → SERVER_ERROR.
+    if (result.remote_payload.error != ERROR_NONE) {
+        result.terminal = true;
+        return result;
+    }
+    // JS connect.js:433-436 — !payload.udx → SERVER_ERROR.
+    if (!result.remote_payload.udx.has_value()) {
+        result.terminal = true;
+        return result;
+    }
+
+    result.success = true;
+    result.tx_key = noise_ik.tx_key();
+    result.rx_key = noise_ik.rx_key();
+    result.handshake_hash = noise_ik.handshake_hash();
+    result.remote_public_key = remote_pubkey;
+    // JS `router.js:46-78`: serverAddress = hs.peerAddress || to.
+    // The relay's observation of where the server replied from —
+    // the fresh address. Used downstream as Round 1's
+    // `remote_address` field which triggers the server's
+    // fast-mode punch (server.js:530-538).
+    result.server_address = hs_resp.peer_address;
+    return result;
+}
+
 void peer_handshake(rpc::RpcSocket& socket,
                     const compact::Ipv4Address& relay_addr,
                     const noise::Keypair& our_keypair,
@@ -320,91 +396,11 @@ void peer_handshake(rpc::RpcSocket& socket,
                     uint32_t firewall,
                     const std::vector<compact::Ipv4Address>& addresses4,
                     OnHandshakeCallback on_done) {
-
-    // Create Noise IK initiator with real prologue
-    auto noise_ik = std::make_shared<noise::NoiseIK>(true, our_keypair,
-                                                      prologue().data(), prologue().size(),
-                                                      &remote_pubkey);
-
-    // Build noisePayload for msg1
-    // JS: connect.js:396-411 — firewall + addresses4 from caller
-    NoisePayload payload;
-    payload.version = 1;
-    payload.error = ERROR_NONE;
-    payload.firewall = firewall;
-    payload.addresses4 = addresses4;
-    payload.udx = UdxInfo{1, false, our_udx_id, 0};
-    payload.has_secret_stream = true;
-
-    auto payload_bytes = encode_noise_payload(payload);
-
-    // Encrypt payload inside Noise msg1
-    auto noise_msg1 = noise_ik->send(payload_bytes.data(), payload_bytes.size());
-
-    // Wrap in handshake message
-    HandshakeMessage hs_msg;
-    hs_msg.mode = MODE_FROM_CLIENT;
-    hs_msg.noise = std::move(noise_msg1);
-
-    auto hs_value = encode_handshake_msg(hs_msg);
-
-    // Compute target = BLAKE2b-256(remote_pubkey)
-    std::array<uint8_t, 32> target{};
-    crypto_generichash(target.data(), 32, remote_pubkey.data(), 32, nullptr, 0);
-
-    // Send as DHT RPC request
-    messages::Request req;
-    req.to.addr = relay_addr;
-    req.command = messages::CMD_PEER_HANDSHAKE;
-    req.target = target;
-    req.value = std::move(hs_value);
-
-    socket.request(req,
-        [noise_ik, on_done, remote_pubkey](const messages::Response& resp) {
-            HandshakeResult result;
-
-            if (!resp.value.has_value() || resp.value->empty()) {
-                result.success = false;
-                on_done(result);
-                return;
-            }
-
-            auto hs_resp = decode_handshake_msg(resp.value->data(), resp.value->size());
-            if (hs_resp.noise.empty()) {
-                result.success = false;
-                on_done(result);
-                return;
-            }
-
-            auto decrypted = noise_ik->recv(hs_resp.noise.data(), hs_resp.noise.size());
-            if (!decrypted.has_value() || !noise_ik->is_complete()) {
-                result.success = false;
-                on_done(result);
-                return;
-            }
-
-            result.remote_payload = decode_noise_payload(
-                decrypted->data(), decrypted->size());
-
-            result.success = (result.remote_payload.error == ERROR_NONE);
-            result.tx_key = noise_ik->tx_key();
-            result.rx_key = noise_ik->rx_key();
-            result.handshake_hash = noise_ik->handshake_hash();
-            result.remote_public_key = remote_pubkey;
-            // JS `router.js:46-78`: serverAddress = hs.peerAddress || to.
-            // The relay's observation of where the server replied from —
-            // the fresh address. Used downstream as Round 1's
-            // `remote_address` field which triggers the server's
-            // fast-mode punch (server.js:530-538).
-            result.server_address = hs_resp.peer_address;
-
-            on_done(result);
-        },
-        [noise_ik, on_done](uint16_t) {
-            HandshakeResult result;
-            result.success = false;
-            on_done(result);
-        });
+    // Identical to the relayThrough overload with relay_through absent
+    // (flag bit 32 unset → byte-identical wire output).
+    peer_handshake(socket, relay_addr, our_keypair, remote_pubkey,
+                   our_udx_id, firewall, addresses4, std::nullopt,
+                   std::move(on_done));
 }
 
 // Overload with relayThrough in the Noise payload (Phase E)
@@ -450,40 +446,12 @@ void peer_handshake(rpc::RpcSocket& socket,
     req.value = std::move(hs_value);
 
     socket.request(req,
-        [noise_ik, on_done, remote_pubkey](const messages::Response& resp) {
-            HandshakeResult result;
-            if (!resp.value.has_value() || resp.value->empty()) {
-                result.success = false;
-                on_done(result);
-                return;
-            }
-            auto hs_resp = decode_handshake_msg(resp.value->data(), resp.value->size());
-            if (hs_resp.noise.empty()) {
-                result.success = false;
-                on_done(result);
-                return;
-            }
-            auto decrypted = noise_ik->recv(hs_resp.noise.data(), hs_resp.noise.size());
-            if (!decrypted.has_value() || !noise_ik->is_complete()) {
-                result.success = false;
-                on_done(result);
-                return;
-            }
-            result.remote_payload = decode_noise_payload(
-                decrypted->data(), decrypted->size());
-            result.success = (result.remote_payload.error == ERROR_NONE);
-            result.tx_key = noise_ik->tx_key();
-            result.rx_key = noise_ik->rx_key();
-            result.handshake_hash = noise_ik->handshake_hash();
-            result.remote_public_key = remote_pubkey;
-            // JS `router.js:46-78`: serverAddress = hs.peerAddress || to.
-            result.server_address = hs_resp.peer_address;
-            on_done(result);
+        [noise_ik, on_done, remote_pubkey, relay_addr](const messages::Response& resp) {
+            on_done(validate_handshake_response(resp, relay_addr, *noise_ik,
+                                                remote_pubkey));
         },
-        [noise_ik, on_done](uint16_t) {
-            HandshakeResult result;
-            result.success = false;
-            on_done(result);
+        [on_done](uint16_t) {
+            on_done(HandshakeResult{});  // success=false, terminal=false
         });
 }
 

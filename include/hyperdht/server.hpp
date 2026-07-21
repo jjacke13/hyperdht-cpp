@@ -242,6 +242,13 @@ public:
     // schedule (random spray = 1750 probes x 20ms = 35s).
     uint64_t punch_clear_wait = 45000;
 
+    // Blind-relay pairing watchdog. JS: server.js:646 —
+    // `hs.relayTimeout = setTimeout(onabort, 15000)`. On fire the relay
+    // control chain for that session is torn down (abort_relay); the
+    // session itself and its puncher keep running — holepunch may still
+    // win. Overridable so tests don't wait 15s.
+    uint64_t relay_timeout = 15000;
+
     // Blind-relay options (Phase E)
     // JS: server.js:28-29 — this.relayThrough, this.relayKeepAlive
     //
@@ -335,6 +342,25 @@ private:
     // Per-session cleanup — uses configurable handshake_clear_wait
     std::unordered_map<uint32_t, std::unique_ptr<async_utils::UvTimer>> session_timers_;
     void clear_session(uint32_t hp_id);
+
+    // server-8 — per-session blind-relay pairing watchdog + teardown hook.
+    // JS: server.js:646 (hs.relayTimeout) + 675-684 (onabort). `timer` is
+    // armed when the relay bootstrap starts; `abort` is registered once
+    // the relay chain (duplex/mux/client) exists and tears it down.
+    // Erased on pairing success (JS: clearRelayTimeout on 'data',
+    // server.js:652). While the connect to the relay node is in flight
+    // the entry has a timer but no abort fn; the connect continuation
+    // treats a missing entry as "aborted" and bails.
+    struct RelayPending {
+        std::unique_ptr<async_utils::UvTimer> timer;
+        std::function<void()> abort;
+    };
+    std::unordered_map<uint32_t, RelayPending> relay_pending_;
+    // JS onabort (server.js:676-684): stats abort, null relayToken,
+    // destroy the relay chain. Does NOT clear the session. No-op once
+    // the entry is gone. Must be called from a clean frame (timer,
+    // clear_session, close) — never from inside a relay-chain callback.
+    void abort_relay(uint32_t hp_id);
 
     // True while a session's blind-relay pairing is still in flight
     // (relay_token set, connection present). While engaged, session

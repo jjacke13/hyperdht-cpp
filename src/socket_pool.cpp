@@ -199,6 +199,12 @@ void SocketPool::destroy() {
     }
     sockets_.clear();     // H9: pool is destroyed, entries are stale
     lingering_.clear();
+    // NOTE: the SocketRef objects are deliberately NOT deleted here. A
+    // birthday-win HolepunchResult.socket_keepalive holds a deleter that
+    // calls ref->inactive() after the stream dies — possibly after this
+    // pool is destroyed. The refs must stay allocated so that late
+    // inactive() lands on a live object (closed_ makes it a no-op).
+    // Deleting them here would turn every outstanding keepalive into a UAF.
 }
 
 void SocketPool::add(SocketRef* ref) {

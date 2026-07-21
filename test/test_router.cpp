@@ -33,7 +33,8 @@ static ForwardEntry make_echo_entry() {
 static messages::Request make_hs_request(const announce::TargetKey& target,
                                           uint32_t mode,
                                           Ipv4Address from = Ipv4Address::from_string("10.0.0.1", 5000),
-                                          uint16_t tid = 42) {
+                                          uint16_t tid = 42,
+                                          std::optional<Ipv4Address> relay_address = std::nullopt) {
     peer_connect::HandshakeMessage hs_msg;
     hs_msg.mode = mode;
     hs_msg.noise = {0x01, 0x02, 0x03};
@@ -41,6 +42,8 @@ static messages::Request make_hs_request(const announce::TargetKey& target,
         // FROM_RELAY includes the original client's address in peerAddress
         hs_msg.peer_address = Ipv4Address::from_string("192.168.1.100", 9999);
     }
+    // FROM_SECOND_RELAY carries the first relay's address (router.js:156)
+    hs_msg.relay_address = relay_address;
 
     messages::Request req;
     req.target = *reinterpret_cast<const std::array<uint8_t, 32>*>(target.data());
@@ -285,6 +288,61 @@ TEST(Router, RelayReplyIncludesPeerAddress) {
             EXPECT_EQ(hs.peer_address->host_string(), "192.168.1.100");
             EXPECT_EQ(hs.peer_address->port, 9999);
         });
+}
+
+// Server-host FROM_SECOND_RELAY → FROM_SERVER relayed to the embedded
+// relayAddress (the first relay), NOT req.from (router.js:118-126).
+TEST(Router, SecondRelayReplyGoesToRelayAddress) {
+    Router r;
+    auto target = make_target(0x9A);
+    r.set(target, make_echo_entry());
+
+    auto second_relay = Ipv4Address::from_string("10.0.0.1", 5000);   // req.from
+    auto first_relay = Ipv4Address::from_string("157.90.213.229", 49738);
+    auto req = make_hs_request(target, peer_connect::MODE_FROM_SECOND_RELAY,
+                                second_relay, /*tid=*/42, first_relay);
+
+    bool reply_called = false;
+    bool relay_called = false;
+
+    r.handle_peer_handshake(req,
+        [&](const messages::Response&) { reply_called = true; },
+        [&](const messages::Request& relay_req) {
+            relay_called = true;
+            EXPECT_EQ(relay_req.to.addr.host_string(), "157.90.213.229")
+                << "FROM_SECOND_RELAY reply must go to relayAddress (first relay)";
+            EXPECT_EQ(relay_req.to.addr.port, 49738);
+
+            auto hs = peer_connect::decode_handshake_msg(
+                relay_req.value->data(), relay_req.value->size());
+            EXPECT_EQ(hs.mode, peer_connect::MODE_FROM_SERVER);
+        });
+
+    EXPECT_FALSE(reply_called);
+    EXPECT_TRUE(relay_called)
+        << "FROM_SECOND_RELAY with relayAddress must relay FROM_SERVER";
+}
+
+// Server-host FROM_SECOND_RELAY without relayAddress → drop, nothing sent
+// (router.js:119 `if (!relayAddress) return`).
+TEST(Router, SecondRelayWithoutRelayAddressDropped) {
+    Router r;
+    auto target = make_target(0x9B);
+    r.set(target, make_echo_entry());
+
+    auto req = make_hs_request(target, peer_connect::MODE_FROM_SECOND_RELAY);
+
+    bool reply_called = false;
+    bool relay_called = false;
+
+    r.handle_peer_handshake(req,
+        [&](const messages::Response&) { reply_called = true; },
+        [&](const messages::Request&) { relay_called = true; });
+
+    EXPECT_FALSE(reply_called)
+        << "FROM_SECOND_RELAY without relayAddress must not reply";
+    EXPECT_FALSE(relay_called)
+        << "FROM_SECOND_RELAY without relayAddress must not relay";
 }
 
 // Test 7: PEER_HOLEPUNCH FROM_RELAY also sends REQUEST

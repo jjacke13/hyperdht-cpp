@@ -5,18 +5,24 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-07-11.
+Last updated: 2026-07-21.
 
 ---
 
 ## Status snapshot
 
 - **JS-parity sweep 2026-07-09**: 91 confirmed findings (12 HIGH / 45 MED / 34 LOW).
-  **All 12 HIGH closed.** ~70/91 addressed (fixed or accepted-divergence).
-  **~21 MED/LOW still open** (Section A).
-- **Committed** on branch `fix/relay-direct-upgrade` (NOT pushed): `f266b35`
-  deps bump, `88b8022` compact/routing, `5460cfa` core sweep + relay→direct
-  upgrade, `f37ef1d` wrappers, `86353db` docs. Suite 677/677 (excl. live test).
+  **All 12 HIGH closed.** ~76/91 addressed (fixed or accepted-divergence).
+  **16 MED/LOW still open** (Section A).
+- **2026-07-21 batch** (on main): announce-5, announce-7, server-8, connect-8
+  (SECURITY: handshake reply validation + new `Response::remote_addr` source
+  check — RPC matched responses by tid only), connect-10 (client relay-chain
+  teardown; also broke a shared_ptr cycle that leaked ConnState on dead
+  pairings), birthday-win SocketRef keepalive pin (holepunch.cpp:1450
+  residual). Suite 684/684 (excl. live); cpp-reviewer SHIP, ASAN/UBSAN clean.
+- Prior sweep commits (merged to main 2026-07-11): `f266b35` deps bump,
+  `88b8022` compact/routing, `5460cfa` core sweep + relay→direct upgrade,
+  `f37ef1d` wrappers, `86353db` docs.
 - Detail docs: `docs/PARITY-SWEEP-2026-07-09.md` (FREEZE table + per-subsystem
   notes + REMAINING OPEN), `docs/.parity-sweep-appendix.md` (all 91 with
   JS/C++ file:line), `docs/RELAY-UPGRADE-PORT.md` (#266 port design).
@@ -27,15 +33,20 @@ blind-relay, dhtrpc-io, protomux, query, dhtrpc-tick, dht-top. Partial
 
 ---
 
-## A. Open JS-parity findings (21) — the resume worklist
+## A. Open JS-parity findings (16) — the resume worklist
 
-Do **connect-8 + server-1/2/3 first** (correctness/security). Some are ACCEPT
-candidates (anti-DoS) — decide per finding, don't blindly port. Full text +
+Do **server-1/2/3 first** (correctness). Some are ACCEPT candidates
+(anti-DoS) — decide per finding, don't blindly port. Full text +
 JS/C++ file:line for each is in `docs/.parity-sweep-appendix.md`.
 
-### connect (8 open; done: connect-1/2/11)
-- [ ] **connect-8** — handshake reply under-validated: no `mode===REPLY`, no
-  from-address match, no token check. **SECURITY.** Do first.
+### connect (6 open; done: connect-1/2/8/10/11)
+- [x] **connect-8** — DONE 2026-07-21. Handshake reply now validated
+  (mode==REPLY, source-address match via `Response::remote_addr`, version/
+  error/udx checks); JS-terminal failures fail the connect with
+  `ConnectError::SERVER_ERROR` instead of retrying relays.
+- [x] connect-10 — DONE 2026-07-21. 15s timer now tears down the relay chain
+  (`abort_relay_chain`), breaking the pair-callback↔ConnState shared_ptr
+  cycle; deferred teardown from client-callback frames via 0ms re-arm.
 - [ ] connect-3 — `reusableSocket` ignored on the CLIENT path: `ConnectOptions.
   reusable_socket` (dht.hpp:242) declared but never consumed on connect;
   route-cache read (`connect.cpp:509 get_route`) + write (`:155 add_route`)
@@ -48,9 +59,8 @@ JS/C++ file:line for each is in `docs/.parity-sweep-appendix.md`.
 - [ ] connect-6 — LAN same-NAT shortcut runs in PARALLEL with holepunch (JS exclusive).
 - [ ] connect-7 — `opts.holepunch` client veto callback never invoked.
 - [ ] connect-9 — findPeer query not seeded with closestNodes/onlyClosestNodes/retries.
-- [ ] connect-10 — relay pairing 15s timeout is a no-op (no teardown/abort).
 
-### server (8 open; done: server-5)
+### server (7 open; done: server-5/8)
 - [ ] **server-1** — firewall-rejected handshake sends an ERROR_ABORTED Noise
   reply; JS sends nothing. Correctness. Do early.
 - [ ] **server-2** — holepunch reply committed (ERROR_NONE, punching) before the
@@ -60,19 +70,23 @@ JS/C++ file:line for each is in `docs/.parity-sweep-appendix.md`.
 - [ ] server-4 — `MAX_PENDING_HANDSHAKES=256` cap silently drops. **ACCEPT
   candidate** (anti-DoS, like the other caps we kept) — likely just document.
 - [ ] server-6 — `neverPunch` (`opts.holepunch === false`) not implemented.
-- [ ] server-8 — relay pairing has no 15s abort timer.
+- [x] server-8 — DONE 2026-07-21. 15s pairing watchdog (`relay_pending_` +
+  `abort_relay`): tears down the relay chain only, session + puncher keep
+  running (JS onabort parity); pair-error no longer clears the session.
 - [ ] server-9 — server-side same-host LAN match (server.js:414-426) not implemented.
 - [ ] server-11 — OPEN-client shortcut targets self-reported `addresses4[0]` with a null socket.
 
-### router-announce (4 open; done: announce-1/2/3)
+### router-announce (2 open; done: announce-1/2/3/5/7)
 - [ ] announce-4 — announcer embeds relay addresses in the SIGNED announce
   record; JS announces an empty relayAddresses list.
-- [ ] announce-5 — FROM_SECOND_RELAY handshake reply sent to `req.from` instead
-  of the embedded `relayAddress` (known TODO in router.cpp server-host branch).
+- [x] announce-5 — DONE 2026-07-21. Server-host FROM_SECOND_RELAY reply now
+  routed to the embedded relayAddress (first relay), dropped when absent.
 - [ ] announce-6 — holepunch server handler invoked for all incoming modes, not
   only the ones JS gates.
-- [ ] announce-7 — refresh-chain announce not honored: refresh token never
-  stored and re-announce path unimplemented.
+- [x] announce-7 — DONE 2026-07-21. `handle_refresh` ports persistent.js
+  `_onrefresh`: refresh hashes stored on full announce, preimage verified,
+  record re-added, chain rotated. (Latent feature — current JS always sends
+  refresh:null.)
 
 ### secret-stream (1 open)
 - [ ] connect-1 (MED) — `connected`/on_connect gated on the REMOTE header +
@@ -106,10 +120,11 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
 - [ ] Relay→direct upgrade: C++ client rides relay → punch lands → migrates with
   no ETIMEDOUT/-110; relay closed only after provable direct arrival.
 - [ ] Server-side migration when a JS client is on relay and the C++ server punches.
-- [ ] Holepuncher birthday **win** keepalive: winning `SocketRef` must be pinned,
-  not `state->pool` (residual at `holepunch.cpp:1450`); + server-side birthday
-  stream *completion* (accepts via main-socket firewall, not birthday SocketRefs)
-  — THE symmetric-CGNAT-server path.
+- [ ] Holepuncher birthday **win** end-to-end (the pinning residual at
+  holepunch.cpp:1450 is FIXED 2026-07-21 — winning `SocketRef` now rides in
+  `HolepunchResult.socket_keepalive`); still needs live validation, plus
+  server-side birthday stream *completion* (accepts via main-socket firewall,
+  not birthday SocketRefs) — THE symmetric-CGNAT-server path.
 - [ ] Outgoing request id accepted by JS `validateId` → C++ node appears in JS
   routing tables; bootstrapper works as a real DHT id-holder.
 - [ ] TRY_LATER end-to-end (throttled server → client waits 10-20s → completes).
@@ -192,4 +207,3 @@ before any full "core frozen" sign-off:
   heavily this session (rpc, connect, server, holepunch, protomux) to catch
   regressions the per-bucket reviews might have missed. Append new findings to
   Section A.
-- [ ] Push `fix/relay-direct-upgrade` + open PR once the user OKs (currently local).

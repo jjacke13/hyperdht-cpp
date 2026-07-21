@@ -93,9 +93,10 @@ struct HolepunchResult {
     compact::Ipv4Address address;       // Peer's address to connect to
     uint32_t firewall = 0;              // Peer's firewall status
     udx_socket_t* socket = nullptr;     // Socket that received the probe (JS: ref.socket)
-    // Keeps the pool socket alive while the UDX stream uses it. The raw
-    // `socket` pointer above points into this object. Caller must hold
-    // this shared_ptr for the stream's lifetime (type-erased PoolSocket).
+    // Keeps the socket under `socket` alive while the UDX stream uses it.
+    // Caller must hold this shared_ptr for the stream's lifetime. Type-erased:
+    // a PoolSocket for the common win, or the winning birthday SocketRef
+    // (active()'d; the deleter calls inactive()) for a RANDOM+CONSISTENT win.
     std::shared_ptr<void> socket_keepalive;
 };
 

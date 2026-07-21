@@ -14,9 +14,9 @@
 //     handlers) and the else half — a pure relay forwarding on behalf of an
 //     announce-populated ForwardEntry.relay (see relay_peer_handshake /
 //     relay_peer_holepunch below).
-//   - Server-host FROM_SECOND_RELAY is still partial — we send back to
-//     req.from, not the embedded relayAddress (see TODO in the server-host
-//     branch of handle_peer_handshake).
+//   - Server-host FROM_SECOND_RELAY relays the FROM_SERVER reply to the
+//     embedded relayAddress (the first relay), dropping it when absent
+//     (router.js:118-126).
 
 #include "hyperdht/router.hpp"
 
@@ -199,9 +199,10 @@ void Router::clear() {
 //
 // Two halves, matching JS:
 //   - is_server (entry has on_peer_handshake): the local Server answers.
-//       FROM_CLIENT → REPLY; FROM_RELAY / FROM_SECOND_RELAY → relay back
-//       FROM_SERVER to req.from. (Server-host FROM_SECOND_RELAY is partial —
-//       it goes to req.from, not the embedded relayAddress.)
+//       FROM_CLIENT → REPLY; FROM_RELAY → relay back FROM_SERVER to req.from
+//       (router.js:110-117); FROM_SECOND_RELAY → relay back FROM_SERVER to
+//       the embedded relayAddress (the first relay), or drop when absent
+//       (router.js:118-126).
 //   - else (pure relay, entry has only ForwardEntry.relay, or no entry):
 //       relay_peer_handshake() above — FROM_CLIENT → FROM_RELAY toward the
 //       relay (or a closerNodes reply when none is known), FROM_RELAY →
@@ -251,6 +252,9 @@ bool Router::handle_peer_handshake(const messages::Request& req,
     // The client's address (FROM_RELAY: from the peerAddress field; FROM_CLIENT: from the packet)
     auto client_addr = hs_msg.peer_address.value_or(req.from.addr);
     auto incoming_mode = hs_msg.mode;
+    // FROM_SECOND_RELAY: the first relay's address, embedded by the second
+    // relay (router.js:156 `relayAddress: req.from`).
+    auto relay_address = hs_msg.relay_address;
 
     // Capture only the fields we need (avoid copying the full Request with its value vector)
     auto req_tid = req.tid;
@@ -261,7 +265,7 @@ bool Router::handle_peer_handshake(const messages::Request& req,
     // Call the server's handler. It will call reply_fn with the Noise msg2.
     entry->on_peer_handshake(
         hs_msg.noise, client_addr,
-        [req_tid, req_from, req_command, req_target,
+        [req_tid, req_from, req_command, req_target, relay_address,
          reply, relay, client_addr, incoming_mode](std::vector<uint8_t> reply_noise) {
             DHT_LOG( "  [router] reply_fn called, noise=%zu bytes, incoming_mode=%u\n",
                     reply_noise.size(), incoming_mode);
@@ -279,14 +283,18 @@ bool Router::handle_peer_handshake(const messages::Request& req,
 
                 reply(resp);
             } else {
-                // FROM_RELAY (or FROM_SECOND_RELAY — see note below): send REQUEST
-                // back to relay with mode=FROM_SERVER. The relay node converts this
-                // to a RESPONSE for the original client. TID is preserved.
+                // FROM_RELAY / FROM_SECOND_RELAY: send REQUEST back with
+                // mode=FROM_SERVER. The relay node converts this to a RESPONSE
+                // for the original client. TID is preserved.
                 //
-                // NOTE: FROM_SECOND_RELAY should send to relayAddress (the first
-                // relay), not req.from (the second relay). This is not yet
-                // implemented — second-relay is a rare edge case that requires the
-                // client to specify a relayAddress.
+                // FROM_RELAY goes back to req.from (router.js:110-117).
+                // FROM_SECOND_RELAY goes to the embedded relayAddress — the
+                // FIRST relay, not req.from (the second relay); dropped when
+                // absent (router.js:118-126 `if (!relayAddress) return`).
+                if (incoming_mode == peer_connect::MODE_FROM_SECOND_RELAY &&
+                    !relay_address) {
+                    return;
+                }
                 peer_connect::HandshakeMessage relay_msg;
                 relay_msg.mode = peer_connect::MODE_FROM_SERVER;
                 relay_msg.noise = std::move(reply_noise);
@@ -294,7 +302,10 @@ bool Router::handle_peer_handshake(const messages::Request& req,
 
                 messages::Request relay_req;
                 relay_req.tid = req_tid;
-                relay_req.to.addr = req_from;       // Back to relay node
+                relay_req.to.addr =
+                    incoming_mode == peer_connect::MODE_FROM_SECOND_RELAY
+                        ? *relay_address   // Back to the first relay
+                        : req_from;        // Back to relay node
                 relay_req.command = req_command;
                 relay_req.target = req_target;
                 relay_req.internal = false;

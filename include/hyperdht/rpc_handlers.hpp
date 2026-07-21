@@ -92,6 +92,10 @@ private:
     void handle_find_peer(const messages::Request& req);
     void handle_lookup(const messages::Request& req);
     void handle_announce(const messages::Request& req);
+    // Peer-null announce presenting a refresh-chain preimage
+    // (JS persistent.js:72-98 _onrefresh)
+    void handle_refresh(const std::array<uint8_t, 32>& token,
+                        const messages::Request& req);
     void handle_unannounce(const messages::Request& req);
     void handle_mutable_put(const messages::Request& req);
     void handle_mutable_get(const messages::Request& req);
@@ -116,6 +120,19 @@ private:
     uint64_t ann_ttl_ms_;
     LruCache<std::string, std::vector<uint8_t>> mutables_;
     LruCache<std::string, std::vector<uint8_t>> immutables_;
+
+    // Refresh-chain entries (JS persistent.js:21 `this.refreshes`, an xache
+    // with the same { maxSize, maxAge } as the records cache —
+    // hyperdht/index.js:607-608). Keyed by hex of the STORED refresh hash;
+    // a later peer-null announce presents the PREIMAGE
+    // (stored == BLAKE2b(presented), see refresh-chain.js).
+    struct RefreshEntry {
+        announce::TargetKey target{};
+        std::vector<uint8_t> record;   // bare m.peer record (as stored/served)
+        bool announce_self = false;
+    };
+    LruCache<std::string, RefreshEntry> refreshes_;
+
     uv_timer_t* gc_timer_ = nullptr;
 
     // Per-target relay-port "bump" values (JS persistent.js `this.bumps`,
@@ -174,6 +191,7 @@ public:
     void immutables_put(const std::array<uint8_t, 32>& target, std::vector<uint8_t> value) {
         immutables_.put(to_hex_key(target), std::move(value), 0);
     }
+    size_t refresh_count() const { return refreshes_.size(); }
 };
 
 }  // namespace rpc

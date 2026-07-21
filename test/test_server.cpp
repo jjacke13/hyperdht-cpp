@@ -6,6 +6,7 @@
 #include <uv.h>
 
 #include "hyperdht/connection_pool.hpp"
+#include "hyperdht/dht.hpp"
 #include "hyperdht/noise_wrap.hpp"
 #include "hyperdht/router.hpp"
 #include "hyperdht/rpc.hpp"
@@ -837,5 +838,173 @@ TEST(Server, ShareLocalAddressDefault) {
 
     socket.close();
     uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// server-8 — blind-relay pairing watchdog (JS: server.js:646, 675-684)
+// ---------------------------------------------------------------------------
+
+// A client handshake proposing relayThrough starts the server's relay
+// bootstrap: dht->connect(relay_pk) toward a peer that can never be found.
+// The only "bootstrap node" is a silent UDP socket, so the findPeer query
+// waits out its full RPC timeout (>= 1s) — well past the shortened
+// watchdog. The watchdog must:
+//   1. abort the relay chain (stats.relaying.aborts++), and
+//   2. NOT clear the session — the same noise bytes must still dedup onto
+//      the live session afterwards (JS onabort leaves hs alive; the
+//      holepunch runs in parallel and may still win — gotcha 19a).
+// The session is then reaped by its own GC timer (handshake_clear_wait),
+// un-deferred because abort_relay zeroed the relay token, so a re-sent
+// handshake afterwards creates a NEW session (attempts == 2). Closing
+// with that second pairing still in flight exercises the close() drain.
+TEST(Server, RelayWatchdogAbortsChainKeepsSession) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    // Silent "bootstrap": bound UDP socket that never answers.
+    uv_udp_t silent;
+    uv_udp_init(&loop, &silent);
+    struct sockaddr_in silent_addr;
+    uv_ip4_addr("127.0.0.1", 0, &silent_addr);
+    ASSERT_EQ(uv_udp_bind(&silent,
+                          reinterpret_cast<const struct sockaddr*>(&silent_addr), 0), 0);
+    int namelen = sizeof(silent_addr);
+    uv_udp_getsockname(&silent, reinterpret_cast<struct sockaddr*>(&silent_addr),
+                       &namelen);
+    uint16_t silent_port = ntohs(silent_addr.sin_port);
+
+    DhtOptions opts;
+    opts.bootstrap.push_back(
+        compact::Ipv4Address::from_string("127.0.0.1", silent_port));
+    HyperDHT dht(&loop, opts);
+    ASSERT_EQ(dht.bind(), 0);
+
+    auto* srv = dht.create_server();
+    ASSERT_NE(srv, nullptr);
+    srv->relay_timeout = 150;         // watchdog fires fast
+    srv->handshake_clear_wait = 700;  // session GC fires within the test
+
+    noise::Seed server_seed{};
+    server_seed.fill(0x31);
+    auto server_kp = noise::generate_keypair(server_seed);
+
+    bool connection_received = false;
+    srv->listen(server_kp, [&](const ConnectionInfo&) {
+        connection_received = true;
+    });
+
+    // Client msg1 proposing relayThrough (client-proposed, so the server
+    // pairs as non-initiator). Firewall CONSISTENT so the session is
+    // stored instead of direct-connecting.
+    noise::Seed client_seed{};
+    client_seed.fill(0x32);
+    auto client_kp = noise::generate_keypair(client_seed);
+
+    const auto& prol = dht_messages::ns_peer_handshake();
+    noise::NoiseIK client_noise(true, client_kp, prol.data(), prol.size(),
+                                 &server_kp.public_key);
+
+    peer_connect::NoisePayload client_payload;
+    client_payload.version = 1;
+    client_payload.firewall = peer_connect::FIREWALL_CONSISTENT;
+    client_payload.udx = peer_connect::UdxInfo{1, false, 12345, 0};
+    client_payload.has_secret_stream = true;
+    client_payload.addresses4.push_back(
+        compact::Ipv4Address::from_string("10.0.0.1", 5000));
+    peer_connect::RelayThroughInfo rt;
+    rt.public_key.fill(0x55);   // unfindable relay peer
+    rt.token.fill(0x66);
+    client_payload.relay_through = rt;
+
+    auto payload_bytes = peer_connect::encode_noise_payload(client_payload);
+    auto msg1 = client_noise.send(payload_bytes.data(), payload_bytes.size());
+
+    peer_connect::HandshakeMessage hs_msg;
+    hs_msg.mode = peer_connect::MODE_FROM_CLIENT;
+    hs_msg.noise = msg1;
+    auto hs_value = peer_connect::encode_handshake_msg(hs_msg);
+
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32,
+                       server_kp.public_key.data(), 32, nullptr, 0);
+
+    messages::Request req;
+    req.target = target;
+    req.value = hs_value;
+    req.from.addr = compact::Ipv4Address::from_string("10.0.0.1", 5000);
+    req.tid = 7;
+
+    auto dispatch = [&]() {
+        return dht.router().handle_peer_handshake(
+            req, [](const messages::Response&) {},
+            [](const messages::Request&) {});
+    };
+
+    // t=0: first handshake — Phase E starts, watchdog armed.
+    ASSERT_TRUE(dispatch());
+    EXPECT_EQ(dht.relay_stats().attempts, 1);
+    EXPECT_EQ(dht.relay_stats().aborts, 0);
+
+    // One-shot scheduling helper (closes its handle on fire).
+    struct Later {
+        uv_timer_t t{};
+        std::function<void()> fn;
+        void schedule(uv_loop_t* l, uint64_t ms, std::function<void()> f) {
+            fn = std::move(f);
+            uv_timer_init(l, &t);
+            t.data = this;
+            uv_timer_start(&t, [](uv_timer_t* h) {
+                auto* s = static_cast<Later*>(h->data);
+                uv_close(reinterpret_cast<uv_handle_t*>(h), nullptr);
+                s->fn();
+            }, ms, 0);
+        }
+    };
+    Later t1, t2, t3;
+    bool done = false;
+
+    // t=450ms: watchdog (150ms) has fired — relay aborted, session ALIVE:
+    // the same noise bytes must dedup onto the existing session (no new
+    // relay attempt).
+    t1.schedule(&loop, 450, [&]() {
+        EXPECT_EQ(dht.relay_stats().aborts, 1)
+            << "relay watchdog did not fire";
+        ASSERT_TRUE(dispatch());
+        EXPECT_EQ(dht.relay_stats().attempts, 1)
+            << "session was cleared by the relay abort (dedup miss)";
+    });
+
+    // t=900ms: session GC (700ms) has reaped the session (abort_relay
+    // zeroed the relay token, so the GC is not deferred to the 45s punch
+    // backstop). Same bytes now create a NEW session + second relay
+    // attempt.
+    t2.schedule(&loop, 900, [&]() {
+        ASSERT_TRUE(dispatch());
+        EXPECT_EQ(dht.relay_stats().attempts, 2)
+            << "session GC did not run after the relay abort";
+        EXPECT_EQ(dht.relay_stats().aborts, 1);
+    });
+
+    // t=1000ms: close with the second pairing still in flight — the
+    // close() drain must abort it.
+    t3.schedule(&loop, 1000, [&]() {
+        srv->close();
+        EXPECT_EQ(dht.relay_stats().aborts, 2)
+            << "close() did not drain the in-flight relay pairing";
+        done = true;
+    });
+
+    while (!done) uv_run(&loop, UV_RUN_ONCE);
+
+    EXPECT_EQ(dht.relay_stats().successes, 0);
+    EXPECT_FALSE(connection_received);
+
+    uv_close(reinterpret_cast<uv_handle_t*>(&silent), nullptr);
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    // No loop-close assert: HyperDHT::destroy() is known to leave unref'd
+    // handles behind (pre-existing; the FFI layer force-closes via
+    // uv_walk) — matches the teardown style of test_hyperdht.cpp.
     uv_loop_close(&loop);
 }

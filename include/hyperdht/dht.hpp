@@ -226,6 +226,9 @@ namespace ConnectError {
     constexpr int HOLEPUNCH_FAILED      = -5;  // JS: CANNOT_HOLEPUNCH — holepunch probing failed
     constexpr int HOLEPUNCH_TIMEOUT     = -6;  // JS: HOLEPUNCH_ABORTED — passive wait timed out (OPEN fw)
     constexpr int RELAY_FAILED          = -7;  // JS: RELAY_ABORTED — blind relay pairing failed
+    constexpr int SERVER_ERROR          = -8;  // JS: SERVER_ERROR / SERVER_INCOMPATIBLE — the
+                                               // Noise-authenticated server replied with a terminal
+                                               // payload (version!=1, error!=NONE, or missing udx)
 }
 
 using ConnectCallback = std::function<void(int error, const ConnectResult& result)>;

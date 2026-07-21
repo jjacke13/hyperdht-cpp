@@ -113,6 +113,14 @@ HandshakeMessage decode_handshake_msg(const uint8_t* data, size_t len);
 
 struct HandshakeResult {
     bool success = false;
+    // JS parity: connect.js:425-436 — once Noise IK completes, a payload
+    // with version != 1 (SERVER_INCOMPATIBLE), error != NONE (SERVER_ERROR)
+    // or missing udx (SERVER_ERROR) is TERMINAL: JS destroys the whole
+    // connect and does NOT try other relays. Pre-decode garbage (bad mode /
+    // wrong source address / empty noise — router.js:63-71 BAD_HANDSHAKE_REPLY)
+    // is per-attempt: success=false, terminal=false, caller may retry the
+    // next relay.
+    bool terminal = false;
     noise::Key tx_key;
     noise::Key rx_key;
     noise::Hash handshake_hash;

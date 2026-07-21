@@ -5,10 +5,12 @@
 #include <gtest/gtest.h>
 
 #include <sodium.h>
+#include <uv.h>
 
 #include "hyperdht/dht_messages.hpp"
 #include "hyperdht/noise_wrap.hpp"
 #include "hyperdht/peer_connect.hpp"
+#include "hyperdht/rpc.hpp"
 #include "hyperdht/server_connection.hpp"
 
 using namespace hyperdht;
@@ -309,4 +311,224 @@ TEST(ServerHandshake, InvalidNoiseFails) {
         compact::Ipv4Address::from_string("10.0.0.1", 5000), 0, {}, {});
 
     EXPECT_FALSE(result.has_value());
+}
+
+// ===========================================================================
+// Client-side PEER_HANDSHAKE reply validation (parity finding connect-8).
+//
+// Loopback RPC harness: a fake relay answers the client's PEER_HANDSHAKE
+// with a real Noise IK msg2, mutated per test. Mirrors JS:
+//   router.js:63-71  — mode !== REPLY / wrong source address / empty noise
+//                      → BAD_HANDSHAKE_REPLY (per-attempt, NOT terminal)
+//   connect.js:425-436 — version !== 1 / error !== NONE / missing udx
+//                      → SERVER_INCOMPATIBLE / SERVER_ERROR (TERMINAL)
+// ===========================================================================
+
+namespace {
+
+struct ReplyCfg {
+    uint32_t mode = peer_connect::MODE_REPLY;
+    bool clear_noise = false;          // drop the noise bytes from the reply
+    uint32_t version = 1;              // server NoisePayload version
+    uint32_t error = peer_connect::ERROR_NONE;
+    bool include_udx = true;
+    bool reply_from_rogue = false;     // reply from a different socket/port
+};
+
+struct ReplyCtx {
+    rpc::RpcSocket* client = nullptr;
+    rpc::RpcSocket* relay = nullptr;
+    rpc::RpcSocket* rogue = nullptr;
+    bool done = false;
+    bool cleaning = false;
+    uv_timer_t* timer = nullptr;
+    peer_connect::HandshakeResult result;
+};
+
+void reply_on_close(uv_handle_t*) {}
+
+void reply_cleanup(ReplyCtx* ctx) {
+    if (ctx->cleaning) return;
+    ctx->cleaning = true;
+    ctx->client->close();
+    ctx->relay->close();
+    ctx->rogue->close();
+    if (ctx->timer) {
+        uv_close(reinterpret_cast<uv_handle_t*>(ctx->timer), reply_on_close);
+        ctx->timer = nullptr;
+    }
+}
+
+// Runs one full client peer_handshake() against a fake relay that replies
+// per `cfg`, and returns the HandshakeResult the client callback observed.
+peer_connect::HandshakeResult run_reply_scenario(const ReplyCfg& cfg) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    noise::Seed server_seed{};
+    server_seed.fill(0x11);
+    auto server_kp = noise::generate_keypair(server_seed);
+    noise::Seed client_seed{};
+    client_seed.fill(0x22);
+    auto client_kp = noise::generate_keypair(client_seed);
+
+    routing::NodeId cid{};
+    cid.fill(0x01);
+    routing::NodeId rid{};
+    rid.fill(0x02);
+    routing::NodeId gid{};
+    gid.fill(0x03);
+    rpc::RpcSocket client(&loop, cid);
+    rpc::RpcSocket relay(&loop, rid);
+    rpc::RpcSocket rogue(&loop, gid);
+    client.bind(0);
+    relay.bind(0);
+    rogue.bind(0);
+
+    ReplyCtx ctx;
+    ctx.client = &client;
+    ctx.relay = &relay;
+    ctx.rogue = &rogue;
+
+    bool reply_sent = false;
+    relay.on_request([&](const messages::Request& req) {
+        if (!req.value.has_value()) {
+            ADD_FAILURE() << "PEER_HANDSHAKE request carried no value";
+            reply_cleanup(&ctx);
+            return;
+        }
+        auto hs = peer_connect::decode_handshake_msg(
+            req.value->data(), req.value->size());
+
+        // Real Noise IK responder so the reply decrypts and completes.
+        const auto& prol = dht_messages::ns_peer_handshake();
+        noise::NoiseIK responder(false, server_kp, prol.data(), prol.size());
+        auto p1 = responder.recv(hs.noise.data(), hs.noise.size());
+        if (!p1.has_value()) {
+            ADD_FAILURE() << "responder failed to process msg1";
+            reply_cleanup(&ctx);
+            return;
+        }
+
+        peer_connect::NoisePayload rp;
+        rp.version = cfg.version;
+        rp.error = cfg.error;
+        rp.firewall = peer_connect::FIREWALL_OPEN;
+        if (cfg.include_udx) rp.udx = peer_connect::UdxInfo{1, false, 777, 0};
+        rp.has_secret_stream = true;
+        auto rp_bytes = peer_connect::encode_noise_payload(rp);
+        auto msg2 = responder.send(rp_bytes.data(), rp_bytes.size());
+
+        peer_connect::HandshakeMessage reply_msg;
+        reply_msg.mode = cfg.mode;
+        if (!cfg.clear_noise) reply_msg.noise = std::move(msg2);
+
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = req.from.addr;
+        resp.value = peer_connect::encode_handshake_msg(reply_msg);
+
+        reply_sent = true;
+        if (cfg.reply_from_rogue) {
+            // Same tid, valid content — but the UDP source is a different
+            // port than the relay we sent the request to.
+            rogue.reply(resp, true);
+        } else {
+            relay.reply(resp, req.from_server);
+        }
+    });
+
+    auto relay_addr = compact::Ipv4Address::from_string("127.0.0.1", relay.port());
+    peer_connect::peer_handshake(
+        client, relay_addr, client_kp, server_kp.public_key,
+        /*our_udx_id=*/42, peer_connect::FIREWALL_UNKNOWN, /*addresses4=*/{},
+        [&](const peer_connect::HandshakeResult& r) {
+            ctx.result = r;
+            ctx.done = true;
+            reply_cleanup(&ctx);
+        });
+
+    uv_timer_t timer;
+    uv_timer_init(&loop, &timer);
+    timer.data = &ctx;
+    ctx.timer = &timer;
+    uv_timer_start(&timer, [](uv_timer_t* t) {
+        auto* c = static_cast<ReplyCtx*>(t->data);
+        c->timer = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(t), reply_on_close);
+        reply_cleanup(c);
+    }, 8000, 0);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+
+    EXPECT_TRUE(reply_sent) << "fake relay never produced a reply";
+    EXPECT_TRUE(ctx.done) << "peer_handshake callback never fired";
+    return ctx.result;
+}
+
+}  // namespace
+
+TEST(PeerHandshakeReply, WellFormedReplySucceeds) {
+    auto r = run_reply_scenario(ReplyCfg{});
+    EXPECT_TRUE(r.success);
+    EXPECT_FALSE(r.terminal);
+    ASSERT_TRUE(r.remote_payload.udx.has_value());
+    EXPECT_EQ(r.remote_payload.udx->id, 777u);
+}
+
+// JS router.js:65 — hs.mode !== REPLY → BAD_HANDSHAKE_REPLY (retryable).
+TEST(PeerHandshakeReply, WrongModeRejected) {
+    ReplyCfg cfg;
+    cfg.mode = peer_connect::MODE_FROM_SERVER;
+    auto r = run_reply_scenario(cfg);
+    EXPECT_FALSE(r.success);
+    EXPECT_FALSE(r.terminal);
+}
+
+// JS router.js:66-67 — reply must come from the address the request was
+// sent to (the RPC layer matches by tid only). Retryable.
+TEST(PeerHandshakeReply, MismatchedSourceRejected) {
+    ReplyCfg cfg;
+    cfg.reply_from_rogue = true;
+    auto r = run_reply_scenario(cfg);
+    EXPECT_FALSE(r.success);
+    EXPECT_FALSE(r.terminal);
+}
+
+// JS router.js:68 — !hs.noise → BAD_HANDSHAKE_REPLY (retryable).
+TEST(PeerHandshakeReply, EmptyNoiseRejected) {
+    ReplyCfg cfg;
+    cfg.clear_noise = true;
+    auto r = run_reply_scenario(cfg);
+    EXPECT_FALSE(r.success);
+    EXPECT_FALSE(r.terminal);
+}
+
+// JS connect.js:425-428 — payload.version !== 1 → SERVER_INCOMPATIBLE
+// (terminal — the whole connect fails, no relay retry).
+TEST(PeerHandshakeReply, VersionMismatchTerminal) {
+    ReplyCfg cfg;
+    cfg.version = 2;
+    auto r = run_reply_scenario(cfg);
+    EXPECT_FALSE(r.success);
+    EXPECT_TRUE(r.terminal);
+}
+
+// JS connect.js:429-432 — payload.error !== NONE → SERVER_ERROR (terminal).
+TEST(PeerHandshakeReply, ServerErrorTerminal) {
+    ReplyCfg cfg;
+    cfg.error = peer_connect::ERROR_TRY_LATER;
+    auto r = run_reply_scenario(cfg);
+    EXPECT_FALSE(r.success);
+    EXPECT_TRUE(r.terminal);
+}
+
+// JS connect.js:433-436 — !payload.udx → SERVER_ERROR (terminal).
+TEST(PeerHandshakeReply, MissingUdxTerminal) {
+    ReplyCfg cfg;
+    cfg.include_udx = false;
+    auto r = run_reply_scenario(cfg);
+    EXPECT_FALSE(r.success);
+    EXPECT_TRUE(r.terminal);
 }

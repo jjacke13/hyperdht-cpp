@@ -894,6 +894,10 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
         uv_ip4_name(addr, remote_host, sizeof(remote_host));
         auto remote_addr = compact::Ipv4Address::from_string(
             remote_host, ntohs(addr->sin_port));
+        // Expose the actual UDP source to response callbacks (JS res.from,
+        // io.js:86). Inflight matching below is by tid ONLY — consumers that
+        // need JS's reply-source check (router.js:66-67) compare this field.
+        resp.remote_addr = remote_addr;
         nat_sampler_.add(resp.from.addr, remote_addr);
         // Feed the dht-rpc ring sampler the same observation. JS feeds
         // `this._nat` from _addNodeFromNetwork (index.js:480,500,533); the C++

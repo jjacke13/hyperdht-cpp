@@ -405,12 +405,14 @@ static std::vector<uint8_t> build_signed_announce(
     const std::array<uint8_t, 32>& target,
     const std::array<uint8_t, 32>& node_id,
     const std::array<uint8_t, 32>& token,
-    bool for_unannounce = false) {
+    bool for_unannounce = false,
+    const std::optional<std::array<uint8_t, 32>>& refresh = std::nullopt) {
 
     hyperdht::dht_messages::AnnounceMessage ann;
     hyperdht::dht_messages::PeerRecord peer;
     peer.public_key = kp.public_key;
     ann.peer = peer;
+    if (refresh.has_value()) ann.refresh = *refresh;  // signable includes it
 
     auto sig = for_unannounce
         ? hyperdht::announce_sig::sign_unannounce(target, node_id,
@@ -566,6 +568,261 @@ TEST(RpcHandlers, AnnTtlMsPropagatesToStoredEntry) {
         << "RpcHandlers did not honour StorageCacheConfig::ann_ttl_ms — "
            "the announce TTL should come from the config, not the hardcoded "
            "announce::DEFAULT_TTL_MS";
+}
+
+// ---------------------------------------------------------------------------
+// Refresh-chain tests (announce-7)
+//
+// JS: persistent.js:145-147 (onannounce stores the refresh hash),
+//     persistent.js:72-98 (_onrefresh — peer-null announce presents the
+//     PREIMAGE: stored == BLAKE2b(presented), re-adds the record, rotates),
+//     refresh-chain.js (block[i] = H(block[i+1])).
+// ---------------------------------------------------------------------------
+
+// Send a peer-null refresh announce: value carries only the refresh
+// preimage — no peer, no signature (JS onannounce → _onrefresh path).
+static void send_refresh_announce(AnnounceCtx* ctx,
+                                  const std::array<uint8_t, 32>& preimage,
+                                  std::function<void(bool ok)> done) {
+    std::array<uint8_t, 32> target{};
+    target.fill(0xAA);
+
+    hyperdht::dht_messages::AnnounceMessage m;
+    m.refresh = preimage;
+
+    Request req;
+    req.to.addr = Ipv4Address::from_string("127.0.0.1", ctx->server->port());
+    req.command = CMD_ANNOUNCE;
+    req.internal = false;
+    req.target = target;
+    req.token = ctx->token;
+    req.value = hyperdht::dht_messages::encode_announce_msg(m);
+
+    // retries=0 — a silently-dropped refresh times out after one flat
+    // 1000ms cycle (see send_announce).
+    ctx->client->request(req, /*timeout_override_ms=*/0, /*retries=*/0,
+        [done](const Response&) { done(true); },
+        [done](uint16_t) { done(false); });
+}
+
+TEST(RpcHandlers, AnnounceRefreshFieldStored) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    NodeId server_id{};
+    server_id.fill(0x11);
+    RpcSocket server(&loop, server_id);
+    server.bind(0);
+    make_persistent(server);
+    RpcHandlers handlers(server);
+    handlers.install();
+
+    NodeId client_id{};
+    client_id.fill(0x22);
+    RpcSocket client(&loop, client_id);
+    client.bind(0);
+
+    hyperdht::noise::Seed seed{};
+    seed.fill(0x42);
+    auto kp = hyperdht::noise::generate_keypair(seed);
+
+    AnnounceCtx ctx;
+    ctx.server = &server;
+    ctx.client = &client;
+    ctx.handlers = &handlers;
+
+    std::array<uint8_t, 32> target{};
+    target.fill(0xAA);
+    std::array<uint8_t, 32> refresh{};
+    refresh.fill(0xC3);  // opaque hash from the server's point of view
+
+    run_announce_test(ctx, loop, [&kp, &target, &refresh](AnnounceCtx* c) {
+        auto value = build_signed_announce(kp, target, c->server_id, c->token,
+                                           /*for_unannounce=*/false, refresh);
+        send_announce(c, value);
+    });
+
+    EXPECT_TRUE(ctx.announce_accepted)
+        << "signed announce carrying a refresh field should be accepted";
+    // JS persistent.js:145-147 — the refresh hash is remembered.
+    EXPECT_EQ(handlers.refresh_count(), 1u);
+}
+
+TEST(RpcHandlers, AnnounceRefreshPreimageReaddsRecord) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    NodeId server_id{};
+    server_id.fill(0x11);
+    RpcSocket server(&loop, server_id);
+    server.bind(0);
+    make_persistent(server);
+    RpcHandlers handlers(server);
+    handlers.install();
+
+    NodeId client_id{};
+    client_id.fill(0x22);
+    RpcSocket client(&loop, client_id);
+    client.bind(0);
+
+    hyperdht::noise::Seed seed{};
+    seed.fill(0x42);
+    auto kp = hyperdht::noise::generate_keypair(seed);
+
+    AnnounceCtx ctx;
+    ctx.server = &server;
+    ctx.client = &client;
+    ctx.handlers = &handlers;
+
+    std::array<uint8_t, 32> target{};
+    target.fill(0xAA);
+    hyperdht::announce::TargetKey tkey{};
+    std::copy(target.begin(), target.end(), tkey.begin());
+
+    // Refresh chain (refresh-chain.js): block[i] = H(block[i+1]). The
+    // announce carries block0; refresh #1 presents block1, refresh #2
+    // (after rotation) presents block2.
+    std::array<uint8_t, 32> block2{};
+    block2.fill(0x7E);
+    std::array<uint8_t, 32> block1{}, block0{};
+    crypto_generichash(block1.data(), 32, block2.data(), 32, nullptr, 0);
+    crypto_generichash(block0.data(), 32, block1.data(), 32, nullptr, 0);
+
+    bool removed_before_refresh = false;
+    bool refresh1_ok = false, refresh2_ok = false;
+    size_t store_after_refresh1 = 999;
+
+    run_announce_test(ctx, loop, [&](AnnounceCtx* c) {
+        auto value = build_signed_announce(kp, target, c->server_id, c->token,
+                                           /*for_unannounce=*/false, block0);
+        Request req;
+        req.to.addr = Ipv4Address::from_string("127.0.0.1",
+                                               c->server->port());
+        req.command = CMD_ANNOUNCE;
+        req.internal = false;
+        req.target = target;
+        req.token = c->token;
+        req.value = value;
+
+        c->client->request(req, /*timeout_override_ms=*/0, /*retries=*/0,
+            [&, c](const Response& resp) {
+                c->announce_done = true;
+                c->announce_accepted = resp.id.has_value();
+
+                // Wipe the stored record so refresh #1 visibly re-adds it.
+                auto anns = c->handlers->store().get(tkey);
+                if (anns.size() == 1) {
+                    c->handlers->store().remove(tkey, anns[0].from);
+                    removed_before_refresh =
+                        c->handlers->store().get(tkey).empty();
+                }
+
+                send_refresh_announce(c, block1, [&, c](bool ok) {
+                    refresh1_ok = ok;
+                    store_after_refresh1 =
+                        c->handlers->store().get(tkey).size();
+                    // Rotation (persistent.js:94-95): entry is now keyed
+                    // under hex(block1); block2 is its preimage.
+                    send_refresh_announce(c, block2, [&, c](bool ok2) {
+                        refresh2_ok = ok2;
+                        ann_cleanup(c);
+                    });
+                });
+            },
+            [c](uint16_t) {
+                c->announce_done = true;
+                ann_cleanup(c);
+            });
+    });
+
+    EXPECT_TRUE(ctx.announce_accepted) << "announce with refresh accepted";
+    EXPECT_TRUE(removed_before_refresh) << "test precondition";
+    EXPECT_TRUE(refresh1_ok) << "correct preimage must get an empty reply";
+    EXPECT_EQ(store_after_refresh1, 1u)
+        << "refresh must re-add the record (persistent.js:91)";
+    EXPECT_TRUE(refresh2_ok)
+        << "rotated entry must accept the next chain link";
+    EXPECT_EQ(handlers.refresh_count(), 1u)
+        << "rotation re-keys the single entry, never accumulates";
+}
+
+TEST(RpcHandlers, AnnounceRefreshWrongPreimageDropped) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    NodeId server_id{};
+    server_id.fill(0x11);
+    RpcSocket server(&loop, server_id);
+    server.bind(0);
+    make_persistent(server);
+    RpcHandlers handlers(server);
+    handlers.install();
+
+    NodeId client_id{};
+    client_id.fill(0x22);
+    RpcSocket client(&loop, client_id);
+    client.bind(0);
+
+    hyperdht::noise::Seed seed{};
+    seed.fill(0x42);
+    auto kp = hyperdht::noise::generate_keypair(seed);
+
+    AnnounceCtx ctx;
+    ctx.server = &server;
+    ctx.client = &client;
+    ctx.handlers = &handlers;
+
+    std::array<uint8_t, 32> target{};
+    target.fill(0xAA);
+    hyperdht::announce::TargetKey tkey{};
+    std::copy(target.begin(), target.end(), tkey.begin());
+
+    std::array<uint8_t, 32> block1{};
+    block1.fill(0x7E);
+    std::array<uint8_t, 32> block0{};
+    crypto_generichash(block0.data(), 32, block1.data(), 32, nullptr, 0);
+
+    bool refresh_ok = true;  // expect it to become false (silent drop)
+
+    run_announce_test(ctx, loop, [&](AnnounceCtx* c) {
+        auto value = build_signed_announce(kp, target, c->server_id, c->token,
+                                           /*for_unannounce=*/false, block0);
+        Request req;
+        req.to.addr = Ipv4Address::from_string("127.0.0.1",
+                                               c->server->port());
+        req.command = CMD_ANNOUNCE;
+        req.internal = false;
+        req.target = target;
+        req.token = c->token;
+        req.value = value;
+
+        c->client->request(req, /*timeout_override_ms=*/0, /*retries=*/0,
+            [&, c](const Response& resp) {
+                c->announce_done = true;
+                c->announce_accepted = resp.id.has_value();
+
+                // NOT the preimage of block0 — H(garbage) misses the cache.
+                std::array<uint8_t, 32> garbage{};
+                garbage.fill(0x5C);
+                send_refresh_announce(c, garbage, [&, c](bool ok) {
+                    refresh_ok = ok;
+                    ann_cleanup(c);
+                });
+            },
+            [c](uint16_t) {
+                c->announce_done = true;
+                ann_cleanup(c);
+            });
+    });
+
+    EXPECT_TRUE(ctx.announce_accepted) << "announce with refresh accepted";
+    EXPECT_FALSE(refresh_ok)
+        << "wrong preimage must be silently dropped (persistent.js:77) — "
+           "the request times out, no reply";
+    EXPECT_EQ(handlers.refresh_count(), 1u)
+        << "stored refresh entry must not be consumed by a bad preimage";
+    EXPECT_EQ(handlers.store().get(tkey).size(), 1u)
+        << "stored record must be untouched";
 }
 
 TEST(RpcHandlers, AnnounceTamperedSignatureRejected) {

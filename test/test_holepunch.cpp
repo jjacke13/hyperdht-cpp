@@ -251,10 +251,14 @@ TEST(Holepuncher, OnMessageConnect) {
     hp.set_remote_firewall(FIREWALL_CONSISTENT);
 
     bool connected = false;
+    bool had_keepalive = true;
     Ipv4Address connected_addr;
     hp.on_connect([&](const HolepunchResult& result) {
         connected = result.success;
         connected_addr = result.address;
+        // Plain (non-birthday) win carries no keepalive — the
+        // holepunch_connect glue falls back to pinning the PoolSocket.
+        had_keepalive = static_cast<bool>(result.socket_keepalive);
     });
 
     hp.set_remote_addresses({Ipv4Address::from_string("10.0.0.1", 3000)});
@@ -267,6 +271,7 @@ TEST(Holepuncher, OnMessageConnect) {
     EXPECT_TRUE(hp.is_connected());
     EXPECT_FALSE(hp.is_punching());
     EXPECT_EQ(connected_addr.port, 3000u);
+    EXPECT_FALSE(had_keepalive);
 
     hp.close();
     uv_run(&loop, UV_RUN_DEFAULT);
@@ -822,6 +827,60 @@ TEST(Holepuncher, BirthdayEgressPerSocket) {
     hp.close();
     pool.destroy();
     udx_socket_close(&recv_sock);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// Birthday win must pin the winning SocketRef, not the caller's PoolSocket.
+//
+// JS: holepuncher.js:124-146 (_onholepunchmessage) — on the initiator's win
+// the ref stays alive as _allHolders[0] and ref.socket is handed to
+// onconnect. Our Holepuncher::destroy() releases every holder, so the win
+// path must hand the ref to HolepunchResult.socket_keepalive or the socket
+// under the UDX stream dies with the puncher.
+// ---------------------------------------------------------------------------
+
+TEST(Holepuncher, BirthdayWinPinsWinningRef) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    udx_t udx;
+    udx_init(&loop, &udx, nullptr);
+
+    hyperdht::socket_pool::SocketPool pool(&loop, &udx);
+    Holepuncher hp(&loop, true, &pool);
+    hp.set_local_firewall(FIREWALL_RANDOM);
+    hp.set_remote_firewall(FIREWALL_CONSISTENT);
+
+    auto* ref = pool.acquire();
+    ASSERT_NE(ref, nullptr);
+
+    HolepunchResult got;
+    hp.on_connect([&](const HolepunchResult& r) { got = r; });
+
+    // Probe echo arrives on a birthday holder's socket
+    // (JS: _onholepunchmessage(msg, rinfo, ref)).
+    hp.on_message(Ipv4Address::from_string("10.0.0.1", 4000),
+                  ref->socket(), ref);
+
+    ASSERT_TRUE(got.success);
+    EXPECT_EQ(got.socket, ref->socket());
+    ASSERT_TRUE(got.socket_keepalive)
+        << "birthday win must carry the winning SocketRef as keepalive";
+    EXPECT_EQ(got.socket_keepalive.get(), static_cast<void*>(ref));
+
+    // The keepalive must hold the socket open across the puncher-side
+    // release (Holepuncher::destroy() releases all holders)...
+    ref->release();
+    EXPECT_FALSE(ref->is_closed());
+
+    // ...and the socket closes only when the stream drops the keepalive.
+    got.socket_keepalive.reset();
+    EXPECT_TRUE(ref->is_closed());
+
+    hp.destroy();
+    hp.close();
+    pool.destroy();
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }

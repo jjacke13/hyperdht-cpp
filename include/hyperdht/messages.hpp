@@ -114,6 +114,13 @@ struct Response {
     std::vector<compact::Ipv4Address> closer_nodes;   // RESP_FLAG_HAS_CLOSER
     std::optional<uint32_t> error;                     // RESP_FLAG_HAS_ERROR
     std::optional<std::vector<uint8_t>> value;         // RESP_FLAG_HAS_VALUE
+
+    // Transport-layer field (not wire-encoded): the actual UDP source this
+    // response arrived from (set by the receive path, like Request::from).
+    // NOTE: `from` above is the wire-encoded `to` field — the responder's
+    // view of OUR address (JS res.to) — not the sender's own address.
+    // JS res.from (io.js:86) is the rinfo source; this is its C++ analog.
+    compact::Ipv4Address remote_addr{};
 };
 
 // ---------------------------------------------------------------------------

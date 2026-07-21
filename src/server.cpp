@@ -276,6 +276,13 @@ void Server::close(bool force, std::function<void()> on_done) {
         announcer_.reset();
     }
 
+    // server-8: abort in-flight blind-relay pairings (watchdog timers +
+    // relay control chains) so their streams are released before the
+    // loop drains. abort_relay erases each entry, so this terminates.
+    while (!relay_pending_.empty()) {
+        abort_relay(relay_pending_.begin()->first);
+    }
+
     // Cancel all session timers (UvTimer RAII handles stop + close)
     session_timers_.clear();
     pending_punch_streams_.clear();
@@ -341,6 +348,12 @@ void Server::suspend(LogFn log) {
     if (announcer_) announcer_->stop();
 
     if (log) log("Suspending hyperdht server (announcer stopped)");
+
+    // server-8: abort in-flight blind-relay pairings before dropping the
+    // sessions they belong to (mirrors the close() path).
+    while (!relay_pending_.empty()) {
+        abort_relay(relay_pending_.begin()->first);
+    }
 
     // Clear pending holepunches (UvTimer RAII handles stop + close)
     session_timers_.clear();
@@ -659,6 +672,22 @@ void Server::on_handshake_result(
             dht_->relay_stats().attempts++;
         }
 
+        // server-8 — JS: server.js:646 (hs.relayTimeout = setTimeout(onabort,
+        // 15000)). Watchdog over the whole relay bootstrap (connect → mux →
+        // pair). On fire, abort_relay tears down the relay chain only — the
+        // session and its puncher keep running (gotcha 19a: holepunch runs
+        // in parallel and may still win).
+        {
+            auto& rp = relay_pending_[hp_id];
+            rp.timer = std::make_unique<async_utils::UvTimer>(socket_.loop());
+            rp.timer->start([this, hp_id]() {
+                if (closed_) return;
+                DHT_LOG("  [server] Relay pairing timed out, aborting relay (id=%u)\n",
+                        hp_id);
+                abort_relay(hp_id);
+            }, relay_timeout);
+        }
+
         // Determine role: who proposed the relay?
         // JS: server.js:632-639
         bool relay_is_initiator;
@@ -713,8 +742,23 @@ void Server::on_handshake_result(
             if (!alive || !*alive) return;
             if (self->closed_ || !relay_result.success || err != 0) {
                 DHT_LOG("  [server] Relay connect failed: %d\n", err);
-                if (dht_ptr) dht_ptr->relay_stats().aborts++;
+                // clear_session → abort_relay counts the abort and stops
+                // the watchdog (server-8) — no inline stats here or the
+                // abort would be double-counted.
                 if (!self->closed_) self->clear_session(hp_id);
+                return;
+            }
+
+            // server-8 — the watchdog fired (or the session was cleared)
+            // while this connect was in flight. JS onabort already
+            // destroyed hs.relaySocket (server.js:679-682); drop the
+            // fresh relay connection and bail instead of pairing.
+            if (self->relay_pending_.find(hp_id) == self->relay_pending_.end()) {
+                DHT_LOG("  [server] Relay aborted mid-connect, dropping (id=%u)\n",
+                        hp_id);
+                if (relay_result.raw_stream) {
+                    udx_stream_destroy(relay_result.raw_stream);
+                }
                 return;
             }
 
@@ -767,12 +811,42 @@ void Server::on_handshake_result(
                 blind_relay::PROTOCOL_NAME, channel_id, false);
             if (!channel) {
                 DHT_LOG("  [server] Failed to create blind-relay channel\n");
-                if (dht_ptr) dht_ptr->relay_stats().aborts++;
+                // server-8 — route through abort_relay like every other
+                // failure branch: stops the watchdog and counts the abort
+                // exactly once (an inline stats bump would double-count
+                // when the watchdog later reaped the orphaned entry).
+                self->abort_relay(hp_id);
                 return;
             }
 
             auto relay_client = std::make_shared<blind_relay::BlindRelayClient>(channel);
             relay_client->open();
+
+            // server-8 — register the watchdog's teardown now that the
+            // chain exists. client->destroy() drops the stored pair
+            // request (whose success lambda captures the chain's
+            // shared_ptrs — the ref cycle that otherwise keeps everything
+            // alive forever) and duplex->destroy() tears down the relay
+            // control raw stream (JS: hs.relaySocket.destroy(),
+            // server.js:679-682). The chain OBJECTS are then freed when
+            // `hold` — the last owner — drops with this std::function:
+            // ~ServerRelayHold destroys client → mux → duplex in
+            // dependency order. destroy()'s pair-error callback re-enters
+            // abort_relay via the deferred path, which no-ops because the
+            // entry is erased before `abort` runs.
+            {
+                auto hold = std::make_shared<ServerRelayHold>();
+                hold->duplex = relay_duplex;
+                hold->mux    = relay_mux;
+                hold->client = relay_client;
+                auto rit = self->relay_pending_.find(hp_id);
+                if (rit != self->relay_pending_.end()) {
+                    rit->second.abort = [hold]() {
+                        if (hold->client) hold->client->destroy();
+                        if (hold->duplex) hold->duplex->destroy(0);
+                    };
+                }
+            }
 
             // Pair through the relay
             // JS: server.js:649 — hs.relayClient.pair(isInitiator, token, hs.rawStream)
@@ -790,6 +864,13 @@ void Server::on_handshake_result(
                     if (self->closed_) return;
 
                     DHT_LOG("  [server] Relay pairing succeeded! remote_id=%u\n", remote_id);
+
+                    // server-8 — JS: server.js:652, clearRelayTimeout(hs)
+                    // FIRST on 'data'. Erasing drops the watchdog timer and
+                    // the abort fn's chain refs; the chain stays alive via
+                    // this lambda's captures and is handed to the upgrade
+                    // context's ServerRelayHold below.
+                    self->relay_pending_.erase(hp_id);
 
                     if (dht_ptr) dht_ptr->relay_stats().successes++;
 
@@ -895,13 +976,27 @@ void Server::on_handshake_result(
                         self->emit_connection(info);
                     }
                 },
-                [self, dht_ptr, weak_alive, hp_id](int err) {
+                [self, weak_alive, hp_id](int err) {
                     auto alive = weak_alive.lock();
                     if (!alive || !*alive) return;
                     if (self->closed_) return;
                     DHT_LOG("  [server] Relay pairing failed: %d\n", err);
-                    if (dht_ptr) dht_ptr->relay_stats().aborts++;
-                    self->clear_session(hp_id);
+                    // server-8 — JS: .on('error', onabort) (server.js:650).
+                    // onabort destroys the relay chain but does NOT clear
+                    // the session — the holepunch runs in parallel and may
+                    // still win (the session GC backstop reaps hs later).
+                    // This frame is inside a BlindRelayClient callback, so
+                    // destroying the chain here would free the client
+                    // mid-callback: re-arm the watchdog to 0ms and let
+                    // abort_relay run in a clean timer frame. abort_relay
+                    // counts the abort (no inline stats — destroy()'s
+                    // DESTROYED error re-enters here and would double it).
+                    auto rit = self->relay_pending_.find(hp_id);
+                    if (rit != self->relay_pending_.end() && rit->second.timer) {
+                        rit->second.timer->start([self, hp_id]() {
+                            if (!self->closed_) self->abort_relay(hp_id);
+                        }, 0);
+                    }
                 });
         });
     }
@@ -1343,11 +1438,56 @@ bool Server::session_relay_engaged(uint32_t hp_id) const {
                        [](uint8_t b) { return b != 0; });
 }
 
+// server-8 — JS: server.js:676-684 (onabort). Tears down the blind-relay
+// control chain for ONE session without clearing the session: the
+// holepunch runs in parallel and may still win (gotcha 19a). Safe to run
+// from inside the watchdog timer's own callback (UvTimer supports
+// destruction from its own callback frame — async_utils.hpp); must NOT
+// be called from inside a relay-chain callback (the deferred 0ms re-arm
+// in the pair-error path exists for exactly that reason).
+void Server::abort_relay(uint32_t hp_id) {
+    auto it = relay_pending_.find(hp_id);
+    if (it == relay_pending_.end()) return;
+
+    // Move the entry out and erase BEFORE tearing down: the teardown
+    // fires the client's pair-error callback (RelayError::DESTROYED),
+    // which routes back here — the erase makes that re-entry a no-op.
+    auto pending = std::move(it->second);
+    relay_pending_.erase(it);
+
+    // JS: if (!hs.relayPaired) dht.stats.relaying.aborts++ — entry
+    // presence implies not paired (pairing success erases it first).
+    if (dht_) dht_->relay_stats().aborts++;
+
+    // JS: hs.relayToken = null — un-gates session_relay_engaged() so the
+    // session GC timer no longer defers to a relay that is now dead.
+    auto cit = connections_.find(hp_id);
+    if (cit != connections_.end() && cit->second) {
+        cit->second->relay_token.fill(0);
+    }
+
+    // JS: hs.relaySocket.destroy() — registered once the chain was built.
+    // Absent while the connect to the relay node is still in flight; the
+    // connect continuation sees the erased entry and bails. The chain
+    // objects are freed when `pending.abort` (the last ServerRelayHold
+    // owner) drops at end of scope, in client → mux → duplex order.
+    if (pending.abort) pending.abort();
+    // We intentionally skip JS's `if (hs.aborted && hs.rawStream)
+    // rawStream.destroy()` — session teardown owns the rawStream here
+    // (clear_session / ~ServerConnection), and the session must NOT be
+    // cleared from this path.
+}
+
 void Server::clear_session(uint32_t hp_id) {
     auto it = connections_.find(hp_id);
     if (it == connections_.end()) return;
 
     DHT_LOG("  [server] Session cleanup id=%u\n", hp_id);
+
+    // server-8 — a dying session takes its in-flight relay pairing with
+    // it (JS reaps the chain via onabort once hs dies). No-op if the
+    // pairing already succeeded or aborted.
+    abort_relay(hp_id);
 
     // Remove dedup entry
     for (auto dit = handshake_dedup_.begin(); dit != handshake_dedup_.end(); ++dit) {

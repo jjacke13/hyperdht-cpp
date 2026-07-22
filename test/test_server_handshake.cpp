@@ -166,8 +166,10 @@ TEST(ServerHandshake, FirewallRejects) {
     EXPECT_TRUE(result->firewalled);
     EXPECT_TRUE(result->has_error);
     EXPECT_EQ(result->error_code, peer_connect::ERROR_ABORTED);
-    // Still has reply noise (error response)
-    EXPECT_FALSE(result->reply_noise.empty());
+    // server-1 — JS: server.js:258-261 returns null BEFORE handshake.send;
+    // router.js:99 then sends nothing. No Noise msg2 may be built for a
+    // rejected peer — the client sees silence, not a refusal.
+    EXPECT_TRUE(result->reply_noise.empty());
 }
 
 // Two-phase split — decode_handshake() followed by finalize_handshake()
@@ -200,9 +202,9 @@ TEST(ServerHandshake, DecodeThenFinalizeMatchesSync) {
     EXPECT_EQ(result->id, 42);
 }
 
-// Finalizing with rejected=true yields the same ERROR_ABORTED response
-// as the sync-wrapper handle_handshake with a reject-all firewall — so
-// the async firewall path produces a wire-identical reply.
+// Finalizing with rejected=true yields the same outcome as the
+// sync-wrapper handle_handshake with a reject-all firewall — both mark
+// the session firewalled and build NO reply bytes (server-1 silence).
 TEST(ServerHandshake, FinalizeRejectedEqualsSyncReject) {
     noise::Seed server_seed{}; server_seed.fill(0x11);
     auto server_kp = noise::generate_keypair(server_seed);
@@ -220,6 +222,7 @@ TEST(ServerHandshake, FinalizeRejectedEqualsSyncReject) {
     ASSERT_TRUE(async_result.has_value());
     EXPECT_TRUE(async_result->firewalled);
     EXPECT_EQ(async_result->error_code, peer_connect::ERROR_ABORTED);
+    EXPECT_TRUE(async_result->reply_noise.empty());  // server-1: silence
 
     // Fresh decode for the sync call (Noise state is single-use).
     auto client2 = make_client_msg1(client_kp, server_kp.public_key, 1);
@@ -229,6 +232,7 @@ TEST(ServerHandshake, FinalizeRejectedEqualsSyncReject) {
     ASSERT_TRUE(sync_result.has_value());
     EXPECT_TRUE(sync_result->firewalled);
     EXPECT_EQ(sync_result->error_code, async_result->error_code);
+    EXPECT_TRUE(sync_result->reply_noise.empty());  // server-1: silence
 }
 
 TEST(ServerHandshake, HolepunchInfoWhenNotOpen) {
@@ -333,6 +337,7 @@ struct ReplyCfg {
     uint32_t error = peer_connect::ERROR_NONE;
     bool include_udx = true;
     bool reply_from_rogue = false;     // reply from a different socket/port
+    bool client_reusable = false;      // connect-3: opts.reusableSocket
 };
 
 struct ReplyCtx {
@@ -343,6 +348,12 @@ struct ReplyCtx {
     bool cleaning = false;
     uv_timer_t* timer = nullptr;
     peer_connect::HandshakeResult result;
+    // connect-3: the client's msg1 payload udx.reusableSocket, as decoded
+    // by the fake relay (JS connect.js:406).
+    bool client_advertised_reusable = false;
+    // connect-6: the client's address as the relay observed it (req.from);
+    // echoed back in the wire `to` field → HandshakeResult.client_address.
+    compact::Ipv4Address observed_client_addr{};
 };
 
 void reply_on_close(uv_handle_t*) {}
@@ -361,7 +372,10 @@ void reply_cleanup(ReplyCtx* ctx) {
 
 // Runs one full client peer_handshake() against a fake relay that replies
 // per `cfg`, and returns the HandshakeResult the client callback observed.
-peer_connect::HandshakeResult run_reply_scenario(const ReplyCfg& cfg) {
+// `advertised_reusable` (optional) receives the udx.reusableSocket flag the
+// fake relay decoded from the client's msg1 payload (connect-3).
+peer_connect::HandshakeResult run_reply_scenario(
+        const ReplyCfg& cfg, bool* advertised_reusable = nullptr) {
     uv_loop_t loop;
     uv_loop_init(&loop);
 
@@ -410,6 +424,16 @@ peer_connect::HandshakeResult run_reply_scenario(const ReplyCfg& cfg) {
             return;
         }
 
+        // connect-3 — record the client's advertised udx.reusableSocket
+        // (JS connect.js:406: udx.reusableSocket = c.reusableSocket).
+        auto client_payload = peer_connect::decode_noise_payload(
+            p1->data(), p1->size());
+        if (client_payload.udx.has_value()) {
+            ctx.client_advertised_reusable =
+                client_payload.udx->reusable_socket;
+        }
+        ctx.observed_client_addr = req.from.addr;
+
         peer_connect::NoisePayload rp;
         rp.version = cfg.version;
         rp.error = cfg.error;
@@ -441,7 +465,9 @@ peer_connect::HandshakeResult run_reply_scenario(const ReplyCfg& cfg) {
     auto relay_addr = compact::Ipv4Address::from_string("127.0.0.1", relay.port());
     peer_connect::peer_handshake(
         client, relay_addr, client_kp, server_kp.public_key,
-        /*our_udx_id=*/42, peer_connect::FIREWALL_UNKNOWN, /*addresses4=*/{},
+        /*our_udx_id=*/42, /*reusable_socket=*/cfg.client_reusable,
+        peer_connect::FIREWALL_UNKNOWN, /*addresses4=*/{},
+        /*relay_through=*/std::nullopt,
         [&](const peer_connect::HandshakeResult& r) {
             ctx.result = r;
             ctx.done = true;
@@ -464,6 +490,15 @@ peer_connect::HandshakeResult run_reply_scenario(const ReplyCfg& cfg) {
 
     EXPECT_TRUE(reply_sent) << "fake relay never produced a reply";
     EXPECT_TRUE(ctx.done) << "peer_handshake callback never fired";
+    if (advertised_reusable) {
+        *advertised_reusable = ctx.client_advertised_reusable;
+    }
+    // connect-6 — clientAddress = res.to (router.js:77): our address exactly
+    // as the relay observed it (the ephemeral client socket, not port()).
+    if (ctx.result.success) {
+        EXPECT_EQ(ctx.result.client_address, ctx.observed_client_addr);
+        EXPECT_NE(ctx.result.client_address.port, 0);
+    }
     return ctx.result;
 }
 
@@ -475,6 +510,21 @@ TEST(PeerHandshakeReply, WellFormedReplySucceeds) {
     EXPECT_FALSE(r.terminal);
     ASSERT_TRUE(r.remote_payload.udx.has_value());
     EXPECT_EQ(r.remote_payload.udx->id, 777u);
+}
+
+// connect-3 — JS connect.js:406: the client's noisePayload advertises
+// udx.reusableSocket = opts.reusableSocket (previously hardcoded false).
+TEST(PeerHandshakeReply, ReusableSocketAdvertised) {
+    ReplyCfg cfg;
+    cfg.client_reusable = true;
+    bool advertised = false;
+    auto r = run_reply_scenario(cfg, &advertised);
+    EXPECT_TRUE(r.success);
+    EXPECT_TRUE(advertised);
+
+    bool advertised_off = true;
+    run_reply_scenario(ReplyCfg{}, &advertised_off);
+    EXPECT_FALSE(advertised_off);
 }
 
 // JS router.js:65 — hs.mode !== REPLY → BAD_HANDSHAKE_REPLY (retryable).

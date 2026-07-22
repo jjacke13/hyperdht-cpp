@@ -145,6 +145,72 @@ TEST(Server, HandshakeViaRouter) {
     uv_loop_close(&loop);
 }
 
+namespace {
+
+// Shared boilerplate for the server-1/2/3 parity tests: client Noise msg1
+// wrapped in a PEER_HANDSHAKE request, dispatchable through the Router.
+struct ClientHs {
+    noise::Keypair client_kp;
+    std::shared_ptr<noise::NoiseIK> noise;
+    messages::Request req;
+};
+
+ClientHs make_handshake_request(const noise::Keypair& server_kp,
+                                uint32_t client_fw,
+                                uint8_t client_seed_byte = 0x22) {
+    ClientHs out;
+    noise::Seed client_seed{};
+    client_seed.fill(client_seed_byte);
+    out.client_kp = noise::generate_keypair(client_seed);
+
+    const auto& prol = dht_messages::ns_peer_handshake();
+    out.noise = std::make_shared<noise::NoiseIK>(
+        true, out.client_kp, prol.data(), prol.size(), &server_kp.public_key);
+
+    peer_connect::NoisePayload cp;
+    cp.version = 1;
+    cp.firewall = client_fw;
+    cp.udx = peer_connect::UdxInfo{1, false, 12345, 0};
+    cp.has_secret_stream = true;
+    cp.addresses4.push_back(
+        compact::Ipv4Address::from_string("10.0.0.1", 5000));
+    auto cpb = peer_connect::encode_noise_payload(cp);
+    auto msg1 = out.noise->send(cpb.data(), cpb.size());
+
+    peer_connect::HandshakeMessage hs_msg;
+    hs_msg.mode = peer_connect::MODE_FROM_CLIENT;
+    hs_msg.noise = std::move(msg1);
+
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32,
+                       server_kp.public_key.data(), 32, nullptr, 0);
+
+    out.req.target = target;
+    out.req.value = peer_connect::encode_handshake_msg(hs_msg);
+    out.req.from.addr = compact::Ipv4Address::from_string("10.0.0.1", 5000);
+    out.req.tid = 1;
+    return out;
+}
+
+// Run the loop for `ms` milliseconds (the bound socket keeps the loop
+// alive, so stop it explicitly).
+void run_loop_for(uv_loop_t* loop, uint64_t ms) {
+    uv_timer_t t;
+    uv_timer_init(loop, &t);
+    uv_timer_start(&t, [](uv_timer_t* h) { uv_stop(h->loop); }, ms, 0);
+    uv_run(loop, UV_RUN_DEFAULT);
+    uv_close(reinterpret_cast<uv_handle_t*>(&t), nullptr);
+    uv_run(loop, UV_RUN_NOWAIT);  // drain the timer close
+}
+
+}  // namespace
+
+// server-1 — JS: server.js:251,258-261 + router.js:99. A firewall-rejected
+// handshake sends ZERO packets (silence, not a Noise error reply). The
+// rejected session stays for dedup — duplicate noise gets the same silence
+// without a second firewall call — and is reaped by the clear-wait timer,
+// after which the same bytes create a fresh session (firewall consulted
+// again).
 TEST(Server, FirewallRejectsConnection) {
     uv_loop_t loop;
     uv_loop_init(&loop);
@@ -156,6 +222,7 @@ TEST(Server, FirewallRejectsConnection) {
 
     router::Router router;
     Server srv(socket, router);
+    srv.handshake_clear_wait = 100;  // fast reap for the test
 
     noise::Seed server_seed{};
     server_seed.fill(0x11);
@@ -166,47 +233,38 @@ TEST(Server, FirewallRejectsConnection) {
         connection_received = true;
     });
 
-    // Set firewall to reject all
-    srv.set_firewall([](const auto&, const auto&, const auto&) { return true; });
+    int fw_calls = 0;
+    srv.set_firewall([&](const auto&, const auto&, const auto&) {
+        fw_calls++;
+        return true;
+    });
 
-    // Build client handshake
-    noise::Seed client_seed{};
-    client_seed.fill(0x22);
-    auto client_kp = noise::generate_keypair(client_seed);
+    auto hs = make_handshake_request(server_kp, peer_connect::FIREWALL_OPEN);
+    int reply_count = 0;
+    auto dispatch = [&]() {
+        router.handle_peer_handshake(
+            hs.req,
+            [&reply_count](const messages::Response&) { reply_count++; },
+            [](const messages::Request&) {});
+    };
 
-    const auto& prol = dht_messages::ns_peer_handshake();
-    noise::NoiseIK client_noise(true, client_kp, prol.data(), prol.size(),
-                                 &server_kp.public_key);
+    dispatch();
+    EXPECT_EQ(fw_calls, 1);
+    EXPECT_EQ(reply_count, 0) << "rejected handshake must send NOTHING";
 
-    peer_connect::NoisePayload client_payload;
-    client_payload.version = 1;
-    client_payload.firewall = peer_connect::FIREWALL_OPEN;
-    client_payload.udx = peer_connect::UdxInfo{1, false, 1, 0};
-    client_payload.has_secret_stream = true;
-    client_payload.addresses4.push_back(
-        compact::Ipv4Address::from_string("10.0.0.1", 5000));
+    // Duplicate noise bytes inside the clear-wait window: dedup'd onto
+    // the rejected session — same silence, firewall NOT consulted again.
+    dispatch();
+    EXPECT_EQ(fw_calls, 1);
+    EXPECT_EQ(reply_count, 0);
 
-    auto payload_bytes = peer_connect::encode_noise_payload(client_payload);
-    auto msg1 = client_noise.send(payload_bytes.data(), payload_bytes.size());
+    // Clear-wait timer reaps the rejected session; the same bytes then
+    // create a NEW session (firewall consulted again — still silent).
+    run_loop_for(&loop, 300);
+    dispatch();
+    EXPECT_EQ(fw_calls, 2);
+    EXPECT_EQ(reply_count, 0);
 
-    peer_connect::HandshakeMessage hs_msg;
-    hs_msg.mode = peer_connect::MODE_FROM_CLIENT;
-    hs_msg.noise = msg1;
-
-    std::array<uint8_t, 32> target{};
-    crypto_generichash(target.data(), 32,
-                       server_kp.public_key.data(), 32, nullptr, 0);
-
-    messages::Request req;
-    req.target = target;
-    req.value = peer_connect::encode_handshake_msg(hs_msg);
-    req.from.addr = compact::Ipv4Address::from_string("10.0.0.1", 5000);
-    req.tid = 1;
-
-    router.handle_peer_handshake(req, [](const messages::Response&) {},
-                                     [](const messages::Request&) {});
-
-    // Firewall rejected — no connection
     EXPECT_FALSE(connection_received);
 
     srv.close();
@@ -443,8 +501,10 @@ TEST(Server, AsyncFirewallAfterServerCloseIsNoop) {
     uv_loop_close(&loop);
 }
 
-// async firewall that rejects: handshake completes, reply is sent
-// with ERROR_ABORTED, session not registered.
+// server-1 (async path) — a rejected async firewall sends NOTHING: JS
+// _addHandshake resolves null and router.js:99 drops it. A duplicate
+// handshake after the reject dedups onto the rejected session and gets
+// the same silence without re-invoking the firewall.
 TEST(Server, AsyncFirewallDeferredReject) {
     uv_loop_t loop;
     uv_loop_init(&loop);
@@ -461,47 +521,402 @@ TEST(Server, AsyncFirewallDeferredReject) {
     srv.listen(server_kp, [](const ConnectionInfo&) {});
 
     Server::FirewallDoneCb deferred_done;
+    int fw_calls = 0;
     srv.set_firewall_async(
         [&](const auto&, const auto&, const auto&,
-            Server::FirewallDoneCb done) { deferred_done = std::move(done); });
+            Server::FirewallDoneCb done) {
+            fw_calls++;
+            deferred_done = std::move(done);
+        });
 
-    // Build handshake msg1
-    noise::Seed client_seed{}; client_seed.fill(0x22);
-    auto client_kp = noise::generate_keypair(client_seed);
-    const auto& prol = dht_messages::ns_peer_handshake();
-    noise::NoiseIK client_noise(true, client_kp, prol.data(), prol.size(),
-                                 &server_kp.public_key);
-    peer_connect::NoisePayload client_payload;
-    client_payload.version = 1;
-    client_payload.firewall = peer_connect::FIREWALL_OPEN;
-    client_payload.udx = peer_connect::UdxInfo{1, false, 1, 0};
-    client_payload.has_secret_stream = true;
-    client_payload.addresses4.push_back(
-        compact::Ipv4Address::from_string("10.0.0.1", 5000));
-    auto payload_bytes = peer_connect::encode_noise_payload(client_payload);
-    auto msg1 = client_noise.send(payload_bytes.data(), payload_bytes.size());
-    peer_connect::HandshakeMessage hs_msg;
-    hs_msg.mode = peer_connect::MODE_FROM_CLIENT;
-    hs_msg.noise = msg1;
-    std::array<uint8_t, 32> target{};
-    crypto_generichash(target.data(), 32,
-                       server_kp.public_key.data(), 32, nullptr, 0);
-    messages::Request req;
-    req.target = target;
-    req.value = peer_connect::encode_handshake_msg(hs_msg);
-    req.from.addr = compact::Ipv4Address::from_string("10.0.0.1", 5000);
-    req.tid = 1;
+    auto hs = make_handshake_request(server_kp, peer_connect::FIREWALL_OPEN);
+    int reply_count = 0;
+    auto dispatch = [&]() {
+        router.handle_peer_handshake(
+            hs.req,
+            [&reply_count](const messages::Response&) { reply_count++; },
+            [](const messages::Request&) {});
+    };
 
-    bool reply_sent = false;
-    router.handle_peer_handshake(req,
-        [&reply_sent](const messages::Response&) { reply_sent = true; },
-        [](const messages::Request&) {});
+    dispatch();
+    ASSERT_TRUE(deferred_done);
+    deferred_done(/*reject=*/true);
+    // server-1: silence — no packet leaves for a rejected peer.
+    EXPECT_EQ(reply_count, 0) << "rejected async handshake must send NOTHING";
+
+    // Duplicate after the reject: dedup'd, silent, one firewall call total.
+    dispatch();
+    EXPECT_EQ(reply_count, 0);
+    EXPECT_EQ(fw_calls, 1);
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// server-3 — JS: server.js:464-473. Duplicate same-noise handshakes
+// arriving while the async firewall is still deciding must not re-invoke
+// the firewall or spawn a second session; they queue on the pending entry
+// and everyone is replied with the SAME bytes when the decision resolves.
+TEST(Server, AsyncFirewallDuplicateDuringWindow) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed server_seed{}; server_seed.fill(0x11);
+    auto server_kp = noise::generate_keypair(server_seed);
+    srv.listen(server_kp, [](const ConnectionInfo&) {});
+
+    Server::FirewallDoneCb deferred_done;
+    int fw_calls = 0;
+    srv.set_firewall_async(
+        [&](const auto&, const auto&, const auto&,
+            Server::FirewallDoneCb done) {
+            fw_calls++;
+            deferred_done = std::move(done);
+        });
+
+    // CONSISTENT client → accepted session is stored (not the OPEN
+    // direct-connect shortcut), so the post-resolve dedup can be checked.
+    auto hs = make_handshake_request(server_kp,
+                                     peer_connect::FIREWALL_CONSISTENT);
+    std::vector<std::vector<uint8_t>> replies;
+    auto dispatch = [&]() {
+        router.handle_peer_handshake(
+            hs.req,
+            [&replies](const messages::Response& resp) {
+                replies.push_back(resp.value.value_or(std::vector<uint8_t>{}));
+            },
+            [](const messages::Request&) {});
+    };
+
+    dispatch();  // primary — firewall dispatched, decision pending
+    dispatch();  // duplicate during the window — queued, no 2nd invocation
+    EXPECT_EQ(fw_calls, 1) << "duplicate must not re-invoke the firewall";
+    EXPECT_TRUE(replies.empty()) << "no reply before the firewall resolves";
+
+    ASSERT_TRUE(deferred_done);
+    deferred_done(/*reject=*/false);
+    ASSERT_EQ(replies.size(), 2u) << "both requesters replied on resolve";
+    EXPECT_EQ(replies[0], replies[1]) << "identical reply bytes";
+
+    // Post-resolve duplicate: the cached reply is resent — still one
+    // session, still one firewall invocation.
+    dispatch();
+    EXPECT_EQ(fw_calls, 1);
+    ASSERT_EQ(replies.size(), 3u);
+    EXPECT_EQ(replies[2], replies[0]);
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// server-3 + server-1 — duplicates queued during the async window get the
+// same SILENCE when the firewall rejects.
+TEST(Server, AsyncFirewallDuplicateDuringWindowReject) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed server_seed{}; server_seed.fill(0x11);
+    auto server_kp = noise::generate_keypair(server_seed);
+    srv.listen(server_kp, [](const ConnectionInfo&) {});
+
+    Server::FirewallDoneCb deferred_done;
+    int fw_calls = 0;
+    srv.set_firewall_async(
+        [&](const auto&, const auto&, const auto&,
+            Server::FirewallDoneCb done) {
+            fw_calls++;
+            deferred_done = std::move(done);
+        });
+
+    auto hs = make_handshake_request(server_kp,
+                                     peer_connect::FIREWALL_CONSISTENT);
+    int reply_count = 0;
+    auto dispatch = [&]() {
+        router.handle_peer_handshake(
+            hs.req,
+            [&reply_count](const messages::Response&) { reply_count++; },
+            [](const messages::Request&) {});
+    };
+
+    dispatch();
+    dispatch();
+    EXPECT_EQ(fw_calls, 1);
 
     ASSERT_TRUE(deferred_done);
     deferred_done(/*reject=*/true);
-    // Reply still goes out — but with ERROR_ABORTED inside the Noise
-    // payload. Client sees a clean refusal instead of a hang.
-    EXPECT_TRUE(reply_sent);
+    EXPECT_EQ(reply_count, 0) << "rejected: silence for ALL requesters";
+
+    // Dedup keeps answering with silence after the reject resolves.
+    dispatch();
+    EXPECT_EQ(fw_calls, 1);
+    EXPECT_EQ(reply_count, 0);
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// server-2 — JS: server.js:544-546, 576-578, 586-599. The PEER_HOLEPUNCH
+// reply commits only AFTER the holepunch veto and after punch() reports
+// that punching started; both failure paths answer with an encrypted
+// ERROR_ABORTED (JS _abort) instead of a positive "punching" reply.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Complete a CONSISTENT-client handshake through the Router and derive
+// the client-side holepunch secret + session id.
+struct HolepunchHarness {
+    ClientHs hs;
+    uint32_t hp_id = 0;
+    std::shared_ptr<holepunch::SecurePayload> client_secure;
+};
+
+HolepunchHarness make_holepunch_harness(router::Router& router,
+                                        const noise::Keypair& server_kp) {
+    HolepunchHarness h;
+    h.hs = make_handshake_request(server_kp, peer_connect::FIREWALL_CONSISTENT);
+
+    bool got_reply = false;
+    router.handle_peer_handshake(
+        h.hs.req,
+        [&](const messages::Response& resp) {
+            if (!resp.value.has_value()) return;
+            auto resp_hs = peer_connect::decode_handshake_msg(
+                resp.value->data(), resp.value->size());
+            auto decrypted = h.hs.noise->recv(resp_hs.noise.data(),
+                                              resp_hs.noise.size());
+            if (!decrypted.has_value()) return;
+            auto sp = peer_connect::decode_noise_payload(
+                decrypted->data(), decrypted->size());
+            if (sp.holepunch.has_value()) h.hp_id = sp.holepunch->id;
+
+            const auto& ns_hp = dht_messages::ns_peer_holepunch();
+            std::array<uint8_t, 32> secret{};
+            crypto_generichash(secret.data(), 32, ns_hp.data(), 32,
+                               h.hs.noise->handshake_hash().data(), 64);
+            h.client_secure =
+                std::make_shared<holepunch::SecurePayload>(secret);
+            got_reply = true;
+        },
+        [](const messages::Request&) {});
+    EXPECT_TRUE(got_reply) << "handshake through router failed";
+    return h;
+}
+
+// Round-1 "I am punching" PEER_HOLEPUNCH toward the server. The router
+// only hands FROM_RELAY messages with a peerAddress to the server handler
+// (router.js:221), so model the relay hop: req.from = the relay node,
+// msg.peer_address = the client as the relay observed it.
+messages::Request make_holepunch_request(const HolepunchHarness& h,
+                                         const compact::Ipv4Address& to_addr) {
+    holepunch::HolepunchPayload hp;
+    hp.firewall = peer_connect::FIREWALL_CONSISTENT;
+    hp.round = 1;
+    hp.punching = true;
+    hp.addresses.push_back(
+        compact::Ipv4Address::from_string("10.0.0.1", 5000));
+    auto hp_bytes = holepunch::encode_holepunch_payload(hp);
+    auto encrypted = h.client_secure->encrypt(hp_bytes.data(), hp_bytes.size());
+
+    holepunch::HolepunchMessage msg;
+    msg.mode = peer_connect::MODE_FROM_RELAY;
+    msg.id = h.hp_id;
+    msg.payload = std::move(encrypted);
+    // TEST-NET-3 client address: the positive-control test's punch()
+    // sends real UDP probes at it — keep them off routable space.
+    msg.peer_address = compact::Ipv4Address::from_string("203.0.113.9", 40000);
+
+    messages::Request req;
+    req.target = h.hs.req.target;
+    req.value = holepunch::encode_holepunch_msg(msg);
+    req.from.addr = compact::Ipv4Address::from_string("203.0.113.50", 49737);
+    req.to.addr = to_addr;
+    req.tid = 2;
+    return req;
+}
+
+// Decrypt the server's holepunch reply. A FROM_RELAY request is answered
+// via the RELAY callback (a FROM_SERVER request toward the relay node),
+// so this takes the raw relayed value.
+holepunch::HolepunchPayload decrypt_holepunch_reply(
+    const HolepunchHarness& h, const std::vector<uint8_t>& value) {
+    holepunch::HolepunchPayload out;
+    if (value.empty()) return out;
+    auto msg = holepunch::decode_holepunch_msg(value.data(), value.size());
+    auto decrypted =
+        h.client_secure->decrypt(msg.payload.data(), msg.payload.size());
+    if (!decrypted.has_value()) return out;
+    return holepunch::decode_holepunch_payload(decrypted->data(),
+                                               decrypted->size());
+}
+
+}  // namespace
+
+// Veto callback rejects → the client receives an encrypted ERROR_ABORTED,
+// NOT the positive ERROR_NONE/punching reply (which would hang it).
+TEST(Server, HolepunchVetoRepliesEncryptedAborted) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed server_seed{}; server_seed.fill(0x11);
+    auto server_kp = noise::generate_keypair(server_seed);
+    srv.listen(server_kp, [](const ConnectionInfo&) {});
+
+    int veto_calls = 0;
+    srv.set_holepunch([&](uint32_t, uint32_t, const auto&, const auto&) {
+        veto_calls++;
+        return false;  // veto
+    });
+
+    auto h = make_holepunch_harness(router, server_kp);
+    ASSERT_TRUE(h.client_secure);
+
+    auto req = make_holepunch_request(
+        h, compact::Ipv4Address::from_string("198.51.100.7", 55555));
+    bool replied = false;
+    bool handled = router.handle_peer_holepunch(
+        req,
+        [](const messages::Response&) {},
+        [&](const messages::Request& relay_req) {
+            replied = true;
+            ASSERT_TRUE(relay_req.value.has_value());
+            auto payload = decrypt_holepunch_reply(h, *relay_req.value);
+            EXPECT_EQ(payload.error, peer_connect::ERROR_ABORTED);
+            EXPECT_EQ(payload.firewall, peer_connect::FIREWALL_UNKNOWN);
+            EXPECT_FALSE(payload.punching);
+        });
+
+    EXPECT_TRUE(handled);
+    EXPECT_EQ(veto_calls, 1);
+    EXPECT_TRUE(replied) << "veto must produce an ABORTED reply, not silence";
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// punch() fails to start (our NAT classification is still UNKNOWN — one
+// sample only) → encrypted ERROR_ABORTED, matching JS server.js:576-578.
+// Before server-2 this path sent ERROR_NONE with punching=true and the
+// client hung waiting for probes that never came.
+TEST(Server, HolepunchPunchStartFailureRepliesAborted) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed server_seed{}; server_seed.fill(0x11);
+    auto server_kp = noise::generate_keypair(server_seed);
+    srv.listen(server_kp, [](const ConnectionInfo&) {});
+
+    auto h = make_holepunch_harness(router, server_kp);
+    ASSERT_TRUE(h.client_secure);
+
+    auto req = make_holepunch_request(
+        h, compact::Ipv4Address::from_string("198.51.100.7", 55555));
+    bool replied = false;
+    router.handle_peer_holepunch(
+        req,
+        [](const messages::Response&) {},
+        [&](const messages::Request& relay_req) {
+            replied = true;
+            ASSERT_TRUE(relay_req.value.has_value());
+            auto payload = decrypt_holepunch_reply(h, *relay_req.value);
+            EXPECT_EQ(payload.error, peer_connect::ERROR_ABORTED);
+            EXPECT_FALSE(payload.punching);
+        });
+
+    EXPECT_TRUE(replied);
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// Positive control: with a CONSISTENT NAT classification the punch starts
+// and the deferred reply still goes out with ERROR_NONE + punching=true
+// (guards against the moved send being suppressed).
+TEST(Server, HolepunchPunchStartedSendsCommittedReply) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed server_seed{}; server_seed.fill(0x11);
+    auto server_kp = noise::generate_keypair(server_seed);
+    srv.listen(server_kp, [](const ConnectionInfo&) {});
+
+    // Prime the NAT sampler to CONSISTENT: 3 distinct observers report
+    // the same public address (classification needs ≥3 samples).
+    auto our_pub = compact::Ipv4Address::from_string("198.51.100.7", 55555);
+    socket.nat_sampler().add(
+        our_pub, compact::Ipv4Address::from_string("203.0.113.1", 49737));
+    socket.nat_sampler().add(
+        our_pub, compact::Ipv4Address::from_string("203.0.113.2", 49737));
+    socket.nat_sampler().add(
+        our_pub, compact::Ipv4Address::from_string("203.0.113.3", 49737));
+    ASSERT_EQ(socket.nat_sampler().firewall(),
+              peer_connect::FIREWALL_CONSISTENT);
+
+    auto h = make_holepunch_harness(router, server_kp);
+    ASSERT_TRUE(h.client_secure);
+
+    // req.to carries the same public address → 4th consistent sample.
+    auto req = make_holepunch_request(h, our_pub);
+    bool replied = false;
+    router.handle_peer_holepunch(
+        req,
+        [](const messages::Response&) {},
+        [&](const messages::Request& relay_req) {
+            replied = true;
+            ASSERT_TRUE(relay_req.value.has_value());
+            auto payload = decrypt_holepunch_reply(h, *relay_req.value);
+            EXPECT_EQ(payload.error, peer_connect::ERROR_NONE);
+            EXPECT_TRUE(payload.punching);
+            EXPECT_EQ(payload.firewall, peer_connect::FIREWALL_CONSISTENT);
+        });
+
+    EXPECT_TRUE(replied) << "deferred reply must still be sent on success";
 
     srv.close();
     socket.close();

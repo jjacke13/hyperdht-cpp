@@ -102,7 +102,6 @@ private:
     uv_timer_t* ping_timer_ = nullptr;  // Relay keepalive (~5s)
     bool running_ = false;
     bool updating_ = false;
-    bool has_reannounced_ = false;  // prevent update→build_relays→update loop
 
     std::shared_ptr<query::Query> current_query_;
 

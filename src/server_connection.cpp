@@ -140,10 +140,12 @@ std::optional<PendingHandshake> decode_handshake(
 }
 
 // Phase 2 — build the response NoisePayload + msg2 given the firewall
-// decision. `firewall_rejected == true` encodes the same outcome as
-// the sync callback returning true: the Noise exchange still
-// completes and a reply is sent with `error = ERROR_ABORTED`, so the
-// client sees a clean refusal instead of a hang.
+// decision. `firewall_rejected == true` produces NO reply bytes:
+// JS server.js:258-261 returns null from _addHandshake BEFORE
+// handshake.send, and router.js:99 (`if (!reply || !reply.noise)
+// return`) then sends nothing — the rejected peer sees silence.
+// Completing the Noise exchange here would leak the server's
+// presence to peers the firewall filtered out.
 std::optional<ServerConnection> finalize_handshake(
     PendingHandshake pending,
     int holepunch_id,
@@ -163,21 +165,24 @@ std::optional<ServerConnection> finalize_handshake(
     conn.remote_public_key = pending.remote_public_key;
 
     // Step 3: apply firewall decision provided by caller.
+    // server-1 — JS: server.js:258-261. Return WITHOUT running the Noise
+    // send: no msg2, no transport keys, empty reply_noise. The Server
+    // keeps this connection only so duplicate noise bytes dedup onto the
+    // same silence until the clear-wait timer reaps it (JS _clearLater).
     if (firewall_rejected) {
         conn.firewalled = true;
         conn.has_error = true;
         conn.error_code = peer_connect::ERROR_ABORTED;
+        return conn;
     }
 
     // Step 4: Determine error code
-    if (!conn.has_error) {
-        if (conn.remote_payload.version != 1) {
-            conn.error_code = peer_connect::ERROR_VERSION_MISMATCH;
-            conn.has_error = true;
-        } else if (!conn.remote_payload.udx.has_value()) {
-            conn.error_code = peer_connect::ERROR_ABORTED;
-            conn.has_error = true;
-        }
+    if (conn.remote_payload.version != 1) {
+        conn.error_code = peer_connect::ERROR_VERSION_MISMATCH;
+        conn.has_error = true;
+    } else if (!conn.remote_payload.udx.has_value()) {
+        conn.error_code = peer_connect::ERROR_ABORTED;
+        conn.has_error = true;
     }
 
     // Step 5: Assign UDX stream ID (random)
@@ -308,6 +313,32 @@ std::optional<ServerConnection> handle_handshake(
 //   - Always returns a response (JS does too unless we _abort with null).
 // ---------------------------------------------------------------------------
 
+// JS: server.js:602-621 (_abort) — the encrypted error reply the server
+// returns when it must abort a session (holepunch veto, punch failed to
+// start, client-signalled abort). Payload mirrors JS exactly: firewall
+// UNKNOWN, punching/connected false, no addresses, no tokens.
+std::vector<uint8_t> encode_abort_reply(
+    ServerConnection& conn,
+    const compact::Ipv4Address& client_address,
+    uint32_t error) {
+
+    if (!conn.secure) return {};
+
+    holepunch::HolepunchPayload resp;
+    resp.error = error;
+    resp.firewall = peer_connect::FIREWALL_UNKNOWN;
+    resp.round = static_cast<uint32_t>(conn.round);
+    auto resp_bytes = holepunch::encode_holepunch_payload(resp);
+    auto encrypted = conn.secure->encrypt(resp_bytes.data(), resp_bytes.size());
+
+    holepunch::HolepunchMessage resp_msg;
+    resp_msg.mode = peer_connect::MODE_FROM_SERVER;
+    resp_msg.id = 0;
+    resp_msg.payload = std::move(encrypted);
+    resp_msg.peer_address = client_address;
+    return holepunch::encode_holepunch_msg(resp_msg);
+}
+
 HolepunchReply handle_holepunch(
     ServerConnection& conn,
     const std::vector<uint8_t>& value,
@@ -344,21 +375,8 @@ HolepunchReply handle_holepunch(
         if (client_hp.round >= static_cast<uint32_t>(conn.round)) {
             conn.round = static_cast<int>(client_hp.round);
         }
-        // Client is aborting — build error response matching JS _abort()
-        holepunch::HolepunchPayload resp;
-        resp.error = peer_connect::ERROR_ABORTED;
-        resp.firewall = peer_connect::FIREWALL_UNKNOWN;
-        resp.round = static_cast<uint32_t>(conn.round);
-        auto resp_bytes = holepunch::encode_holepunch_payload(resp);
-        auto encrypted = conn.secure->encrypt(resp_bytes.data(), resp_bytes.size());
-
-        holepunch::HolepunchMessage resp_msg;
-        resp_msg.mode = peer_connect::MODE_FROM_SERVER;
-        resp_msg.id = 0;
-        resp_msg.payload = std::move(encrypted);
-        resp_msg.peer_address = client_address;
-
-        reply.value = holepunch::encode_holepunch_msg(resp_msg);
+        // Client is aborting — error response matching JS _abort()
+        reply.value = encode_abort_reply(conn, client_address);
         return reply;
     }
 

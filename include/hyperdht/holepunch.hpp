@@ -90,6 +90,11 @@ HolepunchPayload decode_holepunch_payload(const uint8_t* data, size_t len);
 
 struct HolepunchResult {
     bool success = false;
+    // connect-7 — set (with success=false) when the caller's holepunch veto
+    // rejected the punch. JS: HOLEPUNCH_ABORTED('Client aborted holepunch')
+    // (connect.js:296-307). Lets connect.cpp map the failure to the
+    // HOLEPUNCH_ABORTED-equivalent error code instead of HOLEPUNCH_FAILED.
+    bool aborted = false;
     compact::Ipv4Address address;       // Peer's address to connect to
     uint32_t firewall = 0;              // Peer's firewall status
     udx_socket_t* socket = nullptr;     // Socket that received the probe (JS: ref.socket)
@@ -108,9 +113,14 @@ using OnHolepunchCallback = std::function<void(const HolepunchResult& result)>;
 
 // If the remote peer's firewall is OPEN, we can connect directly
 // using the address from the PEER_HANDSHAKE response.
+// connect-5 — JS getFirstRemoteAddress (connect.js:196-203): the address is
+// the first NON-bogon entry of addresses4, falling back to `server_address`
+// (JS serverAddress = hs.peerAddress || to — the relay's fresh observation).
 // Returns true if direct connection is possible.
 bool try_direct_connect(const peer_connect::HandshakeResult& hs,
-                        HolepunchResult& result);
+                        HolepunchResult& result,
+                        const std::optional<compact::Ipv4Address>&
+                            server_address = std::nullopt);
 
 // ---------------------------------------------------------------------------
 // Holepuncher — the UDP probe engine
@@ -451,6 +461,15 @@ HolepunchMessage decode_holepunch_msg(const uint8_t* data, size_t len);
 // fast_open: if true, send a low-TTL (5) probe to peer_addr before Round 1.
 //            Primes our NAT mapping so the first round-trip is closer to
 //            immediate on CONSISTENT+CONSISTENT NATs. Matches JS opts.fastOpen.
+
+// connect-7 — client-side holepunch veto (JS opts.holepunch, connect.js:296-307).
+// Called after the probe round + NAT analysis, before the punching rounds:
+//   veto(remote_firewall, local_firewall, remote_addresses, local_addresses)
+// Return false to abort the punch (result: success=false, aborted=true).
+using HolepunchVetoFn = std::function<bool(uint32_t, uint32_t,
+    const std::vector<compact::Ipv4Address>&,
+    const std::vector<compact::Ipv4Address>&)>;
+
 void holepunch_connect(rpc::RpcSocket& socket,
                        const peer_connect::HandshakeResult& hs_result,
                        const compact::Ipv4Address& relay_addr,
@@ -467,7 +486,9 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        // (RANDOM+CONSISTENT) and the stats to serialize random
                        // punches (throttle). Null = no birthday / no throttle.
                        socket_pool::SocketPool* birthday_pool = nullptr,
-                       PunchStats* stats = nullptr);
+                       PunchStats* stats = nullptr,
+                       // connect-7 — JS opts.holepunch client veto.
+                       HolepunchVetoFn veto = nullptr);
 
 // ---------------------------------------------------------------------------
 // Utility functions (JS: Holepuncher.localAddresses, Holepuncher.matchAddress)
@@ -477,6 +498,15 @@ void holepunch_connect(rpc::RpcSocket& socket,
 // Returns addresses with the given port. Excludes internal (loopback).
 // Falls back to 127.0.0.1 if no external addresses found.
 std::vector<compact::Ipv4Address> local_addresses(uint16_t port);
+
+// connect-5/6 — port of the npm `bogon` module (JS: const { isBogon,
+// isReserved } = require('bogon'), used by connect.js getFirstRemoteAddress
+// and onlyNonReserved). isBogon = isPrivate || isReserved.
+//   private:  10/8, 100.64/10 (CGNAT), 127/8, 169.254/16, 172.16/12, 192.168/16
+//   reserved: 0/8, 192.0.0/24, 192.0.2/24, 198.18/15, 198.51.100/24,
+//             203.0.113/24, 224/4, 240/4, 255.255.255.255/32
+bool is_bogon(const compact::Ipv4Address& addr);
+bool is_reserved(const compact::Ipv4Address& addr);
 
 // Find the best matching remote address for LAN connections.
 // Matches by IP prefix: 3-octet match (same /24) > 2-octet > 1-octet.

@@ -5,15 +5,24 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-07-21.
+Last updated: 2026-07-22.
 
 ---
 
 ## Status snapshot
 
 - **JS-parity sweep 2026-07-09**: 91 confirmed findings (12 HIGH / 45 MED / 34 LOW).
-  **All 12 HIGH closed.** ~76/91 addressed (fixed or accepted-divergence).
-  **16 MED/LOW still open** (Section A).
+  **All 12 HIGH closed.** ~86/91 addressed (fixed or accepted-divergence).
+  **6 MED/LOW still open** (Section A).
+- **2026-07-22 batch** (on main): server-1 (firewall-reject now SILENT — presence
+  leak closed), server-2 (holepunch reply deferred past veto+punch(), encrypted
+  ABORTED on failure), server-3 (synchronous handshake dedup + duplicate
+  queueing), connect-3 (reusableSocket client wiring), connect-4 (route-shortcut
+  payload), connect-5 (bogon filter + serverAddress fallback), connect-6 (LAN
+  shortcut exclusive, JS trigger via client_address), connect-7 (client
+  holepunch veto), announce-4 (record signs empty relayAddresses — client
+  independence proven both sides), announce-6 (router FROM_RELAY-only handler
+  gate). Suite 702/702; cpp-reviewer SHIP, ASAN/UBSAN clean.
 - **2026-07-21 batch** (on main): announce-5, announce-7, server-8, connect-8
   (SECURITY: handshake reply validation + new `Response::remote_addr` source
   check — RPC matched responses by tid only), connect-10 (client relay-chain
@@ -33,13 +42,13 @@ blind-relay, dhtrpc-io, protomux, query, dhtrpc-tick, dht-top. Partial
 
 ---
 
-## A. Open JS-parity findings (16) — the resume worklist
+## A. Open JS-parity findings (6) — the resume worklist
 
-Do **server-1/2/3 first** (correctness). Some are ACCEPT candidates
-(anti-DoS) — decide per finding, don't blindly port. Full text +
-JS/C++ file:line for each is in `docs/.parity-sweep-appendix.md`.
+Remaining: connect-9, server-4 (ACCEPT candidate — likely just document),
+server-6/9/11, secret-stream connect-1 (deferred, needs live JS cross-test).
+Full text + JS/C++ file:line for each is in `docs/.parity-sweep-appendix.md`.
 
-### connect (6 open; done: connect-1/2/8/10/11)
+### connect (1 open; done: connect-1..8/10/11)
 - [x] **connect-8** — DONE 2026-07-21. Handshake reply now validated
   (mode==REPLY, source-address match via `Response::remote_addr`, version/
   error/udx checks); JS-terminal failures fail the connect with
@@ -47,26 +56,30 @@ JS/C++ file:line for each is in `docs/.parity-sweep-appendix.md`.
 - [x] connect-10 — DONE 2026-07-21. 15s timer now tears down the relay chain
   (`abort_relay_chain`), breaking the pair-callback↔ConnState shared_ptr
   cycle; deferred teardown from client-callback frames via 0ms re-arm.
-- [ ] connect-3 — `reusableSocket` ignored on the CLIENT path: `ConnectOptions.
-  reusable_socket` (dht.hpp:242) declared but never consumed on connect;
-  route-cache read (`connect.cpp:509 get_route`) + write (`:155 add_route`)
-  run unconditionally, not gated on the negotiated flag. NOTE: server-side +
-  wire encoding already work (v0.3.1, holesail); route-GC-on-close now added
-  (holepuncher-6). This is narrower than "unimplemented" — client option
-  wiring + cache gating only.
-- [ ] connect-4 — route-shortcut handshake omits our firewall + addresses.
-- [ ] connect-5 — direct-connect path lacks bogon filtering + serverAddress fallback.
-- [ ] connect-6 — LAN same-NAT shortcut runs in PARALLEL with holepunch (JS exclusive).
-- [ ] connect-7 — `opts.holepunch` client veto callback never invoked.
+- [x] connect-3 — DONE 2026-07-22. reusableSocket threaded: ConnState + UdxInfo
+  advertise flag + route-cache read/write gated on both-sides opt-in.
+- [x] connect-4 — DONE 2026-07-22. `build_local_handshake_info` shared by
+  fire_handshake and the route shortcut (one payload for all attempts).
+- [x] connect-5 — DONE 2026-07-22. `is_bogon`/`is_reserved` (npm bogon port);
+  direct paths use first-non-bogon + serverAddress fallback.
+- [x] connect-6 — DONE 2026-07-22. LAN shortcut EXCLUSIVE of holepunch, JS
+  trigger (`client_address.host == server_address.host`, onlyNonReserved
+  filter, ping-fail aborts). NEEDS LIVE LAN VALIDATION (Section C).
+- [x] connect-7 — DONE 2026-07-22. `opts.holepunch` veto invoked after probe
+  round, before punching; abort maps to HOLEPUNCH_TIMEOUT. Deviation: abort
+  is local-only (no ABORTED round to the relay — see Section G).
 - [ ] connect-9 — findPeer query not seeded with closestNodes/onlyClosestNodes/retries.
 
-### server (7 open; done: server-5/8)
-- [ ] **server-1** — firewall-rejected handshake sends an ERROR_ABORTED Noise
-  reply; JS sends nothing. Correctness. Do early.
-- [ ] **server-2** — holepunch reply committed (ERROR_NONE, punching) before the
-  veto / punch-start. Correctness.
-- [ ] **server-3** — handshake dedup not synchronous on the async-firewall path
-  (JS dedups same-tick). Correctness.
+### server (4 open; done: server-1/2/3/5/8)
+- [x] server-1 — DONE 2026-07-22. Firewall-rejected handshake now sends NOTHING
+  (presence leak closed); rejected session stored only for dedup-silence,
+  reaped by the clear-wait timer.
+- [x] server-2 — DONE 2026-07-22. Holepunch reply committed only after veto +
+  punch()-started; failures send encrypted ABORTED (`encode_abort_reply`).
+  Deviation kept: immediate clear_session vs JS ~10s defer (Section G).
+- [x] server-3 — DONE 2026-07-22. Dedup entry written same-tick before the
+  async firewall dispatch; duplicates queue on `pending_handshakes_` and all
+  get the same reply (or silence) on resolve.
 - [ ] server-4 — `MAX_PENDING_HANDSHAKES=256` cap silently drops. **ACCEPT
   candidate** (anti-DoS, like the other caps we kept) — likely just document.
 - [ ] server-6 — `neverPunch` (`opts.holepunch === false`) not implemented.
@@ -76,13 +89,17 @@ JS/C++ file:line for each is in `docs/.parity-sweep-appendix.md`.
 - [ ] server-9 — server-side same-host LAN match (server.js:414-426) not implemented.
 - [ ] server-11 — OPEN-client shortcut targets self-reported `addresses4[0]` with a null socket.
 
-### router-announce (2 open; done: announce-1/2/3/5/7)
-- [ ] announce-4 — announcer embeds relay addresses in the SIGNED announce
-  record; JS announces an empty relayAddresses list.
+### router-announce (0 open; done: announce-1..7)
+- [x] announce-4 — DONE 2026-07-22. Announcer signs/stores empty relayAddresses
+  (JS parity); proven no client (JS or C++) reads relays from the record —
+  they come from the responding DHT node + the handshake payload. Dead
+  re-announce-once machinery removed.
 - [x] announce-5 — DONE 2026-07-21. Server-host FROM_SECOND_RELAY reply now
   routed to the embedded relayAddress (first relay), dropped when absent.
-- [ ] announce-6 — holepunch server handler invoked for all incoming modes, not
-  only the ones JS gates.
+- [x] announce-6 — DONE 2026-07-22. Holepunch handler now FROM_RELAY-only with
+  the `!peerAddress` drop (router.js:221); FROM_CLIENT/FROM_SERVER route
+  through the pure-relay path (self-hosting server reaches its own handler
+  via one self-hop, like JS).
 - [x] announce-7 — DONE 2026-07-21. `handle_refresh` ports persistent.js
   `_onrefresh`: refresh hashes stored on full announce, preimage verified,
   record re-added, chain rotated. (Latent feature — current JS always sends
@@ -128,6 +145,11 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
 - [ ] Outgoing request id accepted by JS `validateId` → C++ node appears in JS
   routing tables; bootstrapper works as a real DHT id-holder.
 - [ ] TRY_LATER end-to-end (throttled server → client waits 10-20s → completes).
+- [ ] LAN same-NAT shortcut (connect-6, 2026-07-22): now EXCLUSIVE of holepunch
+  — verify a real same-LAN connect still succeeds and a failed LAN ping
+  aborts cleanly instead of hanging.
+- [ ] Empty relayAddresses announce record (announce-4, 2026-07-22): one live
+  nospoon round-trip to confirm relay discovery is unaffected end-to-end.
 
 ---
 
@@ -197,6 +219,18 @@ before any full "core frozen" sign-off:
 - [ ] holepuncher-4: fresh-socket reopen (currently same-socket resample — recovers
   lossy-UNKNOWN, not the new-NAT-mapping case). Blocked on the upgrade-port
   socket-handle invariant; revisit if a real CGNAT case needs it.
+- Documented deviations from the 2026-07-22 batch (deliberate, revisit only if
+  live behavior warrants):
+  - [ ] connect-7 veto abort is local-only; JS also sends an ERROR_ABORTED
+    round to the relay. Skipped: PunchState::complete closes the pool socket
+    immediately (send race). Add with a deferred close if needed.
+  - [ ] `HOLEPUNCH_TIMEOUT` (-6) now covers veto + LAN-ping-fail + passive
+    timeout (all JS HOLEPUNCH_ABORTED). Rename would touch FFI/wrappers.
+  - [ ] server veto/punch-fail clear_session immediately; JS defers ~10s via
+    puncher teardown (pre-existing semantics, kept).
+  - [ ] direct branch lacks JS's `relayed && !remoteHolepunchable` gate —
+    pre-existing structural divergence; gating would break direct-to-server
+    connects (loopback fixtures rely on it).
 
 ---
 

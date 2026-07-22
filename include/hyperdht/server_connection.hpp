@@ -207,6 +207,15 @@ struct HolepunchReply {
     std::optional<compact::Ipv4Address> remote_address;
 };
 
+// JS: server.js:602-621 (_abort) — encrypted error reply for aborting a
+// session (holepunch veto rejected, punch failed to start, client abort).
+// Uses conn.secure + conn.round; returns empty if the session has no
+// holepunch secret.
+std::vector<uint8_t> encode_abort_reply(
+    ServerConnection& conn,
+    const compact::Ipv4Address& client_address,
+    uint32_t error = peer_connect::ERROR_ABORTED);
+
 // random_throttled: caller-provided gate. When true AND this is a random
 // punch (either side RANDOM), the response is built with
 // `error = ERROR_TRY_LATER` and `should_punch` stays false. Mirrors JS

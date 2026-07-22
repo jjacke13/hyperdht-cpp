@@ -385,6 +385,10 @@ static HandshakeResult validate_handshake_response(
     // `remote_address` field which triggers the server's
     // fast-mode punch (server.js:530-538).
     result.server_address = hs_resp.peer_address;
+    // connect-6 — JS `clientAddress: res.to` (router.js:77): our address as
+    // the relay observed it. `resp.from` IS the wire `to` field (see
+    // messages.hpp Response docs).
+    result.client_address = resp.from.addr;
     return result;
 }
 
@@ -399,8 +403,8 @@ void peer_handshake(rpc::RpcSocket& socket,
     // Identical to the relayThrough overload with relay_through absent
     // (flag bit 32 unset → byte-identical wire output).
     peer_handshake(socket, relay_addr, our_keypair, remote_pubkey,
-                   our_udx_id, firewall, addresses4, std::nullopt,
-                   std::move(on_done));
+                   our_udx_id, /*reusable_socket=*/false, firewall,
+                   addresses4, std::nullopt, std::move(on_done));
 }
 
 // Overload with relayThrough in the Noise payload (Phase E)
@@ -409,6 +413,7 @@ void peer_handshake(rpc::RpcSocket& socket,
                     const noise::Keypair& our_keypair,
                     const noise::PubKey& remote_pubkey,
                     uint32_t our_udx_id,
+                    bool reusable_socket,
                     uint32_t firewall,
                     const std::vector<compact::Ipv4Address>& addresses4,
                     const std::optional<RelayThroughInfo>& relay_through,
@@ -424,7 +429,8 @@ void peer_handshake(rpc::RpcSocket& socket,
     payload.error = ERROR_NONE;
     payload.firewall = firewall;
     payload.addresses4 = addresses4;
-    payload.udx = UdxInfo{1, false, our_udx_id, 0};
+    // connect-3 — JS connect.js:406: udx.reusableSocket = c.reusableSocket.
+    payload.udx = UdxInfo{1, reusable_socket, our_udx_id, 0};
     payload.has_secret_stream = true;
     payload.relay_through = relay_through;  // Phase E: include relayThrough
 

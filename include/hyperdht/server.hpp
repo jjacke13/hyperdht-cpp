@@ -94,8 +94,9 @@ public:
     //   });
     //
     // The completion handler must be invoked EXACTLY once. If it's
-    // never called, the handshake stalls until the session timer
-    // (`handshake_clear_wait`, default 10s) GCs the state.
+    // never called, the handshake stalls indefinitely (duplicates keep
+    // queueing on the pending entry — JS parity: `await this.firewall`
+    // never resolving); close()/suspend() drop the pending state.
     //
     // Sync and async callbacks are mutually exclusive. Installing one
     // clears the other.
@@ -329,6 +330,18 @@ private:
     // Pending punches: connections waiting for the client's UDX packet
     // to arrive via the rawStream firewall. Maps local_udx_id → hp_id.
     std::unordered_map<uint32_t, uint32_t> pending_punch_streams_;
+
+    // server-3 — JS: server.js:464-473 ("The next couple of statements
+    // MUST run within the same tick to prevent a malicious peer from
+    // flooding us with handshakes"). When the async firewall is in
+    // flight, the dedup entry is written synchronously and the hp_id is
+    // parked here; duplicate requests arriving during the window queue
+    // their reply_fns on the entry. on_handshake_result flushes everyone
+    // with the same reply bytes (or silence if the firewall rejected).
+    // Cleared in close()/suspend() if the firewall never resolves.
+    std::unordered_map<uint32_t,
+                       std::vector<std::function<void(std::vector<uint8_t>)>>>
+        pending_handshakes_;
 public:
     // Called by rawStream firewall callback (static C function needs access)
     void on_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket,

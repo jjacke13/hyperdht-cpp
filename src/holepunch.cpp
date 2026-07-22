@@ -265,20 +265,76 @@ HolepunchPayload decode_holepunch_payload(const uint8_t* data, size_t len) {
 // ---------------------------------------------------------------------------
 
 bool try_direct_connect(const peer_connect::HandshakeResult& hs,
-                        HolepunchResult& result) {
+                        HolepunchResult& result,
+                        const std::optional<compact::Ipv4Address>&
+                            server_address) {
     if (!hs.success) return false;
 
     // If remote firewall is OPEN, we can connect directly
     if (hs.remote_payload.firewall == peer_connect::FIREWALL_OPEN) {
-        if (!hs.remote_payload.addresses4.empty()) {
+        // connect-5 — JS getFirstRemoteAddress (connect.js:196-203):
+        // first NON-bogon entry of addresses4, else serverAddress.
+        for (const auto& a : hs.remote_payload.addresses4) {
+            if (is_bogon(a)) continue;
             result.success = true;
-            result.address = hs.remote_payload.addresses4[0];
+            result.address = a;
+            result.firewall = peer_connect::FIREWALL_OPEN;
+            return true;
+        }
+        if (server_address.has_value()) {
+            result.success = true;
+            result.address = *server_address;
             result.firewall = peer_connect::FIREWALL_OPEN;
             return true;
         }
     }
 
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Bogon classification — port of the npm `bogon` module (mafintosh/bogon,
+// used by JS connect.js via `const { isBogon, isReserved } = require('bogon')`).
+// IPv4 only — our compact::Ipv4Address never carries IPv6.
+// ---------------------------------------------------------------------------
+
+static bool is_private_ip(const std::array<uint8_t, 4>& ip) {
+    return
+        // 10.0.0.0/8  Private-use networks
+        (ip[0] == 10) ||
+        // 100.64.0.0/10 Carrier-grade NAT
+        (ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127) ||
+        // 127.0.0.0/8 Loopback
+        (ip[0] == 127) ||
+        // 169.254.0.0/16 Link local
+        (ip[0] == 169 && ip[1] == 254) ||
+        // 172.16.0.0/12 Private-use networks
+        (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) ||
+        // 192.168.0.0/16 Private-use networks
+        (ip[0] == 192 && ip[1] == 168);
+}
+
+bool is_reserved(const compact::Ipv4Address& addr) {
+    const auto& ip = addr.host;
+    return
+        // 0.0.0.0/8 "This" network
+        (ip[0] == 0) ||
+        // 192.0.0.0/24 IETF protocol assignments
+        (ip[0] == 192 && ip[1] == 0 && ip[2] == 0) ||
+        // 192.0.2.0/24 TEST-NET-1
+        (ip[0] == 192 && ip[1] == 0 && ip[2] == 2) ||
+        // 198.18.0.0/15 Benchmark testing
+        (ip[0] == 198 && (ip[1] == 18 || ip[1] == 19)) ||
+        // 198.51.100.0/24 TEST-NET-2
+        (ip[0] == 198 && ip[1] == 51 && ip[2] == 100) ||
+        // 203.0.113.0/24 TEST-NET-3
+        (ip[0] == 203 && ip[1] == 0 && ip[2] == 113) ||
+        // 224.0.0.0/4 Multicast, 240.0.0.0/4 Reserved (incl. 255.255.255.255)
+        (ip[0] >= 224);
+}
+
+bool is_bogon(const compact::Ipv4Address& addr) {
+    return is_private_ip(addr.host) || is_reserved(addr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1306,6 +1362,8 @@ struct PunchState {
     // round2_fn → state capture cycle.
     std::shared_ptr<std::function<void()>> round2_fn;
     int trylater_retries = 0;
+    // connect-7 — client-side opts.holepunch veto (JS connect.js:296-307).
+    HolepunchVetoFn veto;
 
     void complete(const HolepunchResult& result) {
         if (completed) return;
@@ -1402,7 +1460,8 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        udx_socket_t** pool_handle_out,
                        std::shared_ptr<void>* pool_keepalive_out,
                        socket_pool::SocketPool* birthday_pool,
-                       PunchStats* stats) {
+                       PunchStats* stats,
+                       HolepunchVetoFn veto) {
 
     // Derive holepunchSecret from handshake hash
     // holepunchSecret = BLAKE2b-256(NS_PEER_HOLEPUNCH, key=handshake_hash)
@@ -1418,6 +1477,7 @@ void holepunch_connect(rpc::RpcSocket& socket,
     state->wait_sampler = std::make_shared<async_utils::Sleeper>(socket.loop());
     state->on_done = std::move(on_done);
     state->socket = &socket;
+    state->veto = std::move(veto);
 
     // Create pool socket (JS: dht._socketPool.acquire())
     // Pass &socket so the pool socket reuses the main RPC's per-peer RTT
@@ -1782,6 +1842,23 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
                             server_addrs[0].host_string().c_str(),
                             server_addrs[0].port);
                     state->puncher->send_probe(server_addrs[0]);
+                }
+
+                // connect-7 — JS connect.js:296-307: client opts.holepunch
+                // veto, after the probe round + analysis, before punching.
+                // Args mirror JS: (puncher.remoteFirewall, nat.firewall,
+                // puncher.remoteAddresses, nat.addresses). False → abort
+                // (JS: HOLEPUNCH_ABORTED('Client aborted holepunch')).
+                if (state->veto &&
+                    !state->veto(effective_remote_fw,
+                                 state->pool->nat_sampler().firewall(),
+                                 server_addrs,
+                                 state->pool->addresses())) {
+                    DHT_LOG("  [hp] Client vetoed holepunch — aborting\n");
+                    HolepunchResult vetoed;
+                    vetoed.aborted = true;
+                    state->complete(vetoed);
+                    return;
                 }
 
                 // -------------------------------------------------------------

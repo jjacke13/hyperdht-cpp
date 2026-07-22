@@ -134,6 +134,11 @@ struct HandshakeResult {
     // current NAT addresses. std::nullopt when the relay didn't include
     // peer_address in its reply (rare — direct, non-relayed PEER_HANDSHAKE).
     std::optional<compact::Ipv4Address> server_address;
+    // connect-6 — JS `clientAddress: res.to` (router.js:77): OUR address as
+    // the relay observed it (the wire `to` field of the reply). Drives the
+    // LAN same-NAT trigger `clientAddress.host === serverAddress.host`
+    // (connect.js:234). Only meaningful when success is true.
+    compact::Ipv4Address client_address{};
 };
 
 // Callback for handshake completion
@@ -162,11 +167,14 @@ void peer_handshake(rpc::RpcSocket& socket,
 
 // Overload that includes relayThrough in the Noise payload (Phase E).
 // JS: connect.js:409-410 — relayThrough: { publicKey, token }
+// connect-3 — reusable_socket: advertised in the payload's udx info
+// (JS connect.js:406 — udx.reusableSocket = c.reusableSocket).
 void peer_handshake(rpc::RpcSocket& socket,
                     const compact::Ipv4Address& relay_addr,
                     const noise::Keypair& our_keypair,
                     const noise::PubKey& remote_pubkey,
                     uint32_t our_udx_id,
+                    bool reusable_socket,
                     uint32_t firewall,
                     const std::vector<compact::Ipv4Address>& addresses4,
                     const std::optional<RelayThroughInfo>& relay_through,

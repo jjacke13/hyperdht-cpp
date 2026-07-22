@@ -651,3 +651,165 @@ TEST(Router, RelayNodeForwardsHolepunchFromClient) {
     EXPECT_FALSE(reply_called);
     EXPECT_TRUE(relay_called) << "relay node must forward holepunch FROM_CLIENT";
 }
+
+// ============================================================================
+// announce-6 — JS holepunch gating: ONLY FROM_RELAY invokes the server
+// handler (router.js:212-247). FROM_CLIENT always relays onward, even at the
+// server host; FROM_SERVER converts to a REPLY; FROM_RELAY without a
+// peerAddress is dropped (router.js:221).
+// ============================================================================
+
+// Helper: server-host entry whose holepunch handler records invocation.
+static ForwardEntry make_hp_server_entry(bool& handler_called) {
+    ForwardEntry entry;
+    entry.on_peer_holepunch = [&handler_called](
+                                  const std::vector<uint8_t>&,
+                                  const Ipv4Address&, const Ipv4Address&,
+                                  const Ipv4Address&,
+                                  std::function<void(std::vector<uint8_t>)> reply_fn) {
+        handler_called = true;
+        holepunch::HolepunchMessage hp;
+        hp.mode = peer_connect::MODE_FROM_SERVER;
+        hp.payload = {0xBE, 0xEF};
+        reply_fn(holepunch::encode_holepunch_msg(hp));
+    };
+    return entry;
+}
+
+// Helper: a PEER_HOLEPUNCH request with the given mode/peerAddress.
+static messages::Request make_hp_request(
+    const announce::TargetKey& target, uint32_t mode,
+    std::optional<Ipv4Address> peer_address,
+    Ipv4Address from = Ipv4Address::from_string("198.51.100.9", 5002)) {
+    holepunch::HolepunchMessage hp;
+    hp.mode = mode;
+    hp.id = 5;
+    hp.payload = {0x01, 0x02};
+    hp.peer_address = peer_address;
+
+    messages::Request req;
+    req.target = *reinterpret_cast<const std::array<uint8_t, 32>*>(target.data());
+    req.value = holepunch::encode_holepunch_msg(hp);
+    req.from.addr = from;
+    req.to.addr = Ipv4Address::from_string("10.0.0.2", 5001);
+    req.tid = 606;
+    req.command = messages::CMD_PEER_HOLEPUNCH;
+    req.internal = false;
+    return req;
+}
+
+// FROM_CLIENT arriving at the server-host node must NOT hit the handler —
+// JS relays it to peerAddress || relay (router.js:213-219).
+TEST(Router, ServerHostRelaysHolepunchFromClient) {
+    Router r;
+    auto target = make_target(0xD1);
+    bool handler_called = false;
+    r.set(target, make_hp_server_entry(handler_called));
+
+    auto server_addr = Ipv4Address::from_string("203.0.113.20", 49737);
+    auto req = make_hp_request(target, peer_connect::MODE_FROM_CLIENT,
+                               server_addr);
+
+    bool reply_called = false;
+    bool relay_called = false;
+    r.handle_peer_holepunch(req,
+        [&](const messages::Response&) { reply_called = true; },
+        [&](const messages::Request& relay_req) {
+            relay_called = true;
+            // Forwarded toward the embedded peerAddress as FROM_RELAY,
+            // peerAddress rewritten to the client's UDP source.
+            EXPECT_EQ(relay_req.to.addr.host_string(), "203.0.113.20");
+            auto out = holepunch::decode_holepunch_msg(
+                relay_req.value->data(), relay_req.value->size());
+            EXPECT_EQ(out.mode, peer_connect::MODE_FROM_RELAY);
+            ASSERT_TRUE(out.peer_address.has_value());
+            EXPECT_EQ(out.peer_address->host_string(), "198.51.100.9");
+            EXPECT_EQ(out.peer_address->port, 5002);
+        });
+
+    EXPECT_FALSE(handler_called)
+        << "FROM_CLIENT must never invoke the server handler (router.js:221)";
+    EXPECT_FALSE(reply_called);
+    EXPECT_TRUE(relay_called) << "server host must relay FROM_CLIENT onward";
+}
+
+// FROM_CLIENT at the server host with neither peerAddress nor a known relay
+// is dropped — JS `if (!peerAddress && !relay) return` (router.js:214).
+TEST(Router, ServerHostDropsHolepunchFromClientWithoutPeerAddress) {
+    Router r;
+    auto target = make_target(0xD2);
+    bool handler_called = false;
+    r.set(target, make_hp_server_entry(handler_called));
+
+    auto req = make_hp_request(target, peer_connect::MODE_FROM_CLIENT,
+                               std::nullopt);
+
+    bool reply_called = false;
+    bool relay_called = false;
+    r.handle_peer_holepunch(req,
+        [&](const messages::Response&) { reply_called = true; },
+        [&](const messages::Request&) { relay_called = true; });
+
+    EXPECT_FALSE(handler_called);
+    EXPECT_FALSE(reply_called);
+    EXPECT_FALSE(relay_called);
+}
+
+// FROM_RELAY without a peerAddress is dropped even at the server host —
+// JS `if (!isServer || !peerAddress) return` (router.js:221).
+TEST(Router, HolepunchFromRelayWithoutPeerAddressDropped) {
+    Router r;
+    auto target = make_target(0xD3);
+    bool handler_called = false;
+    r.set(target, make_hp_server_entry(handler_called));
+
+    auto req = make_hp_request(target, peer_connect::MODE_FROM_RELAY,
+                               std::nullopt);
+
+    bool reply_called = false;
+    bool relay_called = false;
+    r.handle_peer_holepunch(req,
+        [&](const messages::Response&) { reply_called = true; },
+        [&](const messages::Request&) { relay_called = true; });
+
+    EXPECT_FALSE(handler_called)
+        << "FROM_RELAY without peerAddress must not reach the handler";
+    EXPECT_FALSE(reply_called);
+    EXPECT_FALSE(relay_called);
+}
+
+// FROM_SERVER arriving at the server-host node converts to a REPLY toward
+// the embedded peerAddress — never the handler (router.js:239-246).
+TEST(Router, ServerHostConvertsHolepunchFromServerToReply) {
+    Router r;
+    auto target = make_target(0xD4);
+    bool handler_called = false;
+    r.set(target, make_hp_server_entry(handler_called));
+
+    auto client_addr = Ipv4Address::from_string("198.51.100.10", 5003);
+    auto server_addr = Ipv4Address::from_string("203.0.113.21", 49737);
+    auto req = make_hp_request(target, peer_connect::MODE_FROM_SERVER,
+                               client_addr, /*from=*/server_addr);
+
+    bool reply_called = false;
+    bool relay_called = false;
+    r.handle_peer_holepunch(req,
+        [&](const messages::Response& resp) {
+            reply_called = true;
+            // Bounced to the CLIENT (peerAddress), not the server (req.from)
+            EXPECT_EQ(resp.from.addr.host_string(), "198.51.100.10");
+            EXPECT_EQ(resp.from.addr.port, 5003);
+            auto out = holepunch::decode_holepunch_msg(
+                resp.value->data(), resp.value->size());
+            EXPECT_EQ(out.mode, peer_connect::MODE_REPLY);
+            // Reply's peerAddress = the server's address (req.from)
+            ASSERT_TRUE(out.peer_address.has_value());
+            EXPECT_EQ(out.peer_address->host_string(), "203.0.113.21");
+        },
+        [&](const messages::Request&) { relay_called = true; });
+
+    EXPECT_FALSE(handler_called)
+        << "FROM_SERVER must never invoke the server handler";
+    EXPECT_TRUE(reply_called);
+    EXPECT_FALSE(relay_called);
+}

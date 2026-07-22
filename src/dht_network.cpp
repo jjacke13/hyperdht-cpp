@@ -248,8 +248,8 @@ void HyperDHT::fire_persistent() {
     // After the persistent transition, traffic switches from client_socket_
     // to server_socket_ (different port). Servers must fully re-announce
     // (not just refresh) so relay connections are rebuilt on the new socket
-    // and relay addresses point to the new port. notify_online() resets
-    // has_reannounced_ so build_relays() runs fresh with new peer addresses.
+    // and relay addresses point to the new port. notify_online() clears
+    // active relays so build_relays() runs fresh with new peer addresses.
     for (auto& srv : servers_) {
         if (srv) srv->notify_online();
     }

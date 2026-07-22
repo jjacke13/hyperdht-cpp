@@ -323,14 +323,15 @@ bool Router::handle_peer_handshake(const messages::Request& req,
 //
 // JS: .analysis/js/hyperdht/lib/router.js:202-248 (onpeerholepunch)
 //
-// JS dispatches on `mode` (single switch, only FROM_RELAY needs the handler):
-//   - FROM_CLIENT: relay to peerAddress or the known forward relay
-//   - FROM_RELAY:  call state.onpeerholepunch then relay back FROM_SERVER
+// JS dispatches on `mode` (single switch, ONLY FROM_RELAY invokes the server
+// handler — unlike onpeerhandshake, whose server branch takes every mode):
+//   - FROM_CLIENT: relay to peerAddress or the known forward relay — even
+//     when this node hosts the server (router.js:213-219). When the relay IS
+//     the server host, the FROM_RELAY forward addressed to our own external
+//     address loops back and reaches the handler on the next hop.
+//   - FROM_RELAY:  `if (!isServer || !peerAddress) return` (router.js:221),
+//     then call state.onpeerholepunch and relay back FROM_SERVER to req.from
 //   - FROM_SERVER: req.reply with REPLY mode + the embedded peerAddress
-// C++: when this node is the server host (entry has on_peer_holepunch), the
-// existing server-host path handles it (and short-circuits FROM_CLIENT to a
-// direct reply — the collapsed relay==server case). Otherwise a pure relay
-// forwards via relay_peer_holepunch() above (FROM_CLIENT / FROM_SERVER only).
 // ---------------------------------------------------------------------------
 
 bool Router::handle_peer_holepunch(const messages::Request& req,
@@ -347,14 +348,19 @@ bool Router::handle_peer_holepunch(const messages::Request& req,
     // Decode the holepunch message to determine the mode
     auto hp_msg = holepunch::decode_holepunch_msg(req.value->data(), req.value->size());
 
-    if (!entry || !entry->on_peer_holepunch) {
-        // Not the server host — act as a pure relay (JS router.js:212-247, the
-        // FROM_CLIENT / FROM_SERVER cases that aren't gated on the handler).
+    if (hp_msg.mode != peer_connect::MODE_FROM_RELAY) {
+        // FROM_CLIENT / FROM_SERVER never touch the server handler in JS
+        // (router.js:213-219, 239-246) — pure relay/bounce, server host or not.
         return relay_peer_holepunch(req, hp_msg, relay_addr, reply, relay);
     }
 
-    auto incoming_mode = hp_msg.mode;
-    auto client_addr = hp_msg.peer_address.value_or(req.from.addr);
+    // FROM_RELAY: `if (!isServer || !peerAddress) return` (router.js:221).
+    if (!entry || !entry->on_peer_holepunch ||
+        !hp_msg.peer_address.has_value()) {
+        return false;
+    }
+
+    auto client_addr = *hp_msg.peer_address;
 
     // Capture only needed fields (avoid copying the full Request)
     auto req_tid = req.tid;
@@ -365,42 +371,30 @@ bool Router::handle_peer_holepunch(const messages::Request& req,
     // Pass the raw value and client address to the server's handler.
     // The handler decrypts/processes and calls reply_fn with the reply value.
     // NOTE: The callback returns a fully-encoded HolepunchMessage. The router
-    // decodes it to overwrite the mode field (FROM_SERVER or REPLY) and
-    // peerAddress, then re-encodes. This is asymmetric with the handshake path
+    // decodes it to overwrite the mode field (FROM_SERVER) and peerAddress,
+    // then re-encodes. This is asymmetric with the handshake path
     // (which returns raw Noise bytes) but functionally correct.
     entry->on_peer_holepunch(
         *req.value, client_addr, req.from.addr, req.to.addr,
         [req_tid, req_from, req_command, req_target,
-         reply, relay, client_addr, incoming_mode](std::vector<uint8_t> reply_value) {
-            if (incoming_mode == peer_connect::MODE_FROM_CLIENT) {
-                // Direct: send RESPONSE to client with mode=REPLY
-                auto hp_reply = holepunch::decode_holepunch_msg(
-                    reply_value.data(), reply_value.size());
-                hp_reply.mode = peer_connect::MODE_REPLY;
-                hp_reply.peer_address = std::nullopt;
+         relay, client_addr](std::vector<uint8_t> reply_value) {
+            // Relay the reply FROM_SERVER back to req.from — the relaying
+            // DHT node converts it to a REPLY for the client
+            // (router.js:229-236).
+            auto hp_relay = holepunch::decode_holepunch_msg(
+                reply_value.data(), reply_value.size());
+            hp_relay.mode = peer_connect::MODE_FROM_SERVER;
+            hp_relay.peer_address = client_addr;
 
-                messages::Response resp;
-                resp.tid = req_tid;
-                resp.from.addr = req_from;
-                resp.value = holepunch::encode_holepunch_msg(hp_reply);
-                reply(resp);
-            } else {
-                // FROM_RELAY: send REQUEST back to relay with mode=FROM_SERVER
-                auto hp_relay = holepunch::decode_holepunch_msg(
-                    reply_value.data(), reply_value.size());
-                hp_relay.mode = peer_connect::MODE_FROM_SERVER;
-                hp_relay.peer_address = client_addr;
+            messages::Request relay_req;
+            relay_req.tid = req_tid;
+            relay_req.to.addr = req_from;
+            relay_req.command = req_command;
+            relay_req.target = req_target;
+            relay_req.internal = false;
+            relay_req.value = holepunch::encode_holepunch_msg(hp_relay);
 
-                messages::Request relay_req;
-                relay_req.tid = req_tid;
-                relay_req.to.addr = req_from;
-                relay_req.command = req_command;
-                relay_req.target = req_target;
-                relay_req.internal = false;
-                relay_req.value = holepunch::encode_holepunch_msg(hp_relay);
-
-                relay(relay_req);
-            }
+            relay(relay_req);
         });
 
     return true;

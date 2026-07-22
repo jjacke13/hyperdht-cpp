@@ -87,6 +87,10 @@ struct ConnState {
     // outlive the original scope once we enter async territory).
     bool fast_open = true;
     bool local_connection = true;
+    // connect-3 — JS: c.reusableSocket = !!opts.reusableSocket (connect.js:67).
+    bool reusable_socket = false;
+    // connect-7 — JS: opts.holepunch client veto (connect.js:296-307).
+    ConnectOptions::HolepunchVetoFn holepunch_veto;
 
     // Phase E: blind-relay config (from ConnectOptions)
     std::optional<noise::PubKey> relay_through;
@@ -149,8 +153,13 @@ struct ConnState {
         }
 
         // §AUDIT-6: store route after successful connect.
-        // JS: connect.js:474 — socketPool.routes.add(remotePublicKey, rawStream)
-        if (err == 0 && dht && dht->socket_pool() &&
+        // JS: connect.js:473-474 — gated on BOTH sides opting in:
+        // `if (c.reusableSocket && payload.udx.reusableSocket)` →
+        // socketPool.routes.add(remotePublicKey, rawStream)
+        if (err == 0 && reusable_socket &&
+            hs_result.remote_payload.udx.has_value() &&
+            hs_result.remote_payload.udx->reusable_socket &&
+            dht && dht->socket_pool() &&
             result.udx_socket != nullptr) {
             dht->socket_pool()->add_route(
                 remote_pk, result.udx_socket, result.peer_address);
@@ -207,6 +216,54 @@ static void check_exhaustion(std::shared_ptr<ConnState> state);
 static void start_find_peer(std::shared_ptr<ConnState> state);
 
 // ---------------------------------------------------------------------------
+// connect-4 — local half of the noisePayload, shared by EVERY handshake
+// attempt. JS computes ONE payload for all relay attempts including the
+// cached-route path (connect.js:386-411): firewall = OPEN iff
+// remoteAddress() is stable, addresses4 = public + validated LAN,
+// relayThrough if configured.
+// ---------------------------------------------------------------------------
+struct LocalHandshakeInfo {
+    uint32_t firewall = peer_connect::FIREWALL_UNKNOWN;
+    std::vector<compact::Ipv4Address> addresses4;
+    std::optional<peer_connect::RelayThroughInfo> relay_through;
+};
+
+static LocalHandshakeInfo build_local_handshake_info(
+        const std::shared_ptr<ConnState>& state) {
+    LocalHandshakeInfo info;
+
+    // JS: connect.js:388-394 — addr = dht.remoteAddress(); firewall =
+    // addr ? OPEN : UNKNOWN; addresses4 = [addr, ...localAddrs].
+    const auto& sampler = state->socket->nat_sampler();
+    if (!sampler.host().empty() &&
+        sampler.port() != 0 &&
+        !state->socket->is_firewalled() &&
+        sampler.port() == state->socket->port()) {
+        info.firewall = peer_connect::FIREWALL_OPEN;
+        info.addresses4.push_back(compact::Ipv4Address::from_string(
+            sampler.host(), sampler.port()));
+    }
+
+    // LAN addresses (§6 local_connection support).
+    if (state->local_connection) {
+        for (const auto& la : state->dht->validated_local_addresses()) {
+            info.addresses4.push_back(la);
+        }
+    }
+
+    // Build relayThrough for the Noise payload (Phase E)
+    if (state->relay_through.has_value()) {
+        peer_connect::RelayThroughInfo rt;
+        rt.version = 1;
+        rt.public_key = *state->relay_through;
+        rt.token = state->relay_token;
+        info.relay_through = rt;
+    }
+
+    return info;
+}
+
+// ---------------------------------------------------------------------------
 // §AUDIT-2: fire_handshake — start a single PEER_HANDSHAKE through a relay.
 // Called as findPeer results stream in (pipelining) or from cached relays.
 // JS: connect.js:355-368 (connectThroughNode inside for-await).
@@ -217,37 +274,8 @@ static void fire_handshake(std::shared_ptr<ConnState> state,
     state->handshakes_in_flight++;
     state->handshakes_started++;
 
-    // Compute firewall + addresses4 for the handshake payload.
-    // JS: connect.js:386-394 (connectThroughNode)
-    uint32_t our_fw = peer_connect::FIREWALL_UNKNOWN;
-    std::vector<compact::Ipv4Address> our_addrs;
-
-    const auto& sampler = state->socket->nat_sampler();
-    if (!sampler.host().empty() &&
-        sampler.port() != 0 &&
-        !state->socket->is_firewalled() &&
-        sampler.port() == state->socket->port()) {
-        our_fw = peer_connect::FIREWALL_OPEN;
-        our_addrs.push_back(compact::Ipv4Address::from_string(
-            sampler.host(), sampler.port()));
-    }
-
-    // LAN addresses (§6 local_connection support).
-    if (state->local_connection) {
-        for (const auto& la : state->dht->validated_local_addresses()) {
-            our_addrs.push_back(la);
-        }
-    }
-
-    // Build relayThrough for the Noise payload (Phase E)
-    std::optional<peer_connect::RelayThroughInfo> relay_through_info;
-    if (state->relay_through.has_value()) {
-        peer_connect::RelayThroughInfo rt;
-        rt.version = 1;
-        rt.public_key = *state->relay_through;
-        rt.token = state->relay_token;
-        relay_through_info = rt;
-    }
+    // JS: connect.js:386-411 — one payload for all attempts.
+    auto info = build_local_handshake_info(state);
 
     DHT_LOG("  [connect] fire_handshake via %s:%u (%d in flight)\n",
             relay_addr.host_string().c_str(), relay_addr.port,
@@ -255,7 +283,8 @@ static void fire_handshake(std::shared_ptr<ConnState> state,
 
     peer_connect::peer_handshake(*state->socket, relay_addr,
         state->keypair, state->remote_pk, state->our_udx_id,
-        our_fw, our_addrs, relay_through_info,
+        state->reusable_socket,
+        info.firewall, info.addresses4, info.relay_through,
         [state, relay_addr](const peer_connect::HandshakeResult& hs) {
             state->handshakes_in_flight--;
             if (state->completed) return;  // First-success or destruction guard
@@ -407,6 +436,10 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
     state->fast_open = opts.fast_open;
     state->local_connection = opts.local_connection;
     state->relay_keep_alive = opts.relay_keep_alive;
+    // connect-3 — JS connect.js:67: c.reusableSocket = !!opts.reusableSocket.
+    state->reusable_socket = opts.reusable_socket;
+    // connect-7 — JS opts.holepunch veto, threaded into the punch path.
+    state->holepunch_veto = opts.holepunch_veto;
 
     // JS parity (connect.js:842-848): delegate to the ConnectOptions
     // helper which mirrors `selectRelay()` — function form wins, then
@@ -522,8 +555,10 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
     }
 
     // §AUDIT-6: Route shortcut — try cached socket+address before findPeer.
-    // JS: connect.js:177-183 — retryRoute before findAndConnect.
-    if (socket_pool_) {
+    // JS: connect.js:177 — `const route = c.reusableSocket ?
+    // _socketPool.routes.get(...) : null` (connect-3: gated on the option),
+    // then retryRoute before findAndConnect.
+    if (opts.reusable_socket && socket_pool_) {
         auto* route = socket_pool_->get_route(remote_pk);
         if (route) {
             DHT_LOG("  [connect] route shortcut: trying cached route\n");
@@ -532,11 +567,16 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
             // to findPeer. We don't increment handshakes_in_flight because
             // this path returns early (line below) — no pipelining runs
             // concurrently. INVARIANT: the `return` below is load-bearing.
+            //
+            // connect-4 — JS builds ONE noisePayload for all attempts
+            // including this route path (connect.js:386-411): same
+            // firewall/addresses/relayThrough as fire_handshake.
             auto route_addr = route->address;
+            auto info = build_local_handshake_info(state);
             peer_connect::peer_handshake(*socket_, route_addr,
                 keypair, remote_pk, state->our_udx_id,
-                peer_connect::FIREWALL_UNKNOWN, {},
-                std::nullopt,
+                state->reusable_socket,
+                info.firewall, info.addresses4, info.relay_through,
                 [state, route_addr](const peer_connect::HandshakeResult& hs) {
                     if (state->completed || state->alive.expired()) return;
                     if (hs.success) {
@@ -654,9 +694,17 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
         start_relay_path(state, is_initiator, relay_pk, relay_token);
     }
 
-    // Check for direct connect (OPEN firewall)
+    // JS: serverAddress = hs.peerAddress || to (router.js:76) — the relay's
+    // fresh observation of the server, falling back to the request
+    // destination (which IS the server when the handshake wasn't relayed).
+    const compact::Ipv4Address server_addr_js =
+        hs.server_address.value_or(state->relay_addr);
+
+    // Check for direct connect (OPEN firewall).
+    // connect-5 — pass the serverAddress fallback for getFirstRemoteAddress
+    // semantics (connect.js:196-203,212-221).
     holepunch::HolepunchResult hp_result;
-    if (holepunch::try_direct_connect(hs, hp_result)) {
+    if (holepunch::try_direct_connect(hs, hp_result, server_addr_js)) {
         DHT_LOG("  [connect] *** DIRECT CONNECT (server OPEN) → %s:%u "
                 "(no holepunch, no pool socket) ***\n",
                 hp_result.address.host_string().c_str(), hp_result.address.port);
@@ -677,29 +725,31 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
     }
 
     // JS: if no holepunch info (server is OPEN or unreachable for holepunching),
-    // try direct connect using addresses
+    // try direct connect using addresses.
+    // connect-5 — JS connect.js:196-203,212-221: the address is the first
+    // NON-bogon entry of addresses4, falling back to serverAddress (the
+    // relay's fresh observation). Never addresses4[0] blindly.
     if (!hs.remote_payload.holepunch.has_value() ||
         hs.remote_payload.holepunch->relays.empty()) {
-        if (!hs.remote_payload.addresses4.empty()) {
-            DHT_LOG("  [connect] *** NO HOLEPUNCH INFO → direct connect to %s:%u ***\n",
-                    hs.remote_payload.addresses4[0].host_string().c_str(),
-                    hs.remote_payload.addresses4[0].port);
-            ConnectResult result;
-            result.success = true;
-            result.tx_key = hs.tx_key;
-            result.rx_key = hs.rx_key;
-            result.handshake_hash = hs.handshake_hash;
-            result.remote_public_key = hs.remote_public_key;
-            result.peer_address = hs.remote_payload.addresses4[0];
-            result.local_udx_id = state->our_udx_id;
-            if (hs.remote_payload.udx.has_value()) {
-                result.remote_udx_id = hs.remote_payload.udx->id;
-            }
-            state->take_raw_stream(result);
-            state->complete(0, result);
-        } else {
-            state->complete_error(ConnectError::NO_ADDRESSES);
+        compact::Ipv4Address direct_addr = server_addr_js;
+        for (const auto& a : hs.remote_payload.addresses4) {
+            if (!holepunch::is_bogon(a)) { direct_addr = a; break; }
         }
+        DHT_LOG("  [connect] *** NO HOLEPUNCH INFO → direct connect to %s:%u ***\n",
+                direct_addr.host_string().c_str(), direct_addr.port);
+        ConnectResult result;
+        result.success = true;
+        result.tx_key = hs.tx_key;
+        result.rx_key = hs.rx_key;
+        result.handshake_hash = hs.handshake_hash;
+        result.remote_public_key = hs.remote_public_key;
+        result.peer_address = direct_addr;
+        result.local_udx_id = state->our_udx_id;
+        if (hs.remote_payload.udx.has_value()) {
+            result.remote_udx_id = hs.remote_payload.udx->id;
+        }
+        state->take_raw_stream(result);
+        state->complete(0, result);
         return;
     }
 
@@ -747,73 +797,77 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
     }
 
     // --- §6: localConnection LAN shortcut ------------------
-    // JS: connect.js:234-251 — same-NAT shortcut.
+    // connect-6 — JS: connect.js:234-251 — same-NAT shortcut, EXCLUSIVE of
+    // holepunch.
     //
-    // Two triggers:
-    //   A) Same public IP: our NAT sampler host matches the server's
-    //      first address (both behind the same NAT with public IPs).
-    //   B) Subnet match: the server advertises a private address on
-    //      the same subnet as one of our local interfaces (server has
-    //      no public IP yet, e.g. fw=UNKNOWN, but is on our LAN).
+    // Trigger (connect.js:210,234): `c.lan && relayed &&
+    // clientAddress.host === serverAddress.host` where
+    //   relayed       = diffAddress(serverAddress, relayAddress)
+    //   serverAddress = hs.peerAddress || to      (router.js:76)
+    //   clientAddress = res.to — OUR address as the relay observed it
+    //                   (router.js:77; C++ hs.client_address).
+    // Same host seen by the same relay for both peers ⇒ same NAT.
+    //
+    // When a non-reserved server LAN address exists, JS commits EXCLUSIVELY
+    // to the LAN path: ping → onsocket on success, HOLEPUNCH_ABORTED on
+    // failure. The holepunch engine is NEVER started in that case.
     {
-        const bool relayed = !hs.remote_payload.addresses4.empty() &&
-            (hs.remote_payload.addresses4[0] != state->relay_addr);
+        // JS connect.js:210 — relayed = diffAddress(serverAddress, relayAddress)
+        const bool relayed = server_addr_js != state->relay_addr;
 
-        // Check A: same public IP
-        bool same_nat = state->local_connection && relayed &&
-            !state->socket->nat_sampler().host().empty() &&
-            state->socket->nat_sampler().host() ==
-                hs.remote_payload.addresses4[0].host_string();
+        if (state->local_connection && relayed &&
+            hs.client_address.host == server_addr_js.host) {
+            // JS connect.js:235 — payload.addresses4.filter(onlyNonReserved)
+            std::vector<compact::Ipv4Address> server_addresses;
+            for (const auto& a : hs.remote_payload.addresses4) {
+                if (!holepunch::is_reserved(a)) server_addresses.push_back(a);
+            }
 
-        // Check B: server has a private address on our subnet
-        bool same_subnet = false;
-        if (state->local_connection && relayed && !same_nat) {
-            auto my_local = holepunch::local_addresses(0);
-            auto subnet_match = holepunch::match_address(
-                my_local, hs.remote_payload.addresses4);
-            same_subnet = subnet_match.has_value();
-        }
+            if (!server_addresses.empty()) {
+                auto my_local = holepunch::local_addresses(0);
+                auto matched = holepunch::match_address(
+                    my_local, server_addresses);
+                auto lan_addr = matched.value_or(server_addresses[0]);
 
-        if (same_nat || same_subnet) {
+                DHT_LOG("  [connect] LAN shortcut: target %s:%u (matched=%s)\n",
+                        lan_addr.host_string().c_str(), lan_addr.port,
+                        matched.has_value() ? "yes" : "fallback");
 
-            auto my_local = holepunch::local_addresses(0);
-            auto matched = holepunch::match_address(
-                my_local, hs.remote_payload.addresses4);
-
-            auto lan_addr = matched.value_or(hs.remote_payload.addresses4[0]);
-
-            DHT_LOG("  [connect] LAN shortcut: target %s:%u (matched=%s)\n",
-                    lan_addr.host_string().c_str(), lan_addr.port,
-                    matched.has_value() ? "yes" : "fallback");
-
-            assert(state->dht && "ConnState::dht must be set");
-            state->dht->ping(lan_addr,
-                [state, lan_addr](bool ok) {
-                    if (state->completed) return;
-                    if (!ok) {
-                        DHT_LOG("  [connect] LAN ping failed, "
-                                "falling back to holepunch\n");
-                        return;  // holepunch path runs in parallel
-                    }
-                    DHT_LOG("  [connect] LAN ping OK — short-circuiting\n");
-                    ConnectResult result;
-                    result.success = true;
-                    result.tx_key = state->hs_result.tx_key;
-                    result.rx_key = state->hs_result.rx_key;
-                    result.handshake_hash = state->hs_result.handshake_hash;
-                    result.remote_public_key = state->hs_result.remote_public_key;
-                    result.peer_address = lan_addr;
-                    result.local_udx_id = state->our_udx_id;
-                    if (state->hs_result.remote_payload.udx.has_value()) {
-                        result.remote_udx_id =
-                            state->hs_result.remote_payload.udx->id;
-                    }
-                    state->take_raw_stream(result);
-                    state->complete(0, result);
-                });
-            // Note: we do NOT return here. The holepunch below runs in
-            // parallel so a slow LAN ping doesn't block the connect —
-            // whichever path completes first wins via state->completed.
+                assert(state->dht && "ConnState::dht must be set");
+                state->dht->ping(lan_addr,
+                    [state, lan_addr](bool ok) {
+                        if (state->completed) return;
+                        if (!ok) {
+                            // JS connect.js:244-247 — ping failure aborts the
+                            // connect (HOLEPUNCH_ABORTED); the holepunch was
+                            // never started, so this is terminal (modulo the
+                            // relay-in-flight holdoff in complete_error).
+                            DHT_LOG("  [connect] LAN ping failed — abort\n");
+                            state->complete_error(
+                                ConnectError::HOLEPUNCH_TIMEOUT);
+                            return;
+                        }
+                        DHT_LOG("  [connect] LAN ping OK — short-circuiting\n");
+                        ConnectResult result;
+                        result.success = true;
+                        result.tx_key = state->hs_result.tx_key;
+                        result.rx_key = state->hs_result.rx_key;
+                        result.handshake_hash = state->hs_result.handshake_hash;
+                        result.remote_public_key =
+                            state->hs_result.remote_public_key;
+                        result.peer_address = lan_addr;
+                        result.local_udx_id = state->our_udx_id;
+                        if (state->hs_result.remote_payload.udx.has_value()) {
+                            result.remote_udx_id =
+                                state->hs_result.remote_payload.udx->id;
+                        }
+                        state->take_raw_stream(result);
+                        state->complete(0, result);
+                    });
+                // JS connect.js:238-250 — EXCLUSIVE: once we commit to the
+                // LAN path the holepunch engine is never started.
+                return;
+            }
         }
     }
     // --- end §6 LAN shortcut ------------------------------
@@ -846,7 +900,12 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
             if (state->alive.expired() || !hp.success) {
                 // JS: maybeDestroyEncryptedSocket — hold off if a relay
                 // pairing is still in flight (relayThrough fallback).
-                state->complete_error(ConnectError::HOLEPUNCH_FAILED);
+                // connect-7 — a veto abort maps to JS HOLEPUNCH_ABORTED,
+                // which C++ carries as HOLEPUNCH_TIMEOUT (same mapping as
+                // the passive-wait timeout).
+                state->complete_error(hp.aborted
+                    ? ConnectError::HOLEPUNCH_TIMEOUT
+                    : ConnectError::HOLEPUNCH_FAILED);
                 return;
             }
             ConnectResult result;
@@ -872,7 +931,9 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
         // Enables the RANDOM+CONSISTENT birthday-paradox strategy (256 pool
         // sockets) and serializes random punches across connections.
         state->dht ? state->dht->socket_pool() : nullptr,
-        state->dht ? &state->dht->punch_stats() : nullptr);
+        state->dht ? &state->dht->punch_stats() : nullptr,
+        // connect-7 — JS opts.holepunch client veto (connect.js:296-307).
+        state->holepunch_veto);
 }
 
 // ---------------------------------------------------------------------------

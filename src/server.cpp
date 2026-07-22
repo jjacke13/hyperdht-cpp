@@ -299,6 +299,10 @@ void Server::close(bool force, std::function<void()> on_done) {
     // Clear active connections (ServerConnection destructor handles raw_stream)
     connections_.clear();
     handshake_dedup_.clear();
+    // server-3: drop pending async-firewall entries (queued reply_fns are
+    // simply released; the continuation's closed_ guard makes a late
+    // firewall completion a no-op).
+    pending_handshakes_.clear();
 
     if (on_done) on_done();
 }
@@ -360,6 +364,8 @@ void Server::suspend(LogFn log) {
     connections_.clear();
     handshake_dedup_.clear();
     pending_punch_streams_.clear();
+    // server-3: drop pending async-firewall entries (see close()).
+    pending_handshakes_.clear();
 }
 
 void Server::resume() {
@@ -419,9 +425,20 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
             noise.size(), peer_address.host_string().c_str(), peer_address.port);
     if (closed_ || suspended_) return;
 
-    // M14: cap dedup map (entries without matching connections are stale)
+    // M14: cap dedup map (entries without matching connections are stale).
+    // server-3: prune per-entry instead of wholesale — an entry whose
+    // firewall decision is still in flight (pending_handshakes_) or whose
+    // session is live must survive the sweep, or a duplicate would spawn
+    // a second session mid-window.
     if (handshake_dedup_.size() > 512 && handshake_dedup_.size() > connections_.size() * 2) {
-        handshake_dedup_.clear();
+        for (auto it = handshake_dedup_.begin(); it != handshake_dedup_.end();) {
+            if (connections_.count(it->second) ||
+                pending_handshakes_.count(it->second)) {
+                ++it;
+            } else {
+                it = handshake_dedup_.erase(it);
+            }
+        }
     }
 
     // Dedup: same noise bytes = same client via different relay.
@@ -430,9 +447,24 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     auto noise_key = to_hex(noise.data(), noise.size());
     auto dedup_it = handshake_dedup_.find(noise_key);
     if (dedup_it != handshake_dedup_.end()) {
+        // server-3 — JS: server.js:464-473. Firewall decision still in
+        // flight for these noise bytes: queue this requester on the
+        // pending entry (same tick, no Noise re-decode, no second
+        // firewall call). on_handshake_result flushes the queue.
+        auto pit = pending_handshakes_.find(dedup_it->second);
+        if (pit != pending_handshakes_.end()) {
+            DHT_LOG("  [server] Dedup: queueing duplicate on pending id=%u\n",
+                    dedup_it->second);
+            pit->second.push_back(std::move(reply_fn));
+            return;
+        }
         // Already processed this handshake — resend the cached reply
         auto conn_it = connections_.find(dedup_it->second);
         if (conn_it != connections_.end()) {
+            // server-1 — a firewall-rejected session replays as silence.
+            // JS: the duplicate awaits the same promise, gets null, and
+            // router.js:99 drops it — zero packets.
+            if (conn_it->second->firewalled) return;
             DHT_LOG( "  [server] Dedup: reusing session id=%u for same noise\n",
                     dedup_it->second);
             reply_fn(std::vector<uint8_t>(conn_it->second->reply_noise));
@@ -543,6 +575,15 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         auto fired_once = std::make_shared<bool>(false);
         std::weak_ptr<bool> weak_alive = alive_;
 
+        // server-3 — JS: server.js:464-473. Reserve the dedup entry NOW,
+        // in the same tick as the request, BEFORE the user's async
+        // firewall runs. Duplicates arriving during the window queue on
+        // pending_handshakes_[hp_id] instead of re-decoding Noise and
+        // re-invoking the firewall (flood defence). on_handshake_result
+        // resolves the entry — reply to all, or silence on reject.
+        handshake_dedup_[noise_key] = hp_id;
+        pending_handshakes_[hp_id];
+
         firewall_async_(pending_shared->remote_public_key,
                         pending_shared->remote_payload, peer_address,
                         [this, weak_alive, fired_once, pending_shared,
@@ -602,22 +643,70 @@ void Server::on_handshake_result(
     std::optional<server_connection::ServerConnection> result) {
 
     if (closed_ || suspended_) return;
+
+    // server-3: the firewall decision has arrived — resolve the pending
+    // entry now, collecting every duplicate requester queued during the
+    // async window. All of them get the same outcome as the primary.
+    std::vector<std::function<void(std::vector<uint8_t>)>> senders;
+    senders.push_back(std::move(reply_fn));
+    if (auto pit = pending_handshakes_.find(hp_id);
+        pit != pending_handshakes_.end()) {
+        for (auto& fn : pit->second) senders.push_back(std::move(fn));
+        pending_handshakes_.erase(pit);
+    }
+    // Failure paths below must also drop the dedup entry the async path
+    // wrote synchronously (server-3) — otherwise it dangles forever as a
+    // silent black hole for these noise bytes. No-op on the sync path
+    // (its dedup entry is only written on the success path further down).
+    auto drop_dedup = [&]() {
+        auto dit = handshake_dedup_.find(noise_key);
+        if (dit != handshake_dedup_.end() && dit->second == hp_id) {
+            handshake_dedup_.erase(dit);
+        }
+    };
+
     // H23: cap concurrent pending handshakes to prevent resource exhaustion
     constexpr size_t MAX_PENDING_HANDSHAKES = 256;
-    if (connections_.size() >= MAX_PENDING_HANDSHAKES) return;
+    if (connections_.size() >= MAX_PENDING_HANDSHAKES) {
+        drop_dedup();
+        return;
+    }
 
     if (!result.has_value()) {
         DHT_LOG("  [server] Noise handshake FAILED (finalize error)\n");
+        drop_dedup();
         return;
     }
     DHT_LOG("  [server] Noise handshake OK, error=%u\n", result->error_code);
 
     auto& conn = *result;
 
-    // Send the Noise msg2 reply
-    DHT_LOG("  [server] Sending reply: %zu noise bytes\n", conn.reply_noise.size());
-    auto reply_noise = conn.reply_noise;
-    reply_fn(std::move(reply_noise));
+    // server-1 — JS: server.js:258-261 + router.js:99. A firewall-rejected
+    // handshake sends NOTHING (a Noise error reply would leak that a
+    // server lives at this key); queued duplicates get the same silence.
+    // The session is stored ONLY so duplicate noise bytes keep deduping
+    // onto it, and the clear-wait timer reaps it (JS _clearLater).
+    if (conn.firewalled) {
+        DHT_LOG("  [server] Firewall rejected handshake (id=%u) — silent\n", hp_id);
+        conn.created_at = uv_now(socket_.loop());
+        connections_[hp_id] =
+            std::make_unique<server_connection::ServerConnection>(std::move(conn));
+        handshake_dedup_[noise_key] = hp_id;
+        auto reject_timer = std::make_unique<async_utils::UvTimer>(socket_.loop());
+        reject_timer->start([this, hp_id]() {
+            if (!closed_) clear_session(hp_id);
+        }, handshake_clear_wait);
+        session_timers_[hp_id] = std::move(reject_timer);
+        return;
+    }
+
+    // Send the Noise msg2 reply — to the primary requester and every
+    // duplicate queued during the async-firewall window (server-3).
+    DHT_LOG("  [server] Sending reply: %zu noise bytes (%zu requesters)\n",
+            conn.reply_noise.size(), senders.size());
+    for (auto& fn : senders) {
+        if (fn) fn(std::vector<uint8_t>(conn.reply_noise));
+    }
 
     if (conn.has_error) {
         return;
@@ -1085,10 +1174,14 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
 
     // Decode the outer message to get the holepunch ID
     auto hp_msg = holepunch::decode_holepunch_msg(value.data(), value.size());
+    DHT_LOG("  [server] on_peer_holepunch: id=%u, payload=%zu bytes, from=%s:%u\n",
+            hp_msg.id, hp_msg.payload.size(),
+            from_address.host_string().c_str(), from_address.port);
 
     // Find the connection by holepunch ID
     auto it = connections_.find(hp_msg.id);
     if (it == connections_.end()) {
+        DHT_LOG("  [server] on_peer_holepunch: unknown session id=%u\n", hp_msg.id);
         return;  // Unknown session
     }
 
@@ -1167,10 +1260,18 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
         conn, value, peer_address, our_fw, our_addrs, is_relay,
         random_throttled);
 
-    // Send reply
-    if (!reply.value.empty()) {
-        reply_fn(std::move(reply.value));
+    // Undecodable / undecryptable round — nothing to say (JS returns null).
+    if (reply.value.empty()) {
+        return;
     }
+
+    // server-2 — JS: server.js:586-599. The reply built above is NOT sent
+    // yet: JS commits the PEER_HOLEPUNCH response only at the very END,
+    // after the holepunch veto (server.js:544-546) and after p.punch()
+    // reported that punching STARTED (server.js:576-578). Both failure
+    // paths answer with an encrypted ERROR_ABORTED (_abort) instead. The
+    // NAT state inside `reply.value` was captured above (post add/freeze,
+    // pre punch) exactly like JS — only the send moves.
 
     // Fast mode! JS: server.js:528-537 — runs on EVERY round, BEFORE the
     // remoteHolepunching gate, so it fires on round 1 while the client is
@@ -1206,12 +1307,20 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                     reply.remote_firewall, our_fw);
         }
 
-        // JS: server.js:544 — holepunch veto callback
+        // JS: server.js:544-546 — holepunch veto callback.
+        // server-2: `if (!this.holepunch(...)) return this._abort(h)` —
+        // the client must see an encrypted ABORTED, not the positive
+        // reply (which would leave it hanging waiting for a punch that
+        // never starts). Build the abort BEFORE clear_session destroys
+        // conn.secure.
         if (holepunch_cb_) {
             auto local_addrs = socket_.nat_sampler().addresses();
             if (!holepunch_cb_(reply.remote_firewall, our_fw,
                                reply.remote_addresses, local_addrs)) {
                 DHT_LOG("  [server] Holepunch vetoed by callback\n");
+                auto abort_value =
+                    server_connection::encode_abort_reply(conn, peer_address);
+                reply_fn(std::move(abort_value));
                 clear_session(hp_msg.id);
                 return;
             }
@@ -1364,11 +1473,32 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
             valid_addrs.push_back(addr);
         }
         conn.puncher->update_remote(valid_addrs, peer_address.host_string());
-        conn.puncher->punch();
+
+        // server-2 — JS: server.js:576-578 `const punching = await
+        // p.punch(); if (!punching) return this._abort(h)`. punch()
+        // returns false when the firewall combo is unpunchable (our own
+        // NAT still UNKNOWN, RANDOM+RANDOM, a random branch without a
+        // verified remote, or a throttled random punch) — answer with an
+        // encrypted ABORTED instead of a positive "punching" reply.
+        if (!conn.puncher->punch()) {
+            DHT_LOG("  [server] punch() did not start (id=%u) — aborting\n",
+                    hp_msg.id);
+            auto abort_value =
+                server_connection::encode_abort_reply(conn, peer_address);
+            reply_fn(std::move(abort_value));
+            clear_session(hp_msg.id);
+            return;
+        }
 
         // Note: rawStream is already registered in pending_punch_streams_
         // at handshake time (line ~756). No need to register again here.
     }
+
+    // server-2 — commit the reply only now, after the veto passed and the
+    // punch (if any) has started (JS: server.js:586-599). The fast-mode
+    // ping above already fired toward the client (gotcha 19b), matching
+    // JS which pings at server.js:528-537 before returning the reply.
+    reply_fn(std::move(reply.value));
 }
 
 // ---------------------------------------------------------------------------

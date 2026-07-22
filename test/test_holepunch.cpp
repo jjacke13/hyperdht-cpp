@@ -164,6 +164,44 @@ TEST(Holepunch, OpenFirewallDirect) {
     EXPECT_EQ(result.address.host_string(), "1.2.3.4");
 }
 
+// connect-5 — JS getFirstRemoteAddress skips bogon entries (connect.js:196-199).
+TEST(Holepunch, DirectConnectSkipsBogon) {
+    HandshakeResult hs;
+    hs.success = true;
+    hs.remote_payload.firewall = FIREWALL_OPEN;
+    hs.remote_payload.addresses4.push_back(
+        Ipv4Address::from_string("192.168.1.7", 1000));   // private → skipped
+    hs.remote_payload.addresses4.push_back(
+        Ipv4Address::from_string("100.100.1.2", 1001));   // CGNAT → skipped
+    hs.remote_payload.addresses4.push_back(
+        Ipv4Address::from_string("5.6.7.8", 1002));       // public → picked
+
+    HolepunchResult result;
+    EXPECT_TRUE(try_direct_connect(hs, result));
+    EXPECT_EQ(result.address.host_string(), "5.6.7.8");
+    EXPECT_EQ(result.address.port, 1002u);
+}
+
+// connect-5 — all-bogon addresses4 falls back to serverAddress
+// (JS connect.js:202: `return serverAddress`).
+TEST(Holepunch, DirectConnectFallsBackToServerAddress) {
+    HandshakeResult hs;
+    hs.success = true;
+    hs.remote_payload.firewall = FIREWALL_OPEN;
+    hs.remote_payload.addresses4.push_back(
+        Ipv4Address::from_string("10.0.0.9", 1000));      // private → skipped
+
+    auto server_addr = Ipv4Address::from_string("9.9.9.9", 4321);
+    HolepunchResult result;
+    EXPECT_TRUE(try_direct_connect(hs, result, server_addr));
+    EXPECT_EQ(result.address.host_string(), "9.9.9.9");
+    EXPECT_EQ(result.address.port, 4321u);
+
+    // No fallback available → no direct connect.
+    HolepunchResult result2;
+    EXPECT_FALSE(try_direct_connect(hs, result2));
+}
+
 TEST(Holepunch, NonOpenFirewallNoDirect) {
     HandshakeResult hs;
     hs.success = true;
@@ -173,6 +211,40 @@ TEST(Holepunch, NonOpenFirewallNoDirect) {
 
     HolepunchResult result;
     EXPECT_FALSE(try_direct_connect(hs, result));
+}
+
+// ---------------------------------------------------------------------------
+// Bogon classification — must match the npm `bogon` module (connect-5/6).
+// ---------------------------------------------------------------------------
+
+TEST(Bogon, MatchesNpmBogonSemantics) {
+    auto at = [](const char* h) { return Ipv4Address::from_string(h, 1); };
+
+    // Private (isBogon true, isReserved false)
+    for (const char* h : {"10.1.2.3", "100.64.0.1", "100.127.255.255",
+                          "127.0.0.1", "169.254.10.10", "172.16.0.1",
+                          "172.31.255.1", "192.168.1.1"}) {
+        EXPECT_TRUE(is_bogon(at(h))) << h;
+        EXPECT_FALSE(is_reserved(at(h))) << h;
+    }
+
+    // Reserved (both true)
+    for (const char* h : {"0.1.2.3", "192.0.0.5", "192.0.2.5",
+                          "198.18.0.1", "198.19.255.1", "198.51.100.7",
+                          "203.0.113.9", "224.0.0.1", "239.255.255.250",
+                          "240.0.0.1", "255.255.255.255"}) {
+        EXPECT_TRUE(is_bogon(at(h))) << h;
+        EXPECT_TRUE(is_reserved(at(h))) << h;
+    }
+
+    // Public (neither)
+    for (const char* h : {"8.8.8.8", "100.63.0.1", "100.128.0.1",
+                          "172.15.0.1", "172.32.0.1", "192.167.1.1",
+                          "192.169.1.1", "198.17.0.1", "198.20.0.1",
+                          "223.255.255.255", "88.99.3.86"}) {
+        EXPECT_FALSE(is_bogon(at(h))) << h;
+        EXPECT_FALSE(is_reserved(at(h))) << h;
+    }
 }
 
 // ---------------------------------------------------------------------------

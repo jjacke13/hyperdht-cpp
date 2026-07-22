@@ -13,9 +13,8 @@
 //     single `active_relays_` vector and replaces entries on commit.
 //   - JS picks 3 best replies via `pickBest`. C++ commits to all
 //     find_peer replies that have a token (capped by query results).
-//   - `notify_online()` resets has_reannounced_ so build_relays() runs
-//     again after recovery; JS just notifies the `online` Signal which
-//     unblocks `_background`.
+//   - `notify_online()` clears active relays and kicks an update cycle;
+//     JS just notifies the `online` Signal which unblocks `_background`.
 //
 // Lifetime safety: all async callbacks capture a weak_ptr<bool> alive_
 // sentinel. stop_impl() sets *alive_ = false and resets current_query_
@@ -140,18 +139,13 @@ void Announcer::refresh() {
 // model we have no blocked awaiter, so the semantically-equivalent action is
 // to kick an update cycle immediately. `update()` is already idempotent, so
 // this is safe to call repeatedly.
-//
-// Reset `has_reannounced_` so the relay-address re-announce step in
-// build_relays() runs again after recovery. Otherwise, stale relays from
-// before the outage would remain advertised to peers.
 void Announcer::notify_online() {
     if (!running_) {
         DHT_LOG("  [announcer] notify_online: ignored (not running)\n");
         return;
     }
     DHT_LOG("  [announcer] notify_online: triggering update cycle "
-            "(reset has_reannounced_ + clear active_relays_)\n");
-    has_reannounced_ = false;
+            "(clear active_relays_)\n");
     // Clear stale relay entries so the next cycle rebuilds them with
     // fresh peer_addr from the current active_socket() (e.g. after
     // the persistent transition switches from client to server socket).
@@ -287,12 +281,13 @@ void Announcer::commit(const query::QueryReply& node) {
     auto node_id = node.from_id;
     auto token = *node.token;
 
+    // JS announcer.js:241-247 — the signed/stored record always carries
+    // relayAddresses: []. Clients discover relays from the responding DHT
+    // node (connect.js:359) and the handshake payload (server.js:349-368),
+    // never from the record.
     dht_messages::AnnounceMessage ann;
     dht_messages::PeerRecord peer;
     peer.public_key = keypair_.public_key;
-    for (const auto& ri : relays_) {
-        peer.relay_addresses.push_back(ri.relay_address);
-    }
     ann.peer = peer;
 
     auto signature = announce_sig::sign_announce(
@@ -398,27 +393,16 @@ void Announcer::build_relays() {
         relays_.push_back(ri);
     }
 
-    // Update peer record with relay addresses
-    dht_messages::PeerRecord peer;
-    peer.public_key = keypair_.public_key;
-    for (const auto& ri : relays_) {
-        peer.relay_addresses.push_back(ri.relay_address);
-    }
-    record_ = dht_messages::encode_peer_record(peer);
+    // NOTE: record_ is NOT re-encoded here — JS encodes the record once at
+    // construction with relayAddresses: [] and never updates it
+    // (announcer.js:21). Relay info reaches clients via relays_ in the
+    // handshake payload, not the record.
 
     DHT_LOG("  [announcer] Built relay list: %zu relays\n", relays_.size());
     for (const auto& ri : relays_) {
         DHT_LOG("    relay: %s:%u (peer: %s:%u)\n",
                 ri.relay_address.host_string().c_str(), ri.relay_address.port,
                 ri.peer_address.host_string().c_str(), ri.peer_address.port);
-    }
-
-    // Re-announce ONCE with relay addresses
-    if (!relays_.empty() && running_ && !has_reannounced_) {
-        has_reannounced_ = true;
-        DHT_LOG("  [announcer] Re-announcing with %zu relay addresses\n",
-                relays_.size());
-        update();
     }
 }
 

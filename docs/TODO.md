@@ -105,6 +105,17 @@ Full text + JS/C++ file:line for each is in `docs/.parity-sweep-appendix.md`.
   record re-added, chain rotated. (Latent feature — current JS always sends
   refresh:null.)
 
+### nat-sampler / punch payload (2 new, from the 2026-07-22 field diagnosis —
+### real parity debt, NOT implicated in the field failures; see
+### docs/FIELD-DIAGNOSIS-2026-07-22.md "Finding B")
+- [ ] **B1** — NatSampler classifies at `sampled_ >= 3` (nat_sampler.cpp:111);
+  `MIN_SAMPLES=4` feeds an `ok` flag nobody reads. Three agreeing samples
+  latch CONSISTENT and cannot be undone by later samples. Gate on 4 + let
+  disagreeing samples demote.
+- [ ] **B2** — Round-2 holepunch payload sends ONE address (`our_addr`,
+  holepunch.cpp:1880-1885) instead of `nat_sampler().addresses()`; JS sends
+  the full set in both rounds (connect.js:567,654,684).
+
 ### secret-stream (1 open)
 - [ ] connect-1 (MED) — `connected`/on_connect gated on the REMOTE header +
   local write-ack, not on the LOCAL handshake as in JS (+½–1 RTT to first byte).
@@ -128,12 +139,20 @@ doesn't re-report them:
   must not auto-join) — opt in via `default_bootstrap_nodes()`.
 - filterNode composes built-in + caller filter (JS discards the caller's).
 - C API can't express JS's explicit-ephemeral=true→non-adaptive state.
+- Announcer keepalive DRIFT DETECTION (`08e2f47`): pong `to`-field vs stored
+  peer_addr triggers an early refresh (rate-limited 10s). JS discards the
+  pong body (announcer.js:114-121) and waits out the 5-min reannounce.
 
 ---
 
 ## C. Needs LIVE validation (user's nospoon / CGNAT phone)
 
 Loopback can't prove these; validate against a real NAT'd JS peer:
+- [ ] **Finding A fix (`08e2f47`, 2026-07-22)**: announcer publish-after-settle
+  + keepalive drift detection + closestNodes reuse. Retest checklist in
+  `docs/FIELD-DIAGNOSIS-2026-07-22.md` — key test: disconnect → IMMEDIATE
+  reconnect repeatedly across >10 min, expect success at every point in the
+  announce cycle; watch for `DRIFTED` log lines healing within ~5-10s.
 - [ ] Relay→direct upgrade: C++ client rides relay → punch lands → migrates with
   no ETIMEDOUT/-110; relay closed only after provable direct arrival.
 - [ ] Server-side migration when a JS client is on relay and the C++ server punches.

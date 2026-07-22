@@ -15,6 +15,14 @@
 //     find_peer replies that have a token (capped by query results).
 //   - `notify_online()` clears active relays and kicks an update cycle;
 //     JS just notifies the `online` Signal which unblocks `_background`.
+//   - JS publishes `this.relays` only after `await q.finished()` AND
+//     `await Promise.allSettled(ann)` (announcer.js:154-189). C++ mirrors
+//     that with a per-cycle pending-commit counter + query-done flag
+//     (see update()/commit_settled()/maybe_publish()).
+//   - BEYOND-JS: ping_relays() checks each keepalive pong's `to` field
+//     against the relay's announce-time peer_addr to detect NAT-mapping
+//     drift and re-announce early (JS discards the pong body,
+//     announcer.js:114-121). Deliberate divergence; rate-limited.
 //
 // Lifetime safety: all async callbacks capture a weak_ptr<bool> alive_
 // sentinel. stop_impl() sets *alive_ = false and resets current_query_
@@ -37,6 +45,10 @@ constexpr uint64_t REANNOUNCE_MS = 5 * 60 * 1000;
 // Relay ping interval: keep NAT mappings alive.
 // JS pings every 3s. We use 5s — still well within CGNAT UDP timeouts (30-60s).
 constexpr uint64_t RELAY_PING_MS = 5 * 1000;
+
+// Minimum spacing between drift-triggered refreshes (BEYOND-JS, see
+// ping_relays). An oscillating NAT observation must not refresh-storm.
+constexpr uint64_t DRIFT_REFRESH_MIN_MS = 10 * 1000;
 
 Announcer::Announcer(rpc::RpcSocket& socket, const noise::Keypair& keypair,
                      const std::array<uint8_t, 32>& target)
@@ -104,6 +116,12 @@ void Announcer::stop_impl(bool send_unannounce) {
         current_query_.reset();
     }
     updating_ = false;
+    // Invalidate the in-flight cycle (belt-and-braces: *alive_ = false
+    // already makes every cycle callback a no-op).
+    ++cycle_gen_;
+    pending_commits_ = 0;
+    query_done_ = false;
+    closest_nodes_.clear();
 
     if (ping_timer_) {
         uv_timer_stop(ping_timer_);
@@ -151,12 +169,20 @@ void Announcer::notify_online() {
     // the persistent transition switches from client to server socket).
     active_relays_.clear();
     relays_.clear();
-    // Cancel any in-flight query from the pre-transition cycle so
-    // update() isn't blocked by the updating_ guard. Without this,
-    // the old query continues committing with stale peer_addr (wrong
-    // socket port) and the new cycle never starts.
+    // Cancel the in-flight cycle so update() isn't blocked by the
+    // updating_ guard. Bump cycle_gen_ FIRST: every late callback from
+    // the pre-transition cycle (find_peer on_reply/on_done, ANNOUNCE
+    // response/timeout) checks its captured gen and becomes a no-op —
+    // it must neither publish stale relays nor decrement the new
+    // cycle's settle counter.
+    ++cycle_gen_;
+    pending_commits_ = 0;
+    query_done_ = false;
     if (current_query_) {
-        current_query_.reset();
+        // destroy() (not just reset) stops the old walk's fan-out; its
+        // synchronous on_done fires into the stale gen and no-ops.
+        auto q = std::move(current_query_);
+        q->destroy();
     }
     updating_ = false;
     update();
@@ -185,6 +211,16 @@ void Announcer::on_ping_timer(uv_timer_t* timer) {
 //     JS pings every 3s, then sleeps. We use a periodic uv_timer at 5s.
 //     If fewer than MIN_ACTIVE responses come back we trigger refresh()
 //     (matches JS:119-121).
+//
+// BEYOND-JS (deliberate divergence): drift detection. Each pong's
+// `resp.from.addr` (wire `to` field = our external address as this relay
+// observes it RIGHT NOW) is compared against the peer_addr captured from
+// that relay's ANNOUNCE response. A mismatch proves the relay's stored
+// forward state (`relay: req.from` at announce time, persistent.js:131-138)
+// is stale — our NAT mapping drifted — so we refresh() immediately instead
+// of waiting out the 5-min reannounce. JS discards the pong body and only
+// counts responders (announcer.js:114-121). Rate-limited to one refresh
+// per DRIFT_REFRESH_MIN_MS so an oscillating observation can't storm.
 // ---------------------------------------------------------------------------
 
 void Announcer::ping_relays() {
@@ -202,11 +238,45 @@ void Announcer::ping_relays() {
         req.command = messages::CMD_PING;
         req.internal = true;
 
-        socket_.request(req,
-            [weak, this, active_count, pending, total](const messages::Response&) {
+        const auto relay_addr = relay.addr;
+        const auto announced_peer_addr = relay.peer_addr;
+
+        uint16_t tid = socket_.request(req,
+            [weak, this, active_count, pending, total, relay_addr,
+             announced_peer_addr](const messages::Response& resp) {
                 if (auto a = weak.lock(); !a || !*a) return;
                 (*active_count)++;
                 (*pending)--;
+
+                // Drift check (see header comment above).
+                const auto& observed = resp.from.addr;
+                DHT_LOG("  [announcer] keepalive pong from %s:%u — "
+                        "observed us at %s:%u (announced %s:%u)\n",
+                        relay_addr.host_string().c_str(), relay_addr.port,
+                        observed.host_string().c_str(), observed.port,
+                        announced_peer_addr.host_string().c_str(),
+                        announced_peer_addr.port);
+                if (observed.port != 0 && !(observed == announced_peer_addr)) {
+                    const uint64_t now = uv_now(socket_.loop());
+                    if (last_drift_refresh_ms_ == 0 ||
+                        now - last_drift_refresh_ms_ >= DRIFT_REFRESH_MIN_MS) {
+                        last_drift_refresh_ms_ = now;
+                        DHT_LOG("  [announcer] relay %s:%u forward state DRIFTED "
+                                "(%s:%u -> %s:%u) — refreshing announce\n",
+                                relay_addr.host_string().c_str(), relay_addr.port,
+                                announced_peer_addr.host_string().c_str(),
+                                announced_peer_addr.port,
+                                observed.host_string().c_str(), observed.port);
+                        refresh();
+                    } else {
+                        DHT_LOG("  [announcer] relay %s:%u drift detected but "
+                                "rate-limited (last refresh %llums ago)\n",
+                                relay_addr.host_string().c_str(), relay_addr.port,
+                                static_cast<unsigned long long>(
+                                    now - last_drift_refresh_ms_));
+                    }
+                }
+
                 if (*pending == 0 && *active_count < std::min(total, MIN_ACTIVE)) {
                     DHT_LOG("  [announcer] relay health: %d/%d active (min=%d), refreshing\n",
                             *active_count, total, MIN_ACTIVE);
@@ -222,39 +292,104 @@ void Announcer::ping_relays() {
                     refresh();
                 }
             });
+        // Dropped by the congestion queue (tid == 0): neither callback fires
+        // — settle this relay's slot now so the tick's health check can
+        // still evaluate (mirror of the ANNOUNCE commit congestion path).
+        if (tid == 0) {
+            (*pending)--;
+            if (*pending == 0 && *active_count < std::min(total, MIN_ACTIVE)) {
+                DHT_LOG("  [announcer] relay health: %d/%d active (min=%d), refreshing\n",
+                        *active_count, total, MIN_ACTIVE);
+                refresh();
+            }
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Update: find k closest → announce to each
+// Update: find k closest → announce to each → publish after settle
 //
 // JS: .analysis/js/hyperdht/lib/announcer.js:143-197 (_runUpdate + _update)
 //     .analysis/js/hyperdht/lib/announcer.js:298-301 (pickBest)
 //
-// JS calls `dht.findPeer(target)`, awaits the iterative query, picks
-// the 3 best closestReplies, signs+commits each, then unannounces any
-// stale relays from the previous cycle (`_serverRelays[1]` slot).
-// We don't yet do the unannounce diff — we just commit on each query
-// reply that yields a token.
+// JS calls `dht.findPeer(target, { nodes: this._closestNodes })`, awaits
+// the iterative query, picks the 3 best closestReplies, signs+commits
+// each, awaits Promise.allSettled(ann), and only THEN assigns
+// `this.relays` / `this._closestNodes` (announcer.js:154-189). C++
+// mirrors the ordering with an explicit per-cycle state machine:
+//
+//   update()          — starts cycle `gen`: pending_commits_ = 0,
+//                       query_done_ = false, updating_ = true.
+//   commit(gen)       — per tokened reply: ++pending_commits_ before the
+//                       ANNOUNCE request; the response callback, the
+//                       timeout callback, and the congestion-drop path
+//                       (tid == 0) each settle exactly once.
+//   on_done           — query_done_ = true, saves closest_nodes_ for the
+//                       next cycle's seed, then maybe_publish().
+//   maybe_publish()   — when query_done_ && pending_commits_ == 0:
+//                       build_relays() (publish) + updating_ = false.
+//
+// The zero-commit cycle (no token replies) publishes at on_done since
+// pending_commits_ is already 0. A cycle cancelled by notify_online()/
+// stop() bumps cycle_gen_, so every late callback (captured gen) no-ops.
+// We still diff from JS in committing per-reply during the walk rather
+// than to pickBest(3) after it.
 // ---------------------------------------------------------------------------
 
 void Announcer::update() {
     if (updating_ || !running_) return;
     updating_ = true;
 
+    const uint64_t gen = ++cycle_gen_;
+    pending_commits_ = 0;
+    cycle_commits_total_ = 0;
+    query_done_ = false;
+
     auto weak = std::weak_ptr<bool>(alive_);  // C7: sentinel
     current_query_ = dht_ops::find_peer(socket_,
         keypair_.public_key,
-        [weak, this](const query::QueryReply& reply) {
+        [weak, this, gen](const query::QueryReply& reply) {
             if (auto a = weak.lock(); !a || !*a) return;
-            commit(reply);
+            if (gen != cycle_gen_) return;  // cancelled cycle
+            commit(reply, gen);
         },
-        [weak, this](int /*error*/, const std::vector<query::QueryReply>&) {
+        [weak, this, gen](int /*error*/,
+                          const std::vector<query::QueryReply>& closest) {
             if (auto a = weak.lock(); !a || !*a) return;
-            updating_ = false;
+            if (gen != cycle_gen_) return;  // cancelled cycle
             current_query_.reset();
-            if (running_) build_relays();
-        });
+            // Save the walk's closest nodes to seed the next cycle's
+            // find_peer, so reannounce re-hits the SAME relays (JS
+            // announcer.js:187 `this._closestNodes = q.closestNodes`).
+            closest_nodes_.clear();
+            for (const auto& r : closest) {
+                closest_nodes_.push_back({r.from_id, r.from_addr});
+            }
+            query_done_ = true;
+            maybe_publish();
+        },
+        // Seed from the previous cycle (JS announcer.js:156
+        // `nodes: this._closestNodes`). Seeds are consumed before
+        // start(); the on_done above may safely rewrite the vector.
+        &closest_nodes_);
+}
+
+// One ANNOUNCE commit settled (response, timeout, or congestion drop).
+// Only ever called with a live generation — cancelled cycles return
+// before reaching here, and their counter was reset by the next update().
+void Announcer::commit_settled() {
+    if (pending_commits_ > 0) --pending_commits_;
+    maybe_publish();
+}
+
+// Publish gate: JS assigns this.relays only after `await q.finished()`
+// AND `await Promise.allSettled(ann)` (announcer.js:184-189).
+void Announcer::maybe_publish() {
+    if (!query_done_ || pending_commits_ != 0) return;
+    DHT_LOG("  [announcer] cycle settled (%d commits) — publishing relays\n",
+            cycle_commits_total_);
+    if (running_) build_relays();
+    updating_ = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +402,7 @@ void Announcer::update() {
 //     relays observe different ports.
 // ---------------------------------------------------------------------------
 
-void Announcer::commit(const query::QueryReply& node) {
+void Announcer::commit(const query::QueryReply& node, uint64_t gen) {
     if (!node.token.has_value()) {
         DHT_LOG("  [announcer] skip %s:%u (no token)\n",
                 node.from_addr.host_string().c_str(), node.from_addr.port);
@@ -277,6 +412,11 @@ void Announcer::commit(const query::QueryReply& node) {
     DHT_LOG("  [announcer] commit to %s:%u (id=%02x%02x...)\n",
             node.from_addr.host_string().c_str(), node.from_addr.port,
             node.from_id[0], node.from_id[1]);
+
+    // Settle accounting: incremented BEFORE the request goes out; exactly
+    // one of {response, timeout, congestion-drop} settles it below.
+    ++pending_commits_;
+    ++cycle_commits_total_;
 
     auto node_id = node.from_id;
     auto token = *node.token;
@@ -304,11 +444,16 @@ void Announcer::commit(const query::QueryReply& node) {
     req.value = std::move(ann_value);
 
     auto weak = std::weak_ptr<bool>(alive_);  // C7: sentinel
-    socket_.request(req,
-        [weak, this, node](const messages::Response& resp) {
+    uint16_t tid = socket_.request(req,
+        [weak, this, node, gen](const messages::Response& resp) {
             if (auto a = weak.lock(); !a || !*a) return;
-            DHT_LOG("  [announcer] ANNOUNCE accepted by %s:%u\n",
-                    node.from_addr.host_string().c_str(), node.from_addr.port);
+            // Cancelled cycle: neither track the (stale peer_addr) relay
+            // nor touch the new cycle's settle counter.
+            if (gen != cycle_gen_) return;
+            DHT_LOG("  [announcer] ANNOUNCE accepted by %s:%u — "
+                    "relay observed us at %s:%u\n",
+                    node.from_addr.host_string().c_str(), node.from_addr.port,
+                    resp.from.addr.host_string().c_str(), resp.from.addr.port);
 
             RelayNode relay;
             relay.addr = node.from_addr;
@@ -322,22 +467,34 @@ void Announcer::commit(const query::QueryReply& node) {
             relay.peer_addr = resp.from.addr;
 
             // Check if we already have this relay
+            bool updated = false;
             for (auto& existing : active_relays_) {
-                if (existing.addr.host_string() == relay.addr.host_string() &&
-                    existing.addr.port == relay.addr.port) {
+                if (existing.addr == relay.addr) {
                     existing = relay;  // Update token + peer_addr
-                    return;
+                    updated = true;
+                    break;
                 }
             }
-
-            if (active_relays_.size() < 3) {
+            if (!updated && active_relays_.size() < 3) {
                 active_relays_.push_back(relay);
             }
+
+            commit_settled();
         },
-        [node](uint16_t) {
+        [weak, this, node, gen](uint16_t) {
+            if (auto a = weak.lock(); !a || !*a) return;
             DHT_LOG("  [announcer] ANNOUNCE timeout from %s:%u\n",
                     node.from_addr.host_string().c_str(), node.from_addr.port);
+            if (gen != cycle_gen_) return;
+            commit_settled();
         });
+    // Dropped by the congestion queue (tid == 0): neither callback will
+    // fire — settle now so the cycle's publish gate can't wedge.
+    if (tid == 0) {
+        DHT_LOG("  [announcer] ANNOUNCE to %s:%u dropped (congestion)\n",
+                node.from_addr.host_string().c_str(), node.from_addr.port);
+        commit_settled();
+    }
 }
 
 // ---------------------------------------------------------------------------

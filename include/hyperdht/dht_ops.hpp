@@ -28,15 +28,29 @@ std::array<uint8_t, 32> hash_public_key(const uint8_t* pubkey, size_t len);
 // findPeer — find nodes that have announced at a public key
 // ---------------------------------------------------------------------------
 
+// Pre-seed node for the find_peer walk (JS `opts.nodes` — the Announcer
+// passes its previous cycle's closest nodes, announcer.js:156; dht-rpc
+// query.js:47-67 pushes them onto the pending frontier closest-first).
+struct SeedNode {
+    routing::NodeId id;
+    compact::Ipv4Address addr;
+};
+
+// `seed_nodes` (optional): pre-seeds the walk's frontier in closest-first
+// order via Query::add_seed_node before start(). Used by the Announcer to
+// re-hit the SAME relay nodes each reannounce cycle (JS announcer.js:156
+// `nodes: this._closestNodes`).
 std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
                                          const uint8_t* public_key, size_t pk_len,
                                          query::OnReplyCallback on_reply,
-                                         query::OnDoneCallback on_done);
+                                         query::OnDoneCallback on_done,
+                                         const std::vector<SeedNode>* seed_nodes = nullptr);
 
 std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
                                          const std::array<uint8_t, 32>& public_key,
                                          query::OnReplyCallback on_reply,
-                                         query::OnDoneCallback on_done);
+                                         query::OnDoneCallback on_done,
+                                         const std::vector<SeedNode>* seed_nodes = nullptr);
 
 // ---------------------------------------------------------------------------
 // lookup — generic iterative query with a custom command

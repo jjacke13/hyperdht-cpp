@@ -6,6 +6,8 @@
 #include <sodium.h>
 #include <uv.h>
 
+#include <optional>
+
 #include "hyperdht/announcer.hpp"
 #include "hyperdht/dht_messages.hpp"
 #include "hyperdht/noise_wrap.hpp"
@@ -244,4 +246,384 @@ TEST(Announcer, SignedAnnounceHasEmptyRelayAddresses) {
     EXPECT_TRUE(ctx.relays_empty)
         << "signed announce record must carry relayAddresses: [] "
            "(JS announcer.js:241-247)";
+}
+
+// ============================================================================
+// Fake DHT node for the settle / drift / seed tests below.
+//
+// A raw RpcSocket with a scripted on_request handler. Replies are encoded
+// manually and sent via udp_send so the wire `to` field (Response::from —
+// "our address as the responder sees us") can LIE, which RpcSocket::reply
+// cannot do (it uses resp.from.addr as the UDP destination). Response
+// matching on the requester is by tid only, so egress socket is irrelevant;
+// set_firewalled(false) makes udp_send egress the bound port so the reply's
+// `id` passes the requester's validateId (compute_peer_id of UDP source).
+// ============================================================================
+namespace {
+
+struct FakeNode {
+    rpc::RpcSocket sock;
+    compact::Ipv4Address addr;
+    routing::NodeId id;
+
+    int find_peer_count = 0;
+    int announce_count = 0;
+    int ping_count = 0;
+
+    // Behavior knobs
+    std::optional<compact::Ipv4Address> announce_observed;  // lie in ANNOUNCE `to`
+    std::optional<compact::Ipv4Address> ping_observed;      // lie in PING pong `to`
+    std::vector<compact::Ipv4Address> closer;               // FIND_PEER closerNodes
+
+    FakeNode(uv_loop_t* loop, uint8_t id_fill)
+        : sock(loop, make_node_id(id_fill)) {
+        sock.bind(0);
+        sock.set_firewalled(false);  // udp_send egresses the bound port
+        addr = compact::Ipv4Address::from_string("127.0.0.1", sock.port());
+        id = rpc::compute_peer_id(addr);
+        sock.on_request([this](const messages::Request& req) { handle(req); });
+    }
+
+    static routing::NodeId make_node_id(uint8_t fill) {
+        routing::NodeId nid{};
+        nid.fill(fill);
+        return nid;
+    }
+
+    void handle(const messages::Request& req) {
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = req.from.addr;  // truthful wire `to` by default
+        resp.id = id;
+
+        if (req.internal && req.command == messages::CMD_PING) {
+            ping_count++;
+            if (ping_observed) resp.from.addr = *ping_observed;
+        } else if (!req.internal && req.command == messages::CMD_FIND_PEER) {
+            find_peer_count++;
+            // Real token from our store so the follow-up ANNOUNCE passes
+            // the receive path's central token validation.
+            resp.token = sock.token_store().create(req.from.addr.host_string());
+            resp.closer_nodes = closer;
+        } else if (!req.internal && req.command == messages::CMD_ANNOUNCE) {
+            announce_count++;
+            if (announce_observed) resp.from.addr = *announce_observed;
+        }
+
+        sock.udp_send(messages::encode_response(resp), req.from.addr);
+    }
+};
+
+// Seed `client`'s routing table with a fake node.
+void seed_table(rpc::RpcSocket& client, const FakeNode& fake) {
+    routing::Node node;
+    node.id = fake.id;
+    node.host = fake.addr.host_string();
+    node.port = fake.addr.port;
+    node.added = client.tick();
+    node.pinged = client.tick();
+    node.seen = client.tick();
+    client.table().add(node);
+}
+
+noise::Keypair make_keypair(uint8_t fill) {
+    noise::Seed seed{};
+    seed.fill(fill);
+    return noise::generate_keypair(seed);
+}
+
+std::array<uint8_t, 32> make_target(const noise::Keypair& kp) {
+    std::array<uint8_t, 32> target{};
+    crypto_generichash(target.data(), 32, kp.public_key.data(), 32, nullptr, 0);
+    return target;
+}
+
+}  // namespace
+
+// ============================================================================
+// D1 (publish-after-settle) — relays_ must be published from THIS cycle's
+// ANNOUNCE responses, within the FIRST update cycle. The old ordering ran
+// build_relays() in the find_peer completion callback, which on any network
+// (incl. loopback) fires before the ANNOUNCE responses land — so relays()
+// stayed empty until a LATER cycle republished the previous cycle's late
+// responses (one-cycle-stale relays; field "Finding A"). JS orders it as
+// `await q.finished()` → `await Promise.allSettled(ann)` → publish
+// (announcer.js:154-189).
+// ============================================================================
+TEST(Announcer, PublishesRelaysAfterCommitsSettle) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    FakeNode fake(&loop, 0x11);
+    // Distinctive observed address in the ANNOUNCE response: proves the
+    // published peer_addr came from THIS cycle's commit responses.
+    auto distinctive = compact::Ipv4Address::from_string("9.9.9.9", 4242);
+    fake.announce_observed = distinctive;
+    fake.ping_observed = distinctive;  // keep keepalive drift-free
+
+    routing::NodeId cid{};
+    cid.fill(0x22);
+    rpc::RpcSocket client(&loop, cid);
+    client.bind(0);
+    seed_table(client, fake);
+
+    auto kp = make_keypair(0x42);
+    auto target = make_target(kp);
+
+    Announcer ann(client, kp, target);
+
+    struct Ctx {
+        Announcer* ann;
+        FakeNode* fake;
+        rpc::RpcSocket* client;
+        size_t relay_count = 0;
+        compact::Ipv4Address peer_addr{};
+        int find_peer_at_publish = -1;
+        bool done = false;
+        uv_timer_t poll{};
+        uv_timer_t guard{};
+        void cleanup() {
+            if (done) return;
+            done = true;
+            ann->stop_without_unannounce();
+            fake->sock.close();
+            client->close();
+            uv_close(reinterpret_cast<uv_handle_t*>(&poll), nullptr);
+            uv_close(reinterpret_cast<uv_handle_t*>(&guard), nullptr);
+        }
+    } ctx{&ann, &fake, &client};
+
+    ann.start();
+
+    uv_timer_init(&loop, &ctx.poll);
+    ctx.poll.data = &ctx;
+    uv_timer_start(&ctx.poll, [](uv_timer_t* t) {
+        auto* c = static_cast<Ctx*>(t->data);
+        if (c->done) return;
+        if (!c->ann->relays().empty()) {
+            c->relay_count = c->ann->relays().size();
+            c->peer_addr = c->ann->relays()[0].peer_address;
+            c->find_peer_at_publish = c->fake->find_peer_count;
+            c->cleanup();
+        }
+    }, 20, 20);
+
+    uv_timer_init(&loop, &ctx.guard);
+    ctx.guard.data = &ctx;
+    uv_timer_start(&ctx.guard, [](uv_timer_t* t) {
+        static_cast<Ctx*>(t->data)->cleanup();
+    }, 4000, 0);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+
+    EXPECT_EQ(ctx.relay_count, 1u)
+        << "relays() must be published within the FIRST update cycle "
+           "(publish-after-settle, JS announcer.js:184-189)";
+    EXPECT_EQ(ctx.find_peer_at_publish, 1)
+        << "publish must not require a second find_peer cycle";
+    EXPECT_EQ(ctx.peer_addr, distinctive)
+        << "published peer_addr must carry THIS cycle's ANNOUNCE observation";
+}
+
+// ============================================================================
+// D-C (drift detection, BEYOND-JS) — a keepalive pong whose `to` field
+// differs from the relay's announce-time peer_addr proves the relay's
+// stored forward state is stale; the announcer must refresh() (re-run the
+// find_peer+announce cycle). A second drifted pong inside the 10s rate
+// limit must NOT re-trigger. JS discards the pong body (announcer.js:114-121).
+// ============================================================================
+TEST(Announcer, DriftedPongTriggersRateLimitedRefresh) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    FakeNode fake(&loop, 0x11);
+    // Truthful ANNOUNCE observation; the PING pong lies about our address.
+    fake.ping_observed = compact::Ipv4Address::from_string("127.0.0.1", 9999);
+
+    routing::NodeId cid{};
+    cid.fill(0x22);
+    rpc::RpcSocket client(&loop, cid);
+    client.bind(0);
+    seed_table(client, fake);
+
+    auto kp = make_keypair(0x42);
+    auto target = make_target(kp);
+
+    Announcer ann(client, kp, target);
+
+    struct Ctx {
+        Announcer* ann;
+        FakeNode* fake;
+        rpc::RpcSocket* client;
+        // 0: wait cycle 1 settle → ping (drifted)
+        // 1: wait drift refresh (cycle 2) + settle → ping again (in window)
+        // 2: give a potential (wrong) 3rd cycle time to start, then assert
+        int phase = 0;
+        int settle = 0;
+        int find_peer_after_drift = 0;
+        int find_peer_final = 0;
+        bool done = false;
+        uv_timer_t poll{};
+        uv_timer_t guard{};
+        void cleanup() {
+            if (done) return;
+            done = true;
+            ann->stop_without_unannounce();
+            fake->sock.close();
+            client->close();
+            uv_close(reinterpret_cast<uv_handle_t*>(&poll), nullptr);
+            uv_close(reinterpret_cast<uv_handle_t*>(&guard), nullptr);
+        }
+    } ctx{&ann, &fake, &client};
+
+    ann.start();
+
+    uv_timer_init(&loop, &ctx.poll);
+    ctx.poll.data = &ctx;
+    uv_timer_start(&ctx.poll, [](uv_timer_t* t) {
+        auto* c = static_cast<Ctx*>(t->data);
+        if (c->done) return;
+        switch (c->phase) {
+            case 0:
+                // Cycle 1 settled (publish-after-settle ⇒ relays() set only
+                // once the ANNOUNCE resolved and updating_ dropped).
+                if (!c->ann->relays().empty()) {
+                    c->phase = 1;
+                    c->ann->ping_relays_for_test();  // drifted pong #1
+                }
+                break;
+            case 1:
+                // Drift must re-run the full cycle: second find_peer walk +
+                // second ANNOUNCE. Wait a few extra ticks so cycle 2 fully
+                // settles (updating_ false) — the second pong below must be
+                // stopped by the RATE LIMIT, not by the updating_ guard.
+                if (c->fake->find_peer_count >= 2 &&
+                    c->fake->announce_count >= 2 && ++c->settle >= 5) {
+                    c->find_peer_after_drift = c->fake->find_peer_count;
+                    c->phase = 2;
+                    c->settle = 0;
+                    c->ann->ping_relays_for_test();  // drifted pong #2 (<10s)
+                }
+                break;
+            case 2:
+                if (++c->settle >= 8) {
+                    c->find_peer_final = c->fake->find_peer_count;
+                    c->cleanup();
+                }
+                break;
+        }
+    }, 20, 20);
+
+    uv_timer_init(&loop, &ctx.guard);
+    ctx.guard.data = &ctx;
+    uv_timer_start(&ctx.guard, [](uv_timer_t* t) {
+        static_cast<Ctx*>(t->data)->cleanup();
+    }, 8000, 0);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+
+    EXPECT_EQ(ctx.find_peer_after_drift, 2)
+        << "drifted pong must trigger exactly one refresh cycle";
+    EXPECT_EQ(ctx.find_peer_final, 2)
+        << "second drifted pong within 10s must be rate-limited (no 3rd cycle)";
+    EXPECT_GE(fake.ping_count, 2);
+}
+
+// ============================================================================
+// D-B (closestNodes reuse) — the reannounce cycle must seed its find_peer
+// walk with the previous cycle's closest nodes (JS announcer.js:156
+// `nodes: this._closestNodes`, :187 save) so it re-hits the SAME relays.
+// Discriminator: node B is discovered in cycle 1 only via A's closerNodes,
+// then A stops referring it and B is removed from the routing table — in
+// cycle 2 B is reachable ONLY through the saved-seed path.
+// ============================================================================
+TEST(Announcer, ReannounceSeedsPreviousClosestNodes) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    FakeNode a(&loop, 0x11);
+    FakeNode b(&loop, 0x33);
+    a.closer = {b.addr};  // cycle 1: A refers B
+
+    routing::NodeId cid{};
+    cid.fill(0x22);
+    rpc::RpcSocket client(&loop, cid);
+    client.bind(0);
+    seed_table(client, a);  // table: A only
+
+    auto kp = make_keypair(0x42);
+    auto target = make_target(kp);
+
+    Announcer ann(client, kp, target);
+
+    struct Ctx {
+        Announcer* ann;
+        FakeNode* a;
+        FakeNode* b;
+        rpc::RpcSocket* client;
+        int phase = 0;  // 0: wait cycle 1 settle; 1: wait cycle 2; 2: assert
+        int settle = 0;
+        int b_count_cycle1 = 0;
+        int b_count_final = 0;
+        bool done = false;
+        uv_timer_t poll{};
+        uv_timer_t guard{};
+        void cleanup() {
+            if (done) return;
+            done = true;
+            ann->stop_without_unannounce();
+            a->sock.close();
+            b->sock.close();
+            client->close();
+            uv_close(reinterpret_cast<uv_handle_t*>(&poll), nullptr);
+            uv_close(reinterpret_cast<uv_handle_t*>(&guard), nullptr);
+        }
+    } ctx{&ann, &a, &b, &client};
+
+    ann.start();
+
+    uv_timer_init(&loop, &ctx.poll);
+    ctx.poll.data = &ctx;
+    uv_timer_start(&ctx.poll, [](uv_timer_t* t) {
+        auto* c = static_cast<Ctx*>(t->data);
+        if (c->done) return;
+        switch (c->phase) {
+            case 0:
+                // Cycle 1 settled: relays published, B visited + committed.
+                if (!c->ann->relays().empty() && c->b->find_peer_count >= 1 &&
+                    c->b->announce_count >= 1) {
+                    c->b_count_cycle1 = c->b->find_peer_count;
+                    // Cut every path to B except the seeded frontier:
+                    c->a->closer.clear();               // A stops referring B
+                    c->client->table().remove(c->b->id);  // B out of the table
+                    c->phase = 1;
+                    c->ann->refresh();
+                }
+                break;
+            case 1:
+                // Cycle 2 reached A; give B's (seeded) visit time to land.
+                if (c->a->find_peer_count >= 2 && ++c->settle >= 5) {
+                    c->b_count_final = c->b->find_peer_count;
+                    c->cleanup();
+                }
+                break;
+        }
+    }, 20, 20);
+
+    uv_timer_init(&loop, &ctx.guard);
+    ctx.guard.data = &ctx;
+    uv_timer_start(&ctx.guard, [](uv_timer_t* t) {
+        static_cast<Ctx*>(t->data)->cleanup();
+    }, 8000, 0);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+
+    EXPECT_GE(ctx.b_count_cycle1, 1)
+        << "cycle 1 must reach B via A's closerNodes";
+    EXPECT_EQ(ctx.b_count_final, ctx.b_count_cycle1 + 1)
+        << "cycle 2 must query B via the saved closest-nodes seed "
+           "(JS announcer.js:156/187) — without seeding B is unreachable";
 }

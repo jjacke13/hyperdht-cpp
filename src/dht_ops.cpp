@@ -46,7 +46,8 @@ static void add_default_bootstrap(query::Query& q, const rpc::RpcSocket& socket)
 std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
                                          const uint8_t* public_key, size_t pk_len,
                                          query::OnReplyCallback on_reply,
-                                         query::OnDoneCallback on_done) {
+                                         query::OnDoneCallback on_done,
+                                         const std::vector<SeedNode>* seed_nodes) {
     auto target = hash_public_key(public_key, pk_len);
     routing::NodeId target_id{};
     std::copy(target.begin(), target.end(), target_id.begin());
@@ -54,6 +55,13 @@ std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
     auto q = query::Query::create(socket, target_id, messages::CMD_FIND_PEER);
     q->on_reply(std::move(on_reply));
     q->on_done(std::move(on_done));
+    // JS announcer.js:156 — `nodes: this._closestNodes` reseeds the walk with
+    // the previous cycle's closest nodes (query.js:47-67 frontier pre-seed).
+    // Seeds are copied into the query before start(); the caller's vector is
+    // not referenced afterwards.
+    if (seed_nodes) {
+        for (const auto& s : *seed_nodes) q->add_seed_node(s.id, s.addr);
+    }
     add_default_bootstrap(*q, socket);
     q->start();
     return q;
@@ -62,9 +70,10 @@ std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
 std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
                                          const std::array<uint8_t, 32>& public_key,
                                          query::OnReplyCallback on_reply,
-                                         query::OnDoneCallback on_done) {
+                                         query::OnDoneCallback on_done,
+                                         const std::vector<SeedNode>* seed_nodes) {
     return find_peer(socket, public_key.data(), public_key.size(),
-                     std::move(on_reply), std::move(on_done));
+                     std::move(on_reply), std::move(on_done), seed_nodes);
 }
 
 // ---------------------------------------------------------------------------

@@ -71,6 +71,10 @@ public:
 
     bool is_running() const { return running_; }
 
+    // Test-only: drive one relay keepalive round without waiting for the
+    // 5s ping timer (same pattern as RpcSocket::force_check_persistent).
+    void ping_relays_for_test() { ping_relays(); }
+
     // Current relay info (for NoisePayload holepunch field)
     const std::vector<peer_connect::RelayInfo>& relays() const { return relays_; }
 
@@ -103,6 +107,27 @@ private:
     bool running_ = false;
     bool updating_ = false;
 
+    // ---- Publish-after-settle cycle state ----
+    // One "cycle" = one find_peer walk + its ANNOUNCE commits. relays_ is
+    // rebuilt (published) only when the walk has completed AND every commit
+    // has settled (response, timeout, or congestion drop). JS orders this
+    // with `await q.finished()` → `await Promise.allSettled(ann)` → assign
+    // this.relays (announcer.js:154-189). cycle_gen_ invalidates late
+    // callbacks from a cycle cancelled by notify_online()/stop().
+    uint64_t cycle_gen_ = 0;        // bumped at cycle start and on cancel
+    int pending_commits_ = 0;       // in-flight ANNOUNCE commits, this cycle
+    int cycle_commits_total_ = 0;   // commits issued this cycle (logging)
+    bool query_done_ = false;       // this cycle's find_peer walk completed
+
+    // Closest nodes saved at cycle end; seeds the next cycle's find_peer so
+    // reannounce re-hits the SAME relays and keeps refreshing their forward
+    // state (JS announcer.js:156 `nodes: this._closestNodes`, :187 save).
+    std::vector<dht_ops::SeedNode> closest_nodes_;
+
+    // Drift-detection rate limit: uv_now timestamp (ms) of the last
+    // drift-triggered refresh; 0 = never. See ping_relays().
+    uint64_t last_drift_refresh_ms_ = 0;
+
     std::shared_ptr<query::Query> current_query_;
 
     // C7: sentinel for safe async callback invalidation.
@@ -111,7 +136,9 @@ private:
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
 
     void update();
-    void commit(const query::QueryReply& node);
+    void commit(const query::QueryReply& node, uint64_t gen);
+    void commit_settled();   // decrement pending_commits_ + maybe_publish
+    void maybe_publish();    // query_done_ && pending==0 → build_relays
     void unannounce_node(const RelayNode& relay);
     void build_relays();
     void ping_relays();

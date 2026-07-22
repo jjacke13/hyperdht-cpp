@@ -461,8 +461,15 @@ uint16_t RpcSocket::request(const messages::Request& req,
         // C12: cap pending queue to prevent unbounded memory growth
         constexpr size_t MAX_PENDING = 640;
         if (pending_.size() >= MAX_PENDING) {
-            uv_close(reinterpret_cast<uv_handle_t*>(&inflight->timer), nullptr);
-            delete inflight;
+            // The timer was uv_timer_init'd above, so libuv holds the handle
+            // until the close callback runs next tick — the InflightRequest
+            // (which embeds the uv_timer_t) must not be freed before then.
+            // Deleting inline here was a use-after-free under sustained
+            // congestion (>MAX_PENDING queued requests).
+            uv_close(reinterpret_cast<uv_handle_t*>(&inflight->timer),
+                     [](uv_handle_t* h) {
+                         delete static_cast<InflightRequest*>(h->data);
+                     });
             return 0;
         }
         // JS io.js:337 — createRequest pushes EVERY request into io.inflight

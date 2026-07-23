@@ -118,9 +118,17 @@ Full text + JS/C++ file:line for each is in `docs/.parity-sweep-appendix.md`.
   Finding D both-ends capture confirmed this is the field `-5` (client ports
   moved within a run yet latched fw=2). Gate verdict on >=4 + let disagreeing
   samples demote. Flips port-varying peers into the wired birthday strategy.
-- [ ] **B2** — Round-2 holepunch payload sends ONE address (`our_addr`,
-  holepunch.cpp:1880-1885) instead of `nat_sampler().addresses()`; JS sends
-  the full set in both rounds (connect.js:567,654,684).
+- [ ] **B2 (upgraded — land WITH B1)** — Round-2 holepunch payload sends ONE
+  address (`our_addr`, holepunch.cpp:1880-1885) instead of
+  `nat_sampler().addresses()`; JS sends the full set in both rounds
+  (connect.js:567,654,684). Field Finding F (2026-07-23, SUCCESS) shows B2 is
+  load-bearing, not a nicety: a port-varying SERVER (announce `:45747` ≠
+  holepunch egress `:2707`) mislabeled `fw=2 CONSISTENT` (B1 latch) connected
+  ONLY because it reported BOTH ports and the client probed both. B2's
+  multi-address reporting is the mechanism that compensates for B1's
+  mislabel — so B1 (correct classification) + B2 (full address set) are
+  complementary; land both. Also note: Finding F shows B1 mislabels the
+  SERVER's own self-classification too, not just clients.
 - [ ] **D-secondary** — server NatSampler never evicts stale external
   addresses after a NAT remap (`:62622` lingered next to live `:48008`). Real
   but not a connect blocker; wants an eviction/aging pass.
@@ -234,6 +242,16 @@ before any full "core frozen" sign-off:
 
 ## G. Small follow-ups
 
+- [ ] **F1 (field Finding F, 2026-07-23)** — after a direct probe wins
+  (rawStream firewall fires, connected), the client keeps the round-2 BLIND
+  RELAY request alive and retries it 3× to timeout (`Round 2: TIMEOUT
+  (relay)`). Cancel the round-2 relay once the direct probe connects — wasted
+  relay traffic + a scary-but-harmless timeout in field logs. Not a bug.
+- [ ] **F2 (field Finding F, 2026-07-23)** — server logs
+  `on_peer_holepunch: unknown session id=0` for the client's round-2 that
+  arrives AFTER the session connected+cleaned on round 1. Benign; downgrade
+  the log level or match it against a recently-completed session so it doesn't
+  read as an error in field captures.
 - [ ] `immutable_put`/`mutable_put` result callbacks still swallow the commit
   error (their callback signatures lack an error field — unlike announce/put
   which now report failure via OnDoneCallback).

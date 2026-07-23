@@ -145,6 +145,21 @@ the walk was the remaining hole.)
 Regression test `Announcer.RecoversFromWedgedCycleViaWatchdog` reproduces a
 leaked cycle and asserts the watchdog rescues it (red-checked).
 
+## Finding F — SUCCESS case (2026-07-23, post-`f843b4b`) — strengthens B2
+
+Fresh server, laptop connected fast and clean on round 1 (rawStream firewall
+adopted the client's UDX). Instructive detail: the server announced `:45747`
+but the connection completed via `:2707` — the server's holepunch-socket
+egress port, DIFFERENT from its announce port. The server is effectively
+port-varying yet classified `fw=2 CONSISTENT` (the B1 latch — B1 mislabels the
+SERVER's own self-classification too, not just clients). It connected ONLY
+because it reported BOTH ports in `addrs4` and the client probed both. Had
+round 2 sent a single address (B2), it would have failed. So B2 (send the full
+`nat_sampler().addresses()` set in round 2) is the compensating mechanism for
+B1's mislabel — land B1 + B2 together. Two cosmetic nits logged in TODO §G
+(F1: cancel the round-2 relay after a direct win; F2: `unknown session id=0`
+log after round-1 completion).
+
 ## Finding C — parked
 
 `-110` under bulk traffic: untested MTU hypothesis vs relay-migration; needs a

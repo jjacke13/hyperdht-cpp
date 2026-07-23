@@ -61,26 +61,40 @@ cycle. JS shares the same structural blind spot; three things made C++ worse:
 3. closestNodes reuse across announce cycles (JS parity).
 4. Field-grade DHT_LOG on all of the above.
 
-## Finding B — demoted to code debt (not field-implicated)
+## Finding B — RE-IMPLICATED by the Finding D both-ends capture
 
-The operator's phone connects from BOTH networks via the identical path:
-handshake → holepunch payload carries the relay's fresh `peer_address`
-observation of the client's punch socket → server fast-mode pings it → punch
-lands from exactly that port. Confirmed in server logs for mobile data
-(`5.203.174.17:3789`) and CGNAT wifi (`46.177.170.175:56067`). Neither network
-is behaving symmetric; the "every punch fails" wifi session was a stale-window
-artifact of Finding A.
+**Correction (was: "demoted to code debt").** An earlier read demoted B1 after
+two SUCCESS logs where the phone connected from both networks via the fast-mode
+ping — leading to "not field-implicated". The operator then captured a FAILURE
+at both ends (handoff Finding D) that contradicts the demotion: a genuine `-5`
+where the client's ports MOVE within one run (handshake `:3473`, holepunch
+`:3537`) yet the pool sampler latched `fw=2 CONSISTENT`, both ends declared
+CONSISTENT, and neither's probes landed. That is exactly B1 biting. So B1 is a
+CONFIRMED field cause of the field `-5`s, not mere parity debt. The success
+cases were a port-varying NAT that happened to hold a stable mapping long enough
+in that run; the failures are the same NAT when it does not.
 
-Real bugs found by the trace, queued as parity debt (fix later, not blocking):
+- **B1 (confirmed -5 cause) — classification latches at 3 samples.**
+  `NatSampler::add` classifies at `sampled_ >= 3` (src/nat_sampler.cpp:111);
+  `MIN_SAMPLES = 4` (src/holepunch.cpp:1197) only feeds an `ok` flag nobody
+  reads — downstream reads `firewall()` live. Three agreeing low-RTT samples
+  latch CONSISTENT and CANNOT be demoted by later disagreeing samples. A
+  port-varying (symmetric-ish) NAT thus punches consistent-style to one port
+  and fails; the birthday strategy (already wired) never engages because
+  neither side admits RANDOM. **Fix: gate the verdict on >=4 samples AND let
+  disagreeing samples demote a stale CONSISTENT.**
+- **B2 (secondary) — Round-2 payload hardcodes ONE address**
+  (src/holepunch.cpp:1880-1885, `our_addr = resp.from.addr`), ignoring
+  `nat_sampler().addresses()`. JS sends the full nat.addresses set in both
+  rounds (connect.js:567,654,684).
+- **D-secondary (real, not the -5) — server NatSampler never evicts stale
+  external addresses across NAT remaps.** The server's `addrs4` carried a
+  port from an earlier epoch (`:62622`) alongside the live `:48008`; the
+  correct port was present and probed, so this did not cause the failure, but
+  the accumulation wants an eviction/aging pass.
 
-- **B1 — classification latches at 3 samples.** `NatSampler::add` classifies at
-  `sampled_ >= 3` (src/nat_sampler.cpp:111); `MIN_SAMPLES = 4`
-  (src/holepunch.cpp:1197) only feeds an `ok` flag nobody reads — downstream
-  reads `firewall()` live. Three agreeing low-RTT samples latch CONSISTENT.
-  Once latched, later samples cannot undo it.
-- **B2 — Round-2 payload hardcodes ONE address** (src/holepunch.cpp:1880-1885,
-  `our_addr = resp.from.addr`), ignoring `nat_sampler().addresses()`. JS sends
-  the full nat.addresses set in both rounds (connect.js:567,654,684).
+**Priority after Finding E: land B1.** It explains the field `-5`s directly and
+flips port-varying peers into the already-wired birthday punch.
 - False-CONSISTENT is never re-examined: `is_unstable()` only fires on
   UNKNOWN/double-RANDOM (both impls), and the C++ reopen path re-samples the
   SAME pool socket (upgrade-port pin), so it cannot reveal per-socket
@@ -91,6 +105,45 @@ Real bugs found by the trace, queued as parity debt (fix later, not blocking):
 - Also ruled out: serving a connection does NOT disturb announcer/relay state
   (no code path writes announcer state from connection handling) — the
   "disconnect then immediate retry fails" pattern is stale-window timing.
+
+## Finding E — announcer `updating_` latches → server stops reannouncing
+
+Follow-up field report (post-`99ca72c`): the server emitted only keepalive
+pongs for well over 5 min with no `cycle settled` line — the reannounce
+machinery had gone dead, degrading connectivity (the `08e2f47` reachability
+fix depends on cycles actually running).
+
+Root cause: `Announcer::update()` early-returns while `updating_` is true, and
+`updating_` clears in exactly one place — `maybe_publish()`, gated on
+`query_done_ && pending_commits_ == 0`. If any commit's settle callback never
+fires, or the find_peer walk never completes, `updating_` latches forever and
+every subsequent reannounce/refresh/drift trigger no-ops. Recovery only came
+accidentally via `notify_online()` on a network-change event.
+
+The actual leak: `RpcSocket::request()` returns tid==0 when a request is
+dropped (congestion queue full at MAX_PENDING, or socket closing) — and in
+both cases returns BEFORE the request enters `inflight_`/`pending_`, so
+NEITHER the response nor the timeout callback ever fires. In `Query::visit()`
+a dropped visit left `inflight_` stuck above 0, so the walk never completed →
+`on_done` never fired → the announcer's `query_done_` never latched. (The
+ANNOUNCE-commit and keepalive-PING drop paths were already/also settled;
+the walk was the remaining hole.)
+
+### Fixes (`08e2f47`'s follow-up, this batch)
+
+1. `Query::visit()` (src/query.cpp): on a tid==0 drop, settle the visit —
+   `inflight_--; errors_++;` — without a DOWN_HINT (we're congested, the node
+   is innocent). No re-entrant read_more(): visit() runs only inside
+   read_more()'s dispatch loop, which resumes and runs maybe_finish() at its
+   tail. Closes the root leak for ALL queries, not just the announcer.
+2. Stuck-cycle watchdog (src/announcer.cpp on_ping_timer): if `updating_` has
+   been true longer than `cycle_stuck_ms_` (60s), force-reset like
+   notify_online() and re-announce. Belt-and-suspenders — no unknown future
+   settle leak can wedge the announcer for more than a minute. Runs off the 5s
+   ping timer so it can't be starved by an empty relay list.
+
+Regression test `Announcer.RecoversFromWedgedCycleViaWatchdog` reproduces a
+leaked cycle and asserts the watchdog rescues it (red-checked).
 
 ## Finding C — parked
 

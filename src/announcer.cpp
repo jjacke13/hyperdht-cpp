@@ -201,6 +201,42 @@ void Announcer::on_bg_timer(uv_timer_t* timer) {
 void Announcer::on_ping_timer(uv_timer_t* timer) {
     auto* self = static_cast<Announcer*>(timer->data);
     if (!self || !self->running_) return;
+
+    // Stuck-cycle watchdog (belt-and-suspenders for the updating_ latch).
+    // update() early-returns while updating_ is true; if a cycle ever
+    // fails to settle (a leaked commit settle, a walk that never fires
+    // on_done), every future reannounce/refresh/drift trigger no-ops and
+    // the server silently stops reannouncing — field Finding E. The
+    // query-drop settle in query.cpp closes the known leak; this backstop
+    // guarantees no unknown one can wedge the announcer for more than
+    // CYCLE_STUCK_MS: force-reset exactly like notify_online() and start
+    // a fresh cycle. Runs from the 5s ping timer so it cannot be starved
+    // by an empty relay list (ping_relays returns early on empty).
+    if (self->updating_) {
+        const uint64_t now = uv_now(self->socket_.loop());
+        DHT_LOG("  [announcer] cycle state: updating=1 query_done=%d "
+                "pending_commits=%d gen=%llu age=%llums\n",
+                self->query_done_ ? 1 : 0, self->pending_commits_,
+                static_cast<unsigned long long>(self->cycle_gen_),
+                static_cast<unsigned long long>(
+                    now - self->cycle_started_ms_));
+        if (now - self->cycle_started_ms_ > self->cycle_stuck_ms_) {
+            DHT_LOG("  [announcer] cycle STUCK (age>%llums) — force-reset "
+                    "and re-announce\n",
+                    static_cast<unsigned long long>(self->cycle_stuck_ms_));
+            ++self->cycle_gen_;
+            self->pending_commits_ = 0;
+            self->query_done_ = false;
+            if (self->current_query_) {
+                auto q = std::move(self->current_query_);
+                q->destroy();
+            }
+            self->updating_ = false;
+            self->update();
+            return;  // fresh cycle just started; ping next tick
+        }
+    }
+
     self->ping_relays();
 }
 
@@ -343,6 +379,7 @@ void Announcer::update() {
     const uint64_t gen = ++cycle_gen_;
     pending_commits_ = 0;
     cycle_commits_total_ = 0;
+    cycle_started_ms_ = uv_now(socket_.loop());  // stuck-cycle watchdog epoch
     query_done_ = false;
 
     auto weak = std::weak_ptr<bool>(alive_);  // C7: sentinel

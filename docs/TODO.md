@@ -105,16 +105,25 @@ Full text + JS/C++ file:line for each is in `docs/.parity-sweep-appendix.md`.
   record re-added, chain rotated. (Latent feature — current JS always sends
   refresh:null.)
 
-### nat-sampler / punch payload (2 new, from the 2026-07-22 field diagnosis —
-### real parity debt, NOT implicated in the field failures; see
-### docs/FIELD-DIAGNOSIS-2026-07-22.md "Finding B")
-- [ ] **B1** — NatSampler classifies at `sampled_ >= 3` (nat_sampler.cpp:111);
-  `MIN_SAMPLES=4` feeds an `ok` flag nobody reads. Three agreeing samples
-  latch CONSISTENT and cannot be undone by later samples. Gate on 4 + let
-  disagreeing samples demote.
+### nat-sampler / punch payload (from the 2026-07-22 field diagnosis; see
+### docs/FIELD-DIAGNOSIS-2026-07-22.md "Finding B" + "Finding E")
+- [x] **Finding E** — DONE 2026-07-22 (uncommitted): announcer `updating_`
+  latch → server stopped reannouncing. Root leak: `Query::visit()` didn't
+  settle a tid==0 (congestion/closing) request-drop → walk never completed →
+  cycle wedged. Fixed the walk drop-settle + added a 60s stuck-cycle watchdog
+  on the ping timer. Test `RecoversFromWedgedCycleViaWatchdog` (red-checked).
+- [ ] **B1 (NEXT — confirmed field -5 cause)** — NatSampler classifies at
+  `sampled_ >= 3` (nat_sampler.cpp:111); `MIN_SAMPLES=4` feeds an `ok` flag
+  nobody reads. Three agreeing samples latch CONSISTENT and cannot be demoted.
+  Finding D both-ends capture confirmed this is the field `-5` (client ports
+  moved within a run yet latched fw=2). Gate verdict on >=4 + let disagreeing
+  samples demote. Flips port-varying peers into the wired birthday strategy.
 - [ ] **B2** — Round-2 holepunch payload sends ONE address (`our_addr`,
   holepunch.cpp:1880-1885) instead of `nat_sampler().addresses()`; JS sends
   the full set in both rounds (connect.js:567,654,684).
+- [ ] **D-secondary** — server NatSampler never evicts stale external
+  addresses after a NAT remap (`:62622` lingered next to live `:48008`). Real
+  but not a connect blocker; wants an eviction/aging pass.
 
 ### secret-stream (1 open)
 - [ ] connect-1 (MED) — `connected`/on_connect gated on the REMOTE header +
@@ -238,6 +247,14 @@ before any full "core frozen" sign-off:
 - [ ] holepuncher-4: fresh-socket reopen (currently same-socket resample — recovers
   lossy-UNKNOWN, not the new-NAT-mapping case). Blocked on the upgrade-port
   socket-handle invariant; revisit if a real CGNAT case needs it.
+- [ ] Announcer synchronous-cycle-completion parks a stale `current_query_`
+  (cpp-reviewer, Finding E batch): if a full-congestion walk completes
+  synchronously inside `dht_ops::find_peer()` before the
+  `current_query_ = find_peer(...)` assignment, on_done's reset() runs on the
+  old (null) value and the finished Query is parked until the next update().
+  Benign (destroy() idempotent, self-heals, no leak/UAF), pre-existing pattern
+  now reachable via a 2nd trigger. Real fix = defer Query's first dispatch via
+  uv_idle; not warranted yet.
 - Documented deviations from the 2026-07-22 batch (deliberate, revisit only if
   live behavior warrants):
   - [ ] connect-7 veto abort is local-only; JS also sends an ERROR_ABORTED

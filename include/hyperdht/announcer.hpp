@@ -73,7 +73,34 @@ public:
 
     // Test-only: drive one relay keepalive round without waiting for the
     // 5s ping timer (same pattern as RpcSocket::force_check_persistent).
+    // This also runs the stuck-cycle watchdog (via on_ping_timer in the
+    // real path; here we invoke ping_relays directly, so tests exercising
+    // the watchdog call on_ping_timer through the timer or use the helpers
+    // below).
     void ping_relays_for_test() { ping_relays(); }
+
+    // Test-only: shorten the stuck-cycle watchdog threshold so a test can
+    // exercise the backstop without waiting 60s.
+    void set_cycle_stuck_ms_for_test(uint64_t ms) { cycle_stuck_ms_ = ms; }
+
+    // Test-only: simulate a LEAKED announce cycle (field Finding E) — a
+    // cycle that latched updating_ = true and never settled. Reproduces
+    // the exact wedged state the on_ping_timer watchdog must rescue.
+    void wedge_cycle_for_test() {
+        updating_ = true;
+        query_done_ = false;
+        pending_commits_ = 1;                     // "one commit never settled"
+        ++cycle_gen_;
+        current_query_.reset();
+        cycle_started_ms_ = 0;                    // epoch → always past threshold
+    }
+
+    // Test-only: drive the ping timer callback (watchdog + keepalive).
+    // Guarded: ping_timer_ is null until start() — a misuse fails cleanly
+    // instead of null-derefing timer->data inside on_ping_timer.
+    void tick_ping_timer_for_test() {
+        if (ping_timer_) on_ping_timer(ping_timer_);
+    }
 
     // Current relay info (for NoisePayload holepunch field)
     const std::vector<peer_connect::RelayInfo>& relays() const { return relays_; }
@@ -118,6 +145,15 @@ private:
     int pending_commits_ = 0;       // in-flight ANNOUNCE commits, this cycle
     int cycle_commits_total_ = 0;   // commits issued this cycle (logging)
     bool query_done_ = false;       // this cycle's find_peer walk completed
+    uint64_t cycle_started_ms_ = 0; // uv_now at cycle start (stuck watchdog)
+
+    // Stuck-cycle watchdog threshold (on_ping_timer). A healthy cycle =
+    // one find_peer walk (retry-bounded, worst case ~20-30s on a dead
+    // network) + ANNOUNCE commits (RPC-timeout-bounded). 60s is far past
+    // any legitimate cycle; a cycle older than this has leaked a settle
+    // and must be force-reset or the announcer never reannounces again
+    // (field Finding E). Overridable for tests.
+    uint64_t cycle_stuck_ms_ = 60 * 1000;
 
     // Closest nodes saved at cycle end; seeds the next cycle's find_peer so
     // reannounce re-hits the SAME relays and keeps refreshing their forward

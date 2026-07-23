@@ -627,3 +627,106 @@ TEST(Announcer, ReannounceSeedsPreviousClosestNodes) {
         << "cycle 2 must query B via the saved closest-nodes seed "
            "(JS announcer.js:156/187) — without seeding B is unreachable";
 }
+
+// ============================================================================
+// Finding E — stuck-cycle watchdog. If an announce cycle ever leaks a settle
+// (a commit whose response/timeout/drop never fires, or a walk that never
+// completes), updating_ latches true and update() early-returns forever, so
+// the server silently stops reannouncing — which disables the whole 08e2f47
+// reachability machinery. The query-drop settle (query.cpp) closes the known
+// leak; this backstop guarantees no unknown one can wedge the announcer for
+// longer than cycle_stuck_ms_. wedge_cycle_for_test() reproduces the leaked
+// state; the ping-timer watchdog must force-reset it and re-announce.
+// ============================================================================
+TEST(Announcer, RecoversFromWedgedCycleViaWatchdog) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    FakeNode fake(&loop, 0x55);
+
+    routing::NodeId cid{};
+    cid.fill(0x66);
+    rpc::RpcSocket client(&loop, cid);
+    client.bind(0);
+    seed_table(client, fake);
+
+    auto kp = make_keypair(0x77);
+    auto target = make_target(kp);
+
+    Announcer ann(client, kp, target);
+    ann.set_cycle_stuck_ms_for_test(50);  // any wedge is instantly "stuck"
+
+    struct Ctx {
+        Announcer* ann;
+        FakeNode* fake;
+        rpc::RpcSocket* client;
+        int phase = 0;
+        bool wedged_latched = false;   // update() no-op'd while wedged
+        int find_peer_before_watchdog = -1;
+        bool recovered = false;        // relays re-published after watchdog
+        bool done = false;
+        uv_timer_t poll{};
+        uv_timer_t guard{};
+        void cleanup() {
+            if (done) return;
+            done = true;
+            ann->stop_without_unannounce();
+            fake->sock.close();
+            client->close();
+            uv_close(reinterpret_cast<uv_handle_t*>(&poll), nullptr);
+            uv_close(reinterpret_cast<uv_handle_t*>(&guard), nullptr);
+        }
+    } ctx{&ann, &fake, &client};
+
+    ann.start();
+
+    uv_timer_init(&loop, &ctx.poll);
+    ctx.poll.data = &ctx;
+    uv_timer_start(&ctx.poll, [](uv_timer_t* t) {
+        auto* c = static_cast<Ctx*>(t->data);
+        if (c->done) return;
+        switch (c->phase) {
+            case 0:  // wait for the first healthy cycle to publish
+                if (!c->ann->relays().empty()) {
+                    // Leak a cycle: updating_ latches true forever.
+                    c->ann->wedge_cycle_for_test();
+                    c->find_peer_before_watchdog = c->fake->find_peer_count;
+                    c->phase = 1;
+                }
+                break;
+            case 1: {
+                // A wedged announcer must NOT self-heal via the normal
+                // reannounce path (updating_ latched) — find_peer stays put
+                // until the watchdog fires. Fire it explicitly.
+                c->wedged_latched =
+                    (c->fake->find_peer_count == c->find_peer_before_watchdog);
+                c->ann->tick_ping_timer_for_test();  // watchdog → force-reset
+                c->phase = 2;
+                break;
+            }
+            case 2:  // watchdog re-announced → a fresh walk hits the fake again
+                if (c->fake->find_peer_count > c->find_peer_before_watchdog &&
+                    !c->ann->relays().empty()) {
+                    c->recovered = true;
+                    c->cleanup();
+                }
+                break;
+        }
+    }, 20, 20);
+
+    uv_timer_init(&loop, &ctx.guard);
+    ctx.guard.data = &ctx;
+    uv_timer_start(&ctx.guard, [](uv_timer_t* t) {
+        static_cast<Ctx*>(t->data)->cleanup();
+    }, 6000, 0);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+
+    EXPECT_TRUE(ctx.wedged_latched)
+        << "a wedged cycle must latch updating_ (no reannounce) until the "
+           "watchdog fires";
+    EXPECT_TRUE(ctx.recovered)
+        << "the ping-timer watchdog must force-reset a stuck cycle and "
+           "re-announce (field Finding E)";
+}

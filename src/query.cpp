@@ -7,6 +7,8 @@
 
 #include "hyperdht/query.hpp"
 
+#include "hyperdht/debug.hpp"
+
 #include <algorithm>
 
 namespace hyperdht {
@@ -295,7 +297,7 @@ void Query::visit(const PendingNode& node) {
     // JS query.js:28-29,380 — query-walk requests retry `retries_` times
     // (default 5 → 6 transmissions to a silent node) and register the oncycle
     // hook. Both plumb through the RpcSocket's per-request request() overload.
-    socket_.request(req,
+    uint16_t tid = socket_.request(req,
         /*timeout_override_ms=*/0, retries_,
         [self, captured_node, dec_slow](const messages::Response& resp) {
             self->inflight_--;
@@ -314,6 +316,33 @@ void Query::visit(const PendingNode& node) {
             self->slow_++;
             self->read_more();
         });
+
+    // Dropped by the congestion queue or a closing socket (tid == 0):
+    // NEITHER callback will ever fire (rpc.cpp returns before the request
+    // enters inflight_/pending_). Without settling here the walk's
+    // inflight_ never drains, on_done never fires, and callers that gate
+    // on completion (the Announcer's updating_ latch) wedge forever
+    // (field Finding E). Settle as a failed visit: decrement inflight_ and
+    // count it toward the error budget. Do NOT mark the node DOWN or
+    // gossip a DOWN_HINT — the node is innocent, WE are congested. No
+    // read_more() here: visit() only ever runs inside read_more()'s
+    // dispatch loop (line 226), which re-checks its condition after this
+    // returns (inflight_ just dropped) and runs maybe_finish() at its
+    // tail — so the walk resumes and completes without re-entrancy.
+    if (tid == 0) {
+        DHT_LOG("  [query] visit to %s:%u dropped (congestion/closing)\n",
+                captured_node.addr.host_string().c_str(),
+                captured_node.addr.port);
+        // Mark terminal (like on_visit_response/on_visit_timeout do) so a
+        // later closer_nodes referral to the same address in this walk
+        // doesn't re-append a dead referrer. NOT DOWN — we're congested,
+        // the node is innocent (no DOWN_HINT).
+        std::string key = captured_node.addr.host_string() + ":" +
+                          std::to_string(captured_node.addr.port);
+        seen_[key] = NodeState::DONE;
+        inflight_--;
+        errors_++;
+    }
 }
 
 // JS: query.js:259-296 — _onvisit(m, req): marks DONE in _seen, bumps the

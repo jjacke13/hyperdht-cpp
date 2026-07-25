@@ -1,0 +1,32 @@
+Backport of libuv PR #3250 (commit 9f0101dcb8), the uv__udp_io hunk only.
+
+libuv 1.52.0 (PR #4902, "linux: add MSG_ERRQUEUE ipv4/ipv6 udp support")
+changed POLLERR handling: instead of a normal recvmsg (which consumes and
+clears the latched socket error via the kernel's sock_error()), POLLERR now
+drains ONLY the MSG_ERRQUEUE. On a UDP socket with IP_MTU_DISCOVER=IP_PMTUDISC_PROBE
+and no IP_RECVERR -- exactly libudx's data socket (deps/libudx/src/io_posix.c) --
+the error queue is empty, so sk_err is never cleared. After an ICMP
+frag-needed / socket error on a real (small-MTU / mobile / CGNAT) path the
+UDP stream wedges: send() keeps failing, no data flows, no RTO fires, no
+close. Same regression class as libuv #5030 (BIND 9, ISC-bisected to the
+same commit 80a5e3ba).
+
+Fixed upstream on the v1.x branch by PR #3250. Not in any 1.52.x release as
+of 2026-07 (latest tag v1.52.1, crash-guard only). Applies to 1.52.0/1.52.1.
+When libuv >=1.52.2 ships the real fix this patch will fail to apply -- that
+is the signal to drop the override.
+--- a/src/unix/udp.c
++++ b/src/unix/udp.c
+@@ -178,6 +178,12 @@
+   handle = container_of(w, uv_udp_t, io_watcher);
+   assert(handle->type == UV_UDP);
+ 
++  /* Trigger a recv and send to find out what POLLERR occurred. Restores the
++   * pre-1.52.0 behavior of consuming/clearing the latched socket error via a
++   * normal recv (libuv PR #3250; regression from #4902, see libuv #5030). */
++  if (revents & POLLERR)
++    revents |= POLLIN | POLLOUT;
++
+   if (revents & POLLIN)
+     uv__udp_recvmsg(handle, 0);
+ 

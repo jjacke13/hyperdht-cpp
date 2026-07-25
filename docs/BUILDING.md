@@ -17,9 +17,17 @@ and embedded targets:
 | CMake | 3.20+ | Build system |
 | Ninja | any | Build backend (optional, can use Make) |
 | libsodium | 1.0.18+ | All cryptography |
-| libuv | 1.44+ | Event loop (required by libudx) |
+| libuv | **1.51.x** (NOT 1.52.0/1.52.1) | Event loop (required by libudx) — see note below |
 | libudx | pinned | Reliable UDP (git submodule) |
 | C++ compiler | C++20 | GCC 12+ or Clang 15+ |
+
+> **libuv version:** build against **libuv 1.51.x**, not 1.52.0/1.52.1. libuv
+> 1.52.0 introduced a UDP `POLLERR` regression that silently wedges libudx
+> streams on real NAT paths (established connections stall with no self-heal).
+> The Nix flake pins `nixos-25.11` (libuv 1.51) deliberately. On distros with
+> libuv ≥ 1.52 (e.g. Debian trixie, Fedora 42+), install 1.51 or apply the
+> override in `nix/libuv-1.52-udp-pollerr.patch`. Full write-up, upstream
+> status, and the re-check checklist: [LIBUV-VERSION.md](LIBUV-VERSION.md).
 
 ## Quick start
 

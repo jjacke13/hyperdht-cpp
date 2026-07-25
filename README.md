@@ -36,6 +36,14 @@ nix develop && mkdir -p build && cd build && cmake .. -G Ninja && ninja && ctest
 
 Without Nix: install `cmake`, `ninja`, `libsodium`, `libuv`, then the same cmake flow. Docker also works (`docker build -t hyperdht .`). On Windows, use vcpkg for the dependencies and MSVC — CI builds the static and shared variants on every push (`.github/workflows/windows.yml`). See [BUILDING.md](docs/BUILDING.md) for full instructions (Linux, macOS, Windows, Docker, linking, troubleshooting).
 
+> **⚠️ libuv 1.51.x required — do not build against libuv 1.52.0/1.52.1.**
+> libuv 1.52.0 has a UDP `POLLERR` regression that silently wedges established
+> connections on real NAT paths (via libudx's PMTU-probe socket). The flake
+> pins `nixos-25.11` (libuv 1.51) deliberately. Building on `nixos-26.05` /
+> libuv 1.52 requires the override in
+> [`nix/libuv-1.52-udp-pollerr.patch`](nix/libuv-1.52-udp-pollerr.patch).
+> Full write-up + upstream status + re-check checklist: [docs/LIBUV-VERSION.md](docs/LIBUV-VERSION.md).
+
 ## Documentation
 
 | | |

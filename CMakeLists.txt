@@ -52,6 +52,20 @@ elseif(NOT CMAKE_DISABLE_FIND_PACKAGE_PkgConfig AND NOT SODIUM_LIBRARY)
     pkg_check_modules(UV REQUIRED IMPORTED_TARGET libuv)
     set(SODIUM_TARGET PkgConfig::SODIUM)
     set(UV_TARGET PkgConfig::UV)
+
+    # libuv 1.52.0 introduced a UDP POLLERR regression (PR #4902) that wedges
+    # libudx's IP_MTU_DISCOVER=PROBE sockets after an ICMP error on a real
+    # path — established streams silently stall, no self-heal (libuv #5030).
+    # Pin libuv 1.51.x (what libudx itself targets) until libuv >= 1.52.2
+    # ships the fix (PR #3250). A drop-in libuv patch is kept, unwired, at
+    # nix/libuv-1.52-udp-pollerr.patch. See docs/LIBUV-VERSION.md.
+    if(UV_VERSION AND UV_VERSION VERSION_GREATER_EQUAL "1.52.0"
+                  AND UV_VERSION VERSION_LESS "1.52.2")
+        message(WARNING
+            "libuv ${UV_VERSION} has the UDP POLLERR regression (libuv #5030) "
+            "that breaks libudx streams on real NAT paths. Use libuv 1.51.x, "
+            "or apply nix/libuv-1.52-udp-pollerr.patch. See docs/LIBUV-VERSION.md.")
+    endif()
 else()
     # Android / manual: SODIUM_INCLUDE_DIR, SODIUM_LIBRARY, UV_INCLUDE_DIR, UV_LIBRARY
     add_library(sodium_ext STATIC IMPORTED)

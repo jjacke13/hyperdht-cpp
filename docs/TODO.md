@@ -228,12 +228,11 @@ doesn't re-report them:
 ## C. Needs LIVE validation (user's nospoon / CGNAT phone)
 
 Loopback can't prove these; validate against a real NAT'd JS peer:
-- [ ] **Finding H fix (pickBest, 2026-07-26)**: mobile CONNECT LATENCY. Fresh
-  server + phone on mobile CGNAT: expect first connect ~1s (was ~28s hunting
-  dead record-holders). Server log should show `cycle settled (3 commits)`
-  (not ~41). Confirm findPeer still reliably converges to the 3 record-holders
-  (Kademlia should; JS proves it in prod) — the one robustness risk of a
-  3-node record set.
+- [x] **Finding H fix (pickBest, 2026-07-26)** — **FIELD-VALIDATED 2026-07-26**:
+  phone (mobile CGNAT) now connects **every time, fast**. The mobile
+  connect-latency stall (~28s hunting dead record-holders) is gone, and the
+  one robustness risk — findPeer converging to a 3-node record set — did NOT
+  materialize (Kademlia converges, as JS proves in prod). Committed `12c4af6`.
 - [ ] **Finding A fix (`08e2f47`, 2026-07-22)**: announcer publish-after-settle
   + keepalive drift detection + closestNodes reuse. Retest checklist in
   `docs/FIELD-DIAGNOSIS-2026-07-22.md` — key test: disconnect → IMMEDIATE

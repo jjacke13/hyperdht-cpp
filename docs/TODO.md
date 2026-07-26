@@ -5,15 +5,23 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-07-22.
+Last updated: 2026-07-26.
 
 ---
 
 ## Status snapshot
 
+- **Adversarial re-verification 2026-07-26** (16-subsystem Opus workflow):
+  claimed status CONFIRMED accurate — zero FALSE_DONE, all 12 HIGH genuinely
+  closed, all 6 claimed-open genuinely open, ~93% behavioral parity. Added 1
+  HIGH new hazard (server/divergence-1 UAF, NOT fixed), 3 LOW divergences +
+  io-6 DONE→PARTIAL, re-tagged 6 stale-OPEN appendix entries as DONE, reframed
+  B1 as beyond-JS (not a parity bug). Detail in Section A. messages + protomux
+  were UNVERIFIED this pass (finder output-cap failures).
 - **JS-parity sweep 2026-07-09**: 91 confirmed findings (12 HIGH / 45 MED / 34 LOW).
-  **All 12 HIGH closed.** ~86/91 addressed (fixed or accepted-divergence).
-  **6 MED/LOW still open** (Section A).
+  **All 12 HIGH closed.** ~86/91 addressed (fixed or accepted-divergence)
+  (io-6 demoted to PARTIAL 2026-07-26 → ~85/91).
+  **6 MED/LOW still open** (Section A) + 4 new 2026-07-26 findings.
 - **2026-07-22 batch** (on main): server-1 (firewall-reject now SILENT — presence
   leak closed), server-2 (holepunch reply deferred past veto+punch(), encrypted
   ABORTED on failure), server-3 (synchronous handshake dedup + duplicate
@@ -42,11 +50,50 @@ blind-relay, dhtrpc-io, protomux, query, dhtrpc-tick, dht-top. Partial
 
 ---
 
-## A. Open JS-parity findings (6) — the resume worklist
+## A. Open JS-parity findings (6 prior + 4 new 2026-07-26) — the resume worklist
 
 Remaining: connect-9, server-4 (ACCEPT candidate — likely just document),
 server-6/9/11, secret-stream connect-1 (deferred, needs live JS cross-test).
 Full text + JS/C++ file:line for each is in `docs/.parity-sweep-appendix.md`.
+
+### 2026-07-26 adversarial re-verification (workflow) — NEW findings
+Full run: 14/16 subsystems (messages + protomux finders failed on output-cap,
+UNVERIFIED this pass), 11 material findings, ALL skeptic-confirmed (high conf).
+The 12 HIGH and all 6 claimed-open items above survived independently — zero
+FALSE_DONE. Behavioral parity estimate ~93%. Net-new, none previously ledgered:
+- [ ] **server/divergence-1 (HIGH — potential UAF)** — blind relay starts
+  (server.cpp:754) BEFORE the OPEN/direct shortcut returns (JS server.js:394
+  returns first). In relayThrough + OPEN-client + pairing-within-15s: the OPEN
+  on_socket transfers+nulls conn.raw_stream and returns at server.cpp:1099
+  WITHOUT storing the session; the pending relay continuation then
+  `udx_stream_connect()`+`emit_connection()` a 2nd time on that now user-owned
+  stream (the `connections_.find` guard is empty — session never stored). Fix:
+  return before starting relay for OPEN clients, OR cancel the pending relay on
+  the OPEN path. Add a relayThrough+OPEN regression test. **NOT YET FIXED.**
+- [ ] **connect/divergence-1 (LOW)** — reusableSocket route-shortcut callback
+  (connect.cpp:580-591) ignores `hs.terminal`, running a full findPeer walk
+  where JS terminates SERVER_ERROR (can return PEER_NOT_FOUND instead). Fix:
+  apply the `fire_handshake` terminal check (connect.cpp:315-318). One line.
+- [ ] **connect/divergence-2 (LOW)** — step-4 no-holepunch direct-connect
+  (connect.cpp:732-753) missing JS's `(relayed && !remoteHolepunchable)` gate
+  (connect.js:212) and ordered ahead of passive-wait/LAN; a NON-relayed
+  !remoteHolepunchable connect dials server_addr instead of passive-wait /
+  CANNOT_HOLEPUNCH. Likely pre-existing. Gate on `relayed` + reorder, or ledger
+  as a deliberate divergence.
+- [ ] **compact/buffer64k (LOW — doc-only)** — `Buffer::decode` 64KB cap
+  (compact.cpp:239-249) vs JS uncapped; fails SAFE (rejects a superset), H12
+  anti-DoS. Add a ledger line like compact-2's array cap. No code change.
+- [ ] **dhtrpc-io-6 (correction: DONE → PARTIAL)** — a node first seen via an
+  external inbound request is never NAT-sampled; JS `_addNode` samples every
+  new node once regardless of the `sample` gate (index.js:533-536). Low impact
+  (new nodes usually arrive on the active socket). Fix: carry a `sampled` flag
+  + sample new nodes once; or accept + downgrade the ledger entry.
+
+**Docs caught up (code was AHEAD):** 6 appendix entries were labeled OPEN but
+are FIXED + skeptic-confirmed — now tagged `[DONE — verified 2026-07-26]` in
+`docs/.parity-sweep-appendix.md`: holepuncher-1 (birthday wired; symmetric-CGNAT
+stream *completion* still live-unvalidated), query-2, dhttop-1, dhttop-2,
+dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
 
 ### connect (1 open; done: connect-1..8/10/11)
 - [x] **connect-8** — DONE 2026-07-21. Handshake reply now validated
@@ -112,12 +159,28 @@ Full text + JS/C++ file:line for each is in `docs/.parity-sweep-appendix.md`.
   settle a tid==0 (congestion/closing) request-drop → walk never completed →
   cycle wedged. Fixed the walk drop-settle + added a 60s stuck-cycle watchdog
   on the ping timer. Test `RecoversFromWedgedCycleViaWatchdog` (red-checked).
-- [ ] **B1 (NEXT — confirmed field -5 cause)** — NatSampler classifies at
-  `sampled_ >= 3` (nat_sampler.cpp:111); `MIN_SAMPLES=4` feeds an `ok` flag
-  nobody reads. Three agreeing samples latch CONSISTENT and cannot be demoted.
-  Finding D both-ends capture confirmed this is the field `-5` (client ports
-  moved within a run yet latched fw=2). Gate verdict on >=4 + let disagreeing
-  samples demote. Flips port-varying peers into the wired birthday strategy.
+- [x] **Finding H (pickBest)** — DONE 2026-07-26 (announcer.cpp `update()`;
+  see handoff Finding H, both-ends field capture + code-confirmed). The
+  announce record was committed to EVERY walked node (~41) instead of JS
+  `pickBest(q.closestReplies)` = closest 3 (announcer.js:170,298-301). The
+  ~38 extra record-holders had EXPIRED server-forward NAT mappings (only the
+  3 kept-alive `active_relays_` forward), so a client hunted dead relays
+  ~28s before hitting a live one. Fix: commit only the closest `PICK_BEST`(3)
+  replies in `on_done` (full closest set still saved for reseed). Pure JS-
+  parity restoration. Test `CommitsToPickBestThreeNotAllClosest`; 709/709
+  unit + cpp-reviewer SHIP + ASAN clean. **NEEDS LIVE VALIDATION (Section C):
+  mobile connect ~28s → ~1s.** Upstream of the punch; independent of B1/B2.
+- [ ] **B1 (BEYOND-JS field-hardening — NOT a parity bug)** — NatSampler
+  classifies at `sampled_ >= 3` (nat_sampler.cpp:111); `MIN_SAMPLES=4` feeds an
+  `ok` flag nobody reads. Three agreeing samples latch CONSISTENT and cannot be
+  demoted. **2026-07-26 re-verification CORRECTION:** this latch is
+  JS-IDENTICAL — `nat.js _updateFirewall` max-hits only ever grow, never
+  decrement — so stock JS fails the same CGNAT case. B1 is therefore a
+  DELIBERATE divergence, not a parity gap. Fix = gate the verdict on >=4 + let
+  disagreeing samples demote a stale CONSISTENT, to engage the wired birthday
+  strategy on port-varying CGNAT. Finding D both-ends capture makes it a
+  reasonable candidate for the live `-5`, but land it as an intentional
+  field-hardening change, NOT a "parity fix." Still pairs with B2 (below).
 - [ ] **B2 (upgraded — land WITH B1)** — Round-2 holepunch payload sends ONE
   address (`our_addr`, holepunch.cpp:1880-1885) instead of
   `nat_sampler().addresses()`; JS sends the full set in both rounds
@@ -165,6 +228,12 @@ doesn't re-report them:
 ## C. Needs LIVE validation (user's nospoon / CGNAT phone)
 
 Loopback can't prove these; validate against a real NAT'd JS peer:
+- [ ] **Finding H fix (pickBest, 2026-07-26)**: mobile CONNECT LATENCY. Fresh
+  server + phone on mobile CGNAT: expect first connect ~1s (was ~28s hunting
+  dead record-holders). Server log should show `cycle settled (3 commits)`
+  (not ~41). Confirm findPeer still reliably converges to the 3 record-holders
+  (Kademlia should; JS proves it in prod) — the one robustness risk of a
+  3-node record set.
 - [ ] **Finding A fix (`08e2f47`, 2026-07-22)**: announcer publish-after-settle
   + keepalive drift detection + closestNodes reuse. Retest checklist in
   `docs/FIELD-DIAGNOSIS-2026-07-22.md` — key test: disconnect → IMMEDIATE

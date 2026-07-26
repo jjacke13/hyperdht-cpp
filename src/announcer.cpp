@@ -11,8 +11,11 @@
 //     ping_timer_ (RELAY_PING_MS = 5 s).
 //   - JS keeps three rotating Maps in `_serverRelays[3]`. C++ keeps a
 //     single `active_relays_` vector and replaces entries on commit.
-//   - JS picks 3 best replies via `pickBest`. C++ commits to all
-//     find_peer replies that have a token (capped by query results).
+//   - JS picks the 3 best replies via `pickBest` (slice(0,3)) and commits
+//     only to those. C++ matches this: update() commits to the closest
+//     PICK_BEST (3) replies of the walk (field Finding H — committing to
+//     every walked node stranded the record on relays that no longer
+//     forward for the NAT'd server).
 //   - `notify_online()` clears active relays and kicks an update cycle;
 //     JS just notifies the `online` Signal which unblocks `_background`.
 //   - JS publishes `this.relays` only after `await q.finished()` AND
@@ -368,8 +371,8 @@ void Announcer::ping_relays() {
 // The zero-commit cycle (no token replies) publishes at on_done since
 // pending_commits_ is already 0. A cycle cancelled by notify_online()/
 // stop() bumps cycle_gen_, so every late callback (captured gen) no-ops.
-// We still diff from JS in committing per-reply during the walk rather
-// than to pickBest(3) after it.
+// Like JS, the commit targets pickBest(3) after the walk completes (in
+// on_done), not per-reply during it (announcer.js:170).
 // ---------------------------------------------------------------------------
 
 void Announcer::update() {
@@ -385,22 +388,36 @@ void Announcer::update() {
     auto weak = std::weak_ptr<bool>(alive_);  // C7: sentinel
     current_query_ = dht_ops::find_peer(socket_,
         keypair_.public_key,
-        [weak, this, gen](const query::QueryReply& reply) {
-            if (auto a = weak.lock(); !a || !*a) return;
-            if (gen != cycle_gen_) return;  // cancelled cycle
-            commit(reply, gen);
-        },
+        // JS commits AFTER the walk to pickBest(q.closestReplies), not per
+        // reply during it (announcer.js:170). The walk still needs a reply
+        // sink, so on_reply is a no-op here; the commit happens in on_done.
+        [](const query::QueryReply&) {},
         [weak, this, gen](int /*error*/,
                           const std::vector<query::QueryReply>& closest) {
             if (auto a = weak.lock(); !a || !*a) return;
             if (gen != cycle_gen_) return;  // cancelled cycle
             current_query_.reset();
-            // Save the walk's closest nodes to seed the next cycle's
+            // Save the walk's FULL closest set to seed the next cycle's
             // find_peer, so reannounce re-hits the SAME relays (JS
-            // announcer.js:187 `this._closestNodes = q.closestNodes`).
+            // announcer.js:187 `this._closestNodes = q.closestNodes`) —
+            // independent of which subset we commit to below.
             closest_nodes_.clear();
             for (const auto& r : closest) {
                 closest_nodes_.push_back({r.from_id, r.from_addr});
+            }
+            // JS announcer.js:170 — commit the record to
+            // pickBest(q.closestReplies) = the closest PICK_BEST (3) replies
+            // ONLY (pickBest = slice(0,3), announcer.js:298-301), NOT every
+            // walked node. `closest` is the XOR-distance-sorted
+            // closest_replies_ (query.cpp push_closest), so taking the front
+            // == JS pickBest. Committing to all ~k nodes stored the record on
+            // relays whose server-forward NAT mapping had expired (only the 3
+            // kept-alive active_relays_ forward), so a client hunted dead
+            // record-holders for ~28s (field Finding H). Commit BEFORE setting
+            // query_done_ so a synchronous congestion-drop settle inside
+            // commit() can't fire maybe_publish() early.
+            for (size_t i = 0; i < closest.size() && i < PICK_BEST; ++i) {
+                commit(closest[i], gen);
             }
             query_done_ = true;
             maybe_publish();

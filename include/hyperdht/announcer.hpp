@@ -39,6 +39,14 @@ namespace announcer {
 // Minimum active relays before triggering a full refresh (matches JS MIN_ACTIVE)
 constexpr int MIN_ACTIVE = 3;
 
+// The announce record is committed to only the closest `PICK_BEST` replies of
+// the walk — JS `pickBest(q.closestReplies)` = `replies.slice(0, 3)`
+// (announcer.js:170,298-301). Same 3 nodes that are then kept alive
+// (MIN_ACTIVE). Committing to every walked node stores the record on relays
+// whose server-forward NAT mapping has expired → clients hunt dead
+// record-holders (field Finding H).
+constexpr size_t PICK_BEST = 3;
+
 class Announcer {
 public:
     Announcer(rpc::RpcSocket& socket, const noise::Keypair& keypair,

@@ -6,7 +6,9 @@
 #include <sodium.h>
 #include <uv.h>
 
+#include <memory>
 #include <optional>
+#include <vector>
 
 #include "hyperdht/announcer.hpp"
 #include "hyperdht/dht_messages.hpp"
@@ -424,6 +426,85 @@ TEST(Announcer, PublishesRelaysAfterCommitsSettle) {
         << "publish must not require a second find_peer cycle";
     EXPECT_EQ(ctx.peer_addr, distinctive)
         << "published peer_addr must carry THIS cycle's ANNOUNCE observation";
+}
+
+// ============================================================================
+// H (pickBest) — the announce record must be committed to only the 3 closest
+// replies (JS announcer.js:170 `const replies = pickBest(q.closestReplies)`,
+// pickBest = `slice(0, 3)` :298-301), NOT to every walked node. Committing to
+// all ~k nodes stores the record on relays whose server-forward NAT mapping
+// has expired (only the 3 kept-alive active_relays_ forward), so a client
+// hunts dead record-holders for ~28s before hitting a live relay (field
+// Finding H). Regression: a walk returning >3 tokened closest replies must
+// yield exactly 3 ANNOUNCE commits.
+// ============================================================================
+TEST(Announcer, CommitsToPickBestThreeNotAllClosest) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    // Six reachable fake DHT nodes, each returning a token → six tokened
+    // closest replies in the walk. pickBest must trim the commit set to 3.
+    std::vector<std::unique_ptr<FakeNode>> nodes;
+    for (uint8_t i = 0; i < 6; ++i)
+        nodes.push_back(std::make_unique<FakeNode>(&loop,
+                                                   static_cast<uint8_t>(0x11 + i)));
+
+    routing::NodeId cid{};
+    cid.fill(0x22);
+    rpc::RpcSocket client(&loop, cid);
+    client.bind(0);
+    for (auto& n : nodes) seed_table(client, *n);
+
+    auto kp = make_keypair(0x42);
+    auto target = make_target(kp);
+    Announcer ann(client, kp, target);
+
+    struct Ctx {
+        Announcer* ann;
+        std::vector<std::unique_ptr<FakeNode>>* nodes;
+        rpc::RpcSocket* client;
+        bool done = false;
+        uv_timer_t poll{};
+        uv_timer_t guard{};
+        void cleanup() {
+            if (done) return;
+            done = true;
+            ann->stop_without_unannounce();
+            for (auto& n : *nodes) n->sock.close();
+            client->close();
+            uv_close(reinterpret_cast<uv_handle_t*>(&poll), nullptr);
+            uv_close(reinterpret_cast<uv_handle_t*>(&guard), nullptr);
+        }
+    } ctx{&ann, &nodes, &client};
+
+    ann.start();
+
+    uv_timer_init(&loop, &ctx.poll);
+    ctx.poll.data = &ctx;
+    uv_timer_start(&ctx.poll, [](uv_timer_t* t) {
+        auto* c = static_cast<Ctx*>(t->data);
+        if (c->done) return;
+        // Cycle settled once relays are published (all commits settled).
+        if (!c->ann->relays().empty()) c->cleanup();
+    }, 20, 20);
+
+    uv_timer_init(&loop, &ctx.guard);
+    ctx.guard.data = &ctx;
+    uv_timer_start(&ctx.guard, [](uv_timer_t* t) {
+        static_cast<Ctx*>(t->data)->cleanup();
+    }, 4000, 0);
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+
+    int total_announce = 0;
+    for (auto& n : nodes) total_announce += n->announce_count;
+
+    EXPECT_EQ(total_announce, 3)
+        << "announcer must commit to pickBest(3) closest replies "
+           "(JS announcer.js:170), not to every walked node (field Finding H)";
+    EXPECT_LE(ann.relays().size(), 3u)
+        << "at most 3 relays are kept alive (pickBest == MIN_ACTIVE)";
 }
 
 // ============================================================================

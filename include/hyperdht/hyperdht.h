@@ -381,6 +381,15 @@ typedef struct {
      * falling back to holepunch. Pass 0 to skip the LAN path.
      */
     int local_connection;
+
+    /**
+     * Reuse the UDX socket from a previous connection to the same peer
+     * instead of punching a fresh one (JS: `opts.reusableSocket`). It is
+     * advertised in the handshake payload's udx info, so the peer has to
+     * opt in too (server side: `hyperdht_server_set_reusable_socket`).
+     * 0 = off (default), 1 = on.
+     */
+    int reusable_socket;
 } hyperdht_connect_opts_t;
 
 /** Initialise `hyperdht_connect_opts_t` with library defaults. */
@@ -585,6 +594,21 @@ HYPERDHT_API int hyperdht_stream_write_with_drain(
     hyperdht_stream_t* stream,
     const uint8_t* data, size_t len,
     hyperdht_drain_cb on_drain, void* userdata);
+
+/**
+ * Pause / resume delivery of reliable stream data.
+ *
+ * `hyperdht_stream_pause` stops the on_data callback from firing and lets
+ * the peer's congestion window close — the read-side counterpart of the
+ * drain callback above, and the correct way to apply backpressure when
+ * whatever consumes the data is slower than the stream.
+ * `hyperdht_stream_resume` re-arms delivery.
+ *
+ * Both are idempotent and safe on a NULL or already-closed stream.
+ * Unordered datagrams (`hyperdht_stream_send_udp`) are unaffected.
+ */
+HYPERDHT_API void hyperdht_stream_pause(hyperdht_stream_t* stream);
+HYPERDHT_API void hyperdht_stream_resume(hyperdht_stream_t* stream);
 
 /**
  * Close the stream. Sends end-of-stream and triggers on_close.

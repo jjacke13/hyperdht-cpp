@@ -256,6 +256,7 @@ void hyperdht_connect_opts_default(hyperdht_connect_opts_t* opts) {
     opts->relay_keep_alive_ms = 0;  // 0 = library default (5000 ms)
     opts->fast_open = 1;
     opts->local_connection = 1;
+    opts->reusable_socket = 0;  // JS default: false (holesail sets true)
 }
 
 int hyperdht_connect_ex(hyperdht_t* dht,
@@ -291,6 +292,7 @@ int hyperdht_connect_ex(hyperdht_t* dht,
         }
         cpp_opts.fast_open = (opts->fast_open != 0);
         cpp_opts.local_connection = (opts->local_connection != 0);
+        cpp_opts.reusable_socket = (opts->reusable_socket != 0);
     }
 
     dht->dht->connect(pk, cpp_opts,

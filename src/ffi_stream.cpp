@@ -221,6 +221,16 @@ int hyperdht_stream_write_with_drain(hyperdht_stream_t* stream,
         });
 }
 
+void hyperdht_stream_pause(hyperdht_stream_t* stream) {
+    if (!stream || stream->closed || !stream->duplex) return;
+    stream->duplex->pause_read();
+}
+
+void hyperdht_stream_resume(hyperdht_stream_t* stream) {
+    if (!stream || stream->closed || !stream->duplex) return;
+    stream->duplex->resume_read();
+}
+
 void hyperdht_stream_close(hyperdht_stream_t* stream) {
     if (!stream || stream->closed || !stream->duplex) return;
     // Graceful close: `end()` sends write_end on the underlying UDX

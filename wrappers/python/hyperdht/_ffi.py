@@ -106,6 +106,7 @@ class ConnectOpts(ctypes.Structure):
         ("relay_keep_alive_ms", ctypes.c_uint64),
         ("fast_open", ctypes.c_int),
         ("local_connection", ctypes.c_int),
+        ("reusable_socket", ctypes.c_int),
     ]
 
 

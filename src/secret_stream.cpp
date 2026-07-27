@@ -488,6 +488,30 @@ void SecretStreamDuplex::start() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// pause_read / resume_read — read-side backpressure
+//
+// Detaching the udx read callback stops us acking new reliable data, which
+// closes the peer's congestion window: the correct way to stall a producer
+// that is faster than whatever consumes on_message. Unordered datagrams
+// (udx_stream_recv_start) keep flowing — they are lossy by contract.
+//
+// Both are no-ops outside the started window: before start() there is no
+// udx read to stop, and after destroy() the raw stream is already gone.
+// ---------------------------------------------------------------------------
+
+void SecretStreamDuplex::pause_read() {
+    if (!started_ || destroyed_ || read_paused_) return;
+    udx_stream_read_stop(raw_stream_);
+    read_paused_ = true;
+}
+
+void SecretStreamDuplex::resume_read() {
+    if (!started_ || destroyed_ || !read_paused_) return;
+    read_paused_ = false;
+    udx_stream_read_start(raw_stream_, on_udx_read);
+}
+
 // JS: index.js:373-397 — _setupSecretStream() also writes the header buffer
 //     directly via this._rawStream.write(buf). C++ instead enqueues a
 //     udx_stream_write request whose ack flips header_sent_ and may fire

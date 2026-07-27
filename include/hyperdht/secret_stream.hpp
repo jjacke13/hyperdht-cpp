@@ -326,6 +326,21 @@ public:
     // install their own callbacks while the Duplex owns the stream.
     udx_stream_t* raw_stream() { return raw_stream_; }
 
+    // Read-side backpressure. `pause_read()` stops UDX from delivering
+    // further reliable frames so the peer's congestion window closes;
+    // `resume_read()` re-arms delivery. Both are no-ops before `start()`
+    // and after `destroy()`, and both are idempotent.
+    //
+    // JS gets this for free from the Node.js Readable highWaterMark
+    // (.analysis/js/@hyperswarm/secret-stream/index.js:123-153 wires the
+    // 'data' listener into streamx, which pauses on its own).
+    //
+    // Unordered datagrams (send_udp / on_udp_message) are NOT affected —
+    // they are lossy by contract, so buffering them serves nothing.
+    void pause_read();
+    void resume_read();
+    bool is_read_paused() const { return read_paused_; }
+
 private:
     udx_stream_t* raw_stream_;
     uv_loop_t*    loop_;
@@ -341,6 +356,7 @@ private:
     bool ended_     = false;   // user called end()
     bool destroyed_ = false;
     bool read_started_ = false;
+    bool read_paused_ = false;  // user called pause_read() (see above)
     int  close_error_ = 0;
     bool on_close_fired_ = false;
 

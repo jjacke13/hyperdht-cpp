@@ -293,15 +293,59 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
 
 ## E. Hardening / verification tasks
 
-- [ ] Full ASAN/valgrind leak sweep of the hot path (known pre-existing teardown
-  leaks in libuv/libudx internals — confirm no hot-path leaks; re-verify after
-  this session's large diff).
+- [ ] Full ASAN/valgrind leak sweep of the hot path (confirm no hot-path leaks;
+  re-verify after this session's large diff). The teardown leaks previously
+  logged here as "pre-existing, in libuv/libudx internals" were pinned down
+  2026-07-28 — see TD1-TD3 below. **Two of the three are ours, not libuv's.**
 - [ ] Fuzzing: run each `fuzz/` harness (compact, handshake_msg, holepunch_msg,
   messages, noise_payload) ≥30 min under libFuzzer; fix crashes.
 - [ ] Stress: 100 concurrent JS clients vs one C++ server; measure success rate +
   memory growth; confirm the probe-listener multi-slot fix holds.
 - [ ] Soak: 12h+ connection, data every 5 min; verify NAT pinhole + SecretStream
   keepalive, no drift.
+
+### E.1 Teardown defects (found 2026-07-28 while building holesail-cpp)
+
+All three are shutdown-only, so a long-running server pays them once at exit and
+the OS reclaims. **They matter for embedders that create and destroy many DHT
+instances in one process** (test harnesses, apps that rebuild the DHT on a
+network change) — there they accumulate. holesail-cpp scopes them in its
+`test/lsan.supp`, which doubles as the reproduction recipe.
+
+- [ ] **TD1 — `hyperdht_query_cancel()` never fires `on_done`, and the cancelled
+  query is never reaped.** `hyperdht.h` documents "on_done fires exactly once per
+  query (natural completion OR cancel)". It does not fire on cancel.
+  `hyperdht_query_free()` (`src/ffi_core.cpp:31`) deletes only the wrapper, with
+  the comment that `state` "may still be alive via lambda ref, which is fine" —
+  true only if that lambda eventually runs. The internal completion lambda is the
+  sole owner of `QueryState` / `query::Query`, so a cancelled query holds its
+  state forever. **~34 KB per client torn down with a lookup in flight.**
+  VERIFIED with a standalone repro containing no holesail code: the leak is
+  byte-identical with 0 and with 200 loop iterations after cancel, and the done
+  callback never runs — a contract violation, not a timing artifact.
+  Fix is either firing `on_done` on cancel (matches the documented contract,
+  preferred) or giving `query_free` real ownership. Pick one, then re-run the
+  full 716-test lane.
+
+- [ ] **TD2 — every DHT orphans a stopped-but-unclosed `uv_timer_t`.** The
+  interface-watcher timer (`HyperDHT::start_interface_watcher`) is stopped but
+  never `uv_close`d: `active=0 closing=0 ref=1`. The knock-on effect is the
+  bigger problem — **`uv_loop_close()` then returns `EBUSY` permanently**, so
+  libuv cannot free the loop's own internals either and embedders cannot cleanly
+  close or reuse a loop. ~1237 bytes + 4 allocations per DHT, plus the loop.
+  VERIFIED with a zero-holesail program following `hyperdht.h`'s own
+  create → listen → destroy → `uv_run` → free recipe verbatim. holesail-cpp
+  works around it by `uv_walk`-closing the orphan before `uv_loop_close()`
+  (`drain_and_close()` in its `src/cli.cpp`); that workaround should become
+  unnecessary.
+
+- [ ] **TD3 — in-flight connect/stream state dropped when `hyperdht_destroy`
+  beats a graceful close round-trip.** Frames: `HyperDHT::do_connect`,
+  `server::Server::on_handshake_result`, `udx__cirbuf_init` / `_set`. ~11 KB per
+  integration run, and it **scales with connection count** — consistent with
+  per-connection state being abandoned rather than reaped. Lower confidence than
+  TD1/TD2: established by tracing frame `#1` of every unsuppressed allocation to
+  a dependency frame, not by a standalone repro. Reproduce before fixing.
 
 ---
 

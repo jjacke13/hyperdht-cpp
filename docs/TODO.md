@@ -5,12 +5,19 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-07-26.
+Last updated: 2026-07-28.
 
 ---
 
 ## Status snapshot
 
+- **2026-07-28**: C-API SECURITY fix — `hyperdht_server_set_firewall` polarity
+  was inverted, so every C-API server with a firewall admitted exactly the
+  peers it should reject (`0203820`, found via holesail-cpp; regression tests
+  `ServerFfiFirewall.*` red-checked). Raises the priority of the un-audited
+  `ffi_*` layer (Section F). Also landed read-side backpressure
+  (`hyperdht_stream_pause/resume`) + the `reusable_socket` connect option
+  (`a08cade`, Section D). Suite 716/716 unit.
 - **Adversarial re-verification 2026-07-26** (16-subsystem Opus workflow):
   claimed status CONFIRMED accurate — zero FALSE_DONE, all 12 HIGH genuinely
   closed, all 6 claimed-open genuinely open, ~93% behavioral parity. Added 1
@@ -266,10 +273,14 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
 - [ ] **`_relayAddressesCache`** — client-side cache of the server's relay
   addresses keyed by server pubkey; skips the findPeer walk on reconnect (saves
   2-3s). JS `hyperdht/index.js:55` (512-entry xache), `connect.js:323,464`.
-- [ ] **Read-side backpressure** — we consume every UDX byte immediately; JS
-  `rawStream.pause()` (→ `udx_stream_read_stop`) when the read buffer exceeds
-  highWaterMark (16KB). Expose pause/resume on SecretStreamDuplex, wire to UDX.
-  (Also surfaced in protomux-2: no true read-side pause; buffer+teardown substituted.)
+- [x] **Read-side backpressure** — DONE 2026-07-28 (`a08cade`).
+  `SecretStreamDuplex::pause_read/resume_read` wrap
+  `udx_stream_read_stop/read_start`, exposed as `hyperdht_stream_pause/resume`
+  on the C API (idempotent, NULL/closed-safe; unordered datagrams unaffected).
+  Test `test_stream_pause.cpp`. RESIDUAL: the *automatic* highWaterMark (16KB)
+  trigger is NOT implemented — pause/resume is caller-driven, where JS pauses
+  itself when the read buffer exceeds highWaterMark. protomux-2 (no true
+  read-side pause; buffer+teardown substituted) is likewise still open.
 - [ ] **Sleeping-interval wake detection** — VERIFY: the tick rewrite added
   `_onwakeup`/`do_wakeup` + `last_tick_ms_`, but confirm `background_tick`
   actually compares wall-clock gap vs `SLEEPING_INTERVAL` (15s) and triggers the
@@ -304,7 +315,17 @@ before any full "core frozen" sign-off:
 - [ ] `raw-stream-set.js`, `semaphore.js`, `refresh-chain.js`, `commands.js`,
   the udx wrapper.
 - [ ] The entire `ffi_*` layer (the natural freeze boundary — audit last, once
-  the core below it is frozen).
+  the core below it is frozen). **RAISED IN PRIORITY 2026-07-28:** the first
+  real bug found here was a SECURITY inversion — `hyperdht_server_set_firewall`
+  returned `cb(...) == 0` where `FirewallCb` means true=REJECT, so every C-API
+  server with a firewall admitted exactly the peers it should refuse and
+  refused the authorised one (`0203820`, found via holesail-cpp, regression
+  tests `ServerFfiFirewall.*`). Polarity conversions are the smell: the sibling
+  `set_holepunch` (`== 0`) and async `firewall_done` (`!= 0`) were each
+  re-checked and ARE correct — the two callbacks legitimately have opposite
+  polarities (`FirewallCb` true=reject vs `HolepunchCb` false=abort). Audit the
+  rest of `ffi_*` for the same class: bool/int contract mismatches at the
+  boundary, which compile fine and fail silently.
 
 ---
 
@@ -325,9 +346,12 @@ before any full "core frozen" sign-off:
   which now report failure via OnDoneCallback).
 - [ ] Wrapper build CI: Python/Kotlin/Rust announce-ABI change (`f37ef1d`) is
   UNVERIFIED — no wrapper build in the C++ gate. Add a wrapper-build check.
-- [ ] Tighten connect-3 wording in the sweep docs so it's not read as
-  "reusableSocket unimplemented" (server + wire are done; client option +
-  cache gating are the gap).
+- [x] Tighten connect-3 wording in the sweep docs so it's not read as
+  "reusableSocket unimplemented" — RESOLVED 2026-07-28 (`a08cade`): the C-API
+  client option landed as `hyperdht_connect_opts_t.reusable_socket` (tail-
+  appended; Python ctypes mirror updated in the same commit per the CLAUDE.md
+  ABI gotcha). Server + wire + client option are all done; only the route-cache
+  gating nuance remains, tracked as connect/divergence-1 in Section A.
 - [ ] tick-7: full 2-pass bootstrap + `testNat`-gated second `_updateNetworkState`
   (only the quick-firewall PING_NAT first-responder heuristic landed).
 - [ ] holepuncher-4: fresh-socket reopen (currently same-socket resample — recovers

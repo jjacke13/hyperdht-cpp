@@ -12,6 +12,10 @@
 #include "hyperdht/rpc.hpp"
 #include "hyperdht/server.hpp"
 
+#include <hyperdht/hyperdht.h>
+
+#include "../src/ffi_internal.hpp"
+
 using namespace hyperdht;
 using namespace hyperdht::server;
 
@@ -1422,4 +1426,93 @@ TEST(Server, RelayWatchdogAbortsChainKeepsSession) {
     // handles behind (pre-existing; the FFI layer force-closes via
     // uv_walk) — matches the teardown style of test_hyperdht.cpp.
     uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// FFI firewall polarity (regression)
+//
+// hyperdht.h documents the C callback as "return 0 to accept, non-zero to
+// reject", while the C++ FirewallCb returns true to REJECT. The wrapper in
+// ffi_server.cpp has to invert between them, and getting it backwards is
+// silent and catastrophic: a private server admits exactly the peers it
+// should refuse and refuses the authorised one. Found 2026-07-28 via
+// holesail-cpp, whose secure mode could not connect at all.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Drives one handshake through the router with a C-API firewall installed,
+// and reports whether the server replied (accepted) or stayed silent.
+struct FfiFirewallProbe {
+    int fw_calls = 0;
+    int reply_count = 0;
+    bool connection_received = false;
+};
+
+void run_ffi_firewall_case(hyperdht_firewall_cb cb, FfiFirewallProbe* probe) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    routing::NodeId our_id{};
+    our_id.fill(0x42);
+    rpc::RpcSocket socket(&loop, our_id);
+    socket.bind(0);
+
+    router::Router router;
+    Server srv(socket, router);
+
+    noise::Seed server_seed{};
+    server_seed.fill(0x11);
+    auto server_kp = noise::generate_keypair(server_seed);
+
+    srv.listen(server_kp, [probe](const ConnectionInfo&) {
+        probe->connection_received = true;
+    });
+
+    // Install through the C API — this is the code path under test.
+    hyperdht_server_s wrapper{};
+    wrapper.server = &srv;
+    hyperdht_server_set_firewall(&wrapper, cb, probe);
+
+    auto hs = make_handshake_request(server_kp, peer_connect::FIREWALL_OPEN);
+    router.handle_peer_handshake(
+        hs.req,
+        [probe](const messages::Response&) { probe->reply_count++; },
+        [](const messages::Request&) {});
+
+    srv.close();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+}  // namespace
+
+TEST(ServerFfiFirewall, ReturningZeroAccepts) {
+    FfiFirewallProbe probe;
+    run_ffi_firewall_case(
+        [](const uint8_t*, const char*, uint16_t, void* ud) -> int {
+            static_cast<FfiFirewallProbe*>(ud)->fw_calls++;
+            return 0;  // documented: 0 == accept
+        },
+        &probe);
+
+    EXPECT_EQ(probe.fw_calls, 1);
+    EXPECT_GT(probe.reply_count, 0)
+        << "a C firewall returning 0 must ACCEPT — the wrapper inverted it";
+}
+
+TEST(ServerFfiFirewall, ReturningNonZeroRejects) {
+    FfiFirewallProbe probe;
+    run_ffi_firewall_case(
+        [](const uint8_t*, const char*, uint16_t, void* ud) -> int {
+            static_cast<FfiFirewallProbe*>(ud)->fw_calls++;
+            return 1;  // documented: non-zero == reject
+        },
+        &probe);
+
+    EXPECT_EQ(probe.fw_calls, 1);
+    EXPECT_EQ(probe.reply_count, 0)
+        << "a C firewall returning non-zero must REJECT (silence)";
+    EXPECT_FALSE(probe.connection_received);
 }

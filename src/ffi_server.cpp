@@ -75,7 +75,13 @@ void hyperdht_server_set_firewall(hyperdht_server_t* srv,
                        const hyperdht::peer_connect::NoisePayload&,
                        const hyperdht::compact::Ipv4Address& addr) -> bool {
             auto host = addr.host_string();
-            return cb(pk.data(), host.c_str(), addr.port, userdata) == 0;
+            // Opposite polarities: the C contract (hyperdht.h) is "0 accepts,
+            // non-zero rejects", while FirewallCb returns true to REJECT. So
+            // this must be != 0. Inverting it is silent and catastrophic — a
+            // private server then admits exactly the peers it should refuse
+            // and refuses the authorised one. Covered by ServerFfiFirewall.*
+            // in test/test_server.cpp.
+            return cb(pk.data(), host.c_str(), addr.port, userdata) != 0;
         });
 }
 

@@ -5,11 +5,19 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-07-28.
+Last updated: 2026-07-29.
 
 ---
 
 ## Status snapshot
+
+- **2026-07-29**: field Finding I FIXED — the advertised local-address list was
+  a bind-time snapshot, permanently breaking same-LAN connects (`-6`) after any
+  interface change; now re-enumerated live per advertisement
+  (`HyperDHT::local_addresses_now()`), matching JS `_localAddresses()`. Also
+  recorded new field Findings J (HIGH, `uv_close` double-close crash) and K
+  (sampling gate), and DEMOTED B1 — Finding L exonerates it as the `-5` cause,
+  promoting B2. Suite 718/718.
 
 - **2026-07-28**: C-API SECURITY fix — `hyperdht_server_set_firewall` polarity
   was inverted, so every C-API server with a firewall admitted exactly the
@@ -159,6 +167,46 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   record re-added, chain rotated. (Latent feature — current JS always sends
   refresh:null.)
 
+### 2026-07-27 field findings (handoff Findings I/J/K/L)
+
+- [x] **Finding I — server advertised a BIND-TIME local-address snapshot.**
+  DONE 2026-07-29. `validated_local_addresses_` was assigned only in `bind()`
+  (dht.cpp) and never recomputed, so an interface appearing later (DHCP
+  completing after an early bind, interface flap) was never advertised for the
+  process lifetime → same-LAN clients failed **permanently** with `-6`. Fatal
+  rather than degraded because the LAN shortcut is EXCLUSIVE: a bad
+  `addresses4` removes the holepunch fallback too (that exclusivity is correct
+  parity — connect-6 — so the fix is the address list, NOT the fallback).
+  Genuine JS divergence: `_localAddresses()` (server.js:206-208) re-enumerates
+  per handshake (server.js:272).
+  Fix: new `HyperDHT::local_addresses_now()` — live enumerate →
+  `validate_local_addresses()` → refresh snapshot; used by the server handshake
+  reply and the client's `build_local_handshake_info` (memoized per `connect()`
+  on `ConnState`, matching JS's one-payload-per-connect latch, connect.js:386).
+  VERIFIED with a netns repro (interface brought up after bind: before the fix
+  the advertised list stayed `127.0.0.1` even after the interface watcher
+  polled; after, it tracks the live address). Tests
+  `LocalAddressesNowMatchesLiveEnumeration` +
+  `LocalAddressesNowRespectsExcludeLocalAddress` (the latter red-checked
+  against a naive bypass — live re-enumeration MUST stay routed through
+  `validate_local_addresses()` or it resurrects `exclude_local_address()`'d
+  hosts, which nospoon relies on to hide its TUN address). 718/718,
+  cpp-reviewer SHIP, ASAN clean.
+- [ ] **Finding J (HIGH — hard crash)** — `uv_close` double-close abort in
+  `~ConnState` teardown: `udx_stream_destroy` on a handle already closing.
+  The teardown runs INSIDE a `uv_close` callback (`RpcSocket::destroy_request`)
+  when the last `ConnState` ref is dropped by the destruction of the handshake
+  continuation lambdas. 4 occurrences 2026-07-25..27 on the connect FAILURE
+  path. Needs an already-closing guard, or ordering that never drops the last
+  ref from inside a close callback. Reproducible via repeated connect failures.
+- [ ] **Finding K** — the pool-NAT sampling gate does not hold: `pool_fw` is
+  read mid-flight at holepunch.cpp:1758, while the comment at
+  holepunch.cpp:1777-1779 asserts sampling has completed by then. Field log
+  shows `Sampling settled` firing 1 ms BEFORE `sampling done`, with disagreeing
+  values (read fw=3, settled fw=2); ordering varies run to run. Effect on
+  connect outcome NOT established (n=1 each way — do not assume a direction).
+  Minimum: enforce the invariant or correct the comment.
+
 ### nat-sampler / punch payload (from the 2026-07-22 field diagnosis; see
 ### docs/FIELD-DIAGNOSIS-2026-07-22.md "Finding B" + "Finding E")
 - [x] **Finding E** — DONE 2026-07-22 (uncommitted): announcer `updating_`
@@ -185,10 +233,17 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   decrement — so stock JS fails the same CGNAT case. B1 is therefore a
   DELIBERATE divergence, not a parity gap. Fix = gate the verdict on >=4 + let
   disagreeing samples demote a stale CONSISTENT, to engage the wired birthday
-  strategy on port-varying CGNAT. Finding D both-ends capture makes it a
-  reasonable candidate for the live `-5`, but land it as an intentional
-  field-hardening change, NOT a "parity fix." Still pairs with B2 (below).
-- [ ] **B2 (upgraded — land WITH B1)** — Round-2 holepunch payload sends ONE
+  strategy on port-varying CGNAT.
+  **2026-07-27 DEMOTED — field Finding L EXONERATES B1 as the `-5` cause.**
+  The "reasonable candidate for the live `-5`" reading is WITHDRAWN. Mobile
+  capture: all 6 SUCCESSES logged `pool_fw=2` — B1's exact misdeclaration,
+  with the client mapping equally unstable — so B1's precondition is present
+  in the successes; and the one attempt that classified CORRECTLY (`pool_fw=3`
+  RANDOM, i.e. what fixing B1 produces) still failed `-5`. B1 discriminates in
+  neither direction. Keep it as a remedy (a client whose mapping moves
+  mid-handshake wants the birthday fallback), NOT as the cause. **B2 is now
+  the priority of the pair.**
+- [ ] **B2 (NOW THE PRIORITY OF THE PAIR — see Finding L)** — Round-2 holepunch payload sends ONE
   address (`our_addr`, holepunch.cpp:1880-1885) instead of
   `nat_sampler().addresses()`; JS sends the full set in both rounds
   (connect.js:567,654,684). Field Finding F (2026-07-23, SUCCESS) shows B2 is

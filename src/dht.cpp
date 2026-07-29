@@ -283,8 +283,10 @@ int HyperDHT::bind() {
     // §16: validate the machine's local interface addresses once at
     // bind time so the server-side handshake path (`share_local_address`)
     // has a cached list ready. JS runs this from `server._localAddresses`
-    // on every handshake with its own per-host cache; we do the work
-    // once up front and serve every subsequent handshake from the cache.
+    // on every handshake with its own per-host cache; we prime it here so
+    // the first handshake is warm, and `local_addresses_now()` re-enumerates
+    // per advertisement thereafter (Finding I — this priming is NOT the
+    // source of truth; an interface appearing later must still be picked up).
     //
     // Use the ACTUAL bound port (`socket_->port()`) — `opts_.port` may
     // be 0 for ephemeral binds, which would give peers a dead address.
@@ -567,6 +569,31 @@ std::vector<compact::Ipv4Address> HyperDHT::validate_local_addresses(
     }
 
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// local_addresses_now — live equivalent of JS `server._localAddresses()`
+//
+// JS: .analysis/js/hyperdht/lib/server.js:206-208, called per handshake at
+//     server.js:272. See the header comment on this method for the field
+//     history (Finding I) and why validate_local_addresses() must stay in
+//     the path (exclude_local_address() poisons that cache).
+// ---------------------------------------------------------------------------
+
+std::vector<compact::Ipv4Address> HyperDHT::local_addresses_now() {
+    // `socket_` exists before bind() but has no port yet, so testing it alone
+    // is not enough — enumerating here would hand back real hosts stamped
+    // with port 0. Gate on `bound_` (same idiom as remote_address(),
+    // dht.hpp:949) and on `destroyed_`, whose torn-down handle must not be
+    // used for the validation probe. Both keep the pre-bind contract: empty.
+    if (!socket_ || !bound_ || destroyed_) return validated_local_addresses_;
+
+    // Same port source as bind() — the ACTUAL bound port, never opts_.port
+    // (which is 0 for ephemeral binds). Keeping the expression identical is
+    // what makes this a pure freshness change and not a behaviour change.
+    validated_local_addresses_ =
+        validate_local_addresses(holepunch::local_addresses(socket_->port()));
+    return validated_local_addresses_;
 }
 
 // ---------------------------------------------------------------------------

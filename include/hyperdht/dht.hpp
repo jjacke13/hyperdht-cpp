@@ -469,13 +469,38 @@ public:
     std::vector<compact::Ipv4Address> validate_local_addresses(
         const std::vector<compact::Ipv4Address>& addresses);
 
-    // Returns the cached list of local addresses that passed
-    // `validate_local_addresses()` at bind time. The server side reads
-    // this to populate `addresses4` in the Noise payload when
-    // `share_local_address=true`. Matches JS `server._localAddresses()`.
+    // Returns the LAST COMPUTED validated local-address list. Refreshed at
+    // bind() and by every `local_addresses_now()` call, so it tracks the
+    // machine's interfaces rather than freezing at bind.
+    //
+    // Prefer `local_addresses_now()` anywhere the list is about to be
+    // ADVERTISED to a peer — this accessor is a plain observer and can only
+    // be as fresh as the last refresh.
     const std::vector<compact::Ipv4Address>& validated_local_addresses() const {
         return validated_local_addresses_;
     }
+
+    // Re-enumerate the machine's interfaces and return the validated list as
+    // it is RIGHT NOW, refreshing the cached snapshot as a side effect.
+    //
+    // JS parity: `server._localAddresses()` (server.js:206-208) re-enumerates
+    // on EVERY handshake (called at server.js:272). It is what must be used
+    // when building a Noise payload's `addresses4`.
+    //
+    // Field Finding I (2026-07-27): the list used to be computed only inside
+    // bind() and never recomputed, so any interface that appeared afterwards
+    // (DHCP completing after an early bind, interface flap, address renewal)
+    // was never advertised for the whole process lifetime. Same-LAN clients
+    // then failed PERMANENTLY with -6: the LAN shortcut is exclusive, so a
+    // bad `addresses4` removes the holepunch fallback too. The interface
+    // watcher fires and re-announces but never recomputed this list.
+    //
+    // Cost matches JS: enumeration per call, while the expensive part (the
+    // per-host bind probe) stays cached in `validated_host_cache_`. Routing
+    // through `validate_local_addresses()` is REQUIRED, not incidental — it
+    // is what keeps `exclude_local_address()`'s poisoned cache entries
+    // honoured (nospoon's TUN filter depends on it). Do not bypass it.
+    std::vector<compact::Ipv4Address> local_addresses_now();
 
     // Drop a host from the validated-local-address cache so the server
     // side never advertises it in handshake replies.

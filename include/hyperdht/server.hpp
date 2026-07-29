@@ -112,8 +112,8 @@ public:
     Server(rpc::RpcSocket& socket, router::Router& router);
 
     // §16: constructor overload with a HyperDHT back-pointer so the
-    // server can read `dht->validated_local_addresses()` when building
-    // its handshake reply. Without the back-pointer, `share_local_address`
+    // server can call `dht->local_addresses_now()` when building its
+    // handshake reply. Without the back-pointer, `share_local_address`
     // silently drops the LAN addrs.
     Server(rpc::RpcSocket& socket, router::Router& router, HyperDHT* dht);
     ~Server();
@@ -266,8 +266,9 @@ private:
     router::Router& router_;
     // §16 non-owning back-pointer: optional, may be null for tests that
     // construct Server directly without a HyperDHT owner. When non-null
-    // the server queries `dht_->validated_local_addresses()` during
-    // handshake reply construction if `share_local_address == true`.
+    // the server calls `dht_->local_addresses_now()` during handshake
+    // reply construction if `share_local_address == true` — live, so an
+    // interface that appears after bind() is still advertised (Finding I).
     //
     // Lifetime invariant: every Server that carries a non-null `dht_`
     // must outlive its parent HyperDHT's `servers_` vector (the

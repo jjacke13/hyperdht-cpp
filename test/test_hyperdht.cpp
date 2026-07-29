@@ -12,6 +12,7 @@
 
 #include "hyperdht/announce_sig.hpp"
 #include "hyperdht/dht.hpp"
+#include "hyperdht/holepunch.hpp"
 #include "hyperdht/hyperdht.h"
 #include "hyperdht/rpc.hpp"
 #include "hyperdht/secret_stream.hpp"
@@ -1952,6 +1953,97 @@ TEST(HyperDHT, ValidatedLocalAddressesPopulatedAtBind) {
         EXPECT_EQ(addr.port, dht.port())
             << "validated local address port " << addr.port
             << " does not match the bound RpcSocket port " << dht.port();
+    }
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// Finding I — the advertised local-address list must be LIVE, not the
+// bind-time snapshot. `validated_local_addresses_` used to be assigned only
+// inside bind() and never recomputed, so an interface appearing later (DHCP
+// completing after an early bind, interface flap) was never advertised and
+// same-LAN clients failed permanently with -6 (the LAN shortcut is exclusive,
+// so a bad addresses4 also removes the holepunch fallback).
+//
+// JS re-enumerates per handshake: `server._localAddresses()` (server.js:206-208)
+// called at server.js:272.
+//
+// Interface add/remove needs a network namespace, so it is not unit-testable
+// here — that path was verified with a netns repro (interface brought up after
+// bind: live enumeration saw it, the snapshot never did, not even after the
+// watcher polled). These two tests lock in the contract that makes the live
+// path correct and safe.
+// ---------------------------------------------------------------------------
+
+TEST(HyperDHT, LocalAddressesNowMatchesLiveEnumeration) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    // Pre-bind contract preserved: no socket, no port to stamp — empty.
+    EXPECT_TRUE(dht.local_addresses_now().empty())
+        << "local_addresses_now() must stay empty before bind()";
+
+    ASSERT_EQ(dht.bind(), 0);
+
+    // Must equal a freshly computed list, not whatever bind() happened to
+    // cache. Guards against a regression back to returning the snapshot.
+    const auto expected =
+        dht.validate_local_addresses(holepunch::local_addresses(dht.port()));
+    const auto actual = dht.local_addresses_now();
+
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t i = 0; i < actual.size(); i++) {
+        EXPECT_EQ(actual[i].host_string(), expected[i].host_string());
+        EXPECT_EQ(actual[i].port, dht.port())
+            << "advertised local address must carry the bound port";
+    }
+
+    // The observer accessor is refreshed by the live call, so the two can
+    // never drift apart.
+    EXPECT_EQ(dht.validated_local_addresses().size(), actual.size());
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// The regression the live path could plausibly introduce: re-enumerating
+// straight from the OS would resurrect an address that `exclude_local_address`
+// had deliberately dropped. nospoon-cpp relies on that call to stop its TUN
+// address (e.g. 10.0.0.1) being advertised — peers would otherwise try to
+// reach it directly and silently time out, since a TUN routes IP, not UDP.
+// `exclude_local_address` both erases from the list AND poisons
+// `validated_host_cache_`; routing the live path through
+// `validate_local_addresses()` is what keeps the poison effective.
+TEST(HyperDHT, LocalAddressesNowRespectsExcludeLocalAddress) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    ASSERT_EQ(dht.bind(), 0);
+
+    const auto before = dht.local_addresses_now();
+    if (before.empty()) {
+        GTEST_SKIP() << "no local interfaces to exclude on this machine";
+    }
+
+    const std::string excluded = before[0].host_string();
+    dht.exclude_local_address(excluded);
+
+    // Re-enumerating must NOT bring it back, however many times we ask.
+    for (int i = 0; i < 3; i++) {
+        const auto after = dht.local_addresses_now();
+        for (const auto& a : after) {
+            EXPECT_NE(a.host_string(), excluded)
+                << "excluded host reappeared after live re-enumeration "
+                   "(iteration " << i << ") — the live path must go through "
+                   "validate_local_addresses() so the poisoned cache entry "
+                   "is honoured";
+        }
     }
 
     dht.destroy();

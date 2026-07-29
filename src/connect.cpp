@@ -9,6 +9,7 @@
 #include <cassert>
 #include <deque>
 #include <cstdio>
+#include <optional>
 
 #include "hyperdht/async_utils.hpp"
 #include "hyperdht/blind_relay.hpp"
@@ -60,6 +61,13 @@ struct ConnState {
     uint32_t our_udx_id = 0;
     udx_stream_t* raw_stream = nullptr;  // Client rawStream (like JS)
     bool completed = false;
+
+    // connect-4 — the local LAN address list is computed ONCE per connect()
+    // and reused by every relay attempt, mirroring JS's `c.requesting` latch
+    // (connect.js:386) which memoizes one noisePayload for all attempts.
+    // Without this, `local_addresses_now()`'s live re-enumeration would run a
+    // `uv_interface_addresses()` syscall per pipelined relay attempt.
+    std::optional<std::vector<compact::Ipv4Address>> lan_addresses;
 
     // §AUDIT-2: pipelining state (replaces relay_idx + try_relay_fn).
     // Handshakes fire as findPeer results stream in, Semaphore(2).
@@ -244,9 +252,16 @@ static LocalHandshakeInfo build_local_handshake_info(
             sampler.host(), sampler.port()));
     }
 
-    // LAN addresses (§6 local_connection support).
+    // LAN addresses (§6 local_connection support). Enumerated LIVE rather
+    // than read from the bind-time snapshot, which went stale the moment an
+    // interface changed and cost same-LAN peers the LAN path entirely
+    // (Finding I). Memoized on ConnState so all attempts of one connect()
+    // share a single enumeration — see the field comment for the JS parallel.
     if (state->local_connection) {
-        for (const auto& la : state->dht->validated_local_addresses()) {
+        if (!state->lan_addresses.has_value()) {
+            state->lan_addresses = state->dht->local_addresses_now();
+        }
+        for (const auto& la : *state->lan_addresses) {
             info.addresses4.push_back(la);
         }
     }

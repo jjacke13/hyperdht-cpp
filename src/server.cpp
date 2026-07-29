@@ -501,13 +501,13 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         }
     }
     if (share_local_address && dht_ != nullptr) {
-        // Copy the vector by value (not by `const&`) so the append loop
-        // cannot observe a mid-flight modification if the cache is
-        // reconstructed on a network-change event in between. The
-        // single-threaded event loop makes this moot today, but the
-        // by-value copy documents intent and is cheap — the LAN list
-        // is a handful of entries.
-        const auto lan = dht_->validated_local_addresses();
+        // Re-enumerate PER HANDSHAKE, matching JS `_localAddresses()`
+        // (server.js:206-208, called at server.js:272). Reading a snapshot
+        // taken at bind() left same-LAN clients permanently unable to
+        // connect (-6) whenever the interface list changed afterwards —
+        // field Finding I. Returned by value, so the append loop below
+        // cannot observe a mid-flight refresh.
+        const auto lan = dht_->local_addresses_now();
         for (const auto& addr : lan) {
             our_addrs.push_back(addr);
         }

@@ -312,20 +312,37 @@ instances in one process** (test harnesses, apps that rebuild the DHT on a
 network change) — there they accumulate. holesail-cpp scopes them in its
 `test/lsan.supp`, which doubles as the reproduction recipe.
 
-- [ ] **TD1 — `hyperdht_query_cancel()` never fires `on_done`, and the cancelled
-  query is never reaped.** `hyperdht.h` documents "on_done fires exactly once per
-  query (natural completion OR cancel)". It does not fire on cancel.
-  `hyperdht_query_free()` (`src/ffi_core.cpp:31`) deletes only the wrapper, with
-  the comment that `state` "may still be alive via lambda ref, which is fine" —
-  true only if that lambda eventually runs. The internal completion lambda is the
-  sole owner of `QueryState` / `query::Query`, so a cancelled query holds its
-  state forever. **~34 KB per client torn down with a lookup in flight.**
-  VERIFIED with a standalone repro containing no holesail code: the leak is
-  byte-identical with 0 and with 200 loop iterations after cancel, and the done
-  callback never runs — a contract violation, not a timing artifact.
-  Fix is either firing `on_done` on cancel (matches the documented contract,
-  preferred) or giving `query_free` real ownership. Pick one, then re-run the
-  full 716-test lane.
+- [ ] **TD1 — a cancelled query leaks its state (~1.3 KB). The `on_done`
+  contract is NOT violated.** *Corrected 2026-07-29 — the original entry claimed
+  "`hyperdht_query_cancel()` never fires `on_done`, a contract violation". That
+  half is REFUTED by standalone repro; the leak half stands, at a much smaller
+  magnitude than first reported.*
+  - **Contract HOLDS.** `hyperdht_query_cancel()` DOES fire `on_done` with
+    `HYPERDHT_ERR_CANCELLED` (-8), on all four cancelable paths
+    (`immutable_get_ex`, `mutable_get_ex`, `find_peer_ex`, `lookup_ex`), in both
+    orderings (cancel→pump→free and cancel→free→pump). Chain verified in code:
+    `ffi_core.cpp:28` `st.q->destroy()` → `Query::destroy()` →
+    `fire_done_once(QUERY_OK)` → the FFI done lambda, which maps
+    `state->cancelled` to -8. Matches `hyperdht.h:751`.
+  - The one case where the callback does NOT run is `hyperdht_query_free()`
+    **without** a preceding cancel — free deliberately detaches by nulling
+    `done_cb` (`ffi_core.cpp:31-40`). That is documented behaviour
+    (`hyperdht.h:759`), not a defect. Most likely what the original repro hit.
+  - **The leak is real but ~1.3 KB, not ~34 KB.** A/B under ASAN, same binary:
+    baseline create/bind/destroy = 15623 B / 18 allocs; identical run with one
+    `immutable_get_ex` cancelled mid-flight = 16895 B / 35 allocs. Delta =
+    **1272 B / 17 allocations** for the cancelled query, with `on_done` observed
+    firing. So `QueryState` / `query::Query` still outlive teardown even though
+    the completion lambda ran — the ownership problem in `query_free`'s
+    "`state` may still be alive via lambda ref, which is fine" comment is
+    genuine; the reasoning about *why* was not.
+  - Fix: give `query_free` real ownership (or drop the query's self-reference
+    once done). Do NOT "fix" it by firing `on_done` on cancel — that already
+    happens, and adding a second fire would break the fires-exactly-once
+    contract. Re-run the full 716-test lane after.
+  - Repro note: measure with stdout UNBUFFERED. `DHT_LOG` writes to stderr
+    unbuffered while `printf` is block-buffered when piped, which interleaves
+    the transcript misleadingly and can make a callback look like it never ran.
 
 - [ ] **TD2 — every DHT orphans a stopped-but-unclosed `uv_timer_t`.** The
   interface-watcher timer (`HyperDHT::start_interface_watcher`) is stopped but
@@ -338,6 +355,10 @@ network change) — there they accumulate. holesail-cpp scopes them in its
   works around it by `uv_walk`-closing the orphan before `uv_loop_close()`
   (`drain_and_close()` in its `src/cli.cpp`); that workaround should become
   unnecessary.
+  **INDEPENDENTLY RE-CONFIRMED 2026-07-29** (separate repro, hyperdht-cpp only):
+  after `hyperdht_destroy` + full drain, `uv_walk` reports exactly one leftover
+  handle — `type=timer active=0 closing=0 has_ref=1`, matching the description
+  verbatim — and `uv_loop_close()` returns `-16 (EBUSY)`. This one is solid.
 
 - [ ] **TD3 — in-flight connect/stream state dropped when `hyperdht_destroy`
   beats a graceful close round-trip.** Frames: `HyperDHT::do_connect`,

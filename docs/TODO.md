@@ -553,6 +553,25 @@ paths — full write-up in `docs/LIBUV-VERSION.md`; unwired fallback patch in
 
 ## H. Future work
 
+- [ ] **Extract `run_round1()` into named phases** (`src/holepunch.cpp`) — the
+  single worst readability hot spot: **457 lines**, 9× the 50-line guideline.
+  Split into `probe_round` → `await_sampling` → `analyze_and_maybe_reopen` →
+  `round2`, each taking `PunchState`. **Do it WITH the Finding K fix, not as
+  separate churn** — the `proceed` lambda, the sampling gate and the reopen
+  path all live in one function body today, which is precisely why K (a
+  mid-flight `pool_fw` read that contradicts its own comment) is subtle
+  instead of obvious.
+  Scope discipline — a 2026-07-29 measurement says the library is NOT spaghetti
+  otherwise, so do NOT generalise this into a broad refactor: coupling is low
+  (most `src/*.cpp` include 3-5 hyperdht headers; only `dht.hpp` at 12, the
+  facade), code density is ~340 lines/file across 36 files (the ~20.4k raw
+  `src/` total is 27% comments, and those JS `file:line` parity refs are what
+  made Findings H/I/J root-causable by reading). `holepunch.cpp` carries 36
+  lambdas (server 23, connect 19, rpc 17) — the cost of "every JS `await`
+  becomes a callback chain". Coroutines would flatten it but are a large change
+  and hostile to the ESP32 target: rejected. NOTE: raw indentation hits 56
+  columns in holepunch.cpp but that is WRAPPED ARGUMENTS, not nesting — true
+  control-flow nesting at depth >=5 is 19 lines there, 8 in connect.
 - [ ] **Round-2 adversarial JS-parity sweep** — re-run `jsparity-adversarial-sweep`
   over the round-1 blind spots (Section F) + a re-diff of the subsystems changed
   heavily this session (rpc, connect, server, holepunch, protomux) to catch

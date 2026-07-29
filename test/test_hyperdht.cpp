@@ -16,6 +16,7 @@
 #include "hyperdht/hyperdht.h"
 #include "hyperdht/rpc.hpp"
 #include "hyperdht/secret_stream.hpp"
+#include "hyperdht/udx.hpp"
 
 using namespace hyperdht;
 
@@ -1954,6 +1955,61 @@ TEST(HyperDHT, ValidatedLocalAddressesPopulatedAtBind) {
             << "validated local address port " << addr.port
             << " does not match the bound RpcSocket port " << dht.port();
     }
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// Finding J — never call udx_stream_destroy() on a stream whose teardown is
+// already in flight.
+//
+// libudx guards udx_stream_destroy() on UDX_STREAM_CLOSED but not on
+// UDX_STREAM_DESTROYING (deps/libudx/src/udx.c:2709). On the slow send path
+// (uv_udp_try_send -> UV_EAGAIN) close_stream_internal() is deferred to the
+// send completion, so the stream sits DESTROYING-but-not-CLOSED for a loop
+// turn. A second destroy in that window runs close_stream_internal() twice,
+// which uv_close()s the stream's timers twice and trips libuv's
+// assert(!uv__is_closing(handle)) -- the field SIGABRT in ~ConnState teardown.
+//
+// The window is timing-dependent (it needs a full socket send buffer), so the
+// test drives the state directly: set DESTROYING, then assert our teardown
+// helper declines to re-enter libudx. Without the guard it would call
+// udx_stream_destroy() and abort the process.
+// ---------------------------------------------------------------------------
+
+TEST(HyperDHT, DestroyStreamOnceSkipsStreamAlreadyBeingDestroyed) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);
+    ASSERT_EQ(dht.bind(), 0);
+
+    udx_stream_t* s = dht.create_raw_stream();
+    ASSERT_NE(s, nullptr);
+
+    // Fresh stream: teardown must actually run.
+    EXPECT_FALSE(s->status & (UDX_STREAM_DESTROYING | UDX_STREAM_CLOSED));
+
+    // Simulate "destroy already in flight" — exactly the state libudx leaves
+    // behind while a destroy packet is queued on the slow send path.
+    s->status |= UDX_STREAM_DESTROYING;
+    EXPECT_FALSE(udx::destroy_stream_once(s))
+        << "must NOT re-enter udx_stream_destroy() on a DESTROYING stream — "
+           "that runs close_stream_internal() twice and aborts in libuv";
+
+    // A CLOSED stream must be skipped too.
+    s->status = static_cast<uint32_t>(s->status & ~UDX_STREAM_DESTROYING);
+    s->status |= UDX_STREAM_CLOSED;
+    EXPECT_FALSE(udx::destroy_stream_once(s));
+
+    // Restore a clean state and let the real teardown run, so the stream's
+    // finalize callback frees it and the loop can close.
+    s->status = static_cast<uint32_t>(
+        s->status & ~(UDX_STREAM_DESTROYING | UDX_STREAM_CLOSED));
+    EXPECT_TRUE(udx::destroy_stream_once(s))
+        << "a live stream must still be destroyed";
 
     dht.destroy();
     uv_run(&loop, UV_RUN_DEFAULT);

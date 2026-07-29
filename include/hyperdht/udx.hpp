@@ -110,4 +110,36 @@ class UdxStream {
     udx_stream_t handle_{};
 };
 
+// ---------------------------------------------------------------------------
+// destroy_stream_once — tear down a raw stream we own, tolerating a teardown
+// that is already under way. Returns true if a destroy was actually issued.
+//
+// `udx_stream_destroy()` guards on UDX_STREAM_CLOSED but NEVER on
+// UDX_STREAM_DESTROYING (deps/libudx/src/udx.c:2709-2720). Those are not the
+// same window. On the slow send path — `uv_udp_try_send` returns UV_EAGAIN, so
+// the destroy packet goes out via `uv_udp_send` — `close_stream_internal()` is
+// deferred to that send's completion callback, leaving the stream
+// DESTROYING-but-not-CLOSED (and still CONNECTED) for a full loop turn.
+//
+// A second `udx_stream_destroy()` inside that window walks straight past the
+// CLOSED guard, queues a SECOND destroy packet, and ends with
+// `close_stream_internal()` running twice. That function `uv_close()`s the
+// stream's five timers, so the second run closes already-closing handles and
+// trips libuv's `assert(!uv__is_closing(handle))`. Its own
+// `assert(CLOSED == 0)` does not catch it: asserts are compiled out in Release,
+// which is exactly where the field crash was seen (Finding J — SIGABRT in
+// ~ConnState teardown on the connect failure path).
+//
+// Skipping is always semantically correct: a stream that is already
+// DESTROYING or CLOSED is on its way out and will free itself through its
+// finalize callback.
+inline bool destroy_stream_once(udx_stream_t* stream) {
+    if (stream == nullptr) return false;
+    if (stream->status & (UDX_STREAM_DESTROYING | UDX_STREAM_CLOSED)) {
+        return false;
+    }
+    udx_stream_destroy(stream);
+    return true;
+}
+
 }  // namespace hyperdht::udx

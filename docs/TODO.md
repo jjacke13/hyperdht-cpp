@@ -11,6 +11,11 @@ Last updated: 2026-07-29.
 
 ## Status snapshot
 
+- **2026-07-29 (later)**: field Finding J FIXED — `udx_stream_destroy` has no
+  `UDX_STREAM_DESTROYING` guard, so a second destroy inside the deferred-close
+  window ran `close_stream_internal()` twice and aborted in libuv. Now guarded
+  by `udx::destroy_stream_once()`. Reproduced standalone and fixed; 719/719.
+  Surfaced a separate pre-existing UAF in `protomux.cpp:242` (logged below).
 - **2026-07-29**: field Finding I FIXED — the advertised local-address list was
   a bind-time snapshot, permanently breaking same-LAN connects (`-6`) after any
   interface change; now re-enumerated live per advertisement
@@ -192,13 +197,48 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   `validate_local_addresses()` or it resurrects `exclude_local_address()`'d
   hosts, which nospoon relies on to hide its TUN address). 718/718,
   cpp-reviewer SHIP, ASAN clean.
-- [ ] **Finding J (HIGH — hard crash)** — `uv_close` double-close abort in
-  `~ConnState` teardown: `udx_stream_destroy` on a handle already closing.
-  The teardown runs INSIDE a `uv_close` callback (`RpcSocket::destroy_request`)
-  when the last `ConnState` ref is dropped by the destruction of the handshake
-  continuation lambdas. 4 occurrences 2026-07-25..27 on the connect FAILURE
-  path. Needs an already-closing guard, or ordering that never drops the last
-  ref from inside a close callback. Reproducible via repeated connect failures.
+- [x] **Finding J (HIGH — hard crash)** — DONE 2026-07-29. `uv_close`
+  double-close abort in `~ConnState` teardown. ROOT CAUSE: `udx_stream_destroy`
+  (deps/libudx/src/udx.c:2709) guards on `UDX_STREAM_CLOSED` but NEVER on
+  `UDX_STREAM_DESTROYING`. On the slow send path (`uv_udp_try_send` →
+  `UV_EAGAIN`, which happens whenever ANY other send is queued on that socket —
+  common on the busy shared DHT-RPC socket) `close_stream_internal()` is
+  deferred to the send completion, leaving the stream DESTROYING-but-not-CLOSED
+  and still CONNECTED for a loop turn. A second destroy in that window queues a
+  second destroy packet and runs `close_stream_internal()` TWICE, which
+  `uv_close()`s the stream's 5 timers twice → libuv
+  `assert(!uv__is_closing(handle))`. libudx's own `assert(CLOSED == 0)` is
+  compiled out in Release — exactly where the field crash was seen.
+  Fix: `hyperdht::udx::destroy_stream_once()` (include/hyperdht/udx.hpp) skips
+  when `DESTROYING|CLOSED`; applied to `~ConnState` and `ServerConnection`'s
+  dtor + `operator=`. Skipping is always correct — such a stream already
+  finalizes itself. INDEPENDENTLY REPRODUCED by cpp-reviewer with a standalone
+  program against the vendored libudx (forced `UV_EAGAIN`, double destroy →
+  assert in Debug, SIGSEGV in Release; guarded → clean, `finalize_count == 1`).
+  Test `DestroyStreamOnceSkipsStreamAlreadyBeingDestroyed` (red-checked).
+  719/719, cpp-reviewer SHIP.
+  NOTE: `blind_relay.cpp`'s destroy sites are NOT exposed — for a `relayed`
+  stream `udx_stream_destroy` calls `close_stream_internal` synchronously in
+  one call (upstream `fa576bd` made it so deliberately), so there is no window.
+- [ ] **Finding J follow-up** — convert `SecretStreamDuplex::destroy()`
+  (src/secret_stream.cpp:666) to the same guard. It owns the live,
+  post-handshake application stream — the one most likely to have traffic
+  queued at teardown, so the `UV_EAGAIN` window is most plausible there. NOT
+  done with the main fix because that call is load-bearing for control flow
+  (the destroy is what triggers `on_udx_close` → `fire_close`), so skipping it
+  needs a deliberate decision about who fires the close notification and when;
+  a careless change hangs the duplex. No second owner is currently reachable
+  (`relay_upgrade` never destroys; `ffi_stream.cpp:56,125` run before a Duplex
+  exists), so this is hardening, not a known live bug.
+- [ ] **protomux UAF (NEW, found 2026-07-29 by cpp-reviewer under ASAN)** —
+  heap-use-after-free at `src/protomux.cpp:242` in `Channel::open()`, hit by
+  `Protomux.PairNotifyPerProtocol`, `Protomux.UnpairStopsNotify`,
+  `Protomux.PairFallsBackToGlobal`, `ProtomuxParity.AsymmetricIdDataRoundTrip`.
+  Pre-existing (file last touched in `5460cfa`), unrelated to the Finding J
+  diff. Likely synchronous loopback reentrancy: `Mux::write_frame` → `on_data`
+  → `dispatch_frame` frees/replaces the `Channel` while `open()` still uses
+  `this`. Note protomux was also one of the two subsystems left UNVERIFIED by
+  the 2026-07-26 parity re-verification — worth pairing the two.
 - [ ] **Finding K** — the pool-NAT sampling gate does not hold: `pool_fw` is
   read mid-flight at holepunch.cpp:1758, while the comment at
   holepunch.cpp:1777-1779 asserts sampling has completed by then. Field log

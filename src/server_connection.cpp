@@ -32,6 +32,7 @@
 #include <cstring>
 
 #include "hyperdht/dht_messages.hpp"
+#include "hyperdht/udx.hpp"
 
 namespace hyperdht {
 namespace server_connection {
@@ -41,7 +42,9 @@ ServerConnection::~ServerConnection() {
         // Null the RawStreamCtx pointer so the on_close callback doesn't
         // dereference a dangling Server* after the Server is destroyed.
         raw_stream->data = nullptr;
-        udx_stream_destroy(raw_stream);
+        // Same hazard as ~ConnState (Finding J): re-destroying a stream whose
+        // teardown is already in flight aborts the process.
+        udx::destroy_stream_once(raw_stream);
         // The finalize callback (set during init) will delete the memory
         raw_stream = nullptr;
     }
@@ -70,7 +73,7 @@ ServerConnection::ServerConnection(ServerConnection&& other) noexcept
 
 ServerConnection& ServerConnection::operator=(ServerConnection&& other) noexcept {
     if (this != &other) {
-        if (raw_stream) udx_stream_destroy(raw_stream);
+        if (raw_stream) udx::destroy_stream_once(raw_stream);
         id = other.id;
         round = other.round;
         tx_key = other.tx_key;

@@ -19,6 +19,7 @@
 #include "hyperdht/protomux.hpp"
 #include "hyperdht/relay_upgrade.hpp"
 #include "hyperdht/secret_stream.hpp"
+#include "hyperdht/udx.hpp"
 
 // Context stored in client rawStream->data during handshake->connection window.
 // Matches JS: rawStream created at connect() time with firewall callback.
@@ -143,9 +144,14 @@ struct ConnState {
     ~ConnState() {
         // Clean up rawStream if not transferred to ConnectResult.
         // Context is freed by the stream's on_close callback (RAII).
-        if (raw_stream) {
-            udx_stream_destroy(raw_stream);
-        }
+        //
+        // Finding J: this runs from inside a `uv_close` callback whenever the
+        // last ConnState reference is dropped by the destruction of the
+        // handshake continuation lambdas (RpcSocket::destroy_request). If a
+        // teardown of this stream is already in flight, a second
+        // udx_stream_destroy() aborts the process — see destroy_stream_once().
+        udx::destroy_stream_once(raw_stream);
+        raw_stream = nullptr;
         // Relay cleanup is handled by RelayState's destructor
         relay.reset();
     }

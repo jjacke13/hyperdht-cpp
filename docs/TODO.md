@@ -5,12 +5,28 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-07-30.
+Last updated: 2026-07-31.
 
 ---
 
 ## Status snapshot
 
+- **2026-07-31**: **announcer relay-set freeze FIXED** (`6ef85e6` gate split +
+  `82d3c55` per-cycle rebuild, LOCAL, NOT PUSHED). The published relay set was
+  write-once — the ANNOUNCE callback could only refresh an entry it already had
+  or append while under PICK_BEST, and `active_relays_` was otherwise cleared
+  only on stop — so a dead or third-party-unreachable relay was advertised for
+  the life of the process and no healthier node could replace it. That is the
+  mechanism behind every "a restart fixed it" in the field handoff. JS rebuilds
+  per `_update` (announcer.js:172,188). Fix = stage into `cycle_relays_`, swap
+  in `maybe_publish()` guarded against empty; prerequisite gate split so a
+  client holding a previous-generation record still gets a holepunch token
+  (JS unions three `_serverRelays` generations, announcer.js:38-42). Also fixed
+  a pre-existing bug found while tracing: `start()` never re-armed the `alive_`
+  sentinel `stop_impl()` clears, so a **suspended-then-resumed server never
+  re-announced again**. 730/730, ASAN clean, cpp-reviewer SHIP on both.
+  Six tests, all red-checked; the guard is
+  `IsRelayStillAcceptsPreviousGenerationAddress`.
 - **2026-07-30 (later)**: field **Finding M FIXED** — Round 1 now fails over to
   the remaining announce relays instead of treating one dead relay as terminal.
   Deliberately beyond-JS (it is the fix JS's own TODO asks for), capped at
@@ -323,6 +339,44 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   `peer_address` and its own server-maintained session.
   Operational note: nothing client-side recovers; the server must re-announce
   (restart) to draw a fresh relay set.
+
+### Finding O (2026-07-30 handoff) — audited 2026-07-31, mechanism REFRAMED
+- [x] **The real defect was the announcer relay-set FREEZE** — fixed
+  2026-07-31 (`6ef85e6`, `82d3c55`; see the status snapshot). A bad relay roll
+  persisted for the process lifetime because nothing could ever replace it,
+  which is why restarting the server "fixed" it. The controlled A/B in the
+  handoff (run 1: three slots on one symmetric-NAT host, total failure; run 2
+  after restart: three distinct hosts, instant success) is explained by the
+  re-roll, not by diversity per se.
+- [ ] **Host diversity itself — OPEN, and NOT a parity bug.** The audit
+  (2026-07-31 workflow) refuted the parity framing: JS `pickBest` is
+  `replies.slice(0, 3)` (announcer.js:298-301) with no host notion either, so
+  stock JS has the identical gap. Any distinct-host constraint on the announce
+  commit is a deliberate BEYOND-JS hardening change. Hold until the rebuild has
+  field time: the freeze made every bad roll permanent, so re-measure how often
+  a single-host set actually recurs before adding a constraint that could
+  reduce availability in small/clustered DHT regions. Note the premise is also
+  unexplained — `id = BLAKE2b(host, port)` makes each mapping an independent
+  random point, so three mappings of one host being the global closest-3 is
+  suspicious in itself; if it recurs, suspect the selection/sort, not diversity.
+- [ ] **Router forward cache has no TTL and no size cap (HIGH, from the
+  completeness critic).** `src/router.cpp` uses a plain `unordered_map` erased
+  only on explicit unset; JS uses `new Cache(opts.forwards)` with maxSize 65536
+  / maxAge 20 min (router.js:23, index.js:594-595). Any remote ANNOUNCE inserts
+  an attacker-keyed entry: unbounded memory from an unauthenticated wire
+  message, AND stale forwards that keep relaying toward a dead peer forever —
+  i.e. a hyperdht-cpp node is itself one of the silently-dead relays that
+  Finding M has to fail over. Test: insert 100k targets, assert size <= 65536;
+  insert one, advance 21 min, assert `get()` == nullptr. Both fail today.
+- [ ] **Per-cycle UNANNOUNCE not ported** (announcer.js:191-196). Deliberate:
+  C++ reuses the commit-time token, which the receiver rejects after ~15s
+  (rpc_handlers.cpp:819-821), so it would emit provably-rejected datagrams and
+  any test would pass vacuously. Port JS's 2-RTT `_unannounce` (FIND_PEER for a
+  fresh token, announcer.js:205-238) first; until then the existing stop-time
+  UNANNOUNCE is also a placebo.
+- [ ] **`refresh()` has no `_refreshing` latch** (announcer.cpp vs
+  announcer.js:76-79) — a health/drift refresh landing mid-cycle is dropped,
+  costing <=5s until the next ping tick. Low.
 
 ### nat-sampler / punch payload (from the 2026-07-22 field diagnosis; see
 ### docs/FIELD-DIAGNOSIS-2026-07-22.md "Finding B" + "Finding E")

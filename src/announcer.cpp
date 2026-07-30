@@ -157,6 +157,7 @@ void Announcer::stop_impl(bool send_unannounce) {
         }
     }
     active_relays_.clear();
+    cycle_relays_.clear();
     relays_.clear();
 }
 
@@ -175,13 +176,17 @@ void Announcer::notify_online() {
         DHT_LOG("  [announcer] notify_online: ignored (not running)\n");
         return;
     }
-    DHT_LOG("  [announcer] notify_online: triggering update cycle "
-            "(clear active_relays_)\n");
-    // Clear stale relay entries so the next cycle rebuilds them with
-    // fresh peer_addr from the current active_socket() (e.g. after
-    // the persistent transition switches from client to server socket).
-    active_relays_.clear();
-    relays_.clear();
+    DHT_LOG("  [announcer] notify_online: triggering update cycle\n");
+    // Deliberately does NOT clear the published set. It used to, so that the
+    // next cycle would rebuild peer_addr from the current active_socket()
+    // after a persistent transition — but every cycle rebuilds it now, so the
+    // clear bought nothing and cost a window (a walk long) in which we
+    // advertise no relays at all: JS `online.notify()` (announcer.js:52,91)
+    // only wakes the background loop and touches no relay state. The stale
+    // peer_addr survives for those few seconds, which is strictly better than
+    // an empty list — relay_address is unaffected by our NAT, and round 2
+    // re-derives our address from live NAT samples anyway.
+    //
     // Cancel the in-flight cycle so update() isn't blocked by the
     // updating_ guard. Bump cycle_gen_ FIRST: every late callback from
     // the pre-transition cycle (find_peer on_reply/on_done, ANNOUNCE
@@ -275,13 +280,20 @@ void Announcer::on_ping_timer(uv_timer_t* timer) {
 void Announcer::ping_relays() {
     if (active_relays_.empty()) return;
 
+    // Iterate a snapshot, not the live vector. The health branch below calls
+    // refresh() → update() → dht_ops::find_peer, which starts the query
+    // synchronously; a walk that completes without anything in flight fires
+    // on_done in that same frame, reaching maybe_publish() — which now
+    // move-assigns active_relays_ out from under this loop.
+    const std::vector<RelayNode> targets = active_relays_;
+
     // Track how many relays respond. Shared counter freed when all callbacks complete.
     auto active_count = std::make_shared<int>(0);
-    auto total = static_cast<int>(active_relays_.size());
+    auto total = static_cast<int>(targets.size());
     auto pending = std::make_shared<int>(total);
 
     auto weak = std::weak_ptr<bool>(alive_);  // C7: sentinel
-    for (const auto& relay : active_relays_) {
+    for (const auto& relay : targets) {
         messages::Request req;
         req.to.addr = relay.addr;
         req.command = messages::CMD_PING;
@@ -392,6 +404,10 @@ void Announcer::update() {
     const uint64_t gen = ++cycle_gen_;
     pending_commits_ = 0;
     cycle_commits_total_ = 0;
+    // Stage this cycle's acks separately; the live set stays untouched until
+    // the cycle settles. JS builds a fresh `const relays = []` per _update
+    // (announcer.js:172) rather than mutating this.relays in place.
+    cycle_relays_.clear();
     cycle_started_ms_ = uv_now(socket_.loop());  // stuck-cycle watchdog epoch
     query_done_ = false;
 
@@ -450,9 +466,31 @@ void Announcer::commit_settled() {
 // AND `await Promise.allSettled(ann)` (announcer.js:184-189).
 void Announcer::maybe_publish() {
     if (!query_done_ || pending_commits_ != 0) return;
-    DHT_LOG("  [announcer] cycle settled (%d commits) — publishing relays\n",
-            cycle_commits_total_);
-    if (running_) build_relays();
+
+    if (running_) {
+        if (!cycle_relays_.empty()) {
+            DHT_LOG("  [announcer] cycle settled (%d commits) — publishing %zu "
+                    "relays (was %zu, gate=%zu)\n",
+                    cycle_commits_total_, cycle_relays_.size(),
+                    active_relays_.size(), gate_.size());
+            active_relays_ = std::move(cycle_relays_);
+            build_relays();
+        } else {
+            // Deliberate divergence: JS assigns `this.relays = relays` even
+            // when the walk committed to nothing (announcer.js:188). We keep
+            // the previous set instead. An empty list here would strip the
+            // holepunch info from every handshake reply — sending clients down
+            // the "no holepunch info → direct connect" path at a NAT'd address
+            // — and would make ping_relays() return early, stopping keepalive,
+            // drift detection and the health check. Stale relays beat none:
+            // the client can fail over between them, and the next cycle
+            // (bg_timer_, or the health refresh) will replace them.
+            DHT_LOG("  [announcer] cycle committed 0 relays — retaining "
+                    "previous published set (%zu)\n", active_relays_.size());
+        }
+    }
+
+    cycle_relays_.clear();  // moved-from vectors are valid but unspecified
     updating_ = false;
 }
 
@@ -530,17 +568,11 @@ void Announcer::commit(const query::QueryReply& node, uint64_t gen) {
             // different relays may see us on different ports.
             relay.peer_addr = resp.from.addr;
 
-            // Check if we already have this relay
-            bool updated = false;
-            for (auto& existing : active_relays_) {
-                if (existing.addr == relay.addr) {
-                    existing = relay;  // Update token + peer_addr
-                    updated = true;
-                    break;
-                }
-            }
-            if (!updated && active_relays_.size() < PICK_BEST) {
-                active_relays_.push_back(relay);
+            // Stage it. Bounded by PICK_BEST because that is how many nodes
+            // on_done commits to; no dedup scan is needed because a cycle
+            // never commits to the same node twice.
+            if (cycle_relays_.size() < PICK_BEST) {
+                cycle_relays_.push_back(relay);
             }
 
             // Open the token gate for this node the moment it acks, not when

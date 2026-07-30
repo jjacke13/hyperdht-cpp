@@ -130,13 +130,72 @@ std::array<uint8_t, 32> make_target(const noise::Keypair& kp) {
     return target;
 }
 
-// A cycle is over when it is no longer updating and the generation counter has
-// reached `gen`. `!relays().empty()` stops discriminating after cycle 1.
-std::function<bool()> settled_at(const Announcer& ann, uint64_t gen) {
-    return [&ann, gen] {
-        return !ann.is_updating_for_test() && ann.cycle_gen_for_test() >= gen;
-    };
-}
+// Loop + fake DHT + announcer, torn down in the right order no matter how the
+// test exits. Needed because a failing ASSERT_* returns from the test body
+// immediately: with hand-written teardown at the bottom, the first failure
+// leaves the loop full of live handles and uv_loop_close() wedges the binary.
+struct Fixture {
+    uv_loop_t loop{};
+    std::vector<std::unique_ptr<FakeNode>> nodes;
+    std::unique_ptr<rpc::RpcSocket> client;
+    noise::Keypair kp;
+    std::unique_ptr<Announcer> ann;
+
+    explicit Fixture(int node_count) {
+        uv_loop_init(&loop);
+        for (int i = 0; i < node_count; ++i) {
+            nodes.push_back(std::make_unique<FakeNode>(
+                &loop, static_cast<uint8_t>(0x11 + i)));
+        }
+        routing::NodeId cid{};
+        cid.fill(0x22);
+        client = std::make_unique<rpc::RpcSocket>(&loop, cid);
+        client->bind(0);
+        for (auto& n : nodes) seed_table(*client, *n);
+        kp = make_keypair(0x42);
+        ann = std::make_unique<Announcer>(*client, kp, make_target(kp));
+    }
+
+    ~Fixture() {
+        if (ann) ann->stop_without_unannounce();
+        for (auto& n : nodes) n->sock.close();
+        if (client) client->close();
+        uv_run(&loop, UV_RUN_DEFAULT);
+        uv_loop_close(&loop);
+    }
+
+    Fixture(const Fixture&) = delete;
+    Fixture& operator=(const Fixture&) = delete;
+
+    // A cycle is over when it is no longer updating and the generation counter
+    // has reached `gen`. `!relays().empty()` stops discriminating after the
+    // first cycle publishes.
+    bool settled_at(uint64_t gen, uint64_t max_ms = 5000) {
+        return run_until(&loop,
+                         [this, gen] {
+                             return !ann->is_updating_for_test() &&
+                                    ann->cycle_gen_for_test() >= gen;
+                         },
+                         max_ms);
+    }
+
+    // Addresses currently advertised on the wire.
+    std::vector<compact::Ipv4Address> published() const {
+        std::vector<compact::Ipv4Address> out;
+        for (const auto& ri : ann->relays()) out.push_back(ri.relay_address);
+        return out;
+    }
+
+    // Drop these nodes out of the walk: an errored FIND_PEER never reaches
+    // push_closest (query.cpp:377,403), so they leave pickBest next cycle.
+    void fail_walk_for(const std::vector<compact::Ipv4Address>& addrs) {
+        for (auto& n : nodes) {
+            for (const auto& a : addrs) {
+                if (n->addr == a) n->reply_error = true;
+            }
+        }
+    }
+};
 
 bool contains_addr(const std::vector<peer_connect::RelayInfo>& relays,
                    const compact::Ipv4Address& addr) {
@@ -149,96 +208,165 @@ bool contains_addr(const std::vector<peer_connect::RelayInfo>& relays,
 }  // namespace
 
 // ============================================================================
-// The token gate must accept a node that acked our ANNOUNCE even when it is
-// absent from the published list.
+// The published set must follow this cycle's commits.
 //
-// This is the leniency JS gets from unioning three _serverRelays generations
-// (announcer.js:38-42). Without it a client relaying through a record holder
-// from an earlier cycle is refused a holepunch token, and its round 1 comes
-// back tokenless — the exact failure the server.cpp gate comment warns about.
+// It used to be write-once: the commit path could refresh an entry it already
+// had, or append while under PICK_BEST, so once three slots were taken the set
+// was pinned for the life of the process. A relay that died — or that was
+// never reachable from third parties, e.g. behind a symmetric NAT — was
+// advertised to every client forever, and no healthier node could replace it.
+// Restarting the server was the only cure, which is exactly what the field
+// kept observing. JS assigns a freshly built list every cycle
+// (announcer.js:172,188).
 // ============================================================================
-TEST(AnnouncerRelays, IsRelayAcceptsAckedNodeMissingFromPublishedList) {
-    uv_loop_t loop;
-    uv_loop_init(&loop);
+TEST(AnnouncerRelays, PublishedListFollowsCommitSetAcrossCycles) {
+    Fixture f(6);
 
-    // Group A answers first; group B takes over once A starts erroring.
-    std::vector<std::unique_ptr<FakeNode>> nodes;
-    for (uint8_t i = 0; i < 6; ++i) {
-        nodes.push_back(
-            std::make_unique<FakeNode>(&loop, static_cast<uint8_t>(0x11 + i)));
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+
+    const auto gen1 = f.published();
+    ASSERT_EQ(gen1.size(), announcer::PICK_BEST);
+
+    f.fail_walk_for(gen1);
+    f.ann->refresh();
+    ASSERT_TRUE(f.settled_at(2));
+
+    ASSERT_EQ(f.ann->relays().size(), announcer::PICK_BEST)
+        << "cycle 2 must publish a full set from the surviving nodes";
+    for (const auto& old : gen1) {
+        EXPECT_FALSE(contains_addr(f.ann->relays(), old))
+            << "a node that dropped out of the walk is still being advertised "
+               "— the published set is frozen";
+    }
+}
+
+// ============================================================================
+// THE REGRESSION GUARD for the rebuild above.
+//
+// Rebuilding the published set is only safe because the token gate is wider
+// than it: a client that fetched our record during generation 1 is still
+// relaying its holepunch through a generation-1 node, and must still be given
+// a token. Point the gate at the published list instead — the obvious "fix" —
+// and every rebuild test in this file still passes while this one fails,
+// because the rebuild would then have made the gate one generation deep where
+// JS unions three (announcer.js:38-42). Verified: with the gate lookup
+// disabled, the four rebuild tests stay green and only this and the gate-TTL
+// test go red.
+// ============================================================================
+TEST(AnnouncerRelays, IsRelayStillAcceptsPreviousGenerationAddress) {
+    Fixture f(6);
+
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+
+    const auto gen1 = f.published();
+    ASSERT_FALSE(gen1.empty()) << "cycle 1 published nothing";
+
+    f.fail_walk_for(gen1);
+    f.ann->refresh();
+    ASSERT_TRUE(f.settled_at(2));
+
+    // Generation 1 is off the wire …
+    for (const auto& old : gen1) {
+        ASSERT_FALSE(contains_addr(f.ann->relays(), old))
+            << "precondition: cycle 2 must have replaced the published set";
     }
 
-    routing::NodeId cid{};
-    cid.fill(0x22);
-    rpc::RpcSocket client(&loop, cid);
-    client.bind(0);
-    for (auto& n : nodes) seed_table(client, *n);
-
-    auto kp = make_keypair(0x42);
-    auto target = make_target(kp);
-    Announcer ann(client, kp, target);
-
-    ann.start();
-    ASSERT_TRUE(run_until(&loop, settled_at(ann, 1), 5000))
-        << "first announce cycle never settled";
-
-    // Whoever got the record in cycle 1 is what we advertise now.
-    std::vector<compact::Ipv4Address> published;
-    for (const auto& ri : ann.relays()) published.push_back(ri.relay_address);
-    ASSERT_FALSE(published.empty()) << "cycle 1 published nothing";
-
-    // Knock the published set out of the walk; the remaining nodes must take
-    // over the commits in cycle 2.
-    for (auto& n : nodes) {
-        for (const auto& p : published) {
-            if (n->addr == p) n->reply_error = true;
-        }
+    // … but a client that fetched our record during generation 1 is still
+    // relaying through those nodes, and must still be served a token.
+    for (const auto& old : gen1) {
+        EXPECT_TRUE(f.ann->is_relay(old))
+            << "a previous-generation relay was refused: any client holding a "
+               "record from that cycle now fails its holepunch round 1";
     }
 
-    const int announces_before = [&] {
-        int t = 0;
-        for (auto& n : nodes) t += n->announce_count;
-        return t;
-    }();
-
-    ann.refresh();
-    ASSERT_TRUE(run_until(&loop, settled_at(ann, 2), 5000))
-        << "second announce cycle never settled";
-
-    // Someone new acked in cycle 2 …
-    std::vector<compact::Ipv4Address> newly_acked;
-    for (auto& n : nodes) {
-        if (n->reply_error) continue;
-        if (n->announce_count > 0) newly_acked.push_back(n->addr);
-    }
-    int announces_after = 0;
-    for (auto& n : nodes) announces_after += n->announce_count;
-    ASSERT_GT(announces_after, announces_before)
-        << "cycle 2 committed to nobody — the flip did not take";
-    ASSERT_FALSE(newly_acked.empty());
-
-    // … and the gate must accept them, whether or not they made the wire list.
-    for (const auto& a : newly_acked) {
-        EXPECT_TRUE(ann.is_relay(a))
-            << "a node that acked our ANNOUNCE is a legitimate relay for any "
-               "client holding the record it just stored";
-    }
-
-    // Property: the gate can never be narrower than what we advertise.
-    for (const auto& ri : ann.relays()) {
-        EXPECT_TRUE(ann.is_relay(ri.relay_address))
+    // The gate can never be narrower than what we advertise.
+    for (const auto& ri : f.ann->relays()) {
+        EXPECT_TRUE(f.ann->is_relay(ri.relay_address))
             << "is_relay rejected a relay we are advertising";
     }
 
     // An address that never acked anything is still refused.
-    EXPECT_FALSE(
-        ann.is_relay(compact::Ipv4Address::from_string("203.0.113.7", 5555)));
+    EXPECT_FALSE(f.ann->is_relay(
+        compact::Ipv4Address::from_string("203.0.113.7", 5555)));
+}
 
-    ann.stop_without_unannounce();
-    for (auto& n : nodes) n->sock.close();
-    client.close();
-    uv_run(&loop, UV_RUN_DEFAULT);
-    uv_loop_close(&loop);
+// ============================================================================
+// A cycle that commits to nobody must NOT publish an empty list.
+//
+// Deliberate divergence from JS, which assigns `this.relays = relays` freely
+// even when the walk found nothing (announcer.js:188). JS survives that; we do
+// not. An empty relay list makes the handshake reply carry no holepunch info,
+// which sends the client down its "no holepunch info -> direct connect" path
+// straight at a NAT'd address, and it makes ping_relays() return early so the
+// keepalive, drift detection and health checks all stop. Keeping the previous
+// set means we advertise possibly-stale relays during an outage, which is
+// strictly better than advertising none — and the client has relay failover.
+// ============================================================================
+TEST(AnnouncerRelays, AllFailCycleKeepsPublishedList) {
+    Fixture f(4);
+
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+
+    const auto gen1 = f.published();
+    ASSERT_FALSE(gen1.empty());
+
+    // Total DHT outage: nobody answers the walk.
+    for (auto& n : f.nodes) n->reply_error = true;
+
+    f.ann->refresh();
+    ASSERT_TRUE(f.settled_at(2));
+
+    EXPECT_EQ(f.ann->relays().size(), gen1.size())
+        << "an all-fail cycle must retain the previous published set";
+    for (const auto& old : gen1) {
+        EXPECT_TRUE(contains_addr(f.ann->relays(), old));
+        EXPECT_TRUE(f.ann->is_relay(old));
+    }
+}
+
+// ============================================================================
+// A relay that leaves the walk must leave the published set — which is what
+// stops the relay-health check from re-walking forever.
+//
+// ping_relays() refreshes when fewer than min(total, MIN_ACTIVE) relays pong.
+// With the set frozen at three, a single dead relay pinned `total` at 3 and
+// made that condition true on every 5s tick for the rest of the process: a
+// permanent re-walk. Once the set rebuilds, the corpse drops out, `total`
+// becomes 2, and 2 of 2 responding satisfies min(2, 3). Same arithmetic as JS
+// (announcer.js:119-121); no separate eviction rule needed.
+// ============================================================================
+TEST(AnnouncerRelays, DeadRelayLeavesPublishedSetAndStopsRefreshStorm) {
+    Fixture f(3);
+
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    ASSERT_EQ(f.ann->relays().size(), 3u);
+
+    // One relay dies completely: no pong, and gone from the walk.
+    const auto corpse = f.nodes[0]->addr;
+    f.nodes[0]->silent_ping = true;
+    f.nodes[0]->reply_error = true;
+
+    f.ann->refresh();
+    ASSERT_TRUE(f.settled_at(2));
+
+    EXPECT_FALSE(contains_addr(f.ann->relays(), corpse))
+        << "a dead relay must not be advertised after the next cycle";
+    ASSERT_EQ(f.ann->relays().size(), 2u);
+
+    // With the corpse gone the health check is satisfied by the survivors and
+    // must stop triggering walks.
+    const uint64_t gen_before = f.ann->cycle_gen_for_test();
+    for (int i = 0; i < 3; ++i) {
+        f.ann->ping_relays_for_test();
+        run_until(&f.loop, [] { return false; }, 60);
+    }
+    EXPECT_EQ(f.ann->cycle_gen_for_test(), gen_before)
+        << "relay health kept re-walking: min(total, MIN_ACTIVE) is still "
+           "counting a relay that no longer exists";
 }
 
 // ============================================================================
@@ -247,45 +375,28 @@ TEST(AnnouncerRelays, IsRelayAcceptsAckedNodeMissingFromPublishedList) {
 // clock so a refresh storm cannot collapse the window.
 // ============================================================================
 TEST(AnnouncerRelays, IsRelayExpiresAfterWindow) {
-    uv_loop_t loop;
-    uv_loop_init(&loop);
+    Fixture f(1);
+    f.ann->set_gate_ttl_ms_for_test(40);
 
-    FakeNode node(&loop, 0x11);
-
-    routing::NodeId cid{};
-    cid.fill(0x22);
-    rpc::RpcSocket client(&loop, cid);
-    client.bind(0);
-    seed_table(client, node);
-
-    auto kp = make_keypair(0x42);
-    auto target = make_target(kp);
-    Announcer ann(client, kp, target);
-    ann.set_gate_ttl_ms_for_test(40);
-
-    ann.start();
-    ASSERT_TRUE(run_until(&loop, settled_at(ann, 1), 5000));
-    ASSERT_GT(node.announce_count, 0) << "node never acked";
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    ASSERT_GT(f.nodes[0]->announce_count, 0) << "node never acked";
+    const auto addr = f.nodes[0]->addr;
 
     // Still advertised, so part (a) of is_relay answers regardless of age.
-    EXPECT_TRUE(ann.is_relay(node.addr));
+    EXPECT_TRUE(f.ann->is_relay(addr));
 
     // Stop advertising it, then let the window lapse.
-    ann.stop_without_unannounce();
-    EXPECT_TRUE(ann.relays().empty());
-    EXPECT_TRUE(ann.is_relay(node.addr))
+    f.ann->stop_without_unannounce();
+    EXPECT_TRUE(f.ann->relays().empty());
+    EXPECT_TRUE(f.ann->is_relay(addr))
         << "gate must outlive the published list — that is its whole purpose";
 
-    const uint64_t deadline = uv_now(&loop) + 200;
-    run_until(&loop, [&] { return uv_now(&loop) > deadline; }, 1000);
+    const uint64_t deadline = uv_now(&f.loop) + 200;
+    run_until(&f.loop, [&] { return uv_now(&f.loop) > deadline; }, 1000);
 
-    EXPECT_FALSE(ann.is_relay(node.addr))
+    EXPECT_FALSE(f.ann->is_relay(addr))
         << "gate entry must expire once the record it served is long gone";
-
-    node.sock.close();
-    client.close();
-    uv_run(&loop, UV_RUN_DEFAULT);
-    uv_loop_close(&loop);
 }
 
 // ============================================================================
@@ -295,43 +406,24 @@ TEST(AnnouncerRelays, IsRelayExpiresAfterWindow) {
 // never settles, and only the stuck-cycle watchdog keeps firing.
 // ============================================================================
 TEST(AnnouncerRelays, RestartReannouncesAfterStop) {
-    uv_loop_t loop;
-    uv_loop_init(&loop);
+    Fixture f(1);
 
-    FakeNode node(&loop, 0x11);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    ASSERT_FALSE(f.ann->relays().empty()) << "first run never published";
+    const int find_peers_first = f.nodes[0]->find_peer_count;
+    const uint64_t gen_after_first = f.ann->cycle_gen_for_test();
 
-    routing::NodeId cid{};
-    cid.fill(0x22);
-    rpc::RpcSocket client(&loop, cid);
-    client.bind(0);
-    seed_table(client, node);
+    f.ann->stop_without_unannounce();
+    EXPECT_TRUE(f.ann->relays().empty());
 
-    auto kp = make_keypair(0x42);
-    auto target = make_target(kp);
-    Announcer ann(client, kp, target);
-
-    ann.start();
-    ASSERT_TRUE(run_until(&loop, settled_at(ann, 1), 5000));
-    ASSERT_FALSE(ann.relays().empty()) << "first run never published";
-    const int find_peers_first = node.find_peer_count;
-    const uint64_t gen_after_first = ann.cycle_gen_for_test();
-
-    ann.stop_without_unannounce();
-    EXPECT_TRUE(ann.relays().empty());
-
-    ann.start();
-    ASSERT_TRUE(run_until(&loop, settled_at(ann, gen_after_first + 1), 5000))
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(gen_after_first + 1))
         << "restarted announcer never completed a cycle";
 
-    EXPECT_GT(node.find_peer_count, find_peers_first)
+    EXPECT_GT(f.nodes[0]->find_peer_count, find_peers_first)
         << "restarted announcer must walk again";
-    EXPECT_FALSE(ann.relays().empty())
+    EXPECT_FALSE(f.ann->relays().empty())
         << "restarted announcer must republish — a resumed server that never "
            "re-announces is unreachable until the process restarts";
-
-    ann.stop_without_unannounce();
-    node.sock.close();
-    client.close();
-    uv_run(&loop, UV_RUN_DEFAULT);
-    uv_loop_close(&loop);
 }

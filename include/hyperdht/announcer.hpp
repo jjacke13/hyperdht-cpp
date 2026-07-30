@@ -174,8 +174,15 @@ private:
         std::array<uint8_t, 32> token;
     };
     // The relay set we are currently advertising (built into relays_ by
-    // build_relays()).
+    // build_relays()). Built only by maybe_publish(), from cycle_relays_;
+    // cleared on stop.
     std::vector<RelayNode> active_relays_;
+
+    // This cycle's acks, staged until the cycle settles. JS builds the same
+    // list as a fresh local `const relays = []` (announcer.js:172) and assigns
+    // it over this.relays at :188 — it never mutates the live one in place,
+    // which is what let a dead relay outlive every subsequent cycle here.
+    std::vector<RelayNode> cycle_relays_;
 
     // Every node that has acked an ANNOUNCE recently, with when it last did.
     // Backs is_relay(); see RELAY_GATE_MS. Upserted eagerly per ack — JS also

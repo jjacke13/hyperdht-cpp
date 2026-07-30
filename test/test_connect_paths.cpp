@@ -17,6 +17,8 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "hyperdht/compact.hpp"
@@ -401,4 +403,251 @@ TEST(ConnectVeto, VetoTrueProceedsToPunchingRound) {
         << "punching round never reached the relay";
     EXPECT_FALSE(out.result.success);   // relay replied ERROR_ABORTED
     EXPECT_FALSE(out.result.aborted);   // remote abort, not a client veto
+}
+
+// ===========================================================================
+// Finding M — Round-1 relay failover
+//   JS connect.js:271 — "TODO: we should retry here with some of the other
+//   relays, bail for now". Field: one relay unreachable from the client but
+//   healthy from the server = permanent -5 with no failover.
+// ===========================================================================
+
+namespace {
+
+struct FailoverScenarioResult {
+    bool done = false;
+    holepunch::HolepunchResult result;
+    int dead_relay_hp_reqs = 0;
+    bool live_relay_saw_round1 = false;
+    bool live_relay_saw_punching = false;
+    // Round 1 as the LIVE relay saw it — the message's peerAddress is the
+    // forward destination (router.js:214), the payload's remoteAddress is
+    // what the server matches against its own NAT samples (server.js:530).
+    std::optional<Ipv4Address> live_msg_peer_address;
+    std::optional<Ipv4Address> live_payload_remote_address;
+};
+
+// Two relays: the first swallows every PEER_HOLEPUNCH (the field's
+// symmetric-NAT relay — reachable for PINGs, silent for the punch), the
+// second answers Round 1 with a CONSISTENT server payload + token and
+// aborts the punching round so the scenario terminates quickly.
+// `with_fallback=false` is the control: no fallback list, no failover.
+FailoverScenarioResult run_failover_scenario(bool with_fallback) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    FailoverScenarioResult out;
+
+    routing::NodeId cid{};
+    cid.fill(0x01);
+    rpc::RpcSocket client(&loop, cid);
+    client.bind(0);
+
+    routing::NodeId dead_id{};
+    dead_id.fill(0x02);
+    rpc::RpcSocket dead_relay(&loop, dead_id);
+    dead_relay.bind(0);
+    auto dead_addr = Ipv4Address::from_string("127.0.0.1", dead_relay.port());
+
+    routing::NodeId live_id{};
+    live_id.fill(0x03);
+    rpc::RpcSocket live_relay(&loop, live_id);
+    live_relay.bind(0);
+    auto live_addr = Ipv4Address::from_string("127.0.0.1", live_relay.port());
+
+    // Fake DHT nodes so pool NAT sampling reaches >= 4 samples.
+    std::vector<std::unique_ptr<rpc::RpcSocket>> nodes;
+    for (int i = 0; i < 6; i++) {
+        routing::NodeId nid{};
+        nid.fill(static_cast<uint8_t>(0x10 + i));
+        auto n = std::make_unique<rpc::RpcSocket>(&loop, nid);
+        n->bind(0);
+        auto* np = n.get();
+        np->on_request([np](const messages::Request& req) {
+            if (req.internal && req.command == messages::CMD_PING) {
+                answer_ping(*np, req);
+            }
+        });
+        routing::Node node;
+        node.id = nid;
+        node.host = "127.0.0.1";
+        node.port = np->port();
+        client.table().add(node);
+        nodes.push_back(std::move(n));
+    }
+
+    peer_connect::HandshakeResult hs;
+    hs.success = true;
+    hs.handshake_hash.fill(0x77);
+    hs.remote_public_key.fill(0x55);
+
+    const auto& ns_hp = dht_messages::ns_peer_holepunch();
+    std::array<uint8_t, 32> hp_secret{};
+    crypto_generichash(hp_secret.data(), 32, ns_hp.data(), 32,
+                       hs.handshake_hash.data(), 64);
+    auto secure = std::make_shared<holepunch::SecurePayload>(hp_secret);
+
+    // The dead relay answers PINGs (so it still looks alive to the routing
+    // table and to pool sampling) but never answers a holepunch round.
+    dead_relay.on_request([&](const messages::Request& req) {
+        if (req.internal && req.command == messages::CMD_PING) {
+            answer_ping(dead_relay, req);
+            return;
+        }
+        if (req.command == messages::CMD_PEER_HOLEPUNCH) {
+            out.dead_relay_hp_reqs++;
+        }
+    });
+
+    live_relay.on_request([&](const messages::Request& req) {
+        if (req.internal && req.command == messages::CMD_PING) {
+            answer_ping(live_relay, req);
+            return;
+        }
+        if (req.command != messages::CMD_PEER_HOLEPUNCH || !req.value) return;
+
+        auto msg = holepunch::decode_holepunch_msg(
+            req.value->data(), req.value->size());
+        auto dec = secure->decrypt(msg.payload.data(), msg.payload.size());
+        if (!dec) {
+            ADD_FAILURE() << "live relay could not decrypt holepunch payload";
+            return;
+        }
+        auto payload = holepunch::decode_holepunch_payload(
+            dec->data(), dec->size());
+
+        holepunch::HolepunchPayload reply;
+        reply.error = peer_connect::ERROR_NONE;
+        reply.firewall = peer_connect::FIREWALL_CONSISTENT;
+        reply.round = payload.round;
+        if (payload.punching) {
+            out.live_relay_saw_punching = true;
+            reply.error = peer_connect::ERROR_ABORTED;
+        } else {
+            if (!out.live_relay_saw_round1) {
+                out.live_relay_saw_round1 = true;
+                out.live_msg_peer_address = msg.peer_address;
+                out.live_payload_remote_address = payload.remote_address;
+            }
+            reply.addresses.push_back(
+                Ipv4Address::from_string("10.0.0.1", 9999));
+            std::array<uint8_t, 32> token{};
+            token.fill(0xAB);
+            reply.token = token;
+        }
+
+        auto reply_bytes = holepunch::encode_holepunch_payload(reply);
+        holepunch::HolepunchMessage reply_msg;
+        reply_msg.mode = peer_connect::MODE_REPLY;
+        reply_msg.id = msg.id;
+        reply_msg.payload = secure->encrypt(reply_bytes.data(),
+                                            reply_bytes.size());
+
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = req.from.addr;
+        resp.value = holepunch::encode_holepunch_msg(reply_msg);
+        live_relay.reply(resp, req.from_server);
+    });
+
+    // The live relay's OWN view of the server — distinct from the fresh
+    // observation the handshake relay gave us, exactly as in the field.
+    std::vector<peer_connect::RelayInfo> fallbacks;
+    if (with_fallback) {
+        peer_connect::RelayInfo r;
+        r.relay_address = live_addr;
+        r.peer_address = Ipv4Address::from_string("10.0.0.3", 9997);
+        fallbacks.push_back(r);
+    }
+
+    holepunch::holepunch_connect(
+        client, hs, dead_addr,
+        /*peer_addr=*/Ipv4Address::from_string("10.0.0.2", 9998),
+        /*holepunch_id=*/7,
+        peer_connect::FIREWALL_UNKNOWN, {},
+        [&](const holepunch::HolepunchResult& r) {
+            out.done = true;
+            out.result = r;
+        },
+        /*fast_open=*/false,
+        nullptr, nullptr, nullptr, nullptr, nullptr,
+        fallbacks);
+
+    run_until(&loop, [&] { return out.done; }, 30000);
+    EXPECT_TRUE(out.done) << "holepunch_connect callback never fired";
+
+    client.close();
+    dead_relay.close();
+    live_relay.close();
+    for (auto& n : nodes) n->close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+
+    return out;
+}
+
+}  // namespace
+
+// A silent relay must not be terminal: Round 1 retries through the next
+// relay in the announce record and the punch continues from there.
+TEST(ConnectRelayFailover, DeadRelayFallsOverToTheNextRelay) {
+    auto out = run_failover_scenario(/*with_fallback=*/true);
+
+    EXPECT_GE(out.dead_relay_hp_reqs, 1) << "Round 1 never reached relay 1";
+    EXPECT_TRUE(out.live_relay_saw_round1) << "no failover to relay 2";
+    EXPECT_TRUE(out.live_relay_saw_punching)
+        << "failover stopped short of the punching round";
+
+    // The forward destination is the FAILOVER relay's own peer_address
+    // (router.js:214 relays to it verbatim) — not the handshake relay's
+    // observation, which names a mapping this relay has no session on.
+    ASSERT_TRUE(out.live_msg_peer_address.has_value());
+    EXPECT_EQ(out.live_msg_peer_address->host_string(), "10.0.0.3");
+    EXPECT_EQ(out.live_msg_peer_address->port, 9997);
+
+    // The payload's remoteAddress stays the fresh observation — it is what
+    // the server matches against its NAT samples for the fast-mode punch.
+    ASSERT_TRUE(out.live_payload_remote_address.has_value());
+    EXPECT_EQ(out.live_payload_remote_address->host_string(), "10.0.0.2");
+    EXPECT_EQ(out.live_payload_remote_address->port, 9998);
+}
+
+// Control: with no fallback relays the behavior is unchanged — one relay,
+// one attempt, terminal failure.
+TEST(ConnectRelayFailover, NoFallbackRelaysStaysSingleAttempt) {
+    auto out = run_failover_scenario(/*with_fallback=*/false);
+
+    EXPECT_GE(out.dead_relay_hp_reqs, 1);
+    EXPECT_FALSE(out.live_relay_saw_round1);
+    EXPECT_FALSE(out.result.success);
+}
+
+// The failover list is capped below the wire limit (128 relay entries,
+// peer_connect.cpp:175): each entry costs a multi-second RPC, and the
+// handshake reply it comes from is authored by the peer we are dialing.
+TEST(ConnectRelayFailover, FallbackListSkipsTheChosenRelayAndIsCapped) {
+    std::vector<peer_connect::RelayInfo> relays;
+    for (int i = 0; i < 10; i++) {
+        peer_connect::RelayInfo r;
+        r.relay_address =
+            Ipv4Address::from_string("10.9.0." + std::to_string(i), 100 + i);
+        r.peer_address =
+            Ipv4Address::from_string("10.8.0." + std::to_string(i), 200 + i);
+        relays.push_back(r);
+    }
+
+    // Chosen = relays[1]; it must not appear in its own fallback list.
+    auto out = holepunch::pick_fallback_relays(relays, relays[1].relay_address);
+
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].relay_address.host_string(), "10.9.0.0");
+    EXPECT_EQ(out[1].relay_address.host_string(), "10.9.0.2");
+    // Each entry keeps its own peer_address — the relay-specific session.
+    EXPECT_EQ(out[0].peer_address.host_string(), "10.8.0.0");
+    EXPECT_EQ(out[1].peer_address.port, 202);
+
+    // A relay set that is entirely the chosen one yields no failover legs.
+    EXPECT_TRUE(holepunch::pick_fallback_relays({relays[1]},
+                                                relays[1].relay_address)
+                    .empty());
 }

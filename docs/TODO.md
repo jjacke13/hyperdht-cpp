@@ -5,12 +5,18 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-07-29.
+Last updated: 2026-07-30.
 
 ---
 
 ## Status snapshot
 
+- **2026-07-30 (later)**: field **Finding M FIXED** — Round 1 now fails over to
+  the remaining announce relays instead of treating one dead relay as terminal.
+  Deliberately beyond-JS (it is the fix JS's own TODO asks for), capped at
+  `PICK_BEST - 1` legs after cpp-reviewer flagged the 128-entry wire cap as a
+  retry-amplification stall. 722/722, ASAN clean, SHIP. Round-2 failover (JS's
+  second TODO) still open — needs field evidence.
 - **2026-07-30**: field **Finding M** logged as the new P0 (Section A) — one
   unreachable relay in the announce is a permanent unrecoverable `-5` because
   neither implementation fails over to `relays[1..n]`. 81/81 repro, reproduced
@@ -251,7 +257,38 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   values (read fw=3, settled fw=2); ordering varies run to run. Effect on
   connect outcome NOT established (n=1 each way — do not assume a direction).
   Minimum: enforce the invariant or correct the comment.
-- [ ] **Finding M (2026-07-30, P0 — best-evidenced item in the handoff)** — ONE
+- [x] **Finding M — DONE 2026-07-30** (round 1 only; round 2 deliberately left
+  alone, see below). `holepunch::pick_fallback_relays()` hands the announce
+  record minus the chosen relay to `holepunch_connect(..., fallback_relays)`;
+  `fail_round1()` pops the next leg and re-runs `run_round1` on the SAME pool
+  socket, puncher and NAT samples — only the relay changes. Terminal only once
+  the list empties, so the single-relay path is unchanged.
+  Scope matched to JS: the six Round-1 sites that JS reaches by *throwing* out
+  of `probeRound` into the retry catch now fail over (request timeout, bad
+  reply, empty payload, decrypt failure, remote error, no server address);
+  everything JS reaches via `abort()` (double-random NATs, unstable NAT, probe
+  exhaustion) stays terminal.
+  Round 1's two addresses had to be split: the message's `peer_address` is the
+  relay's forward destination (router.js:214 uses it verbatim) and moves with
+  the relay, while the payload's `remote_address` stays the fresh observation
+  the server matches for its fast-mode punch (server.js:530-538). Attempt 0
+  seeds both from the same value, so it is byte-identical to before.
+  SECURITY (cpp-reviewer): the failover list is capped at
+  `announcer::PICK_BEST - 1`, NOT the wire cap of 128 relays
+  (peer_connect.cpp:175) — that bound was sized for parse safety back when
+  extra entries were ignored, and each entry now costs a multi-second RPC, so
+  uncapped it let a hostile connect() target stall its caller for ~6 minutes
+  with garbage address bytes. Honest servers announce ≤3 (pickBest), so the cap
+  costs no real connectivity.
+  Tests: `ConnectRelayFailover.{DeadRelayFallsOverToTheNextRelay,
+  NoFallbackRelaysStaysSingleAttempt, FallbackListSkipsTheChosenRelayAndIsCapped}`
+  (first one red-checked). 722/722 unit; ASAN/UBSAN clean; cpp-reviewer SHIP.
+  STILL OPEN: JS's second TODO (connect.js:312, round-2 failure). C++ already
+  treats a round-2 relay timeout as non-fatal because probing is under way by
+  then, so the remaining gap is only a round-2 *error reply*; failing that over
+  means re-running round 1 for a fresh token. Needs field evidence first.
+  Original report follows.
+- [ ] ~~**Finding M (2026-07-30, P0 — best-evidenced item in the handoff)**~~ — ONE
   unreachable relay in the announce = permanent `-5`, with no failover to the
   other two. 81/81 deterministic field repro (81 × round-1 TIMEOUT to the same
   relay, 0 successes) while six other pool nodes queried in the same

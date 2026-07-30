@@ -470,6 +470,21 @@ using HolepunchVetoFn = std::function<bool(uint32_t, uint32_t,
     const std::vector<compact::Ipv4Address>&,
     const std::vector<compact::Ipv4Address>&)>;
 
+// Finding M — the announce record minus the relay already chosen, in
+// announce order, for use as `fallback_relays` below.
+//
+// Capped independently of the wire limit. The decoder accepts up to 128 relay
+// entries (peer_connect.cpp:175) — a bound sized for parse safety back when
+// extra entries were simply ignored. Failover turns every entry into a
+// multi-second RPC, so an uncapped list would let a hostile connect() target
+// stall its caller for minutes using nothing but garbage address bytes in its
+// (Noise-authenticated, but attacker-authored) handshake reply. An honest
+// server announces at most announcer::PICK_BEST relays, so keeping
+// PICK_BEST - 1 fallbacks costs no real connectivity.
+std::vector<peer_connect::RelayInfo> pick_fallback_relays(
+    const std::vector<peer_connect::RelayInfo>& relays,
+    const compact::Ipv4Address& chosen);
+
 void holepunch_connect(rpc::RpcSocket& socket,
                        const peer_connect::HandshakeResult& hs_result,
                        const compact::Ipv4Address& relay_addr,
@@ -488,7 +503,30 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        socket_pool::SocketPool* birthday_pool = nullptr,
                        PunchStats* stats = nullptr,
                        // connect-7 — JS opts.holepunch client veto.
-                       HolepunchVetoFn veto = nullptr);
+                       HolepunchVetoFn veto = nullptr,
+                       // Finding M — relays to fall back to when the chosen
+                       // relay's Round-1 leg fails. In announce order, minus
+                       // the relay already passed as `relay_addr`. Empty =
+                       // single attempt.
+                       //
+                       // JS asks for exactly this and does not do it:
+                       // connect.js:271 "TODO: we should retry here with some
+                       // of the other relays, bail for now". Field-observed
+                       // (Finding M): one relay behind an endpoint-dependent
+                       // NAT is unreachable from the client while looking
+                       // perfectly healthy to the server (its keepalives ride
+                       // the server's own mapping), so the announcer cannot
+                       // evict it. Without failover that single dead entry is
+                       // a permanent -5 for every client — 81/81 in the field.
+                       //
+                       // Each entry carries its OWN peer_address: `relays[i]`
+                       // is a live server<->relay UDP session, not just an
+                       // address. Round 1 to relay i must name relay i's view
+                       // of the server (router.js:214 forwards to the message's
+                       // peerAddress verbatim); the payload's remote_address
+                       // stays the fresh observation, as in JS.
+                       std::vector<peer_connect::RelayInfo>
+                           fallback_relays = {});
 
 // ---------------------------------------------------------------------------
 // Utility functions (JS: Holepuncher.localAddresses, Holepuncher.matchAddress)

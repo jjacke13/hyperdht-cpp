@@ -788,6 +788,19 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
             break;
         }
     }
+
+    // Finding M — the rest of the announce record, kept as failover legs for
+    // Round 1. JS picks one relay and gives up (connect.js:271 "TODO: we
+    // should retry here with some of the other relays"); in the field one
+    // relay behind an endpoint-dependent NAT was silent to the client while
+    // its keepalives kept it healthy from the server's side, making every
+    // connect fail -5 with no recovery on either end.
+    //
+    // Each entry keeps its OWN peer_address: `relays[i]` is a live
+    // server<->relay UDP session, not merely an address, and the relay
+    // forwards to whatever peerAddress the message names (router.js:214).
+    auto hp_fallbacks =
+        holepunch::pick_fallback_relays(hp_info.relays, hp_relay);
     // JS: c.connect.serverAddress = hs.peerAddress || to (router.js:46-78).
     // Prefer the relay's *fresh* observation of the server's reply address
     // over the *stale* announce-time `relays[i].peer_address`. Fresh is
@@ -954,7 +967,9 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
         state->dht ? state->dht->socket_pool() : nullptr,
         state->dht ? &state->dht->punch_stats() : nullptr,
         // connect-7 — JS opts.holepunch client veto (connect.js:296-307).
-        state->holepunch_veto);
+        state->holepunch_veto,
+        // Finding M — beyond-JS Round-1 relay failover.
+        std::move(hp_fallbacks));
 }
 
 // ---------------------------------------------------------------------------

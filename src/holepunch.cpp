@@ -57,6 +57,7 @@
 
 #include "hyperdht/holepunch.hpp"
 
+#include "hyperdht/announcer.hpp"
 #include "hyperdht/async_utils.hpp"
 #include "hyperdht/debug.hpp"
 #include "hyperdht/dht_messages.hpp"
@@ -1407,14 +1408,69 @@ struct PunchState {
 // and survive across a sleeper-driven retry (Fix 1, JS connect.js:611-613).
 struct Round1Ctx {
     std::array<uint8_t, 32> target{};
+    // Where Round 1 is sent, and the address that relay is told to forward
+    // to (router.js:214 uses the message's peerAddress verbatim). Both move
+    // together on a Finding-M failover — `relays[i]` is a live server<->relay
+    // UDP session, so relay i must be named with relay i's own peer_address.
     compact::Ipv4Address relay_addr;
     compact::Ipv4Address peer_addr;
+    // JS `serverAddress` — the freshest observation of the server we have
+    // (connect.js:558,565 pass it as probeRound's serverAddress, which lands
+    // in the payload as remoteAddress). Constant across a failover: the
+    // server matches it against its own NAT samples to fire the fast-mode
+    // punch (server.js:530-538), so it must stay the fresh value even when
+    // the relay leg changes.
+    compact::Ipv4Address server_addr;
     uint32_t holepunch_id = 0;
     std::vector<compact::Ipv4Address> local_addresses;
+    // Finding M — untried relays, in announce order. Popped from the front
+    // on each failover; empty means the next Round-1 failure is terminal.
+    std::vector<peer_connect::RelayInfo> fallbacks;
 };
 
 // Forward declaration — body lives below holepunch_connect.
 void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx);
+
+// ---------------------------------------------------------------------------
+// fail_round1 — the Round-1 leg through this relay produced nothing usable.
+//
+// JS connect.js:265-274 wraps probeRound in a try/catch whose only action is
+// "TODO: we should retry here with some of the other relays, bail for now".
+// Everything that *throws* out of probeRound lands here: the relay request
+// failing (timeout / bad reply, router.js:190 BAD_HOLEPUNCH_REPLY), an
+// undecryptable payload (HOLEPUNCH_INVALID, connect.js:523), and a remote
+// error code (REMOTE_ABORTED, connect.js:535). The paths that instead
+// `abort()` and return null — double-random NATs, probe timeout — are NOT
+// relay failures and stay terminal, exactly as in JS.
+//
+// Field-observed (Finding M): a relay behind an endpoint-dependent NAT is
+// silent to the client while its keepalives keep it looking healthy to the
+// server, so nothing on either side evicts it. Trying the next relay in the
+// announce record is the whole fix; each attempt costs one bounded RPC.
+// ---------------------------------------------------------------------------
+void fail_round1(const std::shared_ptr<PunchState>& state, Round1Ctx ctx) {
+    if (state->completed) return;
+
+    if (ctx.fallbacks.empty()) {
+        state->complete({});
+        return;
+    }
+
+    const auto next = ctx.fallbacks.front();
+    ctx.fallbacks.erase(ctx.fallbacks.begin());
+    ctx.relay_addr = next.relay_address;
+    ctx.peer_addr = next.peer_address;
+
+    DHT_LOG("  [hp] Round 1 failed via relay — falling over to %s:%u "
+            "(peer=%s:%u, %zu left)\n",
+            ctx.relay_addr.host_string().c_str(), ctx.relay_addr.port,
+            ctx.peer_addr.host_string().c_str(), ctx.peer_addr.port,
+            ctx.fallbacks.size());
+
+    // Same pool socket, same puncher, same NAT samples — only the relay leg
+    // is retried, so nothing about our own classification is thrown away.
+    run_round1(state, std::move(ctx));
+}
 
 }  // anonymous namespace
 
@@ -1448,6 +1504,20 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx);
 //     still come from the pool socket.
 // ---------------------------------------------------------------------------
 
+std::vector<peer_connect::RelayInfo> pick_fallback_relays(
+    const std::vector<peer_connect::RelayInfo>& relays,
+    const compact::Ipv4Address& chosen) {
+    constexpr size_t MAX_FALLBACKS = announcer::PICK_BEST - 1;
+
+    std::vector<peer_connect::RelayInfo> out;
+    for (const auto& r : relays) {
+        if (r.relay_address == chosen) continue;
+        out.push_back(r);
+        if (out.size() == MAX_FALLBACKS) break;
+    }
+    return out;
+}
+
 void holepunch_connect(rpc::RpcSocket& socket,
                        const peer_connect::HandshakeResult& hs_result,
                        const compact::Ipv4Address& relay_addr,
@@ -1461,7 +1531,8 @@ void holepunch_connect(rpc::RpcSocket& socket,
                        std::shared_ptr<void>* pool_keepalive_out,
                        socket_pool::SocketPool* birthday_pool,
                        PunchStats* stats,
-                       HolepunchVetoFn veto) {
+                       HolepunchVetoFn veto,
+                       std::vector<peer_connect::RelayInfo> fallback_relays) {
 
     // Derive holepunchSecret from handshake hash
     // holepunchSecret = BLAKE2b-256(NS_PEER_HOLEPUNCH, key=handshake_hash)
@@ -1576,11 +1647,16 @@ void holepunch_connect(rpc::RpcSocket& socket,
         });
 
     Round1Ctx ctx{
-        target,
-        relay_addr,
-        peer_addr,
-        holepunch_id,
-        local_addresses,
+        .target = target,
+        .relay_addr = relay_addr,
+        .peer_addr = peer_addr,
+        // The first attempt's forward address IS the fresh observation (the
+        // caller passes JS's `serverAddress`), so both start out equal and
+        // the single-relay path is bit-for-bit what it was.
+        .server_addr = peer_addr,
+        .holepunch_id = holepunch_id,
+        .local_addresses = local_addresses,
+        .fallbacks = std::move(fallback_relays),
     };
     // Round 1 fires immediately — does NOT wait for sampling. JS parity.
     run_round1(state, std::move(ctx));
@@ -1626,7 +1702,10 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
     probe.firewall = pool_fw;
     probe.round = 0;
     probe.addresses = addrs;
-    probe.remote_address = ctx.peer_addr;
+    // JS connect.js:565 `remoteAddress: serverAddress` — the fresh
+    // observation, NOT the per-relay forward address (which is carried in
+    // hp_msg.peer_address below). They differ only after a Finding-M failover.
+    probe.remote_address = ctx.server_addr;
 
     auto probe_bytes = encode_holepunch_payload(probe);
     auto encrypted_probe = state->secure->encrypt(probe_bytes.data(),
@@ -1660,7 +1739,7 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
 
             if (!resp.value.has_value() || resp.value->empty()) {
                 DHT_LOG("  [hp] Round 1: no response value\n");
-                state->complete({});
+                fail_round1(state, ctx);
                 return;
             }
             DHT_LOG("  [hp] Round 1: got response (%zu bytes)\n",
@@ -1670,7 +1749,7 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
                 resp.value->data(), resp.value->size());
             if (hp_resp.payload.empty()) {
                 DHT_LOG("  [hp] Round 1: empty payload in decoded msg\n");
-                state->complete({});
+                fail_round1(state, ctx);
                 return;
             }
             DHT_LOG("  [hp] Round 1: payload %zu bytes, peerAddr=%s\n",
@@ -1684,10 +1763,13 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
             auto decrypted = state->secure->decrypt(
                 hp_resp.payload.data(), hp_resp.payload.size());
             if (!decrypted) {
-                // C2: abort on decrypt failure — never fall back to
-                // unauthenticated peerAddress (MITM vector)
-                DHT_LOG("  [hp] Round 1: decrypt FAILED — aborting (no fallback)\n");
-                state->complete({});
+                // C2: drop this reply on decrypt failure — never fall back to
+                // the unauthenticated peerAddress (MITM vector). Retrying the
+                // round through a DIFFERENT relay (Finding M) uses no data
+                // from this reply, so it does not weaken C2; JS throws
+                // HOLEPUNCH_INVALID here, which lands in the same retry catch.
+                DHT_LOG("  [hp] Round 1: decrypt FAILED — no usable reply\n");
+                fail_round1(state, ctx);
                 return;
             }
 
@@ -1702,7 +1784,11 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
 
             if (server_r1.error != peer_connect::ERROR_NONE) {
                 DHT_LOG("  [hp] Round 1: server error %u\n", server_r1.error);
-                state->complete({});
+                // JS REMOTE_ABORTED (connect.js:535) throws out of probeRound
+                // into the retry catch — the error can be relay-specific (the
+                // relay forwarded to a mapping the server no longer owns), so
+                // another relay is worth a try.
+                fail_round1(state, ctx);
                 return;
             }
 
@@ -1723,7 +1809,10 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
                         server_addrs[i].port);
             }
             if (server_addrs.empty()) {
-                state->complete({});
+                // No target to punch at. JS cannot reach this (peerAddress
+                // falls back to `to`, router.js:198); treat it as a failed
+                // leg rather than a dead end.
+                fail_round1(state, ctx);
                 return;
             }
 
@@ -2056,9 +2145,12 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
                 (*poll)();
             }
         },
-        [state](uint16_t) {
+        [state, ctx](uint16_t) {
             DHT_LOG("  [hp] Round 1: TIMEOUT (no response from relay)\n");
-            state->complete({});
+            // Finding M — the exact field failure: 81/81 attempts timed out
+            // on one relay while six other nodes answered in the same
+            // millisecond. Terminal only once the fallbacks run out.
+            fail_round1(state, ctx);
         });
 }
 }  // anonymous namespace

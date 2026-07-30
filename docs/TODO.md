@@ -11,6 +11,11 @@ Last updated: 2026-07-29.
 
 ## Status snapshot
 
+- **2026-07-30**: field **Finding M** logged as the new P0 (Section A) — one
+  unreachable relay in the announce is a permanent unrecoverable `-5` because
+  neither implementation fails over to `relays[1..n]`. 81/81 repro, reproduced
+  on nospoon-JS too, and upstream JS carries the TODO asking for the fix in two
+  places. NOT a parity bug — the fix is a deliberate beyond-JS improvement.
 - **2026-07-29 (later)**: field Finding J FIXED — `udx_stream_destroy` has no
   `UDX_STREAM_DESTROYING` guard, so a second destroy inside the deferred-close
   window ran `close_stream_internal()` twice and aborted in libuv. Now guarded
@@ -246,6 +251,41 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   values (read fw=3, settled fw=2); ordering varies run to run. Effect on
   connect outcome NOT established (n=1 each way — do not assume a direction).
   Minimum: enforce the invariant or correct the comment.
+- [ ] **Finding M (2026-07-30, P0 — best-evidenced item in the handoff)** — ONE
+  unreachable relay in the announce = permanent `-5`, with no failover to the
+  other two. 81/81 deterministic field repro (81 × round-1 TIMEOUT to the same
+  relay, 0 successes) while six other pool nodes queried in the same
+  millisecond all replied — so not a network block.
+  ROOT CAUSE: the chosen relay sits behind an endpoint-dependent (symmetric)
+  NAT, so the *server's* mapping for it (`:58044`, in the announce record) is
+  useless to a third party; the client's own observation of the same host is a
+  different port (`:45262`). The server's 5 s keepalives ride the server's own
+  mapping, so the entry looks healthy from the server — **the announcer cannot
+  detect this**; no server-side liveness check helps.
+  **NOT a C++ bug and NOT a parity divergence** — cross-implementation control:
+  nospoon-JS on the same machine/network/seed fails identically
+  (`HOLEPUNCH_ABORTED` ×6). VERIFIED IN BOTH SOURCES 2026-07-30: selection is
+  faithful parity (`connect.cpp:781-790` vs `pickServerRelay`
+  connect.js:812-817 — host+port match else `relays[0]`), and the bail-out is
+  terminal on both (`holepunch.cpp:2059-2062` `state->complete({})`).
+  **Upstream JS asks for this fix in its own source, twice** (verified
+  verbatim): connect.js:271 `// TODO: we should retry here with some of the
+  other relays, bail for now` and connect.js:312 `// TODO: retry with another
+  relay?`.
+  FIX: on round-1 (and round-2) failure, fail over to `relays[1..n]` instead of
+  completing terminally. Deliberately BEYOND-JS, but it is the fix JS itself
+  requests.
+  **REJECTED alternative — do NOT substitute the client's own observation of
+  the same host** (`:45262`). `relays[i]` is not an address, it is a live
+  server↔relay UDP session, and `probeRound` sends `(peerAddress,
+  relayAddress)` as a unit (connect.js:561). JS documents why at
+  connect.js:280-285: *"If the relays were different, then the server would not
+  have a UDP session open on this address to the client relay, which round2
+  uses."* Port-swapping trades a round-1 timeout for a round-2 failure.
+  Failover is safe precisely because each `relays[i]` carries its own
+  `peer_address` and its own server-maintained session.
+  Operational note: nothing client-side recovers; the server must re-announce
+  (restart) to draw a fresh relay set.
 
 ### nat-sampler / punch payload (from the 2026-07-22 field diagnosis; see
 ### docs/FIELD-DIAGNOSIS-2026-07-22.md "Finding B" + "Finding E")

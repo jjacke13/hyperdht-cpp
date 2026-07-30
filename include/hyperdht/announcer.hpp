@@ -47,6 +47,23 @@ constexpr int MIN_ACTIVE = 3;
 // record-holders (field Finding H).
 constexpr size_t PICK_BEST = 3;
 
+// How long a DHT node may still be holding our record — and therefore still
+// be a legitimate holepunch relay for some client — after it last acked an
+// ANNOUNCE.
+//
+// JS keeps three rotating Maps (`_serverRelays`, announcer.js:35, rotated by
+// `_cycle()` :270-276) and `isRelay()` (:38-41) returns true if the address is
+// in ANY of them. At REANNOUNCE_MS (5 min) per cycle that is a ~10-15 min
+// window. We measure the window in wall clock instead of cycles: a refresh
+// storm (MIN_ACTIVE health, drift detection, notify_online, the stuck-cycle
+// watchdog) can burn several cycles in seconds, which would collapse a
+// cycle-counted window while the records themselves are still very much alive.
+constexpr uint64_t RELAY_GATE_MS = 15 * 60 * 1000;  // == 3 * REANNOUNCE_MS
+
+// Hard bound on the gate so a long-lived server on a churning network cannot
+// grow it without limit (ESP32 is a target). Oldest entry is evicted.
+constexpr size_t GATE_MAX = 16;
+
 class Announcer {
 public:
     Announcer(rpc::RpcSocket& socket, const noise::Keypair& keypair,
@@ -110,8 +127,30 @@ public:
         if (ping_timer_) on_ping_timer(ping_timer_);
     }
 
+    // Test-only: shorten the relay-gate window so a test can exercise
+    // expiry without waiting 15 minutes.
+    void set_gate_ttl_ms_for_test(uint64_t ms) { gate_ttl_ms_ = ms; }
+
+    // Test-only: cycle bookkeeping, for settle predicates. `relays()
+    // non-empty` stops discriminating after the first cycle publishes.
+    uint64_t cycle_gen_for_test() const { return cycle_gen_; }
+    bool is_updating_for_test() const { return updating_; }
+
     // Current relay info (for NoisePayload holepunch field)
     const std::vector<peer_connect::RelayInfo>& relays() const { return relays_; }
+
+    // JS `isRelay(addr)` (announcer.js:38-42) — address-only, node id ignored.
+    //
+    // DELIBERATELY LENIENT, and deliberately NOT the same set as relays():
+    // relays() is the single-cycle list we advertise on the wire right now,
+    // while this is a multi-generation membership test gating holepunch token
+    // issuance (server.cpp handle_peer_holepunch -> ServerConnection). A client
+    // reaches us through a relay named in the announce record IT holds, and
+    // that record may have been published one or two cycles ago. Judging such
+    // a client against only the current list would refuse it a token, which is
+    // exactly the failure this leniency exists to prevent — JS unions three
+    // generations for the same reason.
+    bool is_relay(const compact::Ipv4Address& addr) const;
 
     // Encoded peer record (for Router's FIND_PEER response)
     const std::vector<uint8_t>& record() const { return record_; }
@@ -134,7 +173,22 @@ private:
         std::array<uint8_t, 32> node_id;
         std::array<uint8_t, 32> token;
     };
+    // The relay set we are currently advertising (built into relays_ by
+    // build_relays()).
     std::vector<RelayNode> active_relays_;
+
+    // Every node that has acked an ANNOUNCE recently, with when it last did.
+    // Backs is_relay(); see RELAY_GATE_MS. Upserted eagerly per ack — JS also
+    // records into _serverRelays inside _commit (announcer.js:267), before the
+    // cycle publishes — and deliberately NOT cleared by stop_impl(), because
+    // suspend/resume reuse the same Announcer and a client holding a
+    // pre-suspend record is still legitimately relaying through those nodes.
+    struct GateEntry {
+        compact::Ipv4Address addr;
+        uint64_t last_seen_ms = 0;
+    };
+    std::vector<GateEntry> gate_;
+    uint64_t gate_ttl_ms_ = RELAY_GATE_MS;  // test knob only
 
     // Timers
     uv_timer_t* bg_timer_ = nullptr;    // Re-announce (~5 min)
@@ -184,6 +238,7 @@ private:
     void commit_settled();   // decrement pending_commits_ + maybe_publish
     void maybe_publish();    // query_done_ && pending==0 → build_relays
     void unannounce_node(const RelayNode& relay);
+    void gate_upsert(const compact::Ipv4Address& addr, uint64_t now);
     void build_relays();
     void ping_relays();
 

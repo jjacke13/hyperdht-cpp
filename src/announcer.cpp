@@ -84,6 +84,16 @@ void Announcer::start() {
     if (running_) return;
     running_ = true;
 
+    // Re-arm the C7 sentinel. stop_impl() sets *alive_ = false to make every
+    // in-flight callback a no-op, and nothing else ever sets it back — so
+    // without this line a restarted Announcer is inert: find_peer's on_done,
+    // every ANNOUNCE settle and every keepalive pong return early, updating_
+    // latches true and only the 60s stuck-cycle watchdog keeps firing.
+    // Server::suspend()/resume() stop and start the SAME Announcer, so this
+    // is a live path, not a theoretical one.
+    alive_ = std::make_shared<bool>(true);
+    last_drift_refresh_ms_ = 0;
+
     update();
 
     // Re-announce timer (~5 min)
@@ -529,9 +539,14 @@ void Announcer::commit(const query::QueryReply& node, uint64_t gen) {
                     break;
                 }
             }
-            if (!updated && active_relays_.size() < 3) {
+            if (!updated && active_relays_.size() < PICK_BEST) {
                 active_relays_.push_back(relay);
             }
+
+            // Open the token gate for this node the moment it acks, not when
+            // the cycle publishes (JS writes _serverRelays inside _commit,
+            // announcer.js:267). A client can be relaying through it already.
+            gate_upsert(relay.addr, uv_now(socket_.loop()));
 
             commit_settled();
         },
@@ -589,6 +604,52 @@ void Announcer::unannounce_node(const RelayNode& relay) {
 // JS: .analysis/js/hyperdht/lib/announcer.js:175-189 (the relays/relayAddresses
 //     assembly block at the end of _update — also re-encodes record).
 // ---------------------------------------------------------------------------
+
+// Record (or refresh) a node in the token gate. Bounded by GATE_MAX; the
+// oldest entry loses its slot, which is the right victim — the gate exists to
+// serve clients holding recent records.
+void Announcer::gate_upsert(const compact::Ipv4Address& addr, uint64_t now) {
+    for (auto& e : gate_) {
+        if (e.addr == addr) {
+            e.last_seen_ms = now;
+            return;
+        }
+    }
+    if (gate_.size() >= GATE_MAX) {
+        auto oldest = gate_.begin();
+        for (auto it = gate_.begin(); it != gate_.end(); ++it) {
+            if (it->last_seen_ms < oldest->last_seen_ms) oldest = it;
+        }
+        *oldest = GateEntry{addr, now};
+        return;
+    }
+    gate_.push_back(GateEntry{addr, now});
+}
+
+// JS announcer.js:38-42 — see the header for why this is deliberately wider
+// than relays().
+bool Announcer::is_relay(const compact::Ipv4Address& addr) const {
+    // (a) Never refuse a relay we are advertising right now. The wire list and
+    //     the gate cannot disagree, whatever the window arithmetic says.
+    for (const auto& r : active_relays_) {
+        if (r.addr == addr) return true;
+    }
+
+    // (b) Leniency: any node that acked an ANNOUNCE inside the window may
+    //     still be holding the record a client is relaying through.
+    const uint64_t now = uv_now(socket_.loop());
+    for (const auto& e : gate_) {
+        if (e.addr == addr && now - e.last_seen_ms < gate_ttl_ms_) return true;
+    }
+
+    // Log misses only — a hit fires on every holepunch round. This line is
+    // the one that makes the "server refused a token to a live record holder"
+    // failure visible in a field capture.
+    DHT_LOG("  [announcer] is_relay MISS %s:%u (gate=%zu published=%zu)\n",
+            addr.host_string().c_str(), addr.port, gate_.size(),
+            active_relays_.size());
+    return false;
+}
 
 void Announcer::build_relays() {
     relays_.clear();

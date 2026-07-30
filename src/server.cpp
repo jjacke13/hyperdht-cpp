@@ -1232,16 +1232,15 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     // when is_server_relay): comparing against the client meant the token
     // was never issued, every client round 1 came back tokenless
     // ("inconclusive") and burned 1-2.5s on the round-1 retry.
-    bool is_relay = false;
-    if (announcer_) {
-        for (const auto& ri : announcer_->relays()) {
-            if (ri.relay_address.host_string() == from_address.host_string() &&
-                ri.relay_address.port == from_address.port) {
-                is_relay = true;
-                break;
-            }
-        }
-    }
+    //
+    // The set searched is the announcer's multi-generation gate (JS
+    // announcer.js:38-42), NOT relays(): the client is relaying through a node
+    // named in the record IT holds, which may be a cycle or two behind the
+    // list we advertise right now.
+    bool is_relay = announcer_ && announcer_->is_relay(from_address);
+    DHT_LOG("  [server] holepunch from=%s:%u is_relay=%d\n",
+            from_address.host_string().c_str(), from_address.port,
+            is_relay ? 1 : 0);
 
     // JS parity (server.js:553-574): rate-limit concurrent/too-frequent
     // random-NAT punches at the DHT level. `PunchStats::can_random_punch()`

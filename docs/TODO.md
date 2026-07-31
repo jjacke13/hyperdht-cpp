@@ -359,15 +359,41 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   unexplained — `id = BLAKE2b(host, port)` makes each mapping an independent
   random point, so three mappings of one host being the global closest-3 is
   suspicious in itself; if it recurs, suspect the selection/sort, not diversity.
-- [ ] **Router forward cache has no TTL and no size cap (HIGH, from the
-  completeness critic).** `src/router.cpp` uses a plain `unordered_map` erased
-  only on explicit unset; JS uses `new Cache(opts.forwards)` with maxSize 65536
-  / maxAge 20 min (router.js:23, index.js:594-595). Any remote ANNOUNCE inserts
-  an attacker-keyed entry: unbounded memory from an unauthenticated wire
-  message, AND stale forwards that keep relaying toward a dead peer forever —
-  i.e. a hyperdht-cpp node is itself one of the silently-dead relays that
-  Finding M has to fail over. Test: insert 100k targets, assert size <= 65536;
-  insert one, advance 21 min, assert `get()` == nullptr. Both fail today.
+- [ ] **Router forward cache has no TTL and no size cap (from the completeness
+  critic; RECHECK — scoped down 2026-07-31, still real).** `src/router.cpp` uses
+  a plain `unordered_map` erased only on explicit unset; JS uses
+  `new Cache(opts.forwards)` with maxSize 65536 / maxAge 20 min (router.js:23,
+  index.js:594-595). Two consequences: unbounded memory, and stale forwards that
+  keep relaying toward a peer that is long gone — i.e. a hyperdht-cpp node
+  becomes one of the silently-dead relays Finding M has to fail over.
+  **SCOPE (checked 2026-07-31):** NOT reachable against a firewalled client.
+  Entries arrive only via ANNOUNCE, which only reaches nodes that are in others'
+  routing tables, which requires having passed the firewall probe and gone
+  persistent — a node advertises its id only when persistent and on the server
+  socket (rpc.cpp:846), and table insertion needs that id (rpc.cpp:975-988). So
+  exposure is limited to publicly-reachable nodes (nospoon servers, anything
+  acting as a DHT node); laptop/phone clients are not exposed.
+  **Still real at that scope:** the handler requires target + token + valid
+  Ed25519 signature (rpc_handlers.cpp:593-631), which blocks spoofing but not
+  volume — the token is only address-bound and the target is `BLAKE2b(pubkey)`
+  of a SELF-generated keypair with a self-made signature, so one address can
+  mint unlimited valid targets and therefore unlimited forward entries.
+  Test: insert 100k targets, assert size <= 65536; insert one, advance 21 min,
+  assert `get()` == nullptr. Both fail today.
+- [ ] **RECHECK: the persistence gate is one-shot and cannot demote** (context
+  for Finding O and for the item above; no action decided yet). Becoming a relay
+  requires passing the PING_NAT firewall probe once — five routing-table nodes
+  reply to our server socket, plus the port-preservation check. That proves
+  those five could reach that port at that moment; it does NOT establish
+  endpoint-independence, and nothing ever re-runs it to demote (same
+  promote-but-never-decrement property the B1 audit found in JS `nat.js`
+  `_updateFirewall`). When a NAT mapping later moves, the node re-registers
+  under a NEW id, because `id = BLAKE2b(host, port)` — so each remap enters the
+  routing table as a fresh, legitimately-persistent node. That is exactly how
+  `82.29.173.47` appeared under nine distinct ports in one day and how one
+  physical host could occupy multiple announce slots (Finding O). Any
+  host-diversity work should be designed against this, not against the naive
+  "one node = one entry" model.
 - [ ] **Per-cycle UNANNOUNCE not ported** (announcer.js:191-196). Deliberate:
   C++ reuses the commit-time token, which the receiver rejects after ~15s
   (rpc_handlers.cpp:819-821), so it would emit provably-rejected datagrams and

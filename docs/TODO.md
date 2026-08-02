@@ -440,7 +440,31 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   neither direction. Keep it as a remedy (a client whose mapping moves
   mid-handshake wants the birthday fallback), NOT as the cause. **B2 is now
   the priority of the pair.**
-- [ ] **B2 (NOW THE PRIORITY OF THE PAIR — see Finding L)** — Round-2 holepunch payload sends ONE
+- [x] **B2 — DONE 2026-08-02** (`f6608b7`, PUSHED). Round 2 now sends
+  `pool->addresses()` (the sampler set) like round 1, with the relay's
+  observation kept only as the last-resort fallback. Deliberately does NOT
+  inherit round 1's `ctx.local_addresses` fallback: those are RFC1918
+  (`holepunch::local_addresses` only filters libuv's `is_internal` =
+  loopback/link-local), JS never puts LAN addresses in this field (nat.js:139
+  → `addresses = null` when UNKNOWN, and the encoder omits it), and preferring
+  them would advertise ONLY private addresses on an UNKNOWN classification —
+  worse than the single public mapping this round sent before. Caught by
+  cpp-reviewer.
+  **CORRECTION while implementing:** the claim that C++ also lacks JS's
+  `nat.add(reply.to, reply.from)` (connect.js:578) is WRONG.
+  `PoolSocket::handle_message` (holepunch.cpp:958-963) already feeds every
+  response's wire `to` field to the same sampler — a broader equivalent, since
+  round 1's reply arrives on the pool socket. An explicit call there is dead
+  code; caught because the red-check refused to go red. **B2 was one
+  divergence, not two.**
+  Tests `PunchingRoundGossipsFullSampledSet` + a failover-relay assertion (a
+  relay that was never a pool-sampling target still gets its observation
+  gossiped). Both red-checked. 731/731, ASAN clean, cpp-reviewer SHIP.
+  **Causality NOT claimed** — the same field capture shows connects succeeding
+  with `1 addrs`, and the 2026-08-02 midnight failure had only one sampled
+  mapping, so B2 would not have saved it. Landed on parity grounds. **B1 +
+  D-secondary remain the live pair on that path.** Original entry follows.
+- [ ] ~~**B2 (NOW THE PRIORITY OF THE PAIR — see Finding L)**~~ — Round-2 holepunch payload sends ONE
   address (`our_addr`, holepunch.cpp:1880-1885) instead of
   `nat_sampler().addresses()`; JS sends the full set in both rounds
   (connect.js:567,654,684). Field Finding F (2026-07-23, SUCCESS) shows B2 is

@@ -594,4 +594,4 @@ To be absolutely clear — these files are **not modified**:
 - `components/libuv-esp32/` — the shim (~680 lines)
 - `components/hyperdht/` — ESP-IDF component wrapper (~50 lines)
 - `examples/esp32/` — example app
-- `docs/ESP32-IMPLEMENTATION-PLAN.md` — this document
+- `docs/archive/ESP32-IMPLEMENTATION-PLAN.md` — this document

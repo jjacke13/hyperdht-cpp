@@ -305,7 +305,7 @@ See `docs/TODO.md` (the single worklist) for the up-to-date list. Major ones:
 
 ## References
 
-- Architecture + libuv shim deep-dive: `docs/ESP32-IMPLEMENTATION-PLAN.md`
+- Architecture + libuv shim deep-dive: `docs/archive/ESP32-IMPLEMENTATION-PLAN.md` (historical plan; the port shipped)
 - C API reference: `include/hyperdht/hyperdht.h`
 - Working echo apps: `examples/esp32/` + `examples/esp32/echo-server/`
 - Downstream consumer: [mimiclaw](https://github.com/jjacke13/mimiclaw)

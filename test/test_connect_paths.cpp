@@ -15,6 +15,7 @@
 #include <sodium.h>
 #include <uv.h>
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -425,6 +426,7 @@ struct FailoverScenarioResult {
     // what the server matches against its own NAT samples (server.js:530).
     std::optional<Ipv4Address> live_msg_peer_address;
     std::optional<Ipv4Address> live_payload_remote_address;
+    std::vector<Ipv4Address> punch_addresses;
 };
 
 // Two relays: the first swallows every PEER_HOLEPUNCH (the field's
@@ -453,7 +455,18 @@ FailoverScenarioResult run_failover_scenario(bool with_fallback) {
     live_id.fill(0x03);
     rpc::RpcSocket live_relay(&loop, live_id);
     live_relay.bind(0);
+    // udp_send (used below to lie in the wire `to` field) must egress the
+    // bound port so the reply's id passes the client's validateId.
+    live_relay.set_firewalled(false);
     auto live_addr = Ipv4Address::from_string("127.0.0.1", live_relay.port());
+
+    // What the FAILOVER relay claims to see our pool socket as. Distinct from
+    // everyone else's observation, and this relay is never a
+    // discover_pool_addresses target (only relays[0] is), so JS's
+    // `nat.add(reply.to, reply.from)` (connect.js:578) is the ONLY path by
+    // which it can reach our NAT sampler.
+    const auto live_observed =
+        Ipv4Address::from_string("198.51.100.9", 4444);
 
     // Fake DHT nodes so pool NAT sampling reaches >= 4 samples.
     std::vector<std::unique_ptr<rpc::RpcSocket>> nodes;
@@ -522,6 +535,7 @@ FailoverScenarioResult run_failover_scenario(bool with_fallback) {
         reply.round = payload.round;
         if (payload.punching) {
             out.live_relay_saw_punching = true;
+            out.punch_addresses = payload.addresses;
             reply.error = peer_connect::ERROR_ABORTED;
         } else {
             if (!out.live_relay_saw_round1) {
@@ -545,9 +559,14 @@ FailoverScenarioResult run_failover_scenario(bool with_fallback) {
 
         messages::Response resp;
         resp.tid = req.tid;
-        resp.from.addr = req.from.addr;
+        // Lie about where we see the client: this becomes the client's
+        // `our_addr` for this leg. Sent via udp_send because
+        // RpcSocket::reply() uses resp.from.addr as the UDP destination and
+        // so cannot carry a `to` field that differs from the real source.
+        resp.from.addr = live_observed;
+        resp.id = rpc::compute_peer_id(live_addr);
         resp.value = holepunch::encode_holepunch_msg(reply_msg);
-        live_relay.reply(resp, req.from_server);
+        live_relay.udp_send(messages::encode_response(resp), req.from.addr);
     });
 
     // The live relay's OWN view of the server — distinct from the fresh
@@ -610,6 +629,23 @@ TEST(ConnectRelayFailover, DeadRelayFallsOverToTheNextRelay) {
     ASSERT_TRUE(out.live_payload_remote_address.has_value());
     EXPECT_EQ(out.live_payload_remote_address->host_string(), "10.0.0.2");
     EXPECT_EQ(out.live_payload_remote_address->port, 9998);
+
+    // JS connect.js:578 `nat.add(reply.to, reply.from)` — in C++ this happens
+    // one layer down, in PoolSocket::handle_message, for every response that
+    // arrives on the pool socket. The failover relay is never a pool-sampling
+    // target, so its round-1 reply is the only way its view of us enters the
+    // sampler; pinning that here keeps the punching round advertising a
+    // mapping that only this relay can see.
+    bool saw_failover_observation = false;
+    for (const auto& a : out.punch_addresses) {
+        if (a.host_string() == "198.51.100.9" && a.port == 4444) {
+            saw_failover_observation = true;
+        }
+    }
+    EXPECT_TRUE(saw_failover_observation)
+        << "the failover relay's view of our pool socket never reached the "
+           "NAT sampler, so the punching round could not advertise it";
+    EXPECT_GE(out.punch_addresses.size(), 2u);
 }
 
 // Control: with no fallback relays the behavior is unchanged — one relay,
@@ -650,4 +686,194 @@ TEST(ConnectRelayFailover, FallbackListSkipsTheChosenRelayAndIsCapped) {
     EXPECT_TRUE(holepunch::pick_fallback_relays({relays[1]},
                                                 relays[1].relay_address)
                     .empty());
+}
+
+// ===========================================================================
+// B2 — the punching round must gossip the FULL sampled address set
+//   JS connect.js:654,684 `addresses: c.puncher.nat.addresses` — the same
+//   set round 1 sends (:567). C++ sent only the relay's single observation of
+//   our pool socket, so a server whose probes could not reach that one mapping
+//   had no alternative to try, and the two rounds disagreed about who we are.
+//   Also covers JS connect.js:578 `nat.add(reply.to, reply.from)`: the relay's
+//   observation must enter the sampler, not just be used locally.
+// ===========================================================================
+
+namespace {
+
+struct PunchAddrResult {
+    bool done = false;
+    size_t round1_addrs = 0;
+    size_t punch_addrs = 0;
+    bool saw_round1 = false;
+    bool saw_punch = false;
+    std::vector<Ipv4Address> punch_list;
+};
+
+// Half the sampling nodes report one observed address for our pool socket and
+// half report another, so the pool NAT sampler ends up holding TWO addresses
+// with >=2 hits each — CONSISTENT, and a set the punching round can be seen
+// to carry (or drop).
+PunchAddrResult run_punch_addresses_scenario() {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    PunchAddrResult out;
+
+    routing::NodeId cid{};
+    cid.fill(0x01);
+    rpc::RpcSocket client(&loop, cid);
+    client.bind(0);
+
+    routing::NodeId rid{};
+    rid.fill(0x02);
+    rpc::RpcSocket relay(&loop, rid);
+    relay.bind(0);
+    auto relay_addr = Ipv4Address::from_string("127.0.0.1", relay.port());
+
+    // Two distinct "observed" mappings, neither of them the truthful one, so
+    // the sampled set is unambiguous in the assertions below.
+    const auto obs_a = Ipv4Address::from_string("198.51.100.7", 1111);
+    const auto obs_b = Ipv4Address::from_string("198.51.100.7", 2222);
+
+    std::vector<std::unique_ptr<rpc::RpcSocket>> nodes;
+    for (int i = 0; i < 6; i++) {
+        routing::NodeId nid{};
+        nid.fill(static_cast<uint8_t>(0x10 + i));
+        auto n = std::make_unique<rpc::RpcSocket>(&loop, nid);
+        n->bind(0);
+        n->set_firewalled(false);
+        auto* np = n.get();
+        const auto observed = (i < 3) ? obs_a : obs_b;
+        np->on_request([np, observed](const messages::Request& req) {
+            if (!(req.internal && req.command == messages::CMD_PING)) return;
+            messages::Response resp;
+            resp.tid = req.tid;
+            resp.from.addr = observed;  // lie about where we see them
+            np->udp_send(messages::encode_response(resp), req.from.addr);
+        });
+        routing::Node node;
+        node.id = nid;
+        node.host = "127.0.0.1";
+        node.port = np->port();
+        client.table().add(node);
+        nodes.push_back(std::move(n));
+    }
+
+    peer_connect::HandshakeResult hs;
+    hs.success = true;
+    hs.handshake_hash.fill(0x77);
+    hs.remote_public_key.fill(0x55);
+
+    const auto& ns_hp = dht_messages::ns_peer_holepunch();
+    std::array<uint8_t, 32> hp_secret{};
+    crypto_generichash(hp_secret.data(), 32, ns_hp.data(), 32,
+                       hs.handshake_hash.data(), 64);
+    auto relay_secure = std::make_shared<holepunch::SecurePayload>(hp_secret);
+
+    relay.on_request([&](const messages::Request& req) {
+        if (req.internal && req.command == messages::CMD_PING) {
+            answer_ping(relay, req);
+            return;
+        }
+        if (req.command != messages::CMD_PEER_HOLEPUNCH || !req.value) return;
+
+        auto msg = holepunch::decode_holepunch_msg(
+            req.value->data(), req.value->size());
+        auto dec = relay_secure->decrypt(msg.payload.data(),
+                                         msg.payload.size());
+        if (!dec) {
+            ADD_FAILURE() << "relay could not decrypt holepunch payload";
+            return;
+        }
+        auto payload = holepunch::decode_holepunch_payload(
+            dec->data(), dec->size());
+
+        holepunch::HolepunchPayload reply;
+        reply.error = peer_connect::ERROR_NONE;
+        reply.firewall = peer_connect::FIREWALL_CONSISTENT;
+        reply.round = payload.round;
+        if (payload.punching) {
+            out.saw_punch = true;
+            out.punch_addrs = payload.addresses.size();
+            out.punch_list = payload.addresses;
+            reply.error = peer_connect::ERROR_ABORTED;  // terminate fast
+        } else {
+            if (!out.saw_round1) {
+                out.saw_round1 = true;
+                out.round1_addrs = payload.addresses.size();
+            }
+            reply.addresses.push_back(
+                Ipv4Address::from_string("10.0.0.1", 9999));
+            std::array<uint8_t, 32> token{};
+            token.fill(0xAB);
+            reply.token = token;
+        }
+
+        auto reply_bytes = holepunch::encode_holepunch_payload(reply);
+        holepunch::HolepunchMessage reply_msg;
+        reply_msg.mode = peer_connect::MODE_REPLY;
+        reply_msg.id = msg.id;
+        reply_msg.payload = relay_secure->encrypt(reply_bytes.data(),
+                                                  reply_bytes.size());
+
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = req.from.addr;
+        resp.value = holepunch::encode_holepunch_msg(reply_msg);
+        relay.reply(resp, req.from_server);
+    });
+
+    holepunch::holepunch_connect(
+        client, hs, relay_addr,
+        /*peer_addr=*/Ipv4Address::from_string("10.0.0.2", 9998),
+        /*holepunch_id=*/7,
+        peer_connect::FIREWALL_UNKNOWN, {},
+        [&](const holepunch::HolepunchResult&) { out.done = true; },
+        /*fast_open=*/false,
+        nullptr, nullptr, nullptr, nullptr, nullptr, {});
+
+    run_until(&loop, [&] { return out.done; }, 20000);
+
+    client.close();
+    relay.close();
+    for (auto& n : nodes) n->close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+
+    return out;
+}
+
+}  // namespace
+
+TEST(ConnectPunchAddresses, PunchingRoundGossipsFullSampledSet) {
+    auto out = run_punch_addresses_scenario();
+
+    ASSERT_TRUE(out.saw_round1) << "relay never saw round 1";
+    ASSERT_TRUE(out.saw_punch) << "relay never saw the punching round";
+
+    // Round 1 carrying nothing is correct, not a harness failure: it fires
+    // immediately after the handshake reply, before pool NAT sampling has
+    // settled, so the classification is still UNKNOWN and nat.addresses() is
+    // empty (JS holepuncher.js:19-20 / connect.js:567 behave the same). The
+    // punching round is the one that runs post-sampling, and it is where the
+    // full set has to appear.
+    EXPECT_EQ(out.round1_addrs, 0u)
+        << "round 1 unexpectedly had a settled sample set; if this changes, "
+           "the punching round must still match it";
+
+    ASSERT_EQ(out.punch_addrs, 2u)
+        << "the punching round advertised " << out.punch_addrs
+        << " address(es); the sampler held two distinct mappings and the "
+           "server needs both — with one it has a single candidate to probe "
+           "and nothing to fall back on";
+
+    // Exactly the two mappings the sampling nodes reported, proving the set
+    // came from the NAT sampler and not from the relay's lone observation.
+    std::vector<uint16_t> ports;
+    for (const auto& a : out.punch_list) {
+        EXPECT_EQ(a.host_string(), "198.51.100.7");
+        ports.push_back(a.port);
+    }
+    std::sort(ports.begin(), ports.end());
+    EXPECT_EQ(ports, (std::vector<uint16_t>{1111, 2222}));
 }

@@ -1831,6 +1831,13 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
             // the wire `to` field set by the relay = our public mapping).
             Ipv4Address our_addr = resp.from.addr;
 
+            // JS connect.js:578 does `c.puncher.nat.add(reply.to, reply.from)`
+            // here. No explicit call is needed: this reply arrived on the pool
+            // socket, and PoolSocket::handle_message already feeds every
+            // response's wire `to` field to the same sampler (see the
+            // nat_sampler_.add() above) — a broader equivalent, since it
+            // covers every response rather than just the holepunch reply.
+
             // ------------------------------------------------------------------
             // Everything from here on (analyze, retry, post-R1 probe, Round 2)
             // depends on accurate post-sampling pool NAT classification — JS
@@ -1971,7 +1978,26 @@ void run_round1(std::shared_ptr<PunchState> state, Round1Ctx ctx) {
                     punch.firewall = pool_fw_send;
                     punch.round = 1;
                     punch.punching = true;
-                    punch.addresses.push_back(our_addr);
+
+                    // JS connect.js:654,684 — `addresses: c.puncher.nat.addresses`,
+                    // the FULL sampled set, exactly as round 1 sends it
+                    // (:567). Sending only the relay's single observation left
+                    // the server with one candidate to probe and no
+                    // alternative when that mapping was not reachable from it
+                    // — while round 1 had already advertised the whole set, so
+                    // the two rounds disagreed about who we are.
+                    auto punch_addrs = state->pool->addresses();
+                    // An UNKNOWN classification yields no addresses at all, so
+                    // keep the relay's observation as the safety net — that is
+                    // what this round used to send unconditionally, and it is
+                    // a real public mapping. Deliberately NOT falling back to
+                    // ctx.local_addresses the way round 1 does: those are
+                    // RFC1918 (holepunch::local_addresses only filters libuv's
+                    // is_internal, i.e. loopback/link-local), and JS never puts
+                    // LAN addresses in this field — nat.addresses is null when
+                    // UNKNOWN and the encoder simply omits it.
+                    if (punch_addrs.empty()) punch_addrs.push_back(our_addr);
+                    punch.addresses = std::move(punch_addrs);
 
                     // Generate our token for address verification
                     punch.token = state->secure->token(server_addrs[0].host_string());

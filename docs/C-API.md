@@ -1,6 +1,6 @@
 # C API Reference
 
-Header: [`include/hyperdht/hyperdht.h`](../include/hyperdht/hyperdht.h) (76 functions, heavily commented)
+Header: [`include/hyperdht/hyperdht.h`](../include/hyperdht/hyperdht.h) (90 functions, heavily commented)
 
 The header is the authoritative reference. This page covers the patterns and conventions.
 
@@ -23,7 +23,7 @@ The header is the authoritative reference. This page covers the patterns and con
 | `hyperdht_query_t` | `*_ex()` variants | `hyperdht_query_free()` |
 | `hyperdht_firewall_done_t` | Passed to async firewall cb | `hyperdht_firewall_done()` |
 
-## API surface (76 functions)
+## API surface (90 functions)
 
 | Category | Functions |
 |----------|----------|
@@ -71,7 +71,7 @@ Handles from `_ex` variants (`find_peer_ex`, `lookup_ex`, `immutable_get_ex`, `m
 
 The C FFI is designed for cross-language use:
 
-- **Python**: `wrappers/python/` -- ctypes bindings, 76 functions exposed
+- **Python**: `wrappers/python/` -- ctypes bindings, 90 functions exposed
 - **Kotlin/Swift**: explicit struct padding (`_pad0`), stride constants, completion callbacks
 - **Any language with C FFI**: opaque pointers + callbacks, no C++ symbols exposed
 

@@ -10,8 +10,8 @@ Two devices on different networks, behind NATs, find each other by public key an
 - **NAT traversal** -- UDP holepunching with 4 strategies (consistent, random, birthday paradox, blind relay)
 - **End-to-end encryption** -- Noise IK handshake (Ed25519) + SecretStream (XChaCha20-Poly1305)
 - **Mutable/immutable storage** -- signed key-value records on the DHT
-- **C FFI** -- 76-function `extern "C"` API for Python, Go, Rust, Swift, Kotlin
-- **Python wrapper included** -- `from hyperdht import HyperDHT, KeyPair` and go
+- **C FFI** -- 90-function `extern "C"` API for Python, Go, Rust, Swift, Kotlin
+- **Wrappers included** -- Python (`from hyperdht import HyperDHT, KeyPair`), Rust (`hyperdht` + `hyperdht-sys` crates), Kotlin/JNI for Android
 
 ## Why C++
 
@@ -23,9 +23,9 @@ Wire-compatible with JS `hyperdht@6.29.1`. Live-tested in both directions on the
 
 | | |
 |---|---|
-| **Tests** | 578 unit + 6 live, ASAN/UBSan clean |
-| **API parity** | Full -- wire-compatible with JS `hyperdht@6.29.1` ([audit](docs/archive/JS-PARITY-GAPS.md)) |
-| **Languages** | C++ / C / Python / Kotlin (Swift, Go, Rust planned) |
+| **Tests** | 731 unit + 6 live, ASAN/UBSan clean |
+| **API parity** | Wire-compatible with JS `hyperdht@6.29.1`; behavioural parity ~93% and tracked openly in [docs/TODO.md](docs/TODO.md) ([original audit](docs/archive/JS-PARITY-GAPS.md)) |
+| **Languages** | C++ / C / Python / Rust / Kotlin (Swift, Go via the C API) |
 | **Platforms** | Linux, macOS, Windows, Android, ESP32 |
 
 ## Build
@@ -49,14 +49,15 @@ Without Nix: install `cmake`, `ninja`, `libsodium`, `libuv`, then the same cmake
 | | |
 |---|---|
 | [Build instructions](docs/BUILDING.md) | Linux, macOS, Windows, Docker, Nix — deps, compile, link, troubleshoot |
-| [C API reference](docs/C-API.md) | 76 functions, opaque-pointer pattern, callback-based async |
+| [C API reference](docs/C-API.md) | 90 functions, opaque-pointer pattern, callback-based async |
 | [C++ API reference](docs/CPP-API.md) | RAII wrappers, error codes, single-threaded event loop |
+| [Rust wrapper](docs/BUILDING-RUST.md) | `hyperdht-sys` (bindgen) + safe `hyperdht` crate, async/await API |
 | [Python examples](examples/python/) | Server, client, holesail tunnel, 22 wrapper tests |
 | [ESP32 guide](examples/esp32/) | Build, flash, run HyperDHT on ESP32-S3 (echo server + client) |
 | [Android example](examples/android/) | Kotlin/JNI wrapper with echo test app |
 | [Wire protocol spec](PROTOCOL.md) | Reverse-engineered from JS, 12 sections |
 | [JS name mapping](docs/JS-MAPPING.md) | Side-by-side: `createServer` -> `create_server` -> `hyperdht_server_create` |
-| [Remaining work](docs/REMAINING-WORK.md) | Verification tasks, production readiness, ESP32 porting plan |
+| [Worklist](docs/TODO.md) | Single source of truth: open parity findings, hardening, field diagnoses |
 
 ## Bootstrap nodes
 
@@ -70,7 +71,7 @@ node3.hyperdht.org:49737
 
 ## Contributing
 
-[REMAINING-WORK.md](docs/REMAINING-WORK.md) tracks hardening and production polish. JS protocol parity is complete ([audit](docs/archive/JS-PARITY-GAPS.md)). Every network-behaviour change must be live-tested against a JS peer before landing.
+[docs/TODO.md](docs/TODO.md) is the single source of truth for outstanding work — open JS-parity findings, hardening tasks and field diagnoses, each with the JS `file:line` it diverges from. Every network-behaviour change must be live-tested against a JS peer before landing.
 
 ## License
 

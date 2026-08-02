@@ -296,8 +296,7 @@ idf.py -p /dev/ttyACM0 flash monitor
 
 ## Known limitations (ESP32 build)
 
-See `docs/REMAINING-WORK.md` → "ESP32 (`HYPERDHT_EMBEDDED`) — known
-issues" for the up-to-date list. Major ones:
+See `docs/TODO.md` (the single worklist) for the up-to-date list. Major ones:
 
 - **256-socket OOM risk** under the birthday-paradox holepunch
   strategy (worst-case RAM pressure when peer is behind random NAT).

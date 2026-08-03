@@ -203,6 +203,10 @@ int Channel::add_message(MessageHandler handler) {
 //     this._mux._write0(buffer).
 void Channel::open(const uint8_t* handshake, size_t handshake_len) {
     if (open_sent_ || closed_ || destroyed_) return;
+    // write_frame() below hands the OPEN to the transport, which on a
+    // synchronous transport (loopback / in-process relay) can round-trip a
+    // REJECT and free us before we return. Hold ourselves alive.
+    auto self = shared_from_this();
     open_sent_ = true;
 
     // Assign our local id at OPEN time (JS index.js:71-79), not at create time.
@@ -238,8 +242,9 @@ void Channel::open(const uint8_t* handshake, size_t handshake_len) {
 
     // If the remote already opened this (protocol,id) — its OPEN is queued in
     // incoming_ — pair with the first such open now (JS createChannel incoming
-    // path, index.js:399-414). Skip if the outgoing path already paired us.
-    if (remote_id_ != 0) return;
+    // path, index.js:399-414). Skip if the outgoing path already paired us, or
+    // if the write above already tore us down (REJECT round-tripped).
+    if (destroyed_ || closed_ || remote_id_ != 0) return;
     for (const auto& k : pair_keys_) {
         auto it = mux_.incoming_.find(k);
         if (it != mux_.incoming_.end() && !it->second.empty()) {
@@ -257,6 +262,11 @@ void Channel::open(const uint8_t* handshake, size_t handshake_len) {
 //     [localId, type, payload] frame and writes directly to the stream.
 bool Channel::send(int message_type, const uint8_t* data, size_t len) {
     if (!opened_ || closed_ || remote_id_ == 0) return false;
+    // write_frame() below can round-trip a CLOSE on a synchronous transport and
+    // free us before it returns. Nothing touches `this` after the write today,
+    // so the guard is not load-bearing yet — it is here so that adding any
+    // post-write bookkeeping cannot silently reintroduce the use-after-free.
+    auto self = shared_from_this();
 
     // Build data frame: [localId][messageType][data]. JS puts the SENDER's own
     // localId on every data frame (index.js:270-278); the receiver maps it via
@@ -281,14 +291,17 @@ bool Channel::send(int message_type, const uint8_t* data, size_t len) {
     return true;
 }
 
+// uncork() flushes the batch through the transport, so it carries the same
+// round-trip-frees-us hazard as send(); same reasoning for the guard.
 void Channel::cork()   { mux_.cork(); }
-void Channel::uncork() { mux_.uncork(); }
+void Channel::uncork() { auto self = shared_from_this(); mux_.uncork(); }
 
 // JS: index.js:217-232 — Channel.close(): builds a [0, 3, localId] control
 //     frame, calls _close(false) which fires onclose(false, this) and
 //     finally _write0()s the frame.
 void Channel::close() {
     if (closed_ || destroyed_) return;
+    auto self = shared_from_this();  // write_frame may round-trip and free us
     closed_ = true;
 
     // Build CLOSE message: [0][CONTROL_CLOSE][localId]
@@ -322,8 +335,11 @@ void Channel::fully_open(const uint8_t* remote_handshake, size_t len) {
 //     and resolves the open promise to false.
 void Channel::remote_close() {
     if (destroyed_) return;
+    auto self = shared_from_this();
     closed_ = true;
-    // Move callback out before destroy — destroy erases us from the vector
+    // NOTE: this fires on_destroy before on_close; JS _close (index.js:186-190)
+    // is the other way round. Left as-is deliberately — `self` makes it
+    // memory-safe; the ordering divergence is tracked separately.
     auto close_cb = std::move(on_close);
     destroy();
     if (close_cb) close_cb();
@@ -331,6 +347,7 @@ void Channel::remote_close() {
 
 void Channel::destroy() {
     if (destroyed_) return;
+    auto self = shared_from_this();
     destroyed_ = true;
     opened_ = false;
 
@@ -347,6 +364,7 @@ void Channel::destroy() {
 }
 
 void Channel::dispatch(uint32_t type, const uint8_t* data, size_t len) {
+    auto self = shared_from_this();
     if (type < messages_.size() && messages_[type].on_message) {
         // Copy the handler onto the stack before invoking: a handler is
         // allowed to tear down its own channel (e.g. blind-relay closing the
@@ -410,8 +428,8 @@ Channel* Mux::create_channel(const std::string& protocol,
     // (JS assigns _localId in Channel.open, not the constructor) so the peer
     // sees ids in open order — see Channel::open.
     auto ch = aliases.empty()
-        ? std::make_unique<Channel>(*this, protocol, id, 0)
-        : std::make_unique<Channel>(*this, protocol, aliases, id, 0);
+        ? std::make_shared<Channel>(*this, protocol, id, 0)
+        : std::make_shared<Channel>(*this, protocol, aliases, id, 0);
     Channel* ptr = ch.get();
     channels_.push_back(std::move(ch));
 
@@ -813,21 +831,58 @@ Channel* Mux::find_awaiting_local(const std::string& key) {
 
 void Mux::pair_with_remote(Channel* local, const PendingOpen& remote) {
     uint32_t remote_id = remote.remote_local_id;
+    auto keep = local->shared_from_this();  // on_open may close the channel
     local->set_remote_id(remote_id);
 
-    RemoteSlot& slot = remote_slots_[remote_id];
-    bool was_buffering = slot.buffering;
-    slot.session = local;
+    // Bind the slot to the channel and take the backlog into a local — on_open
+    // may close the channel, and remove_channel() erases
+    // remote_slots_[remote_id], so a RemoteSlot& held across the callback would
+    // dangle (and the backlog's buffered_bytes_ would go unaccounted).
+    //
+    // `buffering` deliberately stays ON across the callback: a frame that
+    // round-trips inside on_open must queue BEHIND this backlog, not overtake
+    // it. JS gets the same ordering because `remote.pending` is only nulled
+    // after the drain (index.js:154) while the buffering test is
+    // `pending !== null` (index.js:516) — so an in-onopen frame is appended,
+    // never dispatched early.
+    //
+    // That applies to the incoming-pair path (Channel::open's tail), which is
+    // the only one with a backlog. handle_open's outgoing path clears
+    // `buffering` before calling us — matching JS `pending: null` at
+    // index.js:628 — so there is nothing to queue behind and an in-onopen frame
+    // dispatches straight away. Both match JS; only the incoming path is
+    // order-sensitive.
+    //
+    // Binding `slot.session` before the callback is likewise JS parity:
+    // _fullyOpenSoon assigns remote.session before queueing the tick
+    // (index.js:112-114). Assigning it after on_open would DROP a reentrant
+    // frame, since handle_data's only outcomes are "buffer" or "dispatch via
+    // slot.session".
+    std::vector<BufferedMessage> pending;
+    {
+        RemoteSlot& slot = remote_slots_[remote_id];
+        slot.session = local;
+        pending = std::move(slot.pending);
+        slot.pending.clear();
+    }
 
-    // Fire on_open with the remote handshake (JS _fullyOpen)…
+    // Fire on_open with the remote handshake (JS _fullyOpen, index.js:124).
     local->fully_open(remote.handshake.data(), remote.handshake.size());
 
-    // …then replay any data buffered while we waited to pair (JS _drain).
-    auto pending = std::move(slot.pending);
-    slot.pending.clear();
-    slot.buffering = false;
-    if (was_buffering && remote_backlog_ > 0) remote_backlog_--;
+    // Re-find rather than reuse the reference above — on_open may have closed
+    // the channel (slot erased) or torn the whole mux down.
+    auto slot_it = remote_slots_.find(remote_id);
+    if (slot_it != remote_slots_.end()) {
+        RemoteSlot& slot = slot_it->second;
+        // Anything that arrived during on_open queued behind the backlog; it
+        // replays after, in arrival order.
+        for (auto& pm : slot.pending) pending.push_back(std::move(pm));
+        slot.pending.clear();
+        if (slot.buffering && remote_backlog_ > 0) remote_backlog_--;
+        slot.buffering = false;
+    }
 
+    // Replay (JS _drain, index.js:147-155).
     for (auto& pm : pending) {
         size_t sz = kBufferOverhead + pm.data.size();
         buffered_bytes_ = buffered_bytes_ >= sz ? buffered_bytes_ - sz : 0;
@@ -957,10 +1012,11 @@ void Mux::on_stream_drain() {
     // JS _ondrain (index.js:492-498): fire ondrain on every non-null local
     // session (i.e. every channel that has opened), opened-and-paired or not —
     // not only fully-opened ones (finding protomux-9).
-    // Snapshot: callbacks may close channels, modifying channels_ vector.
-    auto snapshot = std::vector<Channel*>();
-    for (auto& ch : channels_) snapshot.push_back(ch.get());
-    for (auto* ch : snapshot) {
+    // Snapshot owning refs: an on_drain callback may close a LATER channel in
+    // the snapshot, which frees it — a raw-pointer snapshot would then dangle
+    // on the `ch->destroyed_` read below.
+    auto snapshot = std::vector<std::shared_ptr<Channel>>(channels_);
+    for (auto& ch : snapshot) {
         if (ch->open_sent_ && !ch->destroyed_ && ch->on_drain) {
             ch->on_drain();
         }
@@ -970,7 +1026,23 @@ void Mux::on_stream_drain() {
 void Mux::remove_channel(Channel* ch) {
     // Remove from lookups. JS _close nulls _remote[rid] and frees the local id.
     if (ch->remote_id_ != 0) {
-        remote_slots_.erase(ch->remote_id_);
+        auto it = remote_slots_.find(ch->remote_id_);
+        if (it != remote_slots_.end()) {
+            // Give back the slot's accounting before dropping it — same as
+            // reject_session() does for the slot it discards. Normally there is
+            // nothing owed (a paired slot has been drained and un-buffered),
+            // but a channel that closes itself from inside its own on_open is
+            // torn down while pair_with_remote still has `buffering` set, and
+            // any frame that arrived during the callback is queued in the slot.
+            // Both counters gate anti-DoS teardown, so a leak here would arm
+            // safe_destroy() against later, legitimate traffic.
+            for (const auto& pm : it->second.pending) {
+                size_t sz = kBufferOverhead + pm.data.size();
+                buffered_bytes_ = buffered_bytes_ >= sz ? buffered_bytes_ - sz : 0;
+            }
+            if (it->second.buffering && remote_backlog_ > 0) remote_backlog_--;
+            remote_slots_.erase(it);
+        }
     }
     if (ch->open_sent_) {
         local_to_channel_.erase(ch->local_id_);
@@ -989,7 +1061,7 @@ void Mux::remove_channel(Channel* ch) {
     // Caller must not use 'ch' after this returns.
     channels_.erase(
         std::remove_if(channels_.begin(), channels_.end(),
-                       [ch](const std::unique_ptr<Channel>& p) {
+                       [ch](const std::shared_ptr<Channel>& p) {
                            return p.get() == ch;
                        }),
         channels_.end());
@@ -1066,14 +1138,15 @@ Channel* Mux::get_last_channel(const std::string& protocol,
 }
 
 void Mux::for_each_channel(const std::function<void(Channel*)>& fn) {
-    // Snapshot first — fn may call close() which mutates channels_.
-    std::vector<Channel*> snapshot;
+    // Snapshot owning refs — fn may close() a channel later in the snapshot,
+    // which frees it; raw pointers would dangle.
+    std::vector<std::shared_ptr<Channel>> snapshot;
     snapshot.reserve(channels_.size());
     for (auto& ch : channels_) {
-        if (!ch->destroyed_) snapshot.push_back(ch.get());
+        if (!ch->destroyed_) snapshot.push_back(ch);
     }
-    for (auto* ch : snapshot) {
-        fn(ch);
+    for (auto& ch : snapshot) {
+        if (!ch->destroyed_) fn(ch.get());
     }
 }
 

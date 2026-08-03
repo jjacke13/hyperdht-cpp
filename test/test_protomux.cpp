@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -1215,4 +1216,120 @@ TEST(ProtomuxParity, RejectForOpenedChannelIsFatal) {
     mux.a.on_data(f.data(), f.size());
 
     EXPECT_TRUE(mux.a.is_destroyed());
+}
+
+// ---------------------------------------------------------------------------
+// Lifetime: a channel may be freed underneath a running frame.
+// These only *fail* under ASAN (they are heap-use-after-free, not wrong
+// results) — run build-asan/test_protomux.
+// ---------------------------------------------------------------------------
+
+// A synchronous transport round-trips the REJECT for our OPEN before
+// Channel::open() returns, freeing the channel mid-frame.
+TEST(ProtomuxLifetime, SyncRejectDuringOpenDoesNotUseFreedChannel) {
+    LoopbackMux mux;
+    mux.b.pair("alpha", {}, [](const std::string&, const std::vector<uint8_t>&,
+                               const uint8_t*, size_t) { /* declines */ });
+
+    auto* ch = mux.a.create_channel("alpha");
+    ch->open();  // OPEN -> notify declines -> REJECT -> remote_close() -> freed
+
+    EXPECT_EQ(mux.a.channel_count(), 0u);
+}
+
+// on_open closes the channel from inside pair_with_remote's frame, which
+// also erases the RemoteSlot the pairing code was holding a reference to.
+TEST(ProtomuxLifetime, CloseFromOnOpenDoesNotUseFreedSlot) {
+    LoopbackMux mux;
+
+    auto* ch_b = mux.b.create_channel("x");
+    ch_b->add_message({[](const uint8_t*, size_t) {}});
+    ch_b->on_open = [&](const uint8_t*, size_t) { ch_b->close(); };
+
+    auto* ch_a = mux.a.create_channel("x");
+    ch_a->add_message({[](const uint8_t*, size_t) {}});
+    ch_a->open();
+    ch_b->open();  // pairs, fires on_open, which closes ch_b mid-pair
+
+    EXPECT_EQ(mux.b.channel_count(), 0u);
+    // ch_a is gone too: ch_b's CLOSE round-trips synchronously on loopback.
+    // NOTE: `ch_a` is a dangling raw pointer here — Mux::create_channel hands
+    // out non-owning pointers and frees the object on close.
+    EXPECT_EQ(mux.a.channel_count(), 0u);
+}
+
+// Delivery order: the pre-pair backlog (JS _drain) must be replayed BEFORE any
+// frame that arrives during on_open. Settling the remote slot ahead of
+// fully_open() would clear `buffering` early, so a frame round-tripping inside
+// the callback is dispatched immediately and jumps the queue.
+TEST(ProtomuxLifetime, BufferedReplayPrecedesFramesArrivingDuringOnOpen) {
+    LoopbackMux mux;
+    std::vector<std::string> b_seen;
+
+    auto say = [](Channel* ch, const char* s) {
+        ch->send(0, reinterpret_cast<const uint8_t*>(s), std::strlen(s));
+    };
+
+    auto* ch_a = mux.a.create_channel("x");
+    auto* ch_b = mux.b.create_channel("x");
+
+    ASSERT_EQ(ch_a->add_message({[&](const uint8_t* d, size_t n) {
+        // A answers the "ping" B sends from inside its own on_open; the reply
+        // lands back in B while B is still inside pair_with_remote.
+        if (std::string(reinterpret_cast<const char*>(d), n) == "ping") {
+            say(ch_a, "late");
+        }
+    }}), 0);
+    ASSERT_EQ(ch_b->add_message({[&](const uint8_t* d, size_t n) {
+        b_seen.emplace_back(reinterpret_cast<const char*>(d), n);
+    }}), 0);
+
+    // A pairs first (on B's OPEN) and writes straight from on_open — both
+    // frames land in B's remote slot, which is still buffering.
+    ch_a->on_open = [&](const uint8_t*, size_t) {
+        say(ch_a, "early1");
+        say(ch_a, "early2");
+    };
+    // B pairs a moment later and writes from ITS on_open.
+    ch_b->on_open = [&](const uint8_t*, size_t) { say(ch_b, "ping"); };
+
+    ch_a->open();  // parks in B's incoming_ (no notify handler registered)
+    ch_b->open();  // pairs both ends, fires both on_opens
+
+    EXPECT_EQ(b_seen, (std::vector<std::string>{"early1", "early2", "late"}));
+}
+
+// A channel that closes itself from inside on_open erases its own remote slot
+// before pair_with_remote regains control. Both anti-DoS counters must still
+// come back to zero: remote_backlog_ (the slot was claimed) and buffered_bytes_
+// (the frames that arrived during the callback died with the slot).
+TEST(ProtomuxLifetime, CloseInsideOnOpenBalancesBacklogAccounting) {
+    LoopbackMux mux;
+
+    auto say = [](Channel* ch, const char* s) {
+        ch->send(0, reinterpret_cast<const uint8_t*>(s), std::strlen(s));
+    };
+
+    auto* ch_a = mux.a.create_channel("x");
+    auto* ch_b = mux.b.create_channel("x");
+
+    ch_a->add_message({[&](const uint8_t* d, size_t n) {
+        if (std::string(reinterpret_cast<const char*>(d), n) == "ping") {
+            say(ch_a, "late");  // lands in B's slot mid-callback
+        }
+    }});
+    ch_b->add_message({[](const uint8_t*, size_t) {}});
+
+    ch_a->on_open = [&](const uint8_t*, size_t) { say(ch_a, "early"); };
+    ch_b->on_open = [&](const uint8_t*, size_t) {
+        say(ch_b, "ping");
+        ch_b->close();  // erases the remote slot with "late" still queued in it
+    };
+
+    ch_a->open();
+    ch_b->open();
+
+    EXPECT_EQ(mux.b.channel_count(), 0u);
+    EXPECT_EQ(mux.b.remote_backlog(), 0u);
+    EXPECT_EQ(mux.b.buffered(), 0u);
 }

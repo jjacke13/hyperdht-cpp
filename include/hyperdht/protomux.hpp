@@ -69,7 +69,11 @@ struct MessageHandler {
 // Channel — a virtual stream within the mux
 // ---------------------------------------------------------------------------
 
-class Channel {
+// Owned by Mux via shared_ptr. Every Mux/Channel method that can re-enter
+// user code (write_fn_, on_open, on_close, message handlers) takes a local
+// shared_ptr guard first, so a channel freed underneath a running frame stays
+// alive until that frame unwinds. JS gets this for free from the GC.
+class Channel : public std::enable_shared_from_this<Channel> {
 public:
     Channel(Mux& mux, const std::string& protocol,
             const std::vector<uint8_t>& id, uint32_t local_id);
@@ -236,6 +240,11 @@ public:
     // Number of bytes buffered in pending message queues
     size_t buffered() const { return buffered_bytes_; }
 
+    // Number of remote slots still buffering (unclaimed by a local channel).
+    // Both this and buffered() gate anti-DoS teardown thresholds, so they must
+    // return to zero once every slot is paired or dropped.
+    size_t remote_backlog() const { return remote_backlog_; }
+
     // -----------------------------------------------------------------------
     // State queries
     // -----------------------------------------------------------------------
@@ -253,7 +262,7 @@ private:
     NotifyFn on_notify_;
 
     uint32_t next_local_id_ = 1;
-    std::vector<std::unique_ptr<Channel>> channels_;
+    std::vector<std::shared_ptr<Channel>> channels_;
 
     // Remote ID → slot (JS `_remote[]`). A slot is created the moment a remote
     // OPEN arrives and buffers every data frame for that remote id until a local

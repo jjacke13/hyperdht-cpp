@@ -348,6 +348,19 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   handoff (run 1: three slots on one symmetric-NAT host, total failure; run 2
   after restart: three distinct hosts, instant success) is explained by the
   re-roll, not by diversity per se.
+- [ ] **PARKED by decision 2026-08-03 (Vaios).** Revisit in the mid-term, or
+  sooner if upstream changes `pickBest`. Rationale: it is local selection
+  policy, invisible on the wire, so deferring costs nothing in
+  interoperability; and the announcer rebuild (`82d3c55`) already removed the
+  permanence that made a bad roll fatal. Wake-up triggers, in order:
+  (a) upstream implements the `pickBest` RTT TODO — note RTT alone would make
+  this WORSE, since all mappings of one host share an RTT and would then win
+  all three slots deterministically rather than by luck; (b) a single-host
+  relay set recurs in the field post-rebuild; (c) a `-5` outage that survives
+  a relay-set re-roll. **On revisit, check the statistical premise FIRST** (see
+  the note below) — if three mappings of one host really are the global
+  closest-3 more than rarely, the selection/sort is the bug and a diversity
+  constraint would only mask it.
 - [ ] **Host diversity itself — OPEN, and NOT a parity bug.** The audit
   (2026-07-31 workflow) refuted the parity framing: JS `pickBest` is
   `replies.slice(0, 3)` (announcer.js:298-301) with no host notion either, so
@@ -505,6 +518,34 @@ doesn't re-report them:
 - Announcer keepalive DRIFT DETECTION (`08e2f47`): pong `to`-field vs stored
   peer_addr triggers an early refresh (rate-limited 10s). JS discards the
   pong body (announcer.js:114-121) and waits out the 5-min reannounce.
+- **Round-1 relay FAILOVER (Finding M, `d5988ec`) — FIELD-VALIDATED.** On a
+  round-1 failure we pop the next announce relay and re-run `run_round1` on the
+  SAME pool socket / puncher / NAT samples (`holepunch::fail_round1`,
+  `pick_fallback_relays`; marked at connect.cpp:971). JS bails terminally
+  (connect.js:270-275) — **and asks for exactly this fix in its own source
+  twice**: `// TODO: we should retry here with some of the other relays, bail
+  for now` (connect.js:271) and `// TODO: retry with another relay?`
+  (connect.js:314). Before this, ONE unreachable relay in the announce was a
+  permanent `-5`: 81/81 deterministic repro, and stock nospoon-JS failed
+  identically on the same network, so it is NOT a C++ regression. Field-
+  validated 2026-07-30: two dead relays skipped, rounds 1 AND 2 completed
+  through the third. Retry scope mirrors JS exactly — the six sites JS reaches
+  by THROWING out of `probeRound` fail over; those it reaches via `abort()`
+  (double-random, unstable NAT, probe exhaustion) stay terminal.
+  **SECURITY:** capped at `announcer::PICK_BEST - 1` legs, NOT the 128-entry
+  wire cap — 128 × multi-second RPC would hand a hostile connect() target a
+  ~6-minute stall for free. Honest servers announce ≤3.
+  **Do NOT "simplify" this by substituting the client's own observation of the
+  same relay host** — `relays[i]` is a live server↔relay UDP *session*, not an
+  address; JS explains why at connect.js:280-285. Failover is safe precisely
+  because each entry carries its own `peer_address` and its own session.
+- Announcer STUCK-CYCLE WATCHDOG (`f843b4b`, announcer.cpp:223-245): if
+  `updating_` stays latched past `cycle_stuck_ms_` (60s) the cycle is
+  force-reset. JS has no equivalent; a wedged cycle there silently disables
+  reannounce forever (field Finding E).
+- Announcer relay-set swap is guarded against an EMPTY new cycle
+  (`82d3c55`): a cycle that commits nothing keeps the previous advertised set
+  rather than publishing an empty one. JS would replace unconditionally.
 
 ---
 

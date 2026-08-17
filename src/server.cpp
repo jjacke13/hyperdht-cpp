@@ -479,7 +479,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     // Get our addresses and relay info.
     //
     // `addresses4` layout in the Noise payload (JS `hyperdht/lib/server.js:270-277`):
-    //   [0]       = our remote (public) address, from NAT sampler
+    //   [0]       = our remote (public) address, from `dht.remoteAddress()`
     //   [1..n]    = validated LAN interface addresses, if
     //               `share_local_address == true` (JS default: true)
     //
@@ -488,17 +488,17 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     // populating [1..n] is what enables same-NAT connections without
     // holepunch. Without a HyperDHT back-pointer we can't reach the
     // cached validated list and the LAN advertisement silently no-ops.
-    auto our_addrs = socket_.nat_sampler().addresses();
-    // After persistent transition, the NAT sampler still has addresses
-    // with client_socket_'s port (from pre-transition traffic). Replace
-    // with server_socket_'s port — that's the port we're now reachable
-    // on and the one the firewall is opened for.
-    if (!socket_.is_firewalled()) {
-        uint16_t server_port = socket_.port();
-        for (auto& addr : our_addrs) {
-            addr = compact::Ipv4Address::from_string(
-                addr.host_string(), server_port);
-        }
+    //
+    // JS server.js:269-276 — `ourRemoteAddr = this.dht.remoteAddress()` is
+    // ONE entry, never a NAT-sampler dump. The dump needed a port-rewrite
+    // hack (the shared sampler still holds pre-persistent-transition ports)
+    // and the rewrite collapsed the sampler's top-two host:port samples
+    // onto the same address — field log 2026-08-17: "Server addr[0]:
+    // :58475 addr[1]: :58475". `remote_address()` (dht.hpp:948) already
+    // does the port-drift check the rewrite was papering over.
+    std::vector<compact::Ipv4Address> our_addrs;
+    if (auto ra = dht_ != nullptr ? dht_->remote_address() : std::nullopt) {
+        our_addrs.push_back(*ra);
     }
     if (share_local_address && dht_ != nullptr) {
         // Re-enumerate PER HANDSHAKE, matching JS `_localAddresses()`

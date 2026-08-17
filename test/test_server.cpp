@@ -5,6 +5,8 @@
 #include <sodium.h>
 #include <uv.h>
 
+#include <set>
+
 #include "hyperdht/connection_pool.hpp"
 #include "hyperdht/dht.hpp"
 #include "hyperdht/noise_wrap.hpp"
@@ -1256,6 +1258,92 @@ TEST(Server, ShareLocalAddressDefault) {
     EXPECT_EQ(srv.handshake_clear_wait, 5000u);
 
     socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// JS server.js:269-276 — `addresses4` is `[ourRemoteAddr] + ourLocalAddrs`,
+// where `ourRemoteAddr = this.dht.remoteAddress()`: exactly ONE public
+// entry, never a NAT-sampler dump. The sampler keeps its top two host:port
+// samples even when only one has ≥2 hits (nat_sampler.cpp:196), so dumping
+// it and then rewriting every port to the bound port emitted the same
+// address twice — field log 2026-08-17: "Server addr[0]: :58475
+// addr[1]: :58475".
+TEST(Server, Addresses4IsRemoteAddressPlusLanWithoutDuplicates) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);  // empty bootstrap — offline
+    ASSERT_EQ(dht.bind(), 0);
+    auto& socket = dht.socket();
+
+    // Two ports sampled for the same public host: the bound port (3 hits,
+    // the winner remoteAddress() returns) and a stale one (1 hit, still
+    // emitted by update_addresses' "always keep the top two" rule).
+    const std::string pub_host = "93.184.216.34";
+    const auto our_pub =
+        compact::Ipv4Address::from_string(pub_host, socket.port());
+    for (int i = 1; i <= 3; i++) {
+        ASSERT_TRUE(socket.nat_sampler().add(
+            our_pub, compact::Ipv4Address::from_string(
+                         "203.0.113." + std::to_string(i), 49737)));
+    }
+    ASSERT_TRUE(socket.nat_sampler().add(
+        compact::Ipv4Address::from_string(pub_host, 60000),
+        compact::Ipv4Address::from_string("203.0.113.4", 49737)));
+    ASSERT_EQ(socket.nat_sampler().firewall(),
+              peer_connect::FIREWALL_CONSISTENT);
+    ASSERT_EQ(socket.nat_sampler().addresses().size(), 2u)
+        << "test needs a two-entry sampler to expose the dump";
+
+    // Not firewalled: remoteAddress() is available, and it is the state in
+    // which the old code's port-rewrite collapsed both sampler entries.
+    socket.set_firewalled(false);
+    ASSERT_TRUE(dht.remote_address().has_value());
+
+    auto* srv = dht.create_server();
+    ASSERT_NE(srv, nullptr);
+    noise::Seed server_seed{};
+    server_seed.fill(0x41);
+    auto server_kp = noise::generate_keypair(server_seed);
+    srv->listen(server_kp, [](const ConnectionInfo&) {});
+
+    auto hs = make_handshake_request(server_kp,
+                                     peer_connect::FIREWALL_CONSISTENT, 0x42);
+
+    std::vector<compact::Ipv4Address> addrs;
+    bool got_reply = false;
+    ASSERT_TRUE(dht.router().handle_peer_handshake(
+        hs.req,
+        [&](const messages::Response& resp) {
+            ASSERT_TRUE(resp.value.has_value());
+            auto resp_hs = peer_connect::decode_handshake_msg(
+                resp.value->data(), resp.value->size());
+            auto decrypted =
+                hs.noise->recv(resp_hs.noise.data(), resp_hs.noise.size());
+            ASSERT_TRUE(decrypted.has_value());
+            addrs = peer_connect::decode_noise_payload(decrypted->data(),
+                                                       decrypted->size())
+                        .addresses4;
+            got_reply = true;
+        },
+        [](const messages::Request&) {}));
+    ASSERT_TRUE(got_reply);
+
+    ASSERT_FALSE(addrs.empty());
+    std::set<std::pair<std::string, uint16_t>> seen;
+    int public_count = 0;
+    for (const auto& a : addrs) {
+        EXPECT_TRUE(seen.insert({a.host_string(), a.port}).second)
+            << "duplicate addresses4 entry " << a.host_string() << ":"
+            << a.port;
+        if (a.host_string() == pub_host) public_count++;
+    }
+    EXPECT_EQ(public_count, 1) << "addresses4 must carry ONE public entry";
+    EXPECT_EQ(addrs[0], our_pub) << "addresses4[0] must be remoteAddress()";
+
+    srv->close();
+    dht.destroy();
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }

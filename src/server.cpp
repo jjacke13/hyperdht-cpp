@@ -496,10 +496,17 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     // onto the same address — field log 2026-08-17: "Server addr[0]:
     // :58475 addr[1]: :58475". `remote_address()` (dht.hpp:948) already
     // does the port-drift check the rewrite was papering over.
+    //
+    // Read ONCE: JS keys the addresses4 push, `firewall: OPEN` and
+    // `holepunch: null` all off the same `ourRemoteAddr` binding
+    // (server.js:271, 357-359). Deriving `has_remote_addr` from
+    // `!is_firewalled()` instead let the reply claim OPEN + no holepunch
+    // while carrying zero public addresses — a client with nowhere to go.
+    const auto ourRemoteAddr =
+        dht_ != nullptr ? dht_->remote_address() : std::nullopt;
+
     std::vector<compact::Ipv4Address> our_addrs;
-    if (auto ra = dht_ != nullptr ? dht_->remote_address() : std::nullopt) {
-        our_addrs.push_back(*ra);
-    }
+    if (ourRemoteAddr) our_addrs.push_back(*ourRemoteAddr);
     if (share_local_address && dht_ != nullptr) {
         // Re-enumerate PER HANDSHAKE, matching JS `_localAddresses()`
         // (server.js:206-208, called at server.js:272). Reading a snapshot
@@ -517,10 +524,10 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         relay_infos = announcer_->relays();
     }
 
-    // JS: server.js:271 — `const ourRemoteAddr = this.dht.remoteAddress()`
-    // If the server knows its public address (!firewalled), the response
-    // omits holepunch info → client connects directly without holepunch rounds.
-    bool has_remote_addr = !socket_.is_firewalled();
+    // JS: server.js:357-359 — `firewall: ourRemoteAddr ? OPEN : ...` and
+    // `holepunch: ourRemoteAddr ? null : { id, relays }`. Same binding that
+    // fed addresses4 above, so the three can never disagree.
+    bool has_remote_addr = ourRemoteAddr.has_value();
 
     // Phase E: Generate relay token if relayThrough is configured
     // JS: server.js:350-352 — if (relayThrough) hs.relayToken = relay.token()

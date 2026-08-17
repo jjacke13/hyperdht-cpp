@@ -1298,8 +1298,11 @@ TEST(Server, Addresses4IsRemoteAddressPlusLanWithoutDuplicates) {
 
     // Not firewalled: remoteAddress() is available, and it is the state in
     // which the old code's port-rewrite collapsed both sampler entries.
+    // remoteAddress() itself reads the RING sampler (JS `this._nat`,
+    // index.js:126-131), so seed that with the address JS would publish.
     socket.set_firewalled(false);
-    ASSERT_TRUE(dht.remote_address().has_value());
+    for (int i = 0; i < 3; i++) socket.ring_sampler().add(pub_host, socket.port());
+    ASSERT_EQ(dht.remote_address(), our_pub);
 
     auto* srv = dht.create_server();
     ASSERT_NE(srv, nullptr);
@@ -1341,6 +1344,113 @@ TEST(Server, Addresses4IsRemoteAddressPlusLanWithoutDuplicates) {
     }
     EXPECT_EQ(public_count, 1) << "addresses4 must carry ONE public entry";
     EXPECT_EQ(addrs[0], our_pub) << "addresses4[0] must be remoteAddress()";
+
+    srv->close();
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// JS `remoteAddress()` reads `this.host`/`this.port` (dht-rpc/index.js:126-131)
+// which are `this._nat.host`/`this._nat.port` — the RING sampler, swapped in
+// at rpc.cpp:1424 AFTER the port-preservation check, so its port is the server
+// port by construction. Reading the Nat CLASSIFIER instead (which never evicts
+// and can be frozen on pre-persistent-transition client-socket ports) makes
+// the port-drift guard fire on a perfectly good address, and the reply then
+// carries NO public entry where JS has one.
+//
+// Also pins the JS invariant that `firewall: OPEN`, `holepunch: null` and the
+// addresses4 push all key off the SAME `ourRemoteAddr` (server.js:271,357-359).
+TEST(Server, RemoteAddressUsesRingSamplerNotStaleClassifier) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    HyperDHT dht(&loop);  // empty bootstrap — offline
+    ASSERT_EQ(dht.bind(), 0);
+    auto& socket = dht.socket();
+
+    const std::string pub_host = "93.184.216.34";
+    const uint16_t stale_port = 40001;  // a pre-transition client-socket port
+    ASSERT_NE(socket.port(), stale_port);
+
+    // Classifier: frozen on the STALE port. This is what the old
+    // remote_address() read, and the drift guard would reject it.
+    for (int i = 1; i <= 3; i++) {
+        ASSERT_TRUE(socket.nat_sampler().add(
+            compact::Ipv4Address::from_string(pub_host, stale_port),
+            compact::Ipv4Address::from_string(
+                "203.0.113." + std::to_string(i), 49737)));
+    }
+    ASSERT_EQ(socket.nat_sampler().addresses().front().port, stale_port);
+
+    socket.set_firewalled(false);
+
+    auto* srv = dht.create_server();
+    ASSERT_NE(srv, nullptr);
+    noise::Seed server_seed{};
+    server_seed.fill(0x43);
+    auto server_kp = noise::generate_keypair(server_seed);
+    srv->listen(server_kp, [](const ConnectionInfo&) {});
+
+    // Decode one handshake reply payload.
+    auto reply_payload = [&](uint8_t client_seed_byte) {
+        auto hs = make_handshake_request(
+            server_kp, peer_connect::FIREWALL_CONSISTENT, client_seed_byte);
+        peer_connect::NoisePayload out;
+        bool got = false;
+        EXPECT_TRUE(dht.router().handle_peer_handshake(
+            hs.req,
+            [&](const messages::Response& resp) {
+                ASSERT_TRUE(resp.value.has_value());
+                auto resp_hs = peer_connect::decode_handshake_msg(
+                    resp.value->data(), resp.value->size());
+                auto dec =
+                    hs.noise->recv(resp_hs.noise.data(), resp_hs.noise.size());
+                ASSERT_TRUE(dec.has_value());
+                out = peer_connect::decode_noise_payload(dec->data(),
+                                                         dec->size());
+                got = true;
+            },
+            [](const messages::Request&) {}));
+        EXPECT_TRUE(got);
+        return out;
+    };
+
+    auto count_public = [&](const peer_connect::NoisePayload& p) {
+        int n = 0;
+        for (const auto& a : p.addresses4)
+            if (a.host_string() == pub_host) n++;
+        return n;
+    };
+
+    // (a) Finding B — ring sampler has published nothing yet, so
+    // remoteAddress() is null. JS keys firewall/holepunch/addresses4 on that
+    // ONE value: no public entry ⇒ NOT OPEN and holepunch info present.
+    // `!is_firewalled()` is not the same value and must not be used.
+    {
+        auto p = reply_payload(0x51);
+        EXPECT_EQ(count_public(p), 0);
+        EXPECT_NE(p.firewall, peer_connect::FIREWALL_OPEN)
+            << "firewall OPEN with no public address in addresses4";
+        EXPECT_TRUE(p.holepunch.has_value())
+            << "holepunch omitted with no public address in addresses4";
+    }
+
+    // (b) Finding A — ring sampler now publishes the SERVER port while the
+    // classifier still holds the stale one. JS reads the ring: one public
+    // entry, at the server port, and it leads addresses4.
+    for (int i = 0; i < 3; i++) socket.ring_sampler().add(pub_host, socket.port());
+    ASSERT_EQ(socket.ring_sampler().host(), pub_host);
+    ASSERT_EQ(socket.ring_sampler().port(), socket.port());
+    {
+        auto p = reply_payload(0x52);
+        ASSERT_EQ(count_public(p), 1);
+        ASSERT_FALSE(p.addresses4.empty());
+        EXPECT_EQ(p.addresses4[0],
+                  compact::Ipv4Address::from_string(pub_host, socket.port()));
+        EXPECT_EQ(p.firewall, peer_connect::FIREWALL_OPEN);
+        EXPECT_FALSE(p.holepunch.has_value());
+    }
 
     srv->close();
     dht.destroy();

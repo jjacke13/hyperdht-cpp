@@ -938,23 +938,37 @@ public:
     // JS: dht-rpc/index.js:201-214 `remoteAddress()` — returns our
     // public address as seen by the DHT (from NAT sampling), or
     // `std::nullopt` if:
+    //   - the ring sampler has published no host (JS `!this.host`)
+    //   - the ring sampler has published no port, i.e. randomized NAT
+    //     (JS `!this.port`)
     //   - we're firewalled (NAT unknown)
-    //   - no samples yet (nat_sampler has no addresses)
     //   - our bound port doesn't match the sampled port (our socket
     //     moved underneath us — reject as stale)
+    //
+    // The source is `ring_sampler()`, NOT `nat_sampler()`: JS reads
+    // `this.host`/`this.port` (index.js:126-131), which are
+    // `this._nat.host`/`this._nat.port` — the nat-sampler ring. Our
+    // `nat_sampler_` is the hyperdht Nat CLASSIFIER, a different object
+    // that source-dedups, never evicts and can be frozen holding
+    // pre-persistent-transition client-socket ports; reading it made the
+    // port-drift guard reject a perfectly good address and dropped the
+    // public entry out of every handshake reply. `ring_sampler_` is
+    // swapped from the probe ring at rpc.cpp:1424 only AFTER the
+    // port-preservation check, so its port is the server port by
+    // construction.
     //
     // Useful for advertising our reachability to peers, or for
     // confirming we're properly bootstrapped before issuing queries.
     std::optional<compact::Ipv4Address> remote_address() const {
         if (!socket_ || !bound_) return std::nullopt;
+        const auto& nat = socket_->ring_sampler();
+        if (nat.host().empty()) return std::nullopt;
+        if (nat.port() == 0) return std::nullopt;
         if (socket_->is_firewalled()) return std::nullopt;
-        const auto& addrs = socket_->nat_sampler().addresses();
-        if (addrs.empty()) return std::nullopt;
-        const auto& top = addrs.front();
         // JS parity: drop the sample if our current bound port has
         // drifted away from what the sampler saw.
-        if (top.port != socket_->port()) return std::nullopt;
-        return top;
+        if (nat.port() != socket_->port()) return std::nullopt;
+        return compact::Ipv4Address::from_string(nat.host(), nat.port());
     }
 
     // §7 accessors — read the tuning knobs that consumer apps may need

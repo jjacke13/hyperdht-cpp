@@ -30,6 +30,7 @@
 #include "hyperdht/router.hpp"
 #include "hyperdht/rpc.hpp"
 #include "hyperdht/server.hpp"
+#include "hyperdht/socket_pool.hpp"
 #include "hyperdht/udx.hpp"
 
 using namespace hyperdht;
@@ -154,6 +155,10 @@ class ServerPunchSocket : public ::testing::Test {
     uint32_t hp_id_ = 0;
     std::array<uint8_t, 32> target_{};
 
+    // A birthday pool for the tests that need one (the fixture's Server has
+    // no HyperDHT, so the puncher it builds gets a null pool — server.cpp:1630).
+    std::unique_ptr<socket_pool::SocketPool> pool_;
+
     // Emitted-connection state (the consumer's side of the handover).
     bool emitted_ = false;
     udx_socket_t* emitted_socket_ = nullptr;
@@ -226,11 +231,15 @@ class ServerPunchSocket : public ::testing::Test {
 
     void TearDown() override {
         destroy_streams_and_drain();
+        // The keepalive's deleter lands on a SocketRef the pool owns, so it
+        // must go before the pool tears its sockets down.
         conn_keepalive_.reset();
+        if (pool_) pool_->destroy();
         if (srv_) srv_->close();
         if (socket_) socket_->close();
         for (auto& n : nodes_) n->sock.close();
         uv_run(&loop_, UV_RUN_DEFAULT);
+        pool_.reset();
         srv_.reset();
         socket_.reset();
         nodes_.clear();
@@ -617,6 +626,64 @@ TEST_F(ServerPunchSocket, ClearedSessionClosesItsPunchSocket) {
 
     ASSERT_TRUE(run_loop_until([&] { return srv_->session(hp_id_) == nullptr; }));
     EXPECT_TRUE(weak.expired());
+}
+
+// (i) The SYN does not have to land on the session's punch socket. A server
+//     whose own firewall is RANDOM punches a CONSISTENT client with 256
+//     birthday holders (JS holepuncher.js:271-276), each punching its own NAT
+//     hole from its own socket — so the client's SYN can equally arrive on a
+//     holder. That socket belongs to the SocketPool and is reachable only
+//     through `conn.puncher`, which on_socket drops in the same frame: the
+//     emitted connection must be handed a keepalive pinning the holder, and
+//     the pin must run while the puncher still exists (moving the call below
+//     `conn.puncher.reset()` goes red here too).
+//
+//     What this asserts is the keepalive, not the holder's liveness: today
+//     ~Holepuncher does NOT release its holders (only destroy() does, and
+//     on_socket never calls it), so an unpinned holder currently survives by
+//     accident — reported, not fixed here.
+//
+//     Harness note: this Server has no HyperDHT, so the puncher built by the
+//     round handler gets a null pool (server.cpp:1630) and can never open a
+//     holder. The puncher is injected wired to a real pool on the server's own
+//     udx; what on_socket does with it — pin the arrival socket, then drop the
+//     puncher — is untouched.
+TEST_F(ServerPunchSocket, BirthdayHolderArrivalIsPinnedForTheAdoptedStream) {
+    do_handshake(/*relayed=*/true);
+    auto* c = conn();
+    ASSERT_NE(c, nullptr);
+    ASSERT_TRUE(c->punch_socket);
+
+    pool_ = std::make_unique<socket_pool::SocketPool>(&loop_,
+                                                      socket_->udx_handle());
+    auto puncher = std::make_shared<holepunch::Holepuncher>(
+        &loop_, /*is_initiator=*/false, pool_.get());
+    puncher->set_local_firewall(peer_connect::FIREWALL_RANDOM);
+    puncher->set_remote_firewall(peer_connect::FIREWALL_CONSISTENT);
+    auto probe_target = nodes_[2]->addr();
+    puncher->update_remote({probe_target}, probe_target.host_string());
+    ASSERT_TRUE(puncher->punch())
+        << "RANDOM+CONSISTENT with a wired pool must open birthday holders";
+    c->puncher = std::move(puncher);  // the session is the sole owner, as in prod
+
+    // Each holder punches from its OWN socket (holepunch.cpp:815), so the
+    // first probe source port the target sees IS a holder's port.
+    ASSERT_TRUE(run_loop_until([&] { return nodes_[2]->probes > 0; }));
+    uint16_t holder_port = nodes_[2]->first_probe_src;
+    ASSERT_NE(holder_port, 0);
+    ASSERT_NE(holder_port, punch_port()) << "probe left the punch socket";
+
+    client_udx_connect_to(holder_port);
+    ASSERT_TRUE(run_loop_until([&] { return emitted_; }));
+    ASSERT_EQ(srv_->session(hp_id_), nullptr) << "session outlived the emit";
+
+    auto* ref = pool_->lookup(emitted_socket_);
+    ASSERT_NE(ref, nullptr) << "the SYN did not land on a pool socket";
+    ASSERT_TRUE(conn_keepalive_)
+        << "birthday-holder arrival emitted with no keepalive — the puncher "
+           "was gone by the time the socket was pinned";
+    EXPECT_EQ(conn_keepalive_.get(), static_cast<void*>(ref))
+        << "keepalive pins a socket other than the one the stream is on";
 }
 
 // The park queue is bounded (drop-oldest): a client that floods rounds while

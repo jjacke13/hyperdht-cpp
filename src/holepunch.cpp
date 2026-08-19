@@ -366,10 +366,26 @@ Holepuncher::Holepuncher(uv_loop_t* loop, bool is_initiator,
 
 Holepuncher::~Holepuncher() {
     // M10: clear callbacks on all holders to prevent lingering SocketRefs
-    // from calling back into destroyed Holepuncher during pool linger period
+    // from calling back into destroyed Holepuncher during pool linger period.
+    //
+    // Releasing them is not optional either. Only `destroy()` used to release,
+    // so every path that merely DROPS the puncher leaked its holders back to
+    // nobody — and Server::on_socket takes exactly that path on every
+    // successful connection (`conn.puncher.reset()`). BIRTHDAY_SOCKETS(256)
+    // against MAX_POOL_SOCKETS(512) means acquire() returns nullptr forever
+    // after ~2 punches: the server silently loses birthday punching for the
+    // rest of the process. `release()` is idempotent (released_ guard), so
+    // this is a no-op when destroy() already ran.
     for (auto* h : holders_) {
         h->on_holepunch_message = nullptr;
+        h->release();
     }
+    holders_.clear();
+    // Same story for the process-wide random-punch throttle: a dropped
+    // puncher left `stats_->random_punches` incremented, and
+    // random_punch_limit is 1 — no random punch of any kind could start
+    // again. Also idempotent (randomized_ guard).
+    decrement_randomized();
     stop();
     if (punch_timer_ && !uv_is_closing(reinterpret_cast<uv_handle_t*>(punch_timer_))) {
         // Timer outlives us — null the back-pointer so callbacks don't dereference

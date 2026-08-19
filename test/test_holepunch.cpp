@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <memory>
 #include <set>
 #include <string>
 
@@ -997,6 +998,56 @@ TEST(Holepuncher, BirthdayWinPinsWinningRef) {
 
     hp.destroy();
     hp.close();
+    pool.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
+// BUG B — dropping a Holepuncher without calling destroy() must still give
+// its resources back. Server::on_socket does exactly that on every successful
+// connection (server.cpp: `conn.puncher.reset()`), and only destroy() used to
+// release the holders: BIRTHDAY_SOCKETS(256) against MAX_POOL_SOCKETS(512)
+// means acquire() returns nullptr forever after ~2 punches and the server
+// silently loses birthday punching for the rest of the process. The same drop
+// also left stats_->random_punches incremented, and random_punch_limit is 1,
+// so no random punch of any kind could ever start again.
+// ---------------------------------------------------------------------------
+
+TEST(Holepuncher, DropWithoutDestroyReleasesHoldersAndThrottle) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    udx_t udx;
+    udx_init(&loop, &udx, nullptr);
+
+    hyperdht::socket_pool::SocketPool pool(&loop, &udx);
+    PunchStats stats;
+
+    auto hp = std::make_unique<Holepuncher>(&loop, true, &pool, &stats);
+    hp->set_local_firewall(FIREWALL_RANDOM);
+    hp->set_remote_firewall(FIREWALL_CONSISTENT);
+    hp->update_remote({Ipv4Address::from_string("127.0.0.1", 4242)},
+                      "127.0.0.1");
+
+    ASSERT_TRUE(hp->punch()) << "RANDOM+CONSISTENT with a wired pool must punch";
+    EXPECT_EQ(stats.random_punches, 1);
+
+    // Let the birthday loop acquire a handful of holders.
+    for (int i = 0; i < 4000 && pool.size() < 5; i++) {
+        uv_run(&loop, UV_RUN_NOWAIT);
+    }
+    ASSERT_GE(pool.size(), 5u) << "birthday punch must acquire holder sockets";
+
+    hp.reset();  // exactly what Server::on_socket does on a successful punch
+
+    for (int i = 0; i < 200 && pool.size() > 0; i++) {
+        uv_run(&loop, UV_RUN_NOWAIT);
+    }
+    EXPECT_EQ(pool.size(), 0u)
+        << "dropping the puncher must release every birthday holder";
+    EXPECT_EQ(stats.random_punches, 0)
+        << "dropping the puncher must clear the random-punch throttle";
+
     pool.destroy();
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);

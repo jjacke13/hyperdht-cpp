@@ -1234,14 +1234,11 @@ void Server::start_punch_socket(uint32_t hp_id) {
     // Inbound PEER_HOLEPUNCH rounds. The relay observed our handshake reply
     // leaving this socket, so it forwards the client's rounds here.
     //
-    // NOTE ON SAMPLING: PoolSocket::handle_message already fed the session
-    // NAT sampler by the time this runs (holepunch.cpp:1010). JS samples
-    // later — after command routing, session lookup, payload decrypt and
-    // error==NONE (server.js:491-511) — so our feed is broader than JS's by
-    // one unauthenticated datagram. It is gated on a consumer being wired,
-    // i.e. only a socket that belongs to a live session samples at all; the
-    // decrypt gate below still fences every PAYLOAD-VISIBLE state change
-    // (freeze / firewall / addresses / round).
+    // This consumer also owns the session's `p.nat.add(req.to, req.from)`
+    // (JS server.js:508-511): it is the only place that knows the round
+    // arrived on `p.socket`, and it can run the add in JS's order — after
+    // the payload decrypts and after the error!=NONE abort. PoolSocket
+    // deliberately does not sample inbound requests itself.
     //
     // The sentinel, not `this`, decides liveness: a punch socket can outlive
     // its Server once the adopted stream holds a reference to it (Task 5).
@@ -1258,8 +1255,24 @@ void Server::start_punch_socket(uint32_t hp_id) {
         if (hp_msg.mode != peer_connect::MODE_FROM_RELAY ||
             !hp_msg.peer_address.has_value()) return;
         auto* live = session(hp_id);
-        if (!live || live->id < 0 ||
+        if (!live || live->id < 0 || !live->secure ||
             hp_msg.id != static_cast<uint32_t>(live->id)) return;
+
+        // JS server.js:491-511, in order: decrypt → `if (error !== NONE)
+        // return this._abort(h)` → `if (req.socket === p.socket)
+        // p.nat.add(req.to, req.from)`. The sample is the one piece of
+        // session state a round mutates ahead of the analyzer, so it sits
+        // behind the same authentication as everything else. (The round is
+        // decrypted again downstream; SecurePayload::decrypt is stateless
+        // and this is one XSalsa pass over ~50 bytes.)
+        auto plain = live->secure->decrypt(hp_msg.payload.data(),
+                                           hp_msg.payload.size());
+        if (!plain) return;
+        auto remote = holepunch::decode_holepunch_payload(plain->data(),
+                                                          plain->size());
+        if (remote.error == peer_connect::ERROR_NONE && live->punch_socket) {
+            live->punch_socket->nat_sampler().add(req.to.addr, from);
+        }
 
         DHT_LOG("  [server] Round on punch socket (id=%u) from %s:%u\n",
                 hp_msg.id, from.host_string().c_str(), from.port);
@@ -1356,16 +1369,19 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     // JS server.js:491-493 — `const remotePayload = h.payload.decrypt(...)
     // if (!remotePayload) return null`, BEFORE nat.add / freeze / round.
     // Authenticates the round: without this an unauthenticated datagram
-    // aimed at the punch socket could freeze our NAT classification or
-    // park rounds. handle_holepunch() below re-decrypts authoritatively;
-    // SecurePayload::decrypt is stateless, so this probe costs one XSalsa
-    // pass and changes nothing.
-    if (!conn.secure ||
-        !conn.secure->decrypt(hp_msg.payload.data(), hp_msg.payload.size())) {
+    // could freeze our NAT classification or park rounds. handle_holepunch()
+    // below re-decrypts authoritatively; SecurePayload::decrypt is stateless,
+    // so this costs one XSalsa pass and changes nothing.
+    auto plain = conn.secure
+        ? conn.secure->decrypt(hp_msg.payload.data(), hp_msg.payload.size())
+        : std::nullopt;
+    if (!plain) {
         DHT_LOG("  [server] on_peer_holepunch: payload did not decrypt (id=%u)\n",
                 hp_msg.id);
         return;
     }
+    auto remote_error =
+        holepunch::decode_holepunch_payload(plain->data(), plain->size()).error;
 
     // JS server.js:518-519 — `let stable = await p.analyze(false)`, which
     // first awaits `nat.analyzing`, the puncher's autoSample campaign
@@ -1403,10 +1419,12 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     // A2: feed NAT sampler from the holepunch request.
     //
     // JS server.js:508-511 — `if (req.socket === p.socket) p.nat.add(req.to,
-    // req.from)`: ONLY rounds that landed on the punch socket are sampled.
-    // When we have one, PoolSocket::handle_message already did the add on
-    // arrival (holepunch.cpp:1010) and a round that came in on the main
-    // socket must not feed it — same gate, expressed by arrival path.
+    // req.from)`: ONLY rounds that landed on the session's own socket are
+    // sampled, and only past the error!=NONE abort (server.js:499-504).
+    // With a punch socket that socket's consumer already did this add
+    // (start_punch_socket), and a round that came in on the main socket must
+    // not feed it — same gate, expressed by arrival path. Without one the
+    // main socket IS the session's socket, so we add here.
     //
     // The first arg is the address the client targeted us at (= our public
     // address as the client sees us). The second is the UDP source — the
@@ -1417,7 +1435,9 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     // poisoned the NAT sampler with every connecting client's IP and made
     // the server announce arbitrary client addresses as its own (-5 on
     // every off-LAN client).
-    if (!conn.punch_socket) sampler.add(to_address, from_address);
+    if (!conn.punch_socket && remote_error == peer_connect::ERROR_NONE) {
+        sampler.add(to_address, from_address);
+    }
 
     // A5: NAT freeze — once we have a firm classification, lock it so
     // late samples cannot contradict what the reply is about to say.

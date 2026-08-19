@@ -183,6 +183,10 @@ public:
     // PEER_HOLEPUNCH rounds directly (hyperdht/lib/server.js:508-511 —
     // `req.socket === p.socket`), so it must both dispatch them and answer
     // on the same socket. Without a consumer wired, requests are dropped.
+    //
+    // The consumer owns NAT sampling for these: an inbound request is
+    // unauthenticated here, and JS only calls `p.nat.add` after the payload
+    // decrypts and reports error==NONE. See src/holepunch.cpp REQUEST branch.
     using OnRequestCallback = std::function<void(const messages::Request& req,
                                                  const compact::Ipv4Address& from)>;
     void on_request(OnRequestCallback cb) { on_request_ = std::move(cb); }

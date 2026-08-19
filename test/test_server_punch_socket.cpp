@@ -336,7 +336,8 @@ class ServerPunchSocket : public ::testing::Test {
         return holepunch::encode_holepunch_msg(msg);
     }
 
-    void send_round_to_punch_socket(std::vector<uint8_t> value) {
+    // The PEER_HOLEPUNCH request a relay forwards to us, on the wire.
+    std::vector<uint8_t> wrap_round(std::vector<uint8_t> value) {
         messages::Request req;
         req.tid = 2;
         req.command = messages::CMD_PEER_HOLEPUNCH;
@@ -344,7 +345,11 @@ class ServerPunchSocket : public ::testing::Test {
         req.target = target_;
         req.to.addr = our_public_;  // wire `to` = how the client sees us
         req.value = std::move(value);
-        relay().send(messages::encode_request(req),
+        return messages::encode_request(req);
+    }
+
+    void send_round_to_punch_socket(std::vector<uint8_t> value) {
+        relay().send(wrap_round(std::move(value)),
                      Ipv4Address::from_string("127.0.0.1", punch_port()));
     }
 
@@ -393,6 +398,9 @@ TEST_F(ServerPunchSocket, RoundDeferredUntilPoolSamplingSettles) {
     EXPECT_TRUE(relay().rounds.empty()) << "answered before sampling settled";
     EXPECT_EQ(conn()->punch_socket->nat_sampler().firewall(),
               peer_connect::FIREWALL_UNKNOWN);
+    // A round that DID decrypt feeds the session sampler, parked or not
+    // (JS server.js:508-511 runs before the analyzer await).
+    EXPECT_GE(conn()->punch_socket->nat_sampler().sampled(), 1);
 
     complete_pool_sampling();
     ASSERT_TRUE(run_loop_until([&] { return !relay().rounds.empty(); }));
@@ -435,25 +443,36 @@ TEST_F(ServerPunchSocket, DirectHandshakeCreatesNoPunchSocket) {
     EXPECT_TRUE(c->parked_rounds.empty());
 }
 
-// A round whose payload does not decrypt changes NO session state — it is
-// neither parked nor allowed to freeze the NAT classification. JS drops it at
-// server.js:491-493, before `nat.add` and before the analyzer.
+// A well-formed round whose payload does not decrypt changes NO session state
+// — not the NAT sampler, not the freeze, not the park queue. JS drops it at
+// server.js:491-493, ahead of `nat.add` and the analyzer. Sampling it would
+// let three spoofed sources carrying a chosen `to` pin the address and
+// firewall this session advertises.
 TEST_F(ServerPunchSocket, UndecryptableRoundChangesNoState) {
     do_handshake(/*relayed=*/true);
     ASSERT_TRUE(conn() && conn()->punch_socket);
 
-    holepunch::HolepunchMessage msg;
-    msg.mode = peer_connect::MODE_FROM_RELAY;
-    msg.id = hp_id_;
-    msg.payload = std::vector<uint8_t>(64, 0xAB);  // not our ciphertext
-    msg.peer_address = client_node().addr();
-    send_round_to_punch_socket(holepunch::encode_holepunch_msg(msg));
+    for (int i = 0; i < 3; i++) {  // 3 = NatSampler's CONSISTENT threshold
+        holepunch::HolepunchMessage msg;
+        msg.mode = peer_connect::MODE_FROM_RELAY;
+        msg.id = hp_id_;
+        msg.payload = std::vector<uint8_t>(64, 0xAB);  // not our ciphertext
+        msg.peer_address = client_node().addr();
+        // Distinct spoofed sources: NatSampler dedups by source only.
+        nodes_[i]->send(
+            wrap_round(holepunch::encode_holepunch_msg(msg)),
+            Ipv4Address::from_string("127.0.0.1", punch_port()));
+    }
     pump_ms(100);
 
     auto* c = conn();
     ASSERT_NE(c, nullptr);
-    EXPECT_TRUE(c->parked_rounds.empty());
+    EXPECT_EQ(c->punch_socket->nat_sampler().sampled(), 0)
+        << "unauthenticated rounds must not reach the session NAT sampler";
+    EXPECT_EQ(c->punch_socket->nat_sampler().firewall(),
+              peer_connect::FIREWALL_UNKNOWN);
     EXPECT_FALSE(c->punch_socket->nat_sampler().is_frozen());
+    EXPECT_TRUE(c->parked_rounds.empty());
     EXPECT_TRUE(relay().rounds.empty());
 }
 

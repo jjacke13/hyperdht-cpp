@@ -165,20 +165,29 @@ TEST_F(PoolSocketRequests, InboundRequestDispatchesAndReplyRoundTrips) {
         << "reply did not egress from the pool socket";
 }
 
-TEST_F(PoolSocketRequests, RequestFeedsNatSampler) {
-    // wire `to` field = our external address as the sender saw us
-    // (JS server.js:510 p.nat.add(req.to, req.from)).
+// An inbound request is unauthenticated at this layer, so PoolSocket must NOT
+// sample it. JS runs `p.nat.add(req.to, req.from)` only after the payload
+// decrypts and the round reports error==NONE (server.js:491-511) — otherwise
+// three datagrams from three spoofed sources carrying a chosen `to` pin the
+// session's advertised address and firewall. The consumer owns the add; see
+// `ServerPunchSocket.UndecryptableRoundChangesNoState` for the server-level
+// version of this with a real decrypt.
+TEST_F(PoolSocketRequests, RequestDoesNotFeedNatSampler) {
     messages::Request req;
     req.tid = 1;
     req.command = messages::CMD_PEER_HOLEPUNCH;
     req.to.addr = Ipv4Address::from_string("203.0.113.7", 4242);
 
-    pool_->on_request([](const messages::Request&, const Ipv4Address&) {});
+    bool dispatched = false;
+    pool_->on_request([&](const messages::Request&, const Ipv4Address&) {
+        dispatched = true;
+    });
     send_from_plain_socket(messages::encode_request(req), pool_addr());
-    run_loop_until([&] { return pool_->nat_sampler().sampled() > 0; });
+    run_loop_until([&] { return dispatched; });
 
-    EXPECT_GE(pool_->nat_sampler().sampled(), 1);
-    EXPECT_EQ(pool_->nat_sampler().host(), "203.0.113.7");
+    ASSERT_TRUE(dispatched) << "request must still reach the consumer";
+    EXPECT_EQ(pool_->nat_sampler().sampled(), 0);
+    EXPECT_EQ(pool_->nat_sampler().host(), "");
 }
 
 // No consumer wired → the request is dropped like any other unknown traffic,

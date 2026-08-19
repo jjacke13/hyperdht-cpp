@@ -1000,13 +1000,14 @@ void PoolSocket::handle_message(const uint8_t* data, size_t len,
         // `host` (top of function) is already the UDP source of this datagram.
         auto from = Ipv4Address::from_string(host, ntohs(addr->sin_port));
 
-        // JS server.js:508-511 — rounds arriving on the session's punch socket
-        // feed that session's sampler: `p.nat.add(req.to, req.from)`. The wire
-        // `to` field is OUR external address as the sender observed it; the UDP
-        // source is the dedup key. Note the naming asymmetry with the RESPONSE
-        // branch above, where the same wire `to` field lands in resp.from.addr.
-        nat_sampler_.add(req.to.addr, from);
-
+        // NO SAMPLING HERE. `p.nat.add(req.to, req.from)` (JS server.js:510)
+        // runs only after the payload DECRYPTS and the round reports
+        // error==NONE (server.js:491-504). Sampling a request at this layer
+        // means any three spoofed sources carrying a chosen `to` can pin the
+        // session's advertised address and firewall — which the round reply
+        // then freezes and ships. The owner does the add: server.cpp
+        // start_punch_socket's consumer, behind that decrypt gate.
+        //
         // Mirror the RpcSocket receive path (rpc.cpp:827): the transport-only
         // `from` field is filled in from the datagram source.
         req.from.addr = from;

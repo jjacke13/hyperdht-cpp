@@ -1195,7 +1195,18 @@ void PoolSocket::close() {
     // its capture typically holds the session that owns this socket, so
     // keeping it alive past close() would be a reference cycle. (on_probe_
     // needs no such release — its owner, PunchState::complete, clears it.)
-    on_request_ = nullptr;
+    //
+    // Move to a local instead of clearing in place: if that capture holds the
+    // LAST reference to the owner, destroying it here would re-enter
+    // ~PoolSocket → close(), which early-returns on closing_ and leaves this
+    // frame walking freed members. The local defers the destructor to the end
+    // of scope, after every member access below. Same discipline as the
+    // callback copy in handle_message.
+    // (Deliberately no `on_request_ = nullptr` after the move — that assignment
+    // would itself run a destructor mid-frame, the very hazard being avoided.
+    // Nothing can dispatch after close() anyway: socket_->data is null above,
+    // so on_recv never reaches handle_message.)
+    auto dead = std::move(on_request_);
     // Clean up inflight
     for (auto* inf : inflight_) {
         if (inf->timer && !uv_is_closing(reinterpret_cast<uv_handle_t*>(inf->timer))) {

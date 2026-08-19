@@ -33,6 +33,7 @@ class PoolSocketRequests : public ::testing::Test {
     std::unique_ptr<PoolSocket> pool_;
     std::unique_ptr<UdxSocket> plain_;  // stands in for the remote peer
     std::optional<messages::Response> received_;
+    uint16_t received_src_port_ = 0;  // UDP source of the reply
 
     void SetUp() override {
         uv_loop_init(&loop_);
@@ -63,15 +64,18 @@ class PoolSocketRequests : public ::testing::Test {
     }
 
     static void on_plain_recv(udx_socket_t* s, ssize_t nread,
-                              const uv_buf_t* buf, const struct sockaddr*) {
+                              const uv_buf_t* buf, const struct sockaddr* addr) {
         auto* self = static_cast<PoolSocketRequests*>(s->data);
-        if (!self || nread <= 0) return;
+        if (!self || nread <= 0 || !addr) return;
         messages::Request req;
         messages::Response resp;
         auto type = messages::decode_message(
             reinterpret_cast<const uint8_t*>(buf->base),
             static_cast<size_t>(nread), req, resp);
-        if (type == messages::RESPONSE_ID) self->received_ = resp;
+        if (type != messages::RESPONSE_ID) return;
+        self->received_ = resp;
+        self->received_src_port_ = ntohs(
+            reinterpret_cast<const struct sockaddr_in*>(addr)->sin_port);
     }
 
     Ipv4Address bound_addr(udx_socket_t* s) const {
@@ -153,6 +157,12 @@ TEST_F(PoolSocketRequests, InboundRequestDispatchesAndReplyRoundTrips) {
     EXPECT_EQ(received_->tid, 777);
     ASSERT_TRUE(received_->value.has_value());
     EXPECT_EQ(*received_->value, (std::vector<uint8_t>{9}));
+
+    // The whole point of reply(): the answer egresses from the SAME socket the
+    // request landed on. A reply from any other source port is dropped by
+    // stateful conntrack/CGNAT on a real path (see rpc.cpp:556-565).
+    EXPECT_EQ(received_src_port_, pool_addr().port)
+        << "reply did not egress from the pool socket";
 }
 
 TEST_F(PoolSocketRequests, RequestFeedsNatSampler) {

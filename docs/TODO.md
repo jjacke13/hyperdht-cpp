@@ -863,15 +863,22 @@ separately eliminated. Full case: memory `server_punch_socket_parity`, `Q2-EVIDE
 
 ### J.1 Blocking follow-ups found by this work (pre-existing, NOT caused by it)
 
-- [ ] **BUG B — birthday holders leak; the server permanently loses birthday punching.**
-  `Server::on_socket` does `conn.puncher.reset()` → `~Holepuncher`, which only nulls
-  `on_holepunch_message` + `stop()`; **only `destroy()` releases holders**
-  (`src/holepunch.cpp:367-381` vs `:740`). `BIRTHDAY_SOCKETS`=256
+- [x] **BUG B — birthday holders leak; the server permanently loses birthday punching.**
+  **FIXED `e8fd86c`.** `Server::on_socket` does `conn.puncher.reset()` → `~Holepuncher`,
+  which only nulled `on_holepunch_message` + `stop()`; **only `destroy()` released
+  holders** (`src/holepunch.cpp:367-381` vs `:740`). `BIRTHDAY_SOCKETS`=256
   (`include/hyperdht/holepunch.hpp:284`) vs `MAX_POOL_SOCKETS`=512
   (`src/socket_pool.cpp:178`) ⇒ **after ~2 successful RANDOM+CONSISTENT server punches
-  `acquire()` returns nullptr for the rest of the process.** Measured: 201 sockets
-  retained after the drop, 0 with `destroy()`. Safe to fix now — Task 5's
-  `Holepuncher::pin_socket` keeps an adopted holder alive across `destroy()`.
+  `acquire()` returned nullptr for the rest of the process.** Measured: 201 sockets
+  retained after the drop, 0 with `destroy()`.
+  Fixed in `~Holepuncher` rather than at the one call site, so every drop path is
+  covered; `release()` and `decrement_randomized()` are both idempotent, so it is a
+  no-op when `destroy()` already ran. **A second leak on the same path was found while
+  fixing it:** the dropped puncher also left `PunchStats::random_punches` incremented,
+  and `random_punch_limit` is 1 → `can_random_punch()` never returned true again, so
+  *no* random punch (CONSISTENT+RANDOM sprays included) could start. Test
+  `Holepuncher.DropWithoutDestroyReleasesHoldersAndThrottle`, red-verified on both
+  assertions. 763/763.
 - [ ] **BUG A (HIGH) — the blind-relay chain cannot pair, so `relayThrough` is
   non-functional.** `src/server.cpp:955-1012` and `src/connect.cpp:1119-1145` write the
   Protomux OPEN **in the same frame as `duplex->start()`**, where
@@ -899,6 +906,11 @@ separately eliminated. Full case: memory `server_punch_socket_parity`, `Q2-EVIDE
 - [ ] `SocketPool::destroy()` (`src/socket_pool.cpp:200-206`) still does an unchecked
       `udx_socket_close` + unconditional `closed_ = true` — same class as the
       `SocketRef::do_close` bug fixed on this branch.
+- [ ] `test_server_punch_socket` leaks 64 B / 8 allocs under ASAN — every one is the
+      `RawStreamCtx` allocated at `src/server.cpp:782`, retained because these tests
+      drive a handshake without ever completing or clearing the session. Pre-existing
+      and harness-only (`RawStreamCtx` is freed on the real connect/close paths), but
+      confirm that reading before treating the number as a regression baseline.
 - [ ] **nospoon needs one line when its pin is bumped**: hold `info.socket_keepalive`
       alongside the peer's duplex (`~/Desktop/repos/nospoon/cpp/server.cpp:93-97`
       connects synchronously today, so it currently parks one fd per punched connection).

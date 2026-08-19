@@ -83,7 +83,7 @@ bool relay_peer_handshake(const messages::Request& req,
             fwd.peer_address = req.from.addr;  // JS peerAddress: req.from
             // relayAddress: null
             relay(make_relay_request(req, dest,
-                    peer_connect::encode_handshake_msg(fwd)));
+                    peer_connect::encode_handshake_msg(fwd)), nullptr);
             return true;
         }
         case peer_connect::MODE_FROM_RELAY: {
@@ -95,7 +95,7 @@ bool relay_peer_handshake(const messages::Request& req,
             fwd.peer_address = hs.peer_address;  // keep incoming peerAddress
             fwd.relay_address = req.from.addr;   // JS relayAddress: req.from
             relay(make_relay_request(req, *relay_addr,
-                    peer_connect::encode_handshake_msg(fwd)));
+                    peer_connect::encode_handshake_msg(fwd)), nullptr);
             return true;
         }
         case peer_connect::MODE_FROM_SERVER: {
@@ -138,7 +138,7 @@ bool relay_peer_holepunch(const messages::Request& req,
             fwd.payload = hp.payload;
             fwd.peer_address = req.from.addr;  // JS peerAddress: req.from
             relay(make_relay_request(req, dest,
-                    holepunch::encode_holepunch_msg(fwd)));
+                    holepunch::encode_holepunch_msg(fwd)), nullptr);
             return true;
         }
         case peer_connect::MODE_FROM_SERVER: {
@@ -264,14 +264,18 @@ bool Router::handle_peer_handshake(const messages::Request& req,
 
     // Call the server's handler. It will call reply_fn with the Noise msg2.
     entry->on_peer_handshake(
-        hs_msg.noise, client_addr,
+        hs_msg.noise, client_addr, req.from.addr,
         [req_tid, req_from, req_command, req_target, relay_address,
-         reply, relay, client_addr, incoming_mode](std::vector<uint8_t> reply_noise) {
+         reply, relay, client_addr, incoming_mode](std::vector<uint8_t> reply_noise,
+                                                   udx_socket_t* via) {
             DHT_LOG( "  [router] reply_fn called, noise=%zu bytes, incoming_mode=%u\n",
                     reply_noise.size(), incoming_mode);
 
             if (incoming_mode == peer_connect::MODE_FROM_CLIENT) {
-                // Direct connection: send RESPONSE with mode=REPLY to the client
+                // Direct connection: send RESPONSE with mode=REPLY to the client.
+                // `via` is ignored: JS never has a puncher socket here
+                // (server.js:394-397 — an open/direct server doesn't punch),
+                // and dht-rpc replies ride the request's arrival socket.
                 peer_connect::HandshakeMessage resp_msg;
                 resp_msg.mode = peer_connect::MODE_REPLY;
                 resp_msg.noise = std::move(reply_noise);
@@ -311,7 +315,10 @@ bool Router::handle_peer_handshake(const messages::Request& req,
                 relay_req.internal = false;
                 relay_req.value = peer_connect::encode_handshake_msg(relay_msg);
 
-                relay(relay_req);
+                // JS server.js:481 returns the puncher's socket alongside the
+                // noise; dht-rpc egresses the relayed reply from it so the
+                // relay (and through it the client) learns that address.
+                relay(relay_req, via);
             }
         });
 
@@ -394,7 +401,7 @@ bool Router::handle_peer_holepunch(const messages::Request& req,
             relay_req.internal = false;
             relay_req.value = holepunch::encode_holepunch_msg(hp_relay);
 
-            relay(relay_req);
+            relay(relay_req, nullptr);
         });
 
     return true;

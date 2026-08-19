@@ -163,9 +163,12 @@ void RpcHandlers::handle(const messages::Request& req) {
                         (const messages::Response& resp) {
                             socket_.reply(resp, from_server);
                         },
-                        [this](const messages::Request& req) {
+                        [this](const messages::Request& req, udx_socket_t* via) {
+                            // `via` = the server session's punch socket when
+                            // one exists (JS server.js:481). nullptr keeps the
+                            // DHT's active socket.
                             auto buf = messages::encode_request(req);
-                            socket_.udp_send(buf, req.to.addr);
+                            socket_.udp_send(buf, req.to.addr, via);
                         },
                         // Closer-nodes provider for the no-relay FROM_CLIENT
                         // reply (JS router.js:135). Same table.closest() the
@@ -188,9 +191,9 @@ void RpcHandlers::handle(const messages::Request& req) {
                         (const messages::Response& resp) {
                             socket_.reply(resp, from_server);
                         },
-                        [this](const messages::Request& req) {
+                        [this](const messages::Request& req, udx_socket_t* via) {
                             auto buf = messages::encode_request(req);
-                            socket_.udp_send(buf, req.to.addr);
+                            socket_.udp_send(buf, req.to.addr, via);
                         });
                 }
                 return;

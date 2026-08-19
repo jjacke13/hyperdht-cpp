@@ -340,8 +340,7 @@ private:
     // their reply_fns on the entry. on_handshake_result flushes everyone
     // with the same reply bytes (or silence if the firewall rejected).
     // Cleared in close()/suspend() if the firewall never resolves.
-    std::unordered_map<uint32_t,
-                       std::vector<std::function<void(std::vector<uint8_t>)>>>
+    std::unordered_map<uint32_t, std::vector<router::HandshakeReplyFn>>
         pending_handshakes_;
 public:
     // Called by rawStream firewall callback (static C function needs access)
@@ -387,7 +386,8 @@ private:
     // Router callbacks
     void on_peer_handshake(const std::vector<uint8_t>& noise,
                            const compact::Ipv4Address& peer_address,
-                           std::function<void(std::vector<uint8_t>)> reply_fn);
+                           const compact::Ipv4Address& from_address,
+                           router::HandshakeReplyFn reply_fn);
 
     void on_peer_holepunch(const std::vector<uint8_t>& value,
                            const compact::Ipv4Address& peer_address,
@@ -405,7 +405,7 @@ private:
         std::string noise_key,
         bool has_remote_addr,
         std::optional<peer_connect::RelayThroughInfo> relay_through_info,
-        std::function<void(std::vector<uint8_t>)> reply_fn,
+        router::HandshakeReplyFn reply_fn,
         std::optional<server_connection::ServerConnection> result);
 
     // Called when holepunch or direct connect succeeds

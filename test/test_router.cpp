@@ -16,15 +16,16 @@ static announce::TargetKey make_target(uint8_t fill) {
 
 // No-op callbacks for tests that don't care about them
 static auto noop_reply = [](const messages::Response&) {};
-static auto noop_relay = [](const messages::Request&) {};
+static auto noop_relay = [](const messages::Request&, udx_socket_t*) {};
 
 // Helper: register a handshake handler that echoes back {0xDE, 0xAD}
 static ForwardEntry make_echo_entry() {
     ForwardEntry entry;
     entry.on_peer_handshake = [](const std::vector<uint8_t>&,
                                   const Ipv4Address&,
-                                  std::function<void(std::vector<uint8_t>)> reply_fn) {
-        reply_fn({0xDE, 0xAD});
+                                  const Ipv4Address&,
+                                  HandshakeReplyFn reply_fn) {
+        reply_fn({0xDE, 0xAD}, nullptr);
     };
     return entry;
 }
@@ -106,10 +107,11 @@ TEST(Router, HandshakeDispatch) {
     ForwardEntry entry;
     entry.on_peer_handshake = [&](const std::vector<uint8_t>& noise,
                                    const Ipv4Address&,
-                                   std::function<void(std::vector<uint8_t>)> reply_fn) {
+                                   const Ipv4Address&,
+                                   HandshakeReplyFn reply_fn) {
         handler_called = true;
         received_noise = noise;
-        reply_fn({0xDE, 0xAD});
+        reply_fn({0xDE, 0xAD}, nullptr);
     };
     r.set(target, entry);
 
@@ -176,7 +178,7 @@ TEST(Router, DirectReplyIsResponse) {
             EXPECT_EQ(hs.mode, peer_connect::MODE_REPLY);
             EXPECT_EQ(resp.tid, 42u);
         },
-        [&](const messages::Request&) { relay_called = true; });
+        [&](const messages::Request&, udx_socket_t*) { relay_called = true; });
 
     EXPECT_TRUE(reply_called) << "FROM_CLIENT must use reply (RESPONSE), not relay";
     EXPECT_FALSE(relay_called);
@@ -196,7 +198,7 @@ TEST(Router, RelayReplyIsRequest) {
 
     r.handle_peer_handshake(req,
         [&](const messages::Response&) { reply_called = true; },
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             relay_called = true;
 
             // Verify it's a REQUEST that goes back to the relay
@@ -225,7 +227,7 @@ TEST(Router, RelayReplyPreservesTid) {
 
     r.handle_peer_handshake(req,
         noop_reply,
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             EXPECT_EQ(relay_req.tid, 12345)
                 << "Relay REQUEST must preserve the original TID";
         });
@@ -241,7 +243,7 @@ TEST(Router, RelayReplyModeIsFromServer) {
 
     r.handle_peer_handshake(req,
         noop_reply,
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             ASSERT_TRUE(relay_req.value.has_value());
             auto hs = peer_connect::decode_handshake_msg(
                 relay_req.value->data(), relay_req.value->size());
@@ -260,7 +262,7 @@ TEST(Router, RelayReplyTargetPreserved) {
 
     r.handle_peer_handshake(req,
         noop_reply,
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             ASSERT_TRUE(relay_req.target.has_value());
             std::array<uint8_t, 32> expected{};
             expected.fill(0x88);
@@ -279,7 +281,7 @@ TEST(Router, RelayReplyIncludesPeerAddress) {
 
     r.handle_peer_handshake(req,
         noop_reply,
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             auto hs = peer_connect::decode_handshake_msg(
                 relay_req.value->data(), relay_req.value->size());
             ASSERT_TRUE(hs.peer_address.has_value())
@@ -307,7 +309,7 @@ TEST(Router, SecondRelayReplyGoesToRelayAddress) {
 
     r.handle_peer_handshake(req,
         [&](const messages::Response&) { reply_called = true; },
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             relay_called = true;
             EXPECT_EQ(relay_req.to.addr.host_string(), "157.90.213.229")
                 << "FROM_SECOND_RELAY reply must go to relayAddress (first relay)";
@@ -337,7 +339,7 @@ TEST(Router, SecondRelayWithoutRelayAddressDropped) {
 
     r.handle_peer_handshake(req,
         [&](const messages::Response&) { reply_called = true; },
-        [&](const messages::Request&) { relay_called = true; });
+        [&](const messages::Request&, udx_socket_t*) { relay_called = true; });
 
     EXPECT_FALSE(reply_called)
         << "FROM_SECOND_RELAY without relayAddress must not reply";
@@ -395,7 +397,7 @@ TEST(Router, HolepunchRelayIsRequest) {
 
     r.handle_peer_holepunch(req,
         [&](const messages::Response&) { reply_called = true; },
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             relay_called = true;
 
             // Verify it's a REQUEST
@@ -430,7 +432,7 @@ TEST(Router, FullRelayRoundTrip) {
 
     r.handle_peer_handshake(req,
         noop_reply,
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             // Encode to wire bytes — this is what goes on the network
             auto wire = messages::encode_request(relay_req);
 
@@ -490,7 +492,7 @@ TEST(Router, RelayNodeForwardsHandshakeFromClient) {
     bool relay_called = false;
     r.handle_peer_handshake(req,
         [&](const messages::Response&) { reply_called = true; },
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             relay_called = true;
             // Forwarded toward the entry's relay (the server)
             EXPECT_EQ(relay_req.to.addr.host_string(), "203.0.113.9");
@@ -545,7 +547,7 @@ TEST(Router, RelayNodeNoRelayRepliesWithCloserNodes) {
             ASSERT_EQ(resp.closer_nodes.size(), 1u);
             EXPECT_EQ(resp.closer_nodes[0].host_string(), "192.0.2.55");
         },
-        [&](const messages::Request&) { relay_called = true; },
+        [&](const messages::Request&, udx_socket_t*) { relay_called = true; },
         [&](const announce::TargetKey&) {
             return std::vector<Ipv4Address>{fake_node};
         });
@@ -594,7 +596,7 @@ TEST(Router, RelayNodeBouncesHandshakeFromServerToClient) {
             ASSERT_TRUE(out.peer_address.has_value());
             EXPECT_EQ(out.peer_address->host_string(), "203.0.113.11");
         },
-        [&](const messages::Request&) { relay_called = true; });
+        [&](const messages::Request&, udx_socket_t*) { relay_called = true; });
 
     EXPECT_TRUE(reply_called) << "FROM_SERVER must bounce a REPLY to the client";
     EXPECT_FALSE(relay_called);
@@ -629,7 +631,7 @@ TEST(Router, RelayNodeForwardsHolepunchFromClient) {
     bool relay_called = false;
     r.handle_peer_holepunch(req,
         [&](const messages::Response&) { reply_called = true; },
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             relay_called = true;
             // peerAddress set → forward toward it (the server)
             EXPECT_EQ(relay_req.to.addr.host_string(), "203.0.113.10");
@@ -714,7 +716,7 @@ TEST(Router, ServerHostRelaysHolepunchFromClient) {
     bool relay_called = false;
     r.handle_peer_holepunch(req,
         [&](const messages::Response&) { reply_called = true; },
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             relay_called = true;
             // Forwarded toward the embedded peerAddress as FROM_RELAY,
             // peerAddress rewritten to the client's UDP source.
@@ -748,7 +750,7 @@ TEST(Router, ServerHostDropsHolepunchFromClientWithoutPeerAddress) {
     bool relay_called = false;
     r.handle_peer_holepunch(req,
         [&](const messages::Response&) { reply_called = true; },
-        [&](const messages::Request&) { relay_called = true; });
+        [&](const messages::Request&, udx_socket_t*) { relay_called = true; });
 
     EXPECT_FALSE(handler_called);
     EXPECT_FALSE(reply_called);
@@ -770,7 +772,7 @@ TEST(Router, HolepunchFromRelayWithoutPeerAddressDropped) {
     bool relay_called = false;
     r.handle_peer_holepunch(req,
         [&](const messages::Response&) { reply_called = true; },
-        [&](const messages::Request&) { relay_called = true; });
+        [&](const messages::Request&, udx_socket_t*) { relay_called = true; });
 
     EXPECT_FALSE(handler_called)
         << "FROM_RELAY without peerAddress must not reach the handler";
@@ -806,10 +808,60 @@ TEST(Router, ServerHostConvertsHolepunchFromServerToReply) {
             ASSERT_TRUE(out.peer_address.has_value());
             EXPECT_EQ(out.peer_address->host_string(), "203.0.113.21");
         },
-        [&](const messages::Request&) { relay_called = true; });
+        [&](const messages::Request&, udx_socket_t*) { relay_called = true; });
 
     EXPECT_FALSE(handler_called)
         << "FROM_SERVER must never invoke the server handler";
     EXPECT_TRUE(reply_called);
     EXPECT_FALSE(relay_called);
+}
+
+// ============================================================================
+// Server reply egress socket (JS server.js:481 —
+// `return { socket: h.puncher && h.puncher.socket, noise: h.reply }`; dht-rpc
+// sends the reply from that socket instead of the DHT's main one)
+// ============================================================================
+
+TEST(Router, ServerReplyPropagatesEgressSocket) {
+    Router r;
+    auto target = make_target(0x77);
+
+    // Pointer identity only — nothing is ever sent through it.
+    udx_socket_t fake_socket{};
+
+    Ipv4Address seen_client{};
+    Ipv4Address seen_from{};
+
+    ForwardEntry entry;
+    entry.on_peer_handshake = [&](const std::vector<uint8_t>&,
+                                  const Ipv4Address& client_addr,
+                                  const Ipv4Address& from_addr,
+                                  HandshakeReplyFn reply_fn) {
+        seen_client = client_addr;
+        seen_from = from_addr;
+        reply_fn({0xDE, 0xAD}, &fake_socket);
+    };
+    r.set(target, std::move(entry));
+
+    // FROM_RELAY: peerAddress = the client (192.168.1.100:9999),
+    // req.from = the relaying DHT node (10.0.0.1:5000).
+    auto req = make_hs_request(target, peer_connect::MODE_FROM_RELAY);
+
+    udx_socket_t* seen_via = reinterpret_cast<udx_socket_t*>(0x1);
+    bool relay_called = false;
+
+    r.handle_peer_handshake(req,
+        [](const messages::Response&) {
+            ADD_FAILURE() << "FROM_RELAY must use the relay fn, not reply";
+        },
+        [&](const messages::Request&, udx_socket_t* via) {
+            relay_called = true;
+            seen_via = via;
+        });
+
+    ASSERT_TRUE(relay_called);
+    EXPECT_EQ(seen_via, &fake_socket)
+        << "the server's chosen egress socket must reach the relay sender";
+    EXPECT_EQ(seen_client, Ipv4Address::from_string("192.168.1.100", 9999));
+    EXPECT_EQ(seen_from, Ipv4Address::from_string("10.0.0.1", 5000));
 }

@@ -327,8 +327,9 @@ struct SendContext {
     std::vector<uint8_t> buf;
 };
 
-void RpcSocket::udp_send(const std::vector<uint8_t>& buf, const compact::Ipv4Address& to) {
-    udp_send_on(buf, to, active_socket());
+void RpcSocket::udp_send(const std::vector<uint8_t>& buf, const compact::Ipv4Address& to,
+                         udx_socket_t* via) {
+    udp_send_on(buf, to, via ? via : active_socket());
 }
 
 void RpcSocket::udp_send_on(const std::vector<uint8_t>& buf,

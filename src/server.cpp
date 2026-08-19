@@ -188,8 +188,9 @@ void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection)
     router::ForwardEntry entry;
     entry.on_peer_handshake = [this](const std::vector<uint8_t>& noise,
                                       const compact::Ipv4Address& peer_addr,
-                                      std::function<void(std::vector<uint8_t>)> reply_fn) {
-        on_peer_handshake(noise, peer_addr, std::move(reply_fn));
+                                      const compact::Ipv4Address& from_addr,
+                                      router::HandshakeReplyFn reply_fn) {
+        on_peer_handshake(noise, peer_addr, from_addr, std::move(reply_fn));
     };
     entry.on_peer_holepunch = [this](const std::vector<uint8_t>& value,
                                       const compact::Ipv4Address& peer_addr,
@@ -420,7 +421,8 @@ const std::vector<peer_connect::RelayInfo>& Server::relay_addresses() const {
 
 void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
                                 const compact::Ipv4Address& peer_address,
-                                std::function<void(std::vector<uint8_t>)> reply_fn) {
+                                const compact::Ipv4Address& from_address,
+                                router::HandshakeReplyFn reply_fn) {
     DHT_LOG( "  [server] on_peer_handshake: noise=%zu bytes, from=%s:%u\n",
             noise.size(), peer_address.host_string().c_str(), peer_address.port);
     if (closed_ || suspended_) return;
@@ -467,7 +469,9 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
             if (conn_it->second->firewalled) return;
             DHT_LOG( "  [server] Dedup: reusing session id=%u for same noise\n",
                     dedup_it->second);
-            reply_fn(std::vector<uint8_t>(conn_it->second->reply_noise));
+            // ponytail: nullptr egress for now — Task 4 hands the session's
+            // punch socket here.
+            reply_fn(std::vector<uint8_t>(conn_it->second->reply_noise), nullptr);
             return;
         }
         // Session was already completed/cleaned up — remove stale dedup entry
@@ -594,7 +598,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         firewall_async_(pending_shared->remote_public_key,
                         pending_shared->remote_payload, peer_address,
                         [this, weak_alive, fired_once, pending_shared,
-                         hp_id, noise_key, has_remote_addr,
+                         hp_id, noise_key, has_remote_addr, from_address,
                          relay_through_shared, our_addrs, relay_infos,
                          reply_fn](bool reject) mutable {
             // (2) Once-guard.
@@ -613,6 +617,8 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
                 our_addrs, relay_infos, reject,
                 has_remote_addr, relay_through_shared,
                 reusable_socket);
+            // Relay hint for the session punch socket (Task 4 consumes it).
+            if (res) res->handshake_relay_addr = from_address;
             on_handshake_result(hp_id, noise_key, has_remote_addr,
                                 relay_through_shared, reply_fn, std::move(res));
         });
@@ -632,6 +638,8 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         our_addrs, relay_infos, rejected,
         has_remote_addr, relay_through_info,
         reusable_socket);
+    // Relay hint for the session punch socket (Task 4 consumes it).
+    if (result) result->handshake_relay_addr = from_address;
 
     on_handshake_result(hp_id, noise_key, has_remote_addr,
                         relay_through_info, reply_fn, std::move(result));
@@ -646,7 +654,7 @@ void Server::on_handshake_result(
     std::string noise_key,
     bool has_remote_addr,
     std::optional<peer_connect::RelayThroughInfo> relay_through_info,
-    std::function<void(std::vector<uint8_t>)> reply_fn,
+    router::HandshakeReplyFn reply_fn,
     std::optional<server_connection::ServerConnection> result) {
 
     if (closed_ || suspended_) return;
@@ -654,7 +662,7 @@ void Server::on_handshake_result(
     // server-3: the firewall decision has arrived — resolve the pending
     // entry now, collecting every duplicate requester queued during the
     // async window. All of them get the same outcome as the primary.
-    std::vector<std::function<void(std::vector<uint8_t>)>> senders;
+    std::vector<router::HandshakeReplyFn> senders;
     senders.push_back(std::move(reply_fn));
     if (auto pit = pending_handshakes_.find(hp_id);
         pit != pending_handshakes_.end()) {
@@ -712,7 +720,9 @@ void Server::on_handshake_result(
     DHT_LOG("  [server] Sending reply: %zu noise bytes (%zu requesters)\n",
             conn.reply_noise.size(), senders.size());
     for (auto& fn : senders) {
-        if (fn) fn(std::vector<uint8_t>(conn.reply_noise));
+        // ponytail: nullptr egress for now — Task 4 hands the session's
+        // punch socket here.
+        if (fn) fn(std::vector<uint8_t>(conn.reply_noise), nullptr);
     }
 
     if (conn.has_error) {

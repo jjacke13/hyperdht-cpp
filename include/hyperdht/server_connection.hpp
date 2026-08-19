@@ -60,6 +60,11 @@ struct ServerConnection {
     uint32_t our_firewall = peer_connect::FIREWALL_UNKNOWN;
     std::vector<compact::Ipv4Address> our_addresses;
 
+    // UDP source of the PEER_HANDSHAKE that opened this session (JS `req.from`
+    // — the relaying DHT node on a relayed handshake). Kept as the relay hint
+    // for discovering the session punch socket's NAT address.
+    compact::Ipv4Address handshake_relay_addr{};
+
     // State flags
     bool firewalled = false;   // Rejected by firewall callback
     bool has_error = false;

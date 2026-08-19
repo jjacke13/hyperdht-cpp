@@ -27,15 +27,31 @@ namespace router {
 // ForwardEntry — what's registered for a target
 // ---------------------------------------------------------------------------
 
+// Reply callback for a server-hosted PEER_HANDSHAKE.
+//   reply_noise: the Noise msg2 bytes
+//   via: egress socket override for RELAYED replies — nullptr means the
+//     DHT's own active socket (today's behaviour, and the only option for a
+//     direct FROM_CLIENT reply, which rides the request's arrival socket).
+// JS: server.js:481 `return { socket: h.puncher && h.puncher.socket,
+// noise: h.reply }` — dht-rpc sends the reply from that socket, so the
+// client's first sight of the server is already the punch socket.
+using HandshakeReplyFn =
+    std::function<void(std::vector<uint8_t> reply_noise, udx_socket_t* via)>;
+
 struct ForwardEntry {
     // Called when PEER_HANDSHAKE arrives for this target.
     // noise: the raw Noise msg1 bytes from the client
     // peer_address: the client's address as seen by the relay
+    // from_address: the actual UDP source of the request (JS `req.from`) —
+    //   the relaying DHT node on relayed rounds. Mirrors the HolepunchFn
+    //   parameter of the same name; the server keeps it as the relay hint
+    //   for the session's punch socket.
     // reply_fn: call with Noise msg2 bytes to respond
     using HandshakeFn = std::function<void(
         const std::vector<uint8_t>& noise,
         const compact::Ipv4Address& peer_address,
-        std::function<void(std::vector<uint8_t> reply_noise)> reply_fn)>;
+        const compact::Ipv4Address& from_address,
+        HandshakeReplyFn reply_fn)>;
 
     // Called when PEER_HOLEPUNCH arrives for this target.
     // msg: the decoded holepunch message (id, payload, peerAddress)
@@ -100,8 +116,12 @@ public:
     // Callback types for reply (sends RESPONSE) and relay (sends REQUEST).
     // The relay path is used when mode=FROM_RELAY: the server sends a REQUEST
     // back to the relay node, which then converts it to a RESPONSE for the client.
+    // RelayFn's second argument is the egress socket override (nullptr = the
+    // DHT's active socket). Only a server-hosted handshake reply ever names
+    // one; every other relay/forward path passes nullptr.
     using ReplyFn = std::function<void(const messages::Response&)>;
-    using RelayFn = std::function<void(const messages::Request&)>;
+    using RelayFn = std::function<void(const messages::Request&, udx_socket_t* via)>;
+    using HandshakeReplyFn = router::HandshakeReplyFn;
 
     // Supplies the k closest routing-table nodes to a target. Used by the
     // relay-forward FROM_CLIENT branch when no relay is known, to answer the

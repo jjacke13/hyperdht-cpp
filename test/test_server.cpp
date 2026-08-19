@@ -131,7 +131,7 @@ TEST(Server, HandshakeViaRouter) {
                 EXPECT_TRUE(client_noise.is_complete());
             }
         },
-        [](const messages::Request&) {});
+        [](const messages::Request&, udx_socket_t*) {});
 
     EXPECT_TRUE(handled);
 
@@ -251,7 +251,7 @@ TEST(Server, FirewallRejectsConnection) {
         router.handle_peer_handshake(
             hs.req,
             [&reply_count](const messages::Response&) { reply_count++; },
-            [](const messages::Request&) {});
+            [](const messages::Request&, udx_socket_t*) {});
     };
 
     dispatch();
@@ -348,7 +348,7 @@ TEST(Server, AsyncFirewallDeferredAccept) {
     router.handle_peer_handshake(
         req,
         [&reply_sent](const messages::Response&) { reply_sent = true; },
-        [](const messages::Request&) {});
+        [](const messages::Request&, udx_socket_t*) {});
 
     // Firewall was invoked exactly once, but the reply is still
     // pending — `done` wasn't called yet.
@@ -422,7 +422,7 @@ TEST(Server, AsyncFirewallDoneCalledTwiceIsNoop) {
     int reply_count = 0;
     router.handle_peer_handshake(req,
         [&reply_count](const messages::Response&) { reply_count++; },
-        [](const messages::Request&) {});
+        [](const messages::Request&, udx_socket_t*) {});
 
     ASSERT_TRUE(deferred_done);
     deferred_done(/*reject=*/false);
@@ -489,7 +489,7 @@ TEST(Server, AsyncFirewallAfterServerCloseIsNoop) {
     int reply_count = 0;
     router.handle_peer_handshake(req,
         [&reply_count](const messages::Response&) { reply_count++; },
-        [](const messages::Request&) {});
+        [](const messages::Request&, udx_socket_t*) {});
     ASSERT_TRUE(deferred_done);
 
     // Tear down the server BEFORE the user completes the firewall.
@@ -541,7 +541,7 @@ TEST(Server, AsyncFirewallDeferredReject) {
         router.handle_peer_handshake(
             hs.req,
             [&reply_count](const messages::Response&) { reply_count++; },
-            [](const messages::Request&) {});
+            [](const messages::Request&, udx_socket_t*) {});
     };
 
     dispatch();
@@ -600,7 +600,7 @@ TEST(Server, AsyncFirewallDuplicateDuringWindow) {
             [&replies](const messages::Response& resp) {
                 replies.push_back(resp.value.value_or(std::vector<uint8_t>{}));
             },
-            [](const messages::Request&) {});
+            [](const messages::Request&, udx_socket_t*) {});
     };
 
     dispatch();  // primary — firewall dispatched, decision pending
@@ -659,7 +659,7 @@ TEST(Server, AsyncFirewallDuplicateDuringWindowReject) {
         router.handle_peer_handshake(
             hs.req,
             [&reply_count](const messages::Response&) { reply_count++; },
-            [](const messages::Request&) {});
+            [](const messages::Request&, udx_socket_t*) {});
     };
 
     dispatch();
@@ -725,7 +725,7 @@ HolepunchHarness make_holepunch_harness(router::Router& router,
                 std::make_shared<holepunch::SecurePayload>(secret);
             got_reply = true;
         },
-        [](const messages::Request&) {});
+        [](const messages::Request&, udx_socket_t*) {});
     EXPECT_TRUE(got_reply) << "handshake through router failed";
     return h;
 }
@@ -811,7 +811,7 @@ TEST(Server, HolepunchVetoRepliesEncryptedAborted) {
     bool handled = router.handle_peer_holepunch(
         req,
         [](const messages::Response&) {},
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             replied = true;
             ASSERT_TRUE(relay_req.value.has_value());
             auto payload = decrypt_holepunch_reply(h, *relay_req.value);
@@ -858,7 +858,7 @@ TEST(Server, HolepunchPunchStartFailureRepliesAborted) {
     router.handle_peer_holepunch(
         req,
         [](const messages::Response&) {},
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             replied = true;
             ASSERT_TRUE(relay_req.value.has_value());
             auto payload = decrypt_holepunch_reply(h, *relay_req.value);
@@ -913,7 +913,7 @@ TEST(Server, HolepunchPunchStartedSendsCommittedReply) {
     router.handle_peer_holepunch(
         req,
         [](const messages::Response&) {},
-        [&](const messages::Request& relay_req) {
+        [&](const messages::Request& relay_req, udx_socket_t*) {
             replied = true;
             ASSERT_TRUE(relay_req.value.has_value());
             auto payload = decrypt_holepunch_reply(h, *relay_req.value);
@@ -1330,7 +1330,7 @@ TEST(Server, Addresses4IsRemoteAddressPlusLanWithoutDuplicates) {
                         .addresses4;
             got_reply = true;
         },
-        [](const messages::Request&) {}));
+        [](const messages::Request&, udx_socket_t*) {}));
     ASSERT_TRUE(got_reply);
 
     ASSERT_FALSE(addrs.empty());
@@ -1411,7 +1411,7 @@ TEST(Server, RemoteAddressUsesRingSamplerNotStaleClassifier) {
                                                          dec->size());
                 got = true;
             },
-            [](const messages::Request&) {}));
+            [](const messages::Request&, udx_socket_t*) {}));
         EXPECT_TRUE(got);
         return out;
     };
@@ -1555,7 +1555,7 @@ TEST(Server, RelayWatchdogAbortsChainKeepsSession) {
     auto dispatch = [&]() {
         return dht.router().handle_peer_handshake(
             req, [](const messages::Response&) {},
-            [](const messages::Request&) {});
+            [](const messages::Request&, udx_socket_t*) {});
     };
 
     // t=0: first handshake — Phase E starts, watchdog armed.
@@ -1676,7 +1676,7 @@ void run_ffi_firewall_case(hyperdht_firewall_cb cb, FfiFirewallProbe* probe) {
     router.handle_peer_handshake(
         hs.req,
         [probe](const messages::Response&) { probe->reply_count++; },
-        [](const messages::Request&) {});
+        [](const messages::Request&, udx_socket_t*) {});
 
     srv.close();
     socket.close();

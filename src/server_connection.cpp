@@ -62,6 +62,7 @@ ServerConnection::ServerConnection(ServerConnection&& other) noexcept
       raw_stream(other.raw_stream),
       our_firewall(other.our_firewall),
       our_addresses(std::move(other.our_addresses)),
+      handshake_relay_addr(other.handshake_relay_addr),
       firewalled(other.firewalled),
       has_error(other.has_error),
       error_code(other.error_code),
@@ -88,6 +89,7 @@ ServerConnection& ServerConnection::operator=(ServerConnection&& other) noexcept
         other.raw_stream = nullptr;
         our_firewall = other.our_firewall;
         our_addresses = std::move(other.our_addresses);
+        handshake_relay_addr = other.handshake_relay_addr;
         firewalled = other.firewalled;
         has_error = other.has_error;
         error_code = other.error_code;

@@ -239,6 +239,42 @@ TEST_F(PoolSocketRequests, MatchedResponseFeedsNatSampler) {
     EXPECT_EQ(pool_->nat_sampler().host(), "198.51.100.9");
 }
 
+// close() must not pull the socket out from under a stream that was adopted
+// onto it (udx_socket_close returns UV_EBUSY, udx.c:2175), and the refusal has
+// to be visible in a SHIPPED build — DHT_LOG compiles to a no-op there
+// (debug.hpp:19), so the counter is the only diagnostic that survives.
+TEST_F(PoolSocketRequests, BusyCloseKeepsSocketOpenAndCounts) {
+    udx_stream_t stream{};
+    ASSERT_EQ(udx_stream_init(udx_->handle(), &stream, 4321,
+                              [](udx_stream_t*, int) {}, nullptr), 0);
+    struct sockaddr_in dest{};
+    uv_ip4_addr("127.0.0.1", bound_addr(plain_->handle()).port, &dest);
+    ASSERT_EQ(udx_stream_connect(&stream, pool_->socket_handle(), 99,
+                                 reinterpret_cast<const struct sockaddr*>(&dest)),
+              0);
+
+    auto* handle = pool_->socket_handle();
+    uint64_t before = hyperdht::udx::busy_close_count();
+
+    pool_->close();
+
+    EXPECT_EQ(hyperdht::udx::busy_close_count(), before + 1);
+    EXPECT_TRUE(pool_->is_closing());
+    EXPECT_EQ(pool_->socket_handle(), handle)
+        << "close() nulled a handle udx still owns";
+    EXPECT_FALSE(uv_is_closing(reinterpret_cast<uv_handle_t*>(handle)))
+        << "socket closed under a live stream";
+
+    // Clean up what the contract violation left behind: the stream goes first,
+    // then the socket can actually close (this is what the keepalive would
+    // have guaranteed in the right order).
+    hyperdht::udx::destroy_stream_once(&stream);
+    run_loop_until([] { return false; }, 60);
+    EXPECT_TRUE(hyperdht::udx::close_socket_unless_busy(handle));
+    run_loop_until([] { return false; }, 60);
+    pool_.reset();  // TearDown must not double-close
+}
+
 // No consumer wired → the request is dropped like any other unknown traffic,
 // and nothing is fed to the sampler.
 TEST_F(PoolSocketRequests, RequestWithoutConsumerIsDropped) {

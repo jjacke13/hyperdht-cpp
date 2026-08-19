@@ -142,4 +142,32 @@ inline bool destroy_stream_once(udx_stream_t* stream) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// close_socket_unless_busy — close a udx socket unless a stream is still on it.
+//
+// `udx_socket_close()` returns UV_EBUSY while `socket->streams != NULL`
+// (deps/libudx/src/udx.c:2175). Every owner in this codebase used to discard
+// that return and then mark itself closed, which is a lie in two directions:
+// the socket is still open (fd parked, uv_udp_t active, loop won't drain) AND
+// the owner stops guarding it, so a later teardown skips the one step that
+// keeps a late datagram from reaching a destroyed owner.
+//
+// Returns true when the close was issued (caller may drop the handle), false
+// on refusal (caller MUST keep treating the socket as open and owned). libudx
+// has no close-when-idle hook — finalize auto-closes only during
+// `udx_teardown()` (udx.c:448-451) — so a refusal is not retried here; the
+// owner retries on its next close attempt, and the socket is otherwise reaped
+// at teardown.
+//
+// A refusal means an adopted stream's owner dropped its socket keepalive
+// early; `busy_close_count()` makes that visible in shipped builds, where
+// DHT_LOG compiles to a no-op (debug.hpp:19).
+//
+// Both live in udx.cpp, NOT inline: a Release shared build sets
+// VISIBILITY_INLINES_HIDDEN (CMakeLists.txt:214-218), which would give the
+// library and its consumer a counter each — silently zero on the side doing
+// the reading, in exactly the configuration this counter is for.
+bool close_socket_unless_busy(udx_socket_t* socket);
+uint64_t busy_close_count();
+
 }  // namespace hyperdht::udx

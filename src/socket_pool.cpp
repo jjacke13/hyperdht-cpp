@@ -97,8 +97,16 @@ void SocketRef::do_close() {
         return;
     }
 
+    // Close FIRST, flag second. udx refuses (UV_EBUSY) while a stream is still
+    // attached — which happens when a connection was adopted onto this holder
+    // and its owner dropped the keepalive. Flagging closed_ on a refusal is the
+    // dangerous half: on_socket_close never fires, so SocketPool::remove()
+    // never runs, and SocketPool::destroy() then SKIPS this ref — leaving
+    // socket_.data pointing at a SocketRef whose pool_ reference has died with
+    // the pool, so one late datagram reaches a destroyed pool. Staying "not
+    // closed" keeps the ref guarded: destroy() nulls socket_.data and retries.
+    if (!udx::close_socket_unless_busy(&socket_)) return;
     closed_ = true;
-    udx_socket_close(&socket_);
 }
 
 void SocketRef::unlinger() {

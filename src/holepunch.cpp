@@ -723,6 +723,20 @@ void Holepuncher::analyze(bool allow_reopen, OnAnalyzeDone on_done) {
     if (on_done) on_done(true);
 }
 
+// JS holepuncher.js:136-142 keeps the socket a connection landed on alive as
+// `_allHolders[0]`; we hand the caller a ref instead. Goes through the pool
+// rather than scanning holders_ so it also covers a retryRoute socket — the
+// question being answered is "does the pool own the socket this stream was
+// just bound to", and only the pool can answer it.
+std::shared_ptr<void> Holepuncher::pin_socket(udx_socket_t* sock) {
+    if (!sock || !pool_) return nullptr;
+    auto* ref = pool_->lookup(sock);
+    if (!ref || ref->is_closed()) return nullptr;
+    ref->active();
+    return std::shared_ptr<void>(
+        ref, [](socket_pool::SocketRef* p) { p->inactive(); });
+}
+
 void Holepuncher::destroy() {
     if (destroyed_) return;
     destroyed_ = true;
@@ -1240,22 +1254,18 @@ void PoolSocket::close() {
         // The heap-alloc'd socket_t is freed by the on_close cb we
         // registered in PoolSocket's constructor.
         //
-        // UV_EBUSY = a udx stream is still attached (udx.c:2175). That means
-        // a connection was adopted onto this socket and its owner dropped
-        // ConnectionInfo::socket_keepalive while the stream was still live.
-        // Closing anyway would pull the socket out from under that stream, so
-        // we DON'T: no uv_close, no free, and socket_ keeps pointing at what
-        // udx still owns (a null socket_ would be a lie the send paths read).
-        // The stream stays usable; the price is one socket that libudx will
-        // only reap at udx_teardown(). Deliberately no retry timer — udx has
-        // no close-when-idle hook (finalize auto-closes only during teardown,
-        // udx.c:448-451), so a retry would mean an unref'd timer that either
-        // spins for the process's life or leaks at loop exit. The keepalive is
-        // the mechanism; this branch is its assertion failing loudly.
-        int rc = udx_socket_close(socket_);
-        if (rc < 0) {
-            DHT_LOG("  [pool] udx_socket_close refused (%d) — a stream is "
-                    "still attached; leaving the socket open\n", rc);
+        // A refusal (UV_EBUSY) means a connection was adopted onto this socket
+        // and its owner dropped ConnectionInfo::socket_keepalive while the
+        // stream was still live. Closing anyway would pull the socket out from
+        // under that stream, so we don't: no uv_close, no free, and socket_
+        // keeps pointing at what udx still owns (a null socket_ would be a lie
+        // the send paths read). See udx::close_socket_unless_busy for the
+        // policy and udx::busy_close_count() for the always-on counter — this
+        // branch is the keepalive contract failing, and DHT_LOG alone would be
+        // invisible in a shipped build.
+        if (!udx::close_socket_unless_busy(socket_)) {
+            DHT_LOG("  [pool] socket close refused — a stream is still "
+                    "attached; leaving the socket open\n");
             return;
         }
         socket_ = nullptr;

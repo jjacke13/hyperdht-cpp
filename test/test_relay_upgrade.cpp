@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "hyperdht/holepunch.hpp"
 #include "hyperdht/noise_wrap.hpp"
 #include "hyperdht/relay_upgrade.hpp"
 #include "hyperdht/secret_stream.hpp"
@@ -80,6 +81,65 @@ TEST(RelayUpgrade, FreshStreamConfirmsNowCallbackNeverFires) {
     relay.close();
     direct.close();
     peer.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// The relay→direct migration is an ADOPTION: the client's direct nudge fires
+// the firewall tap with the server session's punch socket, and changeRemote
+// binds the live relayed stream to it. The session that owns that socket is
+// reaped independently (punch_clear_wait), so the context must hold the socket
+// itself — the same hazard the punched path solves with
+// ConnectionInfo::socket_keepalive. Server::on_handshake_result hands it over
+// at emit (`upgrade->set_socket_keepalive(conn->punch_socket)`); this proves
+// the holding half survives both the owner drop and the migration.
+TEST(RelayUpgradeContext, SocketKeepaliveHoldsTheMigrationTarget) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    Udx udx(&loop);
+
+    UdxSocket relay(udx);
+    auto a = loopback(0);
+    ASSERT_EQ(relay.bind(reinterpret_cast<const struct sockaddr*>(&a)), 0);
+
+    // The session's punch socket, owned by a shared_ptr exactly as
+    // ServerConnection owns it.
+    auto punch = std::make_shared<hyperdht::holepunch::PoolSocket>(
+        &loop, udx.handle());
+    ASSERT_EQ(punch->bind(), 0);
+    std::weak_ptr<hyperdht::holepunch::PoolSocket> weak = punch;
+    auto* punch_handle = punch->socket_handle();
+    struct sockaddr_in punch_addr{};
+    int len = sizeof(punch_addr);
+    udx_socket_getsockname(punch_handle,
+                           reinterpret_cast<struct sockaddr*>(&punch_addr), &len);
+
+    UdxStream stream(udx, 1, [](udx_stream_t*, int) {}, nullptr);
+    auto relay_bound = bound_of(relay);
+    ASSERT_EQ(stream.connect(relay, 2,
+                             reinterpret_cast<const struct sockaddr*>(&relay_bound)),
+              0);
+
+    auto ctx = std::make_shared<UpgradeContext>(stream.handle(), 2,
+                                                relay.handle());
+    ctx->set_socket_keepalive(punch);
+
+    punch.reset();  // the session is reaped by the clear-wait backstop
+    ASSERT_FALSE(weak.expired()) << "upgrade context did not hold the socket";
+
+    // The client's direct nudge arrives on the punch socket.
+    ctx->on_firewall(punch_handle,
+                     reinterpret_cast<const struct sockaddr*>(&punch_addr));
+    EXPECT_TRUE(ctx->is_upgraded());
+    EXPECT_FALSE(weak.expired())
+        << "migration target freed under the stream it now carries";
+
+    udx_stream_destroy(stream.handle());
+    uv_run(&loop, UV_RUN_NOWAIT);
+    ctx.reset();  // the emitted stream is finally gone
+    EXPECT_TRUE(weak.expired());
+
+    relay.close();
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }

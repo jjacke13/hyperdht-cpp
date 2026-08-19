@@ -904,6 +904,51 @@ TEST(Holepuncher, BirthdayEgressPerSocket) {
 }
 
 // ---------------------------------------------------------------------------
+// The server never wins through on_message (it is the non-initiator: it echoes
+// probes and never marks itself connected). Its connection arrives as the
+// client's UDX SYN on whichever socket the punch opened — which can be a
+// birthday HOLDER, since a RANDOM-firewall server opens 256 of them. The
+// adopting side must be able to pin that socket, because Server::on_socket
+// drops the puncher (releasing every holder) in the same frame.
+// ---------------------------------------------------------------------------
+
+TEST(Holepuncher, PinSocketHoldsPoolSocketAcrossRelease) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    udx_t udx;
+    udx_init(&loop, &udx, nullptr);
+
+    hyperdht::socket_pool::SocketPool pool(&loop, &udx);
+    Holepuncher hp(&loop, false, &pool);  // non-initiator = the server
+
+    auto* ref = pool.acquire();
+    ASSERT_NE(ref, nullptr);
+
+    auto keepalive = hp.pin_socket(ref->socket());
+    ASSERT_TRUE(keepalive) << "a pool-owned socket must be pinnable";
+    EXPECT_EQ(keepalive.get(), static_cast<void*>(ref));
+
+    ref->release();  // what puncher.reset() does to every holder
+    EXPECT_FALSE(ref->is_closed());
+
+    keepalive.reset();  // the adopted stream is finally done
+    EXPECT_TRUE(ref->is_closed());
+
+    // A socket the pool does not own is not ours to pin.
+    udx_socket_t stranger{};
+    udx_socket_init(&udx, &stranger, nullptr);
+    EXPECT_EQ(hp.pin_socket(&stranger), nullptr);
+    EXPECT_EQ(hp.pin_socket(nullptr), nullptr);
+    udx_socket_close(&stranger);
+
+    hp.destroy();
+    hp.close();
+    pool.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+// ---------------------------------------------------------------------------
 // Birthday win must pin the winning SocketRef, not the caller's PoolSocket.
 //
 // JS: holepuncher.js:124-146 (_onholepunchmessage) — on the initiator's win

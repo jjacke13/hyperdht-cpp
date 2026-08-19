@@ -97,4 +97,24 @@ int UdxStream::relay_to(UdxStream& dest) {
     return udx_stream_relay_to(&handle_, dest.handle());
 }
 
+// ---------------------------------------------------------------------------
+// Busy-close policy — see the contract in udx.hpp.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Single-threaded event loop: no atomic needed.
+uint64_t g_busy_close_count = 0;
+}  // namespace
+
+bool close_socket_unless_busy(udx_socket_t* socket) {
+    if (socket == nullptr) return false;
+    if (udx_socket_close(socket) < 0) {  // UV_EBUSY: a stream is still attached
+        g_busy_close_count++;
+        return false;
+    }
+    return true;
+}
+
+uint64_t busy_close_count() { return g_busy_close_count; }
+
 }  // namespace hyperdht::udx

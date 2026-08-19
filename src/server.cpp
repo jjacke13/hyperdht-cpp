@@ -1122,6 +1122,21 @@ void Server::on_handshake_result(
                             auto cit2 = self->connections_.find(hp_id);
                             if (cit2 != self->connections_.end() && cit2->second) {
                                 cit2->second->upgrade = upgrade;
+                                // This is an adoption path too: the client's
+                                // direct nudge fires the Duplex firewall tap
+                                // with the PUNCH socket (udx finds the stream
+                                // through its global table), and changeRemote
+                                // binds this live stream to it. The session —
+                                // sole owner of that socket — is reaped by the
+                                // punch_clear_wait backstop, so the upgrade
+                                // must hold it, exactly like the punched
+                                // client path (connect.cpp:928). Pinned for
+                                // the relayed stream's whole life even if no
+                                // punch ever lands: one socket per relayed
+                                // session, in exchange for never closing one
+                                // under a migrated stream.
+                                upgrade->set_socket_keepalive(
+                                    cit2->second->punch_socket);
                             }
                         }
                         self->emit_connection(info);
@@ -1825,6 +1840,14 @@ void Server::on_socket(server_connection::ServerConnection& conn,
     if (!info.socket_keepalive && conn.punch_socket && udx_sock &&
         udx_sock == conn.punch_socket->socket_handle()) {
         info.socket_keepalive = conn.punch_socket;
+    }
+    // The SYN can equally land on one of the puncher's birthday holders (a
+    // RANDOM-firewall server opens 256 of them), which are owned by the
+    // SocketPool and released by `conn.puncher.reset()` a few lines below —
+    // under the stream we are handing over. Pin whichever pool socket it
+    // actually arrived on. Must run BEFORE the puncher is dropped.
+    if (!info.socket_keepalive && conn.puncher && udx_sock) {
+        info.socket_keepalive = conn.puncher->pin_socket(udx_sock);
     }
     // Transfer rawStream ownership. Clean up the Server's firewall context.
     if (conn.raw_stream && conn.raw_stream->data) {

@@ -255,6 +255,53 @@ TEST_F(SocketPoolTest, AddRouteSetsReusable) {
 // Destroy
 // ---------------------------------------------------------------------------
 
+// A holder that still carries an adopted stream cannot close: udx returns
+// UV_EBUSY (udx.c:2175). Flagging it closed anyway is the dangerous half —
+// on_socket_close never fires, so remove() never runs, and destroy() then skips
+// the ref without nulling socket_.data, leaving one late datagram able to reach
+// a SocketRef whose pool is gone. The ref must stay guarded and closeable.
+TEST_F(SocketPoolTest, BusyCloseLeavesRefOpenAndGuarded) {
+    SocketPool pool(&loop_, &udx_);
+    auto* ref = pool.acquire();
+    ASSERT_NE(ref, nullptr);
+
+    udx_stream_t stream{};
+    ASSERT_EQ(udx_stream_init(&udx_, &stream, 7777,
+                              [](udx_stream_t*, int) {}, nullptr), 0);
+    struct sockaddr_in dest{};
+    uv_ip4_addr("127.0.0.1", 12345, &dest);
+    ASSERT_EQ(udx_stream_connect(&stream, ref->socket(), 1,
+                                 reinterpret_cast<const struct sockaddr*>(&dest)),
+              0);
+
+    uint64_t before = hyperdht::udx::busy_close_count();
+    ref->release();  // refs → 0 → do_close()
+
+    EXPECT_EQ(hyperdht::udx::busy_close_count(), before + 1);
+    EXPECT_FALSE(ref->is_closed()) << "ref claims closed while udx refused";
+    EXPECT_EQ(pool.lookup(ref->socket()), ref) << "ref must stay registered";
+    EXPECT_EQ(ref->socket()->data, static_cast<void*>(ref))
+        << "still routable, so still guarded";
+
+    // Stream gone → the next close attempt succeeds: the refusal is not
+    // sticky, which is what makes "no retry timer" an acceptable policy.
+    // (A bounded pump, not run_loop(): UV_RUN_DEFAULT cannot return while the
+    // socket this test deliberately left open still holds the loop.)
+    hyperdht::udx::destroy_stream_once(&stream);
+    for (int i = 0; i < 50 && ref->socket()->streams != nullptr; i++) {
+        uv_run(&loop_, UV_RUN_NOWAIT);
+    }
+    ASSERT_EQ(ref->socket()->streams, nullptr) << "stream never detached";
+
+    ref->active();
+    ref->inactive();  // refs → 0 again → do_close() retries
+    EXPECT_TRUE(ref->is_closed());
+
+    run_loop();  // close callback → pool.remove() → ref deleted; don't touch it
+    EXPECT_EQ(pool.size(), 0u);
+    pool.destroy();
+}
+
 TEST_F(SocketPoolTest, DestroyClosesAll) {
     SocketPool pool(&loop_, &udx_);
 

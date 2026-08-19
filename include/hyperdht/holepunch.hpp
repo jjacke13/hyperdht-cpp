@@ -21,6 +21,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -377,6 +378,13 @@ public:
 
     // Number of held socket refs (for birthday paradox tracking)
     size_t holder_count() const { return holders_.size(); }
+
+    // Pin the pool socket a stream was just adopted onto, so destroy() (which
+    // releases every holder) can't close it under that stream. Returns null
+    // when `sock` isn't one of the pool's sockets — the caller then has no
+    // socket to keep alive. Same shape as the birthday-win keepalive in
+    // on_message: active() now, inactive() when the consumer drops the ref.
+    std::shared_ptr<void> pin_socket(udx_socket_t* sock);
 
 private:
     uv_loop_t* loop_;

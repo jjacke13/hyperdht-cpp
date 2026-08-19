@@ -842,3 +842,63 @@ second parity oracle. Two workstreams:
   (announce/lookup, current pain).
 - [ ] Mine their interop `.rs` assertions for edges we may skip (empty relays,
   refresh-only announce, `bump` handling, `MAX_RELAY_ADDRESSES` truncation).
+
+---
+
+## J. Server per-session punch socket (branch `feat/server-punch-socket`, IN PROGRESS)
+
+Plan: `docs/superpowers/plans/2026-08-17-server-punch-socket-parity.md`.
+Ledger: `.superpowers/sdd/2026-08-17-server-punch-socket-parity/progress.md` (every
+parked finding + deferred minor lives there — read it before resuming).
+State: Tasks 1-5 done, HEAD `22bf567`, 762/762. **Task 6 pending. Not merged, not
+field-tested, not shippable.**
+
+**Why:** the C++ server punched from the persistent announce socket (shared with
+announces, relay keepalives and all DHT RPC for the process lifetime); JS acquires a
+fresh pool socket per holepunch session (`holepuncher.js:14`, `server.js:436`). Proven
+by a control we already had: a nospoon-**JS** server on the same Pi5, same router, same
+clients, connected every time for months while the C++ server failed intermittently
+(handoff line 14 + §Finding Q). Client, network, router and probe format were each
+separately eliminated. Full case: memory `server_punch_socket_parity`, `Q2-EVIDENCE-2026-08-04.md`.
+
+### J.1 Blocking follow-ups found by this work (pre-existing, NOT caused by it)
+
+- [ ] **BUG B — birthday holders leak; the server permanently loses birthday punching.**
+  `Server::on_socket` does `conn.puncher.reset()` → `~Holepuncher`, which only nulls
+  `on_holepunch_message` + `stop()`; **only `destroy()` releases holders**
+  (`src/holepunch.cpp:367-381` vs `:740`). `BIRTHDAY_SOCKETS`=256
+  (`include/hyperdht/holepunch.hpp:284`) vs `MAX_POOL_SOCKETS`=512
+  (`src/socket_pool.cpp:178`) ⇒ **after ~2 successful RANDOM+CONSISTENT server punches
+  `acquire()` returns nullptr for the rest of the process.** Measured: 201 sockets
+  retained after the drop, 0 with `destroy()`. Safe to fix now — Task 5's
+  `Holepuncher::pin_socket` keeps an adopted holder alive across `destroy()`.
+- [ ] **BUG A (HIGH) — the blind-relay chain cannot pair, so `relayThrough` is
+  non-functional.** `src/server.cpp:955-1012` and `src/connect.cpp:1119-1145` write the
+  Protomux OPEN **in the same frame as `duplex->start()`**, where
+  `SecretStreamDuplex::write` returns `-2` (`!connected_` — needs the peer header) and the
+  Mux **discards the failure**; and they call `pair()` before the channel is open, where
+  `Channel::send` refuses and `BlindRelayClient::pair` discards the false. No retry path
+  exists. JS has neither guard. Measured: production order never pairs; deferring both
+  pairs fine. **This is the mitigation `Q2-EVIDENCE` and the handoff recommend for the
+  Finding Q outages — it does not work today.** Also makes the relay→direct keepalive
+  call site (`server.cpp:1138`) unreachable at runtime.
+
+### J.2 Task 6 (remaining plan work)
+
+- [ ] cpp-reviewer on the whole branch; ASAN (band-compare, `test_server` leak total is
+      noisy 90-105 KB); live cross-test; JS interop.
+- [ ] **`hyperdht.h` `hyperdht_stream_open` must document the contract**: connect the
+      stream **synchronously in the callback OR hold `info.socket_keepalive`**. An async
+      consumer sees `socket->streams == NULL` at drop, `udx_socket_close` succeeds, the
+      socket is freed, and the later `udx_stream_connect` is a use-after-free.
+- [ ] Expose `udx::busy_close_count()` through the C FFI (`hyperdht.h:1065-1079` already
+      exposes relay/punch stats); wrapper consumers currently cannot read it.
+- [ ] `relay_token` is missing from BOTH `ServerConnection` move ops
+      (`src/server_connection.cpp:53-100`) — silently zeroed, un-gates
+      `session_relay_engaged()`. Latent today (written after the final move).
+- [ ] `SocketPool::destroy()` (`src/socket_pool.cpp:200-206`) still does an unchecked
+      `udx_socket_close` + unconditional `closed_ = true` — same class as the
+      `SocketRef::do_close` bug fixed on this branch.
+- [ ] **nospoon needs one line when its pin is bumped**: hold `info.socket_keepalive`
+      alongside the peer's duplex (`~/Desktop/repos/nospoon/cpp/server.cpp:93-97`
+      connects synchronously today, so it currently parks one fd per punched connection).

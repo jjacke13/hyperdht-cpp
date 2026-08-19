@@ -24,6 +24,7 @@ static ForwardEntry make_echo_entry() {
     entry.on_peer_handshake = [](const std::vector<uint8_t>&,
                                   const Ipv4Address&,
                                   const Ipv4Address&,
+                                  bool /*relayed*/,
                                   HandshakeReplyFn reply_fn) {
         reply_fn({0xDE, 0xAD}, nullptr);
     };
@@ -108,6 +109,7 @@ TEST(Router, HandshakeDispatch) {
     entry.on_peer_handshake = [&](const std::vector<uint8_t>& noise,
                                    const Ipv4Address&,
                                    const Ipv4Address&,
+                                   bool /*relayed*/,
                                    HandshakeReplyFn reply_fn) {
         handler_called = true;
         received_noise = noise;
@@ -357,7 +359,7 @@ TEST(Router, HolepunchRelayIsRequest) {
                                   const Ipv4Address& peer_addr,
                                   const Ipv4Address& from_addr,
                                   const Ipv4Address& to_addr,
-                                  std::function<void(std::vector<uint8_t>)> reply_fn) {
+                                  router::HolepunchReplyFn reply_fn) {
         // peer_address = client's address from the message (JS peerAddress)
         EXPECT_EQ(peer_addr.host_string(), "192.168.1.50");
         EXPECT_EQ(peer_addr.port, 8888);
@@ -372,7 +374,7 @@ TEST(Router, HolepunchRelayIsRequest) {
         reply_hp.mode = peer_connect::MODE_FROM_SERVER;
         reply_hp.id = 0;
         reply_hp.payload = {0xBE, 0xEF};
-        reply_fn(holepunch::encode_holepunch_msg(reply_hp));
+        reply_fn(holepunch::encode_holepunch_msg(reply_hp), nullptr);
     };
     r.set(target, entry);
 
@@ -668,12 +670,12 @@ static ForwardEntry make_hp_server_entry(bool& handler_called) {
                                   const std::vector<uint8_t>&,
                                   const Ipv4Address&, const Ipv4Address&,
                                   const Ipv4Address&,
-                                  std::function<void(std::vector<uint8_t>)> reply_fn) {
+                                  router::HolepunchReplyFn reply_fn) {
         handler_called = true;
         holepunch::HolepunchMessage hp;
         hp.mode = peer_connect::MODE_FROM_SERVER;
         hp.payload = {0xBE, 0xEF};
-        reply_fn(holepunch::encode_holepunch_msg(hp));
+        reply_fn(holepunch::encode_holepunch_msg(hp), nullptr);
     };
     return entry;
 }
@@ -836,6 +838,7 @@ TEST(Router, ServerReplyPropagatesEgressSocket) {
     entry.on_peer_handshake = [&](const std::vector<uint8_t>&,
                                   const Ipv4Address& client_addr,
                                   const Ipv4Address& from_addr,
+                                  bool /*relayed*/,
                                   HandshakeReplyFn reply_fn) {
         seen_client = client_addr;
         seen_from = from_addr;

@@ -343,6 +343,13 @@ private:
     std::unordered_map<uint32_t, std::vector<router::HandshakeReplyFn>>
         pending_handshakes_;
 public:
+    // Live session by holepunch id, or nullptr. Read-only inspection hook for
+    // tests (punch socket, parked rounds) — not part of the public API.
+    server_connection::ServerConnection* session(uint32_t hp_id) {
+        auto it = connections_.find(hp_id);
+        return it == connections_.end() ? nullptr : it->second.get();
+    }
+
     // Called by rawStream firewall callback (static C function needs access)
     void on_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket,
                                const struct sockaddr* from);
@@ -387,13 +394,23 @@ private:
     void on_peer_handshake(const std::vector<uint8_t>& noise,
                            const compact::Ipv4Address& peer_address,
                            const compact::Ipv4Address& from_address,
+                           bool relayed,
                            router::HandshakeReplyFn reply_fn);
 
     void on_peer_holepunch(const std::vector<uint8_t>& value,
                            const compact::Ipv4Address& peer_address,
                            const compact::Ipv4Address& from_address,
                            const compact::Ipv4Address& to_address,
-                           std::function<void(std::vector<uint8_t>)> reply_fn);
+                           router::HolepunchReplyFn reply_fn);
+
+    // Wire the session's punch socket: inbound rounds (PoolSocket::on_request)
+    // and the NAT-sampling campaign whose completion releases them.
+    // No-op when the session has no punch socket.
+    void start_punch_socket(uint32_t hp_id);
+
+    // discover_pool_addresses concluded for this session — release the
+    // rounds parked while it ran (JS: `await p.analyze(false)` resolving).
+    void on_punch_sampling_done(uint32_t hp_id);
 
     // Common post-handshake work: send reply, set up rawStream, attach
     // blind-relay (if configured), store session state, arm session timer.
@@ -404,6 +421,7 @@ private:
         uint32_t hp_id,
         std::string noise_key,
         bool has_remote_addr,
+        bool relayed,
         std::optional<peer_connect::RelayThroughInfo> relay_through_info,
         router::HandshakeReplyFn reply_fn,
         std::optional<server_connection::ServerConnection> result);

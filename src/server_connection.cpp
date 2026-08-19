@@ -67,6 +67,9 @@ ServerConnection::ServerConnection(ServerConnection&& other) noexcept
       has_error(other.has_error),
       error_code(other.error_code),
       puncher(std::move(other.puncher)),
+      punch_socket(std::move(other.punch_socket)),
+      punch_sampling_done(other.punch_sampling_done),
+      parked_rounds(std::move(other.parked_rounds)),
       created_at(other.created_at),
       upgrade(std::move(other.upgrade)) {
     other.raw_stream = nullptr;  // Transfer ownership
@@ -94,6 +97,9 @@ ServerConnection& ServerConnection::operator=(ServerConnection&& other) noexcept
         has_error = other.has_error;
         error_code = other.error_code;
         puncher = std::move(other.puncher);
+        punch_socket = std::move(other.punch_socket);
+        punch_sampling_done = other.punch_sampling_done;
+        parked_rounds = std::move(other.parked_rounds);
         created_at = other.created_at;
         upgrade = std::move(other.upgrade);
     }

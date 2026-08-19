@@ -132,6 +132,18 @@ static bool has_same_addr(const std::vector<compact::Ipv4Address>& addrs,
     return false;
 }
 
+// Egress socket for anything this session sends toward the client or its
+// relays — JS `{ socket: h.puncher && h.puncher.socket }` (server.js:481,
+// router.js:233). nullptr = the DHT's active socket.
+//
+// ALWAYS call this at the send site. Caching the raw pointer outlives the
+// PoolSocket: close() nulls its handle and the udx close callback frees it.
+static udx_socket_t* punch_egress(
+    const server_connection::ServerConnection& conn) {
+    if (!conn.punch_socket || conn.punch_socket->is_closing()) return nullptr;
+    return conn.punch_socket->socket_handle();
+}
+
 static std::string to_hex(const uint8_t* data, size_t len) {
     static const char h[] = "0123456789abcdef";
     std::string out;
@@ -189,14 +201,16 @@ void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection)
     entry.on_peer_handshake = [this](const std::vector<uint8_t>& noise,
                                       const compact::Ipv4Address& peer_addr,
                                       const compact::Ipv4Address& from_addr,
+                                      bool relayed,
                                       router::HandshakeReplyFn reply_fn) {
-        on_peer_handshake(noise, peer_addr, from_addr, std::move(reply_fn));
+        on_peer_handshake(noise, peer_addr, from_addr, relayed,
+                          std::move(reply_fn));
     };
     entry.on_peer_holepunch = [this](const std::vector<uint8_t>& value,
                                       const compact::Ipv4Address& peer_addr,
                                       const compact::Ipv4Address& from_addr,
                                       const compact::Ipv4Address& to_addr,
-                                      std::function<void(std::vector<uint8_t>)> reply_fn) {
+                                      router::HolepunchReplyFn reply_fn) {
         on_peer_holepunch(value, peer_addr, from_addr, to_addr, std::move(reply_fn));
     };
 
@@ -422,6 +436,7 @@ const std::vector<peer_connect::RelayInfo>& Server::relay_addresses() const {
 void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
                                 const compact::Ipv4Address& peer_address,
                                 const compact::Ipv4Address& from_address,
+                                bool relayed,
                                 router::HandshakeReplyFn reply_fn) {
     DHT_LOG( "  [server] on_peer_handshake: noise=%zu bytes, from=%s:%u\n",
             noise.size(), peer_address.host_string().c_str(), peer_address.port);
@@ -469,9 +484,10 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
             if (conn_it->second->firewalled) return;
             DHT_LOG( "  [server] Dedup: reusing session id=%u for same noise\n",
                     dedup_it->second);
-            // ponytail: nullptr egress for now — Task 4 hands the session's
-            // punch socket here.
-            reply_fn(std::vector<uint8_t>(conn_it->second->reply_noise), nullptr);
+            // Egress socket read HERE, never captured: the session's punch
+            // socket may have been closed since the original reply.
+            reply_fn(std::vector<uint8_t>(conn_it->second->reply_noise),
+                     punch_egress(*conn_it->second));
             return;
         }
         // Session was already completed/cleaned up — remove stale dedup entry
@@ -598,9 +614,9 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         firewall_async_(pending_shared->remote_public_key,
                         pending_shared->remote_payload, peer_address,
                         [this, weak_alive, fired_once, pending_shared,
-                         hp_id, noise_key, has_remote_addr, from_address,
-                         relay_through_shared, our_addrs, relay_infos,
-                         reply_fn](bool reject) mutable {
+                         hp_id, noise_key, has_remote_addr, relayed,
+                         from_address, relay_through_shared, our_addrs,
+                         relay_infos, reply_fn](bool reject) mutable {
             // (2) Once-guard.
             if (*fired_once) return;
             *fired_once = true;
@@ -619,7 +635,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
                 reusable_socket);
             // Relay hint for the session punch socket (Task 4 consumes it).
             if (res) res->handshake_relay_addr = from_address;
-            on_handshake_result(hp_id, noise_key, has_remote_addr,
+            on_handshake_result(hp_id, noise_key, has_remote_addr, relayed,
                                 relay_through_shared, reply_fn, std::move(res));
         });
         return;
@@ -641,7 +657,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     // Relay hint for the session punch socket (Task 4 consumes it).
     if (result) result->handshake_relay_addr = from_address;
 
-    on_handshake_result(hp_id, noise_key, has_remote_addr,
+    on_handshake_result(hp_id, noise_key, has_remote_addr, relayed,
                         relay_through_info, reply_fn, std::move(result));
 }
 
@@ -653,6 +669,7 @@ void Server::on_handshake_result(
     uint32_t hp_id,
     std::string noise_key,
     bool has_remote_addr,
+    bool relayed,
     std::optional<peer_connect::RelayThroughInfo> relay_through_info,
     router::HandshakeReplyFn reply_fn,
     std::optional<server_connection::ServerConnection> result) {
@@ -715,14 +732,42 @@ void Server::on_handshake_result(
         return;
     }
 
+    // JS server.js:390-394 — an OPEN client is connected to directly, with
+    // no puncher built. Computed here because the reply (and therefore the
+    // punch-socket decision) is committed before the direct-connect branch
+    // further down.
+    const bool client_open =
+        conn.remote_payload.firewall == peer_connect::FIREWALL_OPEN &&
+        !conn.remote_payload.addresses4.empty();
+
+#ifndef HYPERDHT_EMBEDDED
+    // Acquire the session's punch socket BEFORE the reply goes out: the
+    // relay — and through it the client — must learn this address, not the
+    // main socket's (JS server.js:481 returns `h.puncher.socket` and dht-rpc
+    // egresses the reply from it; the puncher itself was built at
+    // server.js:436 with `dht._socketPool.acquire()`).
+    //
+    // Gated exactly like JS's puncher: a direct handshake (`!peerAddress`),
+    // an OPEN client and a server that already knows its public address all
+    // return before :436. `has_error` matches server.js:384-388, which
+    // destroys the stream and clears before the puncher exists.
+    if (relayed && !has_remote_addr && !client_open && !conn.has_error) {
+        auto pool = std::make_shared<holepunch::PoolSocket>(
+            socket_.loop(), socket_.udx_handle(), &socket_);
+        if (pool->bind() == 0) {
+            conn.punch_socket = std::move(pool);
+            DHT_LOG("  [server] Session id=%u acquired a punch socket\n", hp_id);
+        }
+        // bind() failed → stay on the main socket (the pre-Task-4 path).
+    }
+#endif
+
     // Send the Noise msg2 reply — to the primary requester and every
     // duplicate queued during the async-firewall window (server-3).
     DHT_LOG("  [server] Sending reply: %zu noise bytes (%zu requesters)\n",
             conn.reply_noise.size(), senders.size());
     for (auto& fn : senders) {
-        // ponytail: nullptr egress for now — Task 4 hands the session's
-        // punch socket here.
-        if (fn) fn(std::vector<uint8_t>(conn.reply_noise), nullptr);
+        if (fn) fn(std::vector<uint8_t>(conn.reply_noise), punch_egress(conn));
     }
 
     if (conn.has_error) {
@@ -1108,8 +1153,7 @@ void Server::on_handshake_result(
     }
 
     // JS: server.js:390-394 — if client is OPEN, connect directly
-    if (conn_ptr->remote_payload.firewall == peer_connect::FIREWALL_OPEN &&
-        !conn_ptr->remote_payload.addresses4.empty()) {
+    if (client_open) {
         auto peer_addr = conn_ptr->remote_payload.addresses4[0];
         DHT_LOG("  [server] Client is OPEN, connecting directly\n");
         on_socket(*conn_ptr, peer_addr);
@@ -1134,6 +1178,11 @@ void Server::on_handshake_result(
     if (connections_[hp_id]->raw_stream) {
         pending_punch_streams_[connections_[hp_id]->local_udx_id] = hp_id;
     }
+
+    // Rounds and NAT sampling start only now that the session is reachable
+    // from `connections_` — discover's on_done and the pool's on_request
+    // both look it up by id.
+    start_punch_socket(hp_id);
 
     // Per-session timeout (RAII) — JS: server.js:445-462 (_clearLater + _clear)
     auto session_timer = std::make_unique<async_utils::UvTimer>(socket_.loop());
@@ -1167,6 +1216,106 @@ void Server::on_handshake_result(
 }
 
 // ---------------------------------------------------------------------------
+// start_punch_socket — inbound rounds + NAT sampling for the punch socket
+//
+// JS: holepuncher.js:14-21 — the Holepuncher acquires a pool socket and
+//     immediately `nat.autoSample()`s it; server.js:508-511 shows the rounds
+//     arriving on that same socket (`req.socket === p.socket`).
+// ---------------------------------------------------------------------------
+
+void Server::start_punch_socket(uint32_t hp_id) {
+    auto it = connections_.find(hp_id);
+    if (it == connections_.end() || !it->second || !it->second->punch_socket) {
+        return;
+    }
+    auto& conn = *it->second;
+    auto& pool = *conn.punch_socket;
+
+    // Inbound PEER_HOLEPUNCH rounds. The relay observed our handshake reply
+    // leaving this socket, so it forwards the client's rounds here.
+    //
+    // NOTE ON SAMPLING: PoolSocket::handle_message already fed the session
+    // NAT sampler by the time this runs (holepunch.cpp:1010). JS samples
+    // later — after command routing, session lookup, payload decrypt and
+    // error==NONE (server.js:491-511) — so our feed is broader than JS's by
+    // one unauthenticated datagram. It is gated on a consumer being wired,
+    // i.e. only a socket that belongs to a live session samples at all; the
+    // decrypt gate below still fences every PAYLOAD-VISIBLE state change
+    // (freeze / firewall / addresses / round).
+    //
+    // The sentinel, not `this`, decides liveness: a punch socket can outlive
+    // its Server once the adopted stream holds a reference to it (Task 5).
+    auto weak_alive = std::weak_ptr<bool>(alive_);
+    pool.on_request([this, weak_alive, hp_id](const messages::Request& req,
+                                              const compact::Ipv4Address& from) {
+        if (auto a = weak_alive.lock(); !a || !*a) return;
+        if (closed_) return;
+        // Gate before any state change (JS router.js:206-222 + server.js:487).
+        if (req.internal || req.command != messages::CMD_PEER_HOLEPUNCH) return;
+        if (!req.value.has_value() || !req.target.has_value()) return;
+        auto hp_msg = holepunch::decode_holepunch_msg(req.value->data(),
+                                                      req.value->size());
+        if (hp_msg.mode != peer_connect::MODE_FROM_RELAY ||
+            !hp_msg.peer_address.has_value()) return;
+        auto* live = session(hp_id);
+        if (!live || live->id < 0 ||
+            hp_msg.id != static_cast<uint32_t>(live->id)) return;
+
+        DHT_LOG("  [server] Round on punch socket (id=%u) from %s:%u\n",
+                hp_msg.id, from.host_string().c_str(), from.port);
+
+        // Answer on the socket the round arrived on (JS router.js:233
+        // `{ socket: reply.socket }`). Re-uses the Router's FROM_SERVER
+        // wrapping so both arrival paths encode identically.
+        router_.handle_peer_holepunch(
+            req,
+            [this, hp_id](const messages::Response& resp) {
+                auto* c = session(hp_id);
+                socket_.udp_send(messages::encode_response(resp),
+                                 resp.from.addr, c ? punch_egress(*c) : nullptr);
+            },
+            [this, hp_id](const messages::Request& relay_req,
+                          udx_socket_t* via) {
+                auto* c = session(hp_id);
+                socket_.udp_send(messages::encode_request(relay_req),
+                                 relay_req.to.addr,
+                                 via ? via : (c ? punch_egress(*c) : nullptr));
+            });
+    });
+
+    // JS holepuncher.js:20 `this.nat.autoSample()` — until it concludes,
+    // `analyze()` blocks every round (server.js:519).
+    holepunch::discover_pool_addresses(
+        pool, socket_.table(), conn.handshake_relay_addr,
+        [this, weak_alive, hp_id](bool ok) {
+            if (auto a = weak_alive.lock(); !a || !*a) return;
+            if (closed_) return;
+            DHT_LOG("  [server] Punch-socket sampling done (id=%u, ok=%d)\n",
+                    hp_id, ok ? 1 : 0);
+            on_punch_sampling_done(hp_id);
+        });
+}
+
+// Release the rounds parked while the punch socket was sampling. Fires
+// even when sampling failed (ok=false): JS resolves `nat.analyzing` either
+// way and lets the round see FIREWALL_UNKNOWN, which punch() then rejects.
+void Server::on_punch_sampling_done(uint32_t hp_id) {
+    auto it = connections_.find(hp_id);
+    if (it == connections_.end() || !it->second) return;
+    it->second->punch_sampling_done = true;
+
+    auto parked = std::move(it->second->parked_rounds);
+    it->second->parked_rounds.clear();
+    for (auto& r : parked) {
+        // Each round can clear_session() (abort / veto / punch failure), so
+        // re-check liveness instead of hoisting the lookup.
+        if (closed_ || connections_.find(hp_id) == connections_.end()) return;
+        on_peer_holepunch(r.value, r.peer_address, r.from_address,
+                          r.to_address, std::move(r.reply_fn));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // on_peer_holepunch — handle incoming holepunch rounds
 //
 // JS: .analysis/js/hyperdht/lib/server.js:483-600 (_onpeerholepunch)
@@ -1186,7 +1335,7 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                                 const compact::Ipv4Address& peer_address,
                                 const compact::Ipv4Address& from_address,
                                 const compact::Ipv4Address& to_address,
-                                std::function<void(std::vector<uint8_t>)> reply_fn) {
+                                router::HolepunchReplyFn reply_fn) {
     if (closed_) return;
 
     // Decode the outer message to get the holepunch ID
@@ -1204,11 +1353,41 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
 
     auto& conn = *it->second;
 
+    // JS server.js:491-493 — `const remotePayload = h.payload.decrypt(...)
+    // if (!remotePayload) return null`, BEFORE nat.add / freeze / round.
+    // Authenticates the round: without this an unauthenticated datagram
+    // aimed at the punch socket could freeze our NAT classification or
+    // park rounds. handle_holepunch() below re-decrypts authoritatively;
+    // SecurePayload::decrypt is stateless, so this probe costs one XSalsa
+    // pass and changes nothing.
+    if (!conn.secure ||
+        !conn.secure->decrypt(hp_msg.payload.data(), hp_msg.payload.size())) {
+        DHT_LOG("  [server] on_peer_holepunch: payload did not decrypt (id=%u)\n",
+                hp_msg.id);
+        return;
+    }
+
+    // JS server.js:518-519 — `let stable = await p.analyze(false)`, which
+    // first awaits `nat.analyzing`, the puncher's autoSample campaign
+    // (holepuncher.js:20, 85-86). Our equivalent campaign is
+    // discover_pool_addresses; until it resolves the session sampler says
+    // UNKNOWN and the answer we would send is a lie the client acts on.
+    // Park the round; on_punch_sampling_done drains in arrival order.
+    if (conn.punch_socket && !conn.punch_sampling_done) {
+        constexpr size_t MAX_PARKED_ROUNDS = 8;
+        if (conn.parked_rounds.size() >= MAX_PARKED_ROUNDS) {
+            conn.parked_rounds.erase(conn.parked_rounds.begin());
+        }
+        conn.parked_rounds.push_back({value, peer_address, from_address,
+                                      to_address, std::move(reply_fn)});
+        DHT_LOG("  [server] Round parked until sampling settles (id=%u, %zu queued)\n",
+                hp_msg.id, conn.parked_rounds.size());
+        return;
+    }
+
     // JS parity — server.js:509-584 order:
     //   1. nat.add(req.to, req.from)        ← feed sampler from request
-    //   2. await nat.analyze(false/true)    ← classification (no-op here — our
-    //                                         sampler is synchronous, classification
-    //                                         updates inside add() already)
+    //   2. await nat.analyze(false/true)    ← settled above by the deferral
     //   3. if (firewall !== UNKNOWN) nat.freeze()   ← lock classification
     //   4. build reply using p.nat.firewall  ← uses post-add, post-freeze value
     //
@@ -1216,12 +1395,21 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     // tiny window where the reply carried our *pre-add* firewall. Matches
     // JS exactly now.
 
-    // A2: feed NAT sampler from the holepunch request. We always feed
-    // because we use a single socket (no pool socket on the server).
+    // The session's NAT view is the punch socket's when it has one — JS
+    // reads `p.nat` throughout, never the DHT's own sampler.
+    auto& sampler = conn.punch_socket ? conn.punch_socket->nat_sampler()
+                                      : socket_.nat_sampler();
+
+    // A2: feed NAT sampler from the holepunch request.
     //
-    // JS server.js:510 — `p.nat.add(req.to, req.from)`. The first arg
-    // is the address the client targeted us at (= our public address as
-    // the client sees us). The second arg is the UDP source — the
+    // JS server.js:508-511 — `if (req.socket === p.socket) p.nat.add(req.to,
+    // req.from)`: ONLY rounds that landed on the punch socket are sampled.
+    // When we have one, PoolSocket::handle_message already did the add on
+    // arrival (holepunch.cpp:1010) and a round that came in on the main
+    // socket must not feed it — same gate, expressed by arrival path.
+    //
+    // The first arg is the address the client targeted us at (= our public
+    // address as the client sees us). The second is the UDP source — the
     // relaying DHT node — used by the sampler as its dedup key, so the
     // three holepunch relays count as three independent observations.
     //
@@ -1229,18 +1417,18 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     // poisoned the NAT sampler with every connecting client's IP and made
     // the server announce arbitrary client addresses as its own (-5 on
     // every off-LAN client).
-    socket_.nat_sampler().add(to_address, from_address);
+    if (!conn.punch_socket) sampler.add(to_address, from_address);
 
     // A5: NAT freeze — once we have a firm classification, lock it so
     // late samples cannot contradict what the reply is about to say.
-    if (socket_.nat_sampler().firewall() != peer_connect::FIREWALL_UNKNOWN) {
-        socket_.nat_sampler().freeze();
+    if (sampler.firewall() != peer_connect::FIREWALL_UNKNOWN) {
+        sampler.freeze();
     }
 
     // Capture NAT state AFTER add/freeze — this is what the reply
     // advertises (JS server.js:590: `firewall: p.nat.firewall`).
-    auto our_fw = socket_.nat_sampler().firewall();
-    auto our_addrs = socket_.nat_sampler().addresses();
+    auto our_fw = sampler.firewall();
+    auto our_addrs = sampler.addresses();
 
     // Check if the request came from one of our relay nodes.
     // JS: server.js:495 — `this._announcer.isRelay(req.from)`, i.e. the
@@ -1258,6 +1446,14 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     DHT_LOG("  [server] holepunch from=%s:%u is_relay=%d\n",
             from_address.host_string().c_str(), from_address.port,
             is_relay ? 1 : 0);
+    if (!is_relay) {
+        // One-glance field check: a gate miss now also depends on WHICH
+        // socket the round arrived on — the relay's source address as
+        // observed by the punch socket must still match the announcer's
+        // multi-generation set.
+        DHT_LOG("  [server] is_relay MISS: no token for id=%u (arrived on %s socket)\n",
+                hp_msg.id, conn.punch_socket ? "punch" : "main");
+    }
 
     // JS parity (server.js:553-574): rate-limit concurrent/too-frequent
     // random-NAT punches at the DHT level. `PunchStats::can_random_punch()`
@@ -1301,9 +1497,17 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
          our_fw == peer_connect::FIREWALL_OPEN) &&
         reply.remote_address.has_value() &&
         has_same_addr(our_addrs, *reply.remote_address)) {
-        DHT_LOG("  [server] Fast-mode ping to %s:%u (peer_address)\n",
-                peer_address.host_string().c_str(), peer_address.port);
-        socket_.send_probe(peer_address);
+        DHT_LOG("  [server] Fast-mode ping to %s:%u (peer_address, %s socket)\n",
+                peer_address.host_string().c_str(), peer_address.port,
+                conn.punch_socket ? "punch" : "main");
+        // JS `p.ping(peerAddress)` → `holepunch(this._holder.socket, ...)`
+        // (holepuncher.js:77) — the probe must leave the punch socket or the
+        // client sees it as coming from an address it never opened toward.
+        if (conn.punch_socket) {
+            conn.punch_socket->send_probe(peer_address);
+        } else {
+            socket_.send_probe(peer_address);
+        }
     }
 
     if (reply.should_punch) {
@@ -1330,13 +1534,14 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
         // never starts). Build the abort BEFORE clear_session destroys
         // conn.secure.
         if (holepunch_cb_) {
-            auto local_addrs = socket_.nat_sampler().addresses();
+            // JS passes `p.nat.addresses` (server.js:570) — the session's
+            // sampler, already captured in our_addrs.
             if (!holepunch_cb_(reply.remote_firewall, our_fw,
-                               reply.remote_addresses, local_addrs)) {
+                               reply.remote_addresses, our_addrs)) {
                 DHT_LOG("  [server] Holepunch vetoed by callback\n");
                 auto abort_value =
                     server_connection::encode_abort_reply(conn, peer_address);
-                reply_fn(std::move(abort_value));
+                reply_fn(std::move(abort_value), punch_egress(conn));
                 clear_session(hp_msg.id);
                 return;
             }
@@ -1369,9 +1574,21 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                 dht_ ? dht_->socket_pool() : nullptr,
                 dht_ ? &dht_->punch_stats() : nullptr);
             auto weak = std::weak_ptr<bool>(alive_);  // H10: sentinel
-            conn.puncher->set_send_fn([weak, this](const compact::Ipv4Address& addr) {
+            uint32_t probe_id = hp_msg.id;
+            conn.puncher->set_send_fn([weak, this, probe_id](
+                                          const compact::Ipv4Address& addr) {
                 if (auto a = weak.lock(); !a || !*a) return;
-                if (!closed_) socket_.send_probe(addr);
+                if (closed_) return;
+                // JS holepuncher.js:77 — probes leave `this._holder.socket`,
+                // the session's own socket. Looked up per send: the session
+                // (and its socket) can die while the punch schedule runs.
+                auto* live = session(probe_id);
+                if (live && live->punch_socket &&
+                    !live->punch_socket->is_closing()) {
+                    live->punch_socket->send_probe(addr);
+                    return;
+                }
+                socket_.send_probe(addr);
             });
             conn.puncher->set_local_firewall(our_fw);
 
@@ -1501,7 +1718,7 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                     hp_msg.id);
             auto abort_value =
                 server_connection::encode_abort_reply(conn, peer_address);
-            reply_fn(std::move(abort_value));
+            reply_fn(std::move(abort_value), punch_egress(conn));
             clear_session(hp_msg.id);
             return;
         }
@@ -1514,7 +1731,7 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     // punch (if any) has started (JS: server.js:586-599). The fast-mode
     // ping above already fired toward the client (gotcha 19b), matching
     // JS which pings at server.js:528-537 before returning the reply.
-    reply_fn(std::move(reply.value));
+    reply_fn(std::move(reply.value), punch_egress(conn));
 }
 
 // ---------------------------------------------------------------------------

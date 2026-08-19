@@ -265,6 +265,10 @@ bool Router::handle_peer_handshake(const messages::Request& req,
     // Call the server's handler. It will call reply_fn with the Noise msg2.
     entry->on_peer_handshake(
         hs_msg.noise, client_addr, req.from.addr,
+        // JS `direct = !peerAddress` (server.js:473) — the presence of the
+        // field, not the mode, is the signal; a direct handshake never gets
+        // a puncher (server.js:390-394).
+        hs_msg.peer_address.has_value(),
         [req_tid, req_from, req_command, req_target, relay_address,
          reply, relay, client_addr, incoming_mode](std::vector<uint8_t> reply_noise,
                                                    udx_socket_t* via) {
@@ -384,7 +388,8 @@ bool Router::handle_peer_holepunch(const messages::Request& req,
     entry->on_peer_holepunch(
         *req.value, client_addr, req.from.addr, req.to.addr,
         [req_tid, req_from, req_command, req_target,
-         relay, client_addr](std::vector<uint8_t> reply_value) {
+         relay, client_addr](std::vector<uint8_t> reply_value,
+                             udx_socket_t* via) {
             // Relay the reply FROM_SERVER back to req.from — the relaying
             // DHT node converts it to a REPLY for the client
             // (router.js:229-236).
@@ -401,7 +406,9 @@ bool Router::handle_peer_holepunch(const messages::Request& req,
             relay_req.internal = false;
             relay_req.value = holepunch::encode_holepunch_msg(hp_relay);
 
-            relay(relay_req, nullptr);
+            // JS router.js:233 — `{ socket: reply.socket }`: the round's
+            // answer leaves the session's punch socket when it has one.
+            relay(relay_req, via);
         });
 
     return true;

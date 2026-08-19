@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <udx.h>
+
 #include "hyperdht/announce.hpp"
 #include "hyperdht/compact.hpp"
 #include "hyperdht/messages.hpp"
@@ -38,6 +40,15 @@ namespace router {
 using HandshakeReplyFn =
     std::function<void(std::vector<uint8_t> reply_noise, udx_socket_t* via)>;
 
+// Reply callback for a server-hosted PEER_HOLEPUNCH round. Same `via`
+// contract as HandshakeReplyFn: JS returns `{ socket: p.socket, payload }`
+// from _onpeerholepunch and dht-rpc relays the answer from that socket
+// (router.js:229-235 `req.relay(..., { socket: reply.socket })`), so a
+// session with a punch socket answers its rounds from it — which is also
+// what keeps the relay→punch-socket NAT mapping alive between rounds.
+using HolepunchReplyFn =
+    std::function<void(std::vector<uint8_t> reply_value, udx_socket_t* via)>;
+
 struct ForwardEntry {
     // Called when PEER_HANDSHAKE arrives for this target.
     // noise: the raw Noise msg1 bytes from the client
@@ -46,11 +57,17 @@ struct ForwardEntry {
     //   the relaying DHT node on relayed rounds. Mirrors the HolepunchFn
     //   parameter of the same name; the server keeps it as the relay hint
     //   for the session's punch socket.
+    // relayed: false when the handshake came straight from the client
+    //   (mode FROM_CLIENT, no peerAddress). JS calls this `direct` and
+    //   never builds a puncher for it (server.js:210 `_addHandshake(...,
+    //   !peerAddress)` → :390-394 early return). `peer_address` alone
+    //   cannot carry the signal: it falls back to req.from when absent.
     // reply_fn: call with Noise msg2 bytes to respond
     using HandshakeFn = std::function<void(
         const std::vector<uint8_t>& noise,
         const compact::Ipv4Address& peer_address,
         const compact::Ipv4Address& from_address,
+        bool relayed,
         HandshakeReplyFn reply_fn)>;
 
     // Called when PEER_HOLEPUNCH arrives for this target.
@@ -67,13 +84,14 @@ struct ForwardEntry {
     //   so the server-side NAT sampler can record what the client thinks
     //   our address is. Without it the sampler is fed (peer, peer) and Pi5
     //   ends up announcing every connecting client's IP as one of its own.
-    // reply_fn: call with encoded reply value
+    // reply_fn: call with the encoded reply value and the egress socket
+    //   override (see router::HolepunchReplyFn above).
     using HolepunchFn = std::function<void(
         const std::vector<uint8_t>& value,
         const compact::Ipv4Address& peer_address,
         const compact::Ipv4Address& from_address,
         const compact::Ipv4Address& to_address,
-        std::function<void(std::vector<uint8_t> reply_value)> reply_fn)>;
+        HolepunchReplyFn reply_fn)>;
 
     HandshakeFn on_peer_handshake;
     HolepunchFn on_peer_holepunch;

@@ -74,6 +74,32 @@ struct ServerConnection {
     // (JS: hs.puncher = new Holepuncher(dht, session, false))
     std::shared_ptr<holepunch::Holepuncher> puncher;
 
+    // Per-session punch socket (JS Holepuncher: dht._socketPool.acquire(),
+    // holepuncher.js:14 — `p.socket`). The handshake reply, the holepunch
+    // rounds and every probe ride this socket, so the relay (and through it
+    // the client) only ever learns THIS address. Null on: EMBEDDED builds,
+    // non-firewalled servers, direct (FROM_CLIENT) handshakes, OPEN clients.
+    std::shared_ptr<holepunch::PoolSocket> punch_socket;
+
+    // False until `discover_pool_addresses` concludes for `punch_socket`.
+    // JS: `await p.analyze(false)` → `await this.nat.analyzing`
+    // (server.js:519, holepuncher.js:85-86).
+    bool punch_sampling_done = false;
+
+    // Rounds that arrived before sampling settled. Drained in order by
+    // Server::on_punch_sampling_done. Bounded (drop-oldest past 8) — a
+    // client that floods rounds must not grow this without limit.
+    struct ParkedRound {
+        std::vector<uint8_t> value;
+        compact::Ipv4Address peer_address{};
+        compact::Ipv4Address from_address{};
+        compact::Ipv4Address to_address{};
+        // router::HolepunchReplyFn, spelled out to keep router.hpp out of
+        // this header's include set.
+        std::function<void(std::vector<uint8_t>, udx_socket_t*)> reply_fn;
+    };
+    std::vector<ParkedRound> parked_rounds;
+
     // Timestamp for stale cleanup (uv_now millis)
     uint64_t created_at = 0;
 

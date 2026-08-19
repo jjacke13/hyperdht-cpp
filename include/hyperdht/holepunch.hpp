@@ -179,6 +179,18 @@ public:
     void send_probe_ttl(const compact::Ipv4Address& to, int ttl);
     void on_holepunch_probe(rpc::OnProbeCallback cb) { on_probe_ = std::move(cb); }
 
+    // Inbound DHT requests. JS: a server session's punch socket receives the
+    // PEER_HOLEPUNCH rounds directly (hyperdht/lib/server.js:508-511 —
+    // `req.socket === p.socket`), so it must both dispatch them and answer
+    // on the same socket. Without a consumer wired, requests are dropped.
+    using OnRequestCallback = std::function<void(const messages::Request& req,
+                                                 const compact::Ipv4Address& from)>;
+    void on_request(OnRequestCallback cb) { on_request_ = std::move(cb); }
+
+    // Encode + send a Response from THIS socket. resp.from.addr is the UDP
+    // destination (same convention as RpcSocket::reply, rpc.cpp:557-571).
+    void reply(const messages::Response& resp);
+
     // NAT sampler (fed from PING responses)
     nat::NatSampler& nat_sampler() { return nat_sampler_; }
     const std::vector<compact::Ipv4Address>& addresses() const {
@@ -215,6 +227,7 @@ private:
     uint16_t next_tid_ = 0;
     std::vector<Inflight*> inflight_;
     rpc::OnProbeCallback on_probe_;
+    OnRequestCallback on_request_;
 
     void handle_message(const uint8_t* data, size_t len,
                         const struct sockaddr_in* addr);

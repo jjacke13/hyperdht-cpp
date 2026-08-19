@@ -988,6 +988,32 @@ void PoolSocket::handle_message(const uint8_t* data, size_t len,
                 return;
             }
         }
+        return;
+    }
+
+    if (type == messages::REQUEST_ID) {
+        // No consumer wired — drop, like any other unknown traffic. Sampling
+        // is deliberately inside the gate: an unowned socket has no session
+        // whose NAT view these observations belong to.
+        if (!on_request_) return;
+
+        // `host` (top of function) is already the UDP source of this datagram.
+        auto from = Ipv4Address::from_string(host, ntohs(addr->sin_port));
+
+        // JS server.js:508-511 — rounds arriving on the session's punch socket
+        // feed that session's sampler: `p.nat.add(req.to, req.from)`. The wire
+        // `to` field is OUR external address as the sender observed it; the UDP
+        // source is the dedup key. Note the naming asymmetry with the RESPONSE
+        // branch above, where the same wire `to` field lands in resp.from.addr.
+        nat_sampler_.add(req.to.addr, from);
+
+        // Mirror the RpcSocket receive path (rpc.cpp:827): the transport-only
+        // `from` field is filled in from the datagram source.
+        req.from.addr = from;
+
+        auto cb = on_request_;  // copy — the handler may reset it during dispatch
+        cb(req, from);
+        return;
     }
 }
 
@@ -1119,6 +1145,30 @@ void PoolSocket::send_probe(const Ipv4Address& to) {
                     });
 }
 
+// Reply on the punch socket itself — JS io.js `_sendReply` sends on the
+// socket the request arrived on (RpcSocket::reply, rpc.cpp:556-571, carries
+// the same note): a stateful NAT/conntrack drops a reply whose source port
+// differs from the port the peer addressed.
+void PoolSocket::reply(const messages::Response& resp) {
+    if (closing_) return;
+    struct SendCtx {
+        udx_socket_send_t req{};
+        std::vector<uint8_t> buf;
+    };
+    auto* ctx = new SendCtx;
+    ctx->buf = messages::encode_response(resp);
+    ctx->req.data = ctx;
+    uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(ctx->buf.data()),
+                                  static_cast<unsigned int>(ctx->buf.size()));
+    struct sockaddr_in dest{};
+    uv_ip4_addr(resp.from.addr.host_string().c_str(), resp.from.addr.port, &dest);
+    udx_socket_send(&ctx->req, socket_, &uv_buf, 1,
+                    reinterpret_cast<const struct sockaddr*>(&dest),
+                    [](udx_socket_send_t* r, int) {
+                        delete static_cast<SendCtx*>(r->data);
+                    });
+}
+
 void PoolSocket::send_probe_ttl(const Ipv4Address& to, int ttl) {
     if (closing_) return;
     struct SendCtx {
@@ -1141,6 +1191,11 @@ void PoolSocket::close() {
     if (closing_) return;
     closing_ = true;
     socket_->data = nullptr;
+    // Release the inbound-request consumer here rather than at destruction:
+    // its capture typically holds the session that owns this socket, so
+    // keeping it alive past close() would be a reference cycle. (on_probe_
+    // needs no such release — its owner, PunchState::complete, clears it.)
+    on_request_ = nullptr;
     // Clean up inflight
     for (auto* inf : inflight_) {
         if (inf->timer && !uv_is_closing(reinterpret_cast<uv_handle_t*>(inf->timer))) {

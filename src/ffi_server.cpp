@@ -45,10 +45,12 @@ int hyperdht_server_listen(hyperdht_server_t* srv,
                             info.local_udx_id, info.is_initiator);
             conn.raw_stream = info.raw_stream;
             conn.udx_socket = info.udx_socket;
-            // Carry the relay→direct upgrade handle (JS PR #266) to the user's
-            // stream_open so the emitted relayed stream can migrate to direct.
-            conn._internal = info.upgrade
-                ? new FfiConnExtra{nullptr, info.upgrade}
+            // Carry the pool/punch-socket keepalive (the emitted stream lives
+            // on a socket the dying session owns) and the relay→direct upgrade
+            // handle (JS PR #266) to the user's stream_open. Same shape as the
+            // connect side, ffi_internal.hpp dispatch_connect_result.
+            conn._internal = (info.socket_keepalive || info.upgrade)
+                ? new FfiConnExtra{info.socket_keepalive, info.upgrade}
                 : nullptr;
             srv->cb(&conn, srv->userdata);
             if (conn._internal) {

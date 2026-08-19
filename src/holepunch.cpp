@@ -956,17 +956,31 @@ void PoolSocket::handle_message(const uint8_t* data, size_t len,
     auto type = messages::decode_message(data, len, req, resp);
 
     if (type == messages::RESPONSE_ID) {
-        // Feed NAT sampler: resp.from.addr = wire `to` field = our external address
-        char host[INET_ADDRSTRLEN];
-        uv_ip4_name(addr, host, sizeof(host));
-        auto remote_addr = Ipv4Address::from_string(host, ntohs(addr->sin_port));
-        nat_sampler_.add(resp.from.addr, remote_addr);
-
-        // Match TID → call response callback
+        // Match TID → sample + call response callback.
+        //
+        // Sampling lives INSIDE the tid match. JS only ever samples a reply to
+        // a request it sent (dht-rpc io.js dispatches by tid; nat.js /
+        // connect.js:578 add from that reply). Sampling every decodable
+        // RESPONSE means anyone who knows this socket's address — the
+        // connecting client learns it from the handshake reply — can pin the
+        // sampler on an address of their choosing with three datagrams from
+        // three of their OWN source ports, no spoofing needed, and the session
+        // then freezes that address and ships it in the round reply. The
+        // NAT-discovery campaign (discover_pool_addresses → JS nat.autoSample)
+        // is unaffected: its PINGs are tid-matched by construction.
         for (auto it = inflight_.begin(); it != inflight_.end(); ++it) {
             if ((*it)->tid == resp.tid) {
                 auto* inf = *it;
                 inflight_.erase(it);
+
+                // resp.from.addr = wire `to` field = our external address as
+                // this peer saw it. Added before the callback runs: the
+                // discovery campaign's on_response reads sampled().
+                char host[INET_ADDRSTRLEN];
+                uv_ip4_name(addr, host, sizeof(host));
+                nat_sampler_.add(
+                    resp.from.addr,
+                    Ipv4Address::from_string(host, ntohs(addr->sin_port)));
 
                 // Feed the per-peer RTT EMA so subsequent requests adapt
                 // their timeout. Mirrors JS dht-rpc/lib/io.js:116-118 where
@@ -1225,7 +1239,25 @@ void PoolSocket::close() {
         // dangling entry that the next udx_socket_close walks → UAF.
         // The heap-alloc'd socket_t is freed by the on_close cb we
         // registered in PoolSocket's constructor.
-        udx_socket_close(socket_);
+        //
+        // UV_EBUSY = a udx stream is still attached (udx.c:2175). That means
+        // a connection was adopted onto this socket and its owner dropped
+        // ConnectionInfo::socket_keepalive while the stream was still live.
+        // Closing anyway would pull the socket out from under that stream, so
+        // we DON'T: no uv_close, no free, and socket_ keeps pointing at what
+        // udx still owns (a null socket_ would be a lie the send paths read).
+        // The stream stays usable; the price is one socket that libudx will
+        // only reap at udx_teardown(). Deliberately no retry timer — udx has
+        // no close-when-idle hook (finalize auto-closes only during teardown,
+        // udx.c:448-451), so a retry would mean an unref'd timer that either
+        // spins for the process's life or leaks at loop exit. The keepalive is
+        // the mechanism; this branch is its assertion failing loudly.
+        int rc = udx_socket_close(socket_);
+        if (rc < 0) {
+            DHT_LOG("  [pool] udx_socket_close refused (%d) — a stream is "
+                    "still attached; leaving the socket open\n", rc);
+            return;
+        }
         socket_ = nullptr;
     }
 }

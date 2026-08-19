@@ -58,6 +58,16 @@ struct ConnectionInfo {
     udx_stream_t* raw_stream = nullptr;  // Pre-created during handshake (like JS rawStream)
     udx_socket_t* udx_socket = nullptr; // Socket that received the probe (JS: ref.socket)
 
+    // Keeps `udx_socket` alive for the emitted stream's lifetime, exactly like
+    // ConnectResult::socket_keepalive on the client side (dht.hpp:203).
+    // `udx_socket` is often NOT the DHT's main socket: it is the session's
+    // per-session punch socket (or a birthday-paradox holder), and that socket
+    // is owned by holepunch state that dies the moment the connection is
+    // emitted. A consumer that connects `raw_stream` to `udx_socket` MUST hold
+    // this until the stream is destroyed — dropping it early closes the socket
+    // under a live stream. Empty when the stream lives on the main socket.
+    std::shared_ptr<void> socket_keepalive;
+
     // Relay→direct upgrade handle (JS PR #266). Set only on the blind-relay
     // emit path; carries the relay control connection + confirmDirectUpgrade
     // state machine (relay_upgrade::UpgradeContext, opaque). The consumer plumbs
@@ -426,10 +436,14 @@ private:
         router::HandshakeReplyFn reply_fn,
         std::optional<server_connection::ServerConnection> result);
 
-    // Called when holepunch or direct connect succeeds
+    // Called when holepunch or direct connect succeeds. `keepalive` owns
+    // `udx_sock` when that socket is not the DHT's main one (the session's
+    // punch socket, a birthday-paradox holder); it is handed to the consumer
+    // through ConnectionInfo::socket_keepalive.
     void on_socket(server_connection::ServerConnection& conn,
                    const compact::Ipv4Address& peer_addr,
-                   udx_socket_t* udx_sock = nullptr);
+                   udx_socket_t* udx_sock = nullptr,
+                   std::shared_ptr<void> keepalive = nullptr);
 };
 
 }  // namespace server

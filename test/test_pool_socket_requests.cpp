@@ -63,6 +63,8 @@ class PoolSocketRequests : public ::testing::Test {
         uv_loop_close(&loop_);
     }
 
+    std::optional<messages::Request> plain_got_request_;
+
     static void on_plain_recv(udx_socket_t* s, ssize_t nread,
                               const uv_buf_t* buf, const struct sockaddr* addr) {
         auto* self = static_cast<PoolSocketRequests*>(s->data);
@@ -72,6 +74,10 @@ class PoolSocketRequests : public ::testing::Test {
         auto type = messages::decode_message(
             reinterpret_cast<const uint8_t*>(buf->base),
             static_cast<size_t>(nread), req, resp);
+        if (type == messages::REQUEST_ID) {
+            self->plain_got_request_ = req;
+            return;
+        }
         if (type != messages::RESPONSE_ID) return;
         self->received_ = resp;
         self->received_src_port_ = ntohs(
@@ -188,6 +194,49 @@ TEST_F(PoolSocketRequests, RequestDoesNotFeedNatSampler) {
     ASSERT_TRUE(dispatched) << "request must still reach the consumer";
     EXPECT_EQ(pool_->nat_sampler().sampled(), 0);
     EXPECT_EQ(pool_->nat_sampler().host(), "");
+}
+
+// Same attack, other message type: a RESPONSE nobody asked for must not reach
+// the NAT sampler either. The connecting client learns the punch socket's
+// address from the handshake reply, so an unmatched-response feed lets it pin
+// the session's advertised address and firewall from three of its OWN source
+// ports — no spoofing needed. JS samples only on MATCHED replies (dht-rpc
+// io.js dispatches by tid; connect.js:578 / nat.js add from the ping reply).
+TEST_F(PoolSocketRequests, UnmatchedResponseDoesNotFeedNatSampler) {
+    messages::Response resp;
+    resp.tid = 4242;  // nothing inflight has this tid
+    resp.from.addr = Ipv4Address::from_string("198.51.100.9", 1234);
+
+    send_from_plain_socket(messages::encode_response(resp), pool_addr());
+    run_loop_until([] { return false; }, 100);
+
+    EXPECT_EQ(pool_->nat_sampler().sampled(), 0);
+    EXPECT_EQ(pool_->nat_sampler().host(), "");
+}
+
+// The other half of the gate: a reply to OUR request still samples, because
+// that is the whole point of the NAT-discovery PING campaign
+// (discover_pool_addresses → nat.js autoSample). Guards against "fix" the
+// unmatched case by killing sampling outright.
+TEST_F(PoolSocketRequests, MatchedResponseFeedsNatSampler) {
+    messages::Request ping;
+    ping.command = messages::CMD_PING;
+    ping.internal = true;
+    ping.to.addr = bound_addr(plain_->handle());
+
+    bool answered = false;
+    pool_->request(ping, [&](const messages::Response&) { answered = true; });
+
+    ASSERT_TRUE(run_loop_until([&] { return plain_got_request_.has_value(); }));
+
+    messages::Response resp;
+    resp.tid = plain_got_request_->tid;
+    resp.from.addr = Ipv4Address::from_string("198.51.100.9", 1234);  // wire `to`
+    send_from_plain_socket(messages::encode_response(resp), pool_addr());
+
+    ASSERT_TRUE(run_loop_until([&] { return answered; }));
+    EXPECT_EQ(pool_->nat_sampler().sampled(), 1);
+    EXPECT_EQ(pool_->nat_sampler().host(), "198.51.100.9");
 }
 
 // No consumer wired → the request is dropped like any other unknown traffic,

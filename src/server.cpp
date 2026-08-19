@@ -1231,6 +1231,23 @@ void Server::start_punch_socket(uint32_t hp_id) {
     auto& conn = *it->second;
     auto& pool = *conn.punch_socket;
 
+    // Probe echo. JS holepuncher.js:118-128 — the non-initiator answers every
+    // inbound 1-byte probe from the socket it arrived on, from the moment the
+    // puncher's socket exists (handshake time), never marking itself
+    // connected. Same policy as the main socket's listener installed in
+    // listen(); without it the client's fast-open and post-round-1 probes die
+    // here and the punch can only complete via the client's own UDX SYN.
+    //
+    // weak, not shared: on_probe_ is owned BY the PoolSocket, so a strong
+    // capture would be a cycle that never frees the session's socket.
+    pool.on_holepunch_probe(
+        [weak_pool = std::weak_ptr<holepunch::PoolSocket>(conn.punch_socket)](
+            const compact::Ipv4Address& from) {
+            if (auto p = weak_pool.lock(); p && !p->is_closing()) {
+                p->send_probe(from);
+            }
+        });
+
     // Inbound PEER_HOLEPUNCH rounds. The relay observed our handshake reply
     // leaving this socket, so it forwards the client's rounds here.
     //
@@ -1250,6 +1267,10 @@ void Server::start_punch_socket(uint32_t hp_id) {
         // Gate before any state change (JS router.js:206-222 + server.js:487).
         if (req.internal || req.command != messages::CMD_PEER_HOLEPUNCH) return;
         if (!req.value.has_value() || !req.target.has_value()) return;
+        // One Router can front several Servers (HyperDHT keeps a vector of
+        // them, dht.hpp:1003). A round for another key's target never belongs
+        // to this session.
+        if (*req.target != target_) return;
         auto hp_msg = holepunch::decode_holepunch_msg(req.value->data(),
                                                       req.value->size());
         if (hp_msg.mode != peer_connect::MODE_FROM_RELAY ||
@@ -1647,6 +1668,13 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                                 hp.address.port, &da);
                     udx_socket_t* direct =
                         hp.socket ? hp.socket : socket_.socket_handle();
+                    // Same rule as on_socket below: the winning holder's
+                    // socket is owned by the puncher we are about to drop
+                    // (connect.cpp:928 does this on the client side).
+                    if (hp.socket_keepalive) {
+                        conn_ptr->upgrade->set_socket_keepalive(
+                            hp.socket_keepalive);
+                    }
                     conn_ptr->upgrade->on_socket(
                         direct, reinterpret_cast<const struct sockaddr*>(&da));
                     return;
@@ -1655,7 +1683,8 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                 // (detached at relay emit, no upgrade) — nothing to emit.
                 if (!conn_ptr->raw_stream) return;
 
-                on_socket(*conn_ptr, hp.address, hp.socket);
+                on_socket(*conn_ptr, hp.address, hp.socket,
+                          hp.socket_keepalive);
             });
 
             // Wire puncher→abort so a FAILED punch clears its session,
@@ -1770,7 +1799,8 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
 
 void Server::on_socket(server_connection::ServerConnection& conn,
                        const compact::Ipv4Address& peer_addr,
-                       udx_socket_t* udx_sock) {
+                       udx_socket_t* udx_sock,
+                       std::shared_ptr<void> keepalive) {
     if (!on_connection_ && connection_listeners_.empty()) return;
 
     ConnectionInfo info;
@@ -1782,6 +1812,20 @@ void Server::on_socket(server_connection::ServerConnection& conn,
     info.local_udx_id = conn.local_udx_id;
     info.is_initiator = false;
     info.udx_socket = udx_sock;
+    // The emitted stream is about to be bound to `udx_sock`, and this session
+    // — the only owner of the punch socket — dies as soon as we return (every
+    // caller has already erased it from connections_). Hand the consumer a
+    // reference so the socket outlives the stream, exactly as the client side
+    // does with ConnectResult::socket_keepalive (connect.cpp:553). The
+    // fallback covers the arrival-socket path: on_raw_stream_firewall passes
+    // the socket the client's SYN landed on, which is this punch socket
+    // whenever the punch worked, and udx routes that SYN here through its
+    // udx_t-global stream table (udx.c:1474).
+    info.socket_keepalive = std::move(keepalive);
+    if (!info.socket_keepalive && conn.punch_socket && udx_sock &&
+        udx_sock == conn.punch_socket->socket_handle()) {
+        info.socket_keepalive = conn.punch_socket;
+    }
     // Transfer rawStream ownership. Clean up the Server's firewall context.
     if (conn.raw_stream && conn.raw_stream->data) {
         delete static_cast<RawStreamCtx*>(conn.raw_stream->data);

@@ -154,6 +154,18 @@ class ServerPunchSocket : public ::testing::Test {
     uint32_t hp_id_ = 0;
     std::array<uint8_t, 32> target_{};
 
+    // Emitted-connection state (the consumer's side of the handover).
+    bool emitted_ = false;
+    udx_socket_t* emitted_socket_ = nullptr;
+    udx_stream_t* adopted_stream_ = nullptr;
+    std::shared_ptr<void> conn_keepalive_;
+
+    // The client's own UDX stream. Its local id must match the `udx.id` the
+    // client advertised in its Noise payload (do_handshake below).
+    static constexpr uint32_t CLIENT_UDX_ID = 12345;
+    udx_stream_t client_stream_{};
+    bool client_stream_live_ = false;
+
     void SetUp() override {
         uv_loop_init(&loop_);
 
@@ -192,10 +204,29 @@ class ServerPunchSocket : public ::testing::Test {
                            server_kp_.public_key.data(), 32, nullptr, 0);
 
         srv_ = std::make_unique<Server>(*socket_, router_);
-        srv_->listen(server_kp_, [](const ConnectionInfo&) {});
+        // What a real consumer does with an emitted connection: hold
+        // `socket_keepalive` for the stream's lifetime and connect the raw
+        // stream to the socket the packet arrived on, synchronously, inside
+        // the callback (test_hyperdht.cpp:312-327, src/ffi_stream.cpp:143).
+        srv_->listen(server_kp_, [this](const ConnectionInfo& info) {
+            emitted_ = true;
+            emitted_socket_ = info.udx_socket;
+            conn_keepalive_ = info.socket_keepalive;
+            if (!info.raw_stream || !info.udx_socket) return;
+            adopted_stream_ = info.raw_stream;
+            udx_stream_firewall(info.raw_stream, nullptr);
+            struct sockaddr_in dest{};
+            uv_ip4_addr(info.peer_address.host_string().c_str(),
+                        info.peer_address.port, &dest);
+            udx_stream_connect(info.raw_stream, info.udx_socket,
+                               info.remote_udx_id,
+                               reinterpret_cast<const struct sockaddr*>(&dest));
+        });
     }
 
     void TearDown() override {
+        destroy_streams_and_drain();
+        conn_keepalive_.reset();
         if (srv_) srv_->close();
         if (socket_) socket_->close();
         for (auto& n : nodes_) n->sock.close();
@@ -238,6 +269,51 @@ class ServerPunchSocket : public ::testing::Test {
 
     void pump_ms(uint64_t ms) { run_loop_until([] { return false; }, ms); }
 
+    // The client's UDX SYN, aimed at the session's punch socket. udx looks a
+    // stream up by local_id in the udx_t-GLOBAL cirbuf (udx.c:1474,1908), so
+    // the packet finds the server's pre-created rawStream even though that
+    // stream was never bound to this socket — and fires its firewall callback
+    // with the PUNCH socket as the arrival socket (udx.c:1481-1487).
+    void client_udx_connect_to(uint16_t port) {
+        auto* c = conn();
+        ASSERT_NE(c, nullptr);
+        ASSERT_EQ(udx_stream_init(fake_udx_->handle(), &client_stream_,
+                                  CLIENT_UDX_ID, [](udx_stream_t*, int) {},
+                                  nullptr),
+                  0);
+        client_stream_live_ = true;
+        struct sockaddr_in dest{};
+        uv_ip4_addr("127.0.0.1", port, &dest);
+        ASSERT_EQ(udx_stream_connect(
+                      &client_stream_, client_node().sock.handle(),
+                      c->local_udx_id,
+                      reinterpret_cast<const struct sockaddr*>(&dest)),
+                  0);
+        // connect() alone puts nothing on the wire — write a byte so the
+        // server actually sees a packet.
+        static uint8_t payload = 0x2a;
+        uv_buf_t b = uv_buf_init(reinterpret_cast<char*>(&payload), 1);
+        auto* w = static_cast<udx_stream_write_t*>(
+            calloc(1, sizeof(udx_stream_write_t) + sizeof(udx_stream_write_buf_t)));
+        udx_stream_write(w, &client_stream_, &b, 1,
+                         [](udx_stream_write_t* r, int, int) { free(r); });
+    }
+
+    // The consumer finishing with the stream. Streams must go BEFORE the
+    // keepalive is dropped — that ordering is the contract the keepalive
+    // exists to express (udx_socket_close returns UV_EBUSY otherwise).
+    void destroy_streams_and_drain() {
+        if (client_stream_live_) {
+            udx::destroy_stream_once(&client_stream_);
+            client_stream_live_ = false;
+        }
+        if (adopted_stream_) {
+            udx::destroy_stream_once(adopted_stream_);
+            adopted_stream_ = nullptr;
+        }
+        pump_ms(60);
+    }
+
     // Drive a PEER_HANDSHAKE through the Router exactly as rpc_handlers does,
     // with a REAL relay egress so the fake relay observes the source port.
     // `relayed` picks JS's `direct` split: FROM_RELAY carries a peerAddress,
@@ -255,7 +331,7 @@ class ServerPunchSocket : public ::testing::Test {
         peer_connect::NoisePayload cp;
         cp.version = 1;
         cp.firewall = client_fw;
-        cp.udx = peer_connect::UdxInfo{1, false, 12345, 0};
+        cp.udx = peer_connect::UdxInfo{1, false, CLIENT_UDX_ID, 0};
         cp.has_secret_stream = true;
         cp.addresses4.push_back(Ipv4Address::from_string("10.0.0.1", 5000));
         auto cpb = peer_connect::encode_noise_payload(cp);
@@ -474,6 +550,73 @@ TEST_F(ServerPunchSocket, UndecryptableRoundChangesNoState) {
     EXPECT_FALSE(c->punch_socket->nat_sampler().is_frozen());
     EXPECT_TRUE(c->parked_rounds.empty());
     EXPECT_TRUE(relay().rounds.empty());
+}
+
+// (e) The server is the non-initiator: every 1-byte probe that lands on the
+//     punch socket is echoed straight back FROM that socket — JS
+//     holepuncher.js:118-128. Without it the client's fast-open and
+//     post-round-1 probes die at the punch socket and the punch never lands.
+TEST_F(ServerPunchSocket, ProbeToPunchSocketIsEchoedFromIt) {
+    do_handshake(/*relayed=*/true);
+    ASSERT_TRUE(conn() && conn()->punch_socket);
+    uint16_t pport = punch_port();
+
+    client_node().send(std::vector<uint8_t>{0x00},
+                       Ipv4Address::from_string("127.0.0.1", pport));
+
+    ASSERT_TRUE(run_loop_until([&] { return client_node().probes > 0; }))
+        << "the punch socket never echoed the probe";
+    EXPECT_EQ(client_node().first_probe_src, pport);
+    EXPECT_NE(client_node().first_probe_src, main_port());
+}
+
+// (f) The client's UDX SYN arrives on the punch socket, so the connection must
+//     be emitted with THAT socket: the stream has to live on the punched
+//     pinhole, not on the main socket the client cannot reach.
+TEST_F(ServerPunchSocket, StreamAdoptionUsesPunchSocket) {
+    do_handshake(/*relayed=*/true);
+    ASSERT_TRUE(conn() && conn()->punch_socket);
+    auto* punch_handle = conn()->punch_socket->socket_handle();
+
+    client_udx_connect_to(punch_port());
+    ASSERT_TRUE(run_loop_until([&] { return emitted_; }));
+    EXPECT_EQ(emitted_socket_, punch_handle);
+    EXPECT_NE(emitted_socket_, socket_->active_socket());
+}
+
+// (g) Adoption kills the session in the same frame: on_raw_stream_firewall
+//     erases it and ~ServerConnection runs at the end of the callback. The
+//     punch socket must NOT go with it — the stream just adopted is bound to
+//     it, and udx_socket_close would either take the socket out from under a
+//     live stream or (UV_EBUSY) silently leak it. ASAN is the real assert.
+TEST_F(ServerPunchSocket, AdoptedPunchSocketOutlivesItsSession) {
+    do_handshake(/*relayed=*/true);
+    ASSERT_TRUE(conn() && conn()->punch_socket);
+    std::weak_ptr<holepunch::PoolSocket> weak = conn()->punch_socket;
+
+    client_udx_connect_to(punch_port());
+    ASSERT_TRUE(run_loop_until([&] { return emitted_; }));
+    ASSERT_EQ(srv_->session(hp_id_), nullptr) << "session outlived the emit";
+    EXPECT_FALSE(weak.expired())
+        << "punch socket freed under the stream that was just adopted onto it";
+    ASSERT_TRUE(conn_keepalive_) << "consumer got no keepalive to hold";
+
+    destroy_streams_and_drain();
+    conn_keepalive_.reset();
+    EXPECT_TRUE(weak.expired()) << "punch socket outlived its stream";
+}
+
+// (h) The other half: a session that never adopted anything takes its punch
+//     socket with it when the clear-wait timer reaps it. Guards the keepalive
+//     from turning every failed punch into a held socket.
+TEST_F(ServerPunchSocket, ClearedSessionClosesItsPunchSocket) {
+    srv_->handshake_clear_wait = 50;  // before do_handshake arms the timer
+    do_handshake(/*relayed=*/true);
+    ASSERT_TRUE(conn() && conn()->punch_socket);
+    std::weak_ptr<holepunch::PoolSocket> weak = conn()->punch_socket;
+
+    ASSERT_TRUE(run_loop_until([&] { return srv_->session(hp_id_) == nullptr; }));
+    EXPECT_TRUE(weak.expired());
 }
 
 // The park queue is bounded (drop-oldest): a client that floods rounds while

@@ -890,27 +890,99 @@ separately eliminated. Full case: memory `server_punch_socket_parity`, `Q2-EVIDE
   Finding Q outages — it does not work today.** Also makes the relay→direct keepalive
   call site (`server.cpp:1138`) unreachable at runtime.
 
-### J.2 Task 6 (remaining plan work)
+### J.2 Task 6
 
-- [ ] cpp-reviewer on the whole branch; ASAN (band-compare, `test_server` leak total is
-      noisy 90-105 KB); live cross-test; JS interop.
-- [ ] **`hyperdht.h` `hyperdht_stream_open` must document the contract**: connect the
-      stream **synchronously in the callback OR hold `info.socket_keepalive`**. An async
-      consumer sees `socket->streams == NULL` at drop, `udx_socket_close` succeeds, the
-      socket is freed, and the later `udx_stream_connect` is a use-after-free.
-- [ ] Expose `udx::busy_close_count()` through the C FFI (`hyperdht.h:1065-1079` already
-      exposes relay/punch stats); wrapper consumers currently cannot read it.
-- [ ] `relay_token` is missing from BOTH `ServerConnection` move ops
-      (`src/server_connection.cpp:53-100`) — silently zeroed, un-gates
-      `session_relay_engaged()`. Latent today (written after the final move).
-- [ ] `SocketPool::destroy()` (`src/socket_pool.cpp:200-206`) still does an unchecked
-      `udx_socket_close` + unconditional `closed_ = true` — same class as the
-      `SocketRef::do_close` bug fixed on this branch.
+Done 2026-08-19/20 except the two items that need a network and a human, which
+are called out at the bottom. **The branch is code-complete and clean, but it
+has still never carried a packet against a real peer.**
+
+- [x] cpp-reviewer on the whole branch — 3 HIGH + 3 MEDIUM, all verified against the
+      code and the JS reference before acting, all fixed in `4d67452` except MEDIUM 1
+      (a genuinely separate parity gap, filed as J.3 below). Detail:
+  - HIGH — `discover_pool_addresses` waited for the SLOWEST sampling ping instead of
+    resolving on classification like JS `nat.js:172-179`. This gate sits in front of
+    every parked PEER_HOLEPUNCH round, so one dead routing-table node held the reply
+    for `MAX_REQUEST_ATTEMPTS × timeout_for(dest)`. Measured on loopback: **3000 ms
+    before, 150 ms after** — routinely longer than the client's own round budget, so
+    the client aborts with `-5` and the server answers a tid nobody is waiting on.
+    A regression on this branch's own target path; the branch would likely have
+    field-failed with it in.
+  - HIGH — `UpgradeContext::set_socket_keepalive` replaced the pin unconditionally.
+    After the firewall tap migrates a stream onto the punch socket, the puncher's
+    later birthday win offers a socket the stream is NOT on (its `on_socket` is a
+    one-shot no-op), and the replace dropped the only ref to the live socket. Fixed
+    in the class, since `src/server.cpp` and `src/connect.cpp` both do it.
+  - HIGH — `SecretStreamDuplex::on_udx_close` nulled the stream's pointer to us but
+    not ours to the stream, so `~SecretStreamDuplex` wrote into memory libudx had
+    already freed. Real heap-use-after-free, caught by ASAN.
+  - MEDIUM — the per-session NAT sampler accepted a tid-matched reply from ANY
+    source. Now source-checked (sample only; the request still completes).
+  - MEDIUM — `include/hyperdht/udx.hpp` claimed refused sockets are "reaped at
+    teardown"; nothing in this codebase calls `udx_teardown()`. Comment corrected.
+- [x] ASAN — **0 errors across every test binary**; leak totals unchanged
+      (`test_server` 91-98 KB, in its noisy band; `test_hyperdht` 171108;
+      `test_connect_paths` 21496). Two real UAFs were found and fixed getting there
+      (the `~SecretStreamDuplex` one above, plus `~FakeRelayPeer` freeing itself out
+      from under its own async `uv_close` callbacks).
+- [x] `hyperdht.h` documents the `hyperdht_stream_open` contract, on both the
+      function and `hyperdht_connection_t::_internal`: call it **synchronously inside
+      the connect/connection callback**. `_internal` carries the socket keepalive and
+      the producer frees it when the callback returns; there is no way to hold it from
+      C without opening the stream, by design.
+- [x] `hyperdht_busy_close_count()` exposed through the C FFI + the Python mirror
+      (`_ffi.py`, `_bindings.py`, `__init__.py`). Rust bindgen and the Kotlin JNI
+      regenerate from the header and need nothing.
+- [x] `relay_token` added to both `ServerConnection` move ops (`e8fd86c`… `78eb2c0`).
+- [x] `SocketPool::destroy()` — checked close so refusals are counted, and it
+      deliberately keeps flagging `closed_` even on refusal. Do NOT "fix" that to
+      match `SocketRef::do_close`: a ref that survives destroy() outlives the udx_t
+      too (`udx_t` is a value member of `RpcSocket`, and `HyperDHT` declares
+      `socket_` before `socket_pool_`), so a late `inactive()` retrying the close is
+      `udx_socket_close` on freed memory. A first version of this change shipped
+      exactly that hazard and the reviewer caught it.
+- [ ] **Live cross-test + JS interop — NOT DONE, needs a network.** This is the only
+      thing standing between the branch and a merge. Everything else is verified.
+- [ ] **nospoon needs one line when its pin is bumped**: hold `info.socket_keepalive`
+      alongside the peer's duplex (`~/Desktop/repos/nospoon/cpp/server.cpp:93-97`
+      connects synchronously today, so it currently parks one fd per punched connection).
+
+### J.3 Found while closing Task 6 (not blockers)
+
+- [ ] **`SocketRef::was_busy_` is dead — the linger path is unreachable, so
+      `reusableSocket`/retryRoute does not work.** `git grep was_busy_` gives three
+      hits: the `= false` initialiser, the read in `if (reusable && was_busy_)`
+      (`src/socket_pool.cpp:90`), and the `= false` inside that branch. Never set
+      true ⇒ `LINGER_TIME_MS`, `lingering_`, `linger_timer_`, `on_linger_timeout`,
+      `on_linger_close` and the body of `unlinger()` are all dead code. JS lingers a
+      reusable socket 3 s past its last ref precisely so the route survives a
+      follow-up connect; we close immediately and `SocketPool::remove` →
+      `gc_routes_for_socket` drops the route with it. A real JS-parity gap, separate
+      from this branch.
+- [ ] `SocketRef::close_maybe` also lacks JS `_closeMaybe`'s `socket.idle` gate
+      (`socket-pool.js:159`) — JS never ATTEMPTS a close while a stream is attached.
+      Worth doing WITH the item above, not before it: without the linger retry there
+      is no hook to close on later, so gating alone just converts a counted refusal
+      into a silent never-close.
+- [ ] `PoolSocket::reply()` (`src/holepunch.cpp`) has no production caller — only
+      `test/test_pool_socket_requests.cpp`. The round reply goes out through
+      `socket_.udp_send(..., via)` instead. Either wire it or delete it.
+- [ ] The sampling PINGs use `MAX_REQUEST_ATTEMPTS` (3) where JS `nat.js:59` uses
+      `{ retry: false }` and re-runs `autoSample` once instead. Now that discovery
+      settles on classification the retries no longer block anything, but it is still
+      a divergence; revisit if sampling shows up in field latency.
+- [ ] `QueryWalk.DownHintEmittedToReferrerOnTimeout` is load-flaky: it needs ~2.02 s
+      of wall clock and failed once in a parallel `ctest` run, then passed standalone
+      3/3 and in a full rerun. Untouched by this branch (`src/query.cpp` and
+      `test/test_query.cpp` are identical to `main`). Give it slack or a deadline that
+      is not wall-clock-tight.
 - [ ] `test_server_punch_socket` leaks 64 B / 8 allocs under ASAN — every one is the
       `RawStreamCtx` allocated at `src/server.cpp:782`, retained because these tests
       drive a handshake without ever completing or clearing the session. Pre-existing
       and harness-only (`RawStreamCtx` is freed on the real connect/close paths), but
       confirm that reading before treating the number as a regression baseline.
-- [ ] **nospoon needs one line when its pin is bumped**: hold `info.socket_keepalive`
-      alongside the peer's duplex (`~/Desktop/repos/nospoon/cpp/server.cpp:93-97`
-      connects synchronously today, so it currently parks one fd per punched connection).
+- [ ] `SocketPoolTest.DestroyClosesAll` accounts for the whole 7488 B `test_socket_pool`
+      ASAN leak: `destroy()` deliberately never deletes `SocketRef`s (an outstanding
+      keepalive may still call `inactive()` on one). Expected, not a defect.
+- [ ] `ServerConnection`'s hand-written move ops exist solely to null
+      `other.raw_stream`. Wrapping `raw_stream` in a move-only holder and defaulting
+      both would delete the bug class that just cost us `relay_token`.

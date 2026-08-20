@@ -6,6 +6,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 
 #include <sodium.h>
 #include <uv.h>
@@ -16,7 +18,24 @@
 using namespace hyperdht;
 
 TEST(LiveServer, WaitForConnection) {
-    auto kp = noise::generate_keypair();  // Random keypair for each run
+    // HYPERDHT_LIVE_SEED=<64 hex chars> — derive the keypair deterministically
+    // instead of generating a fresh one per run. A random key means the remote
+    // side has to be handed a new key every restart, which makes a two-machine
+    // test impossible to coordinate; with a fixed seed the public key is stable
+    // and the remote client can be pointed at it once and re-run at will.
+    noise::Keypair kp;
+    const char* seed_hex = std::getenv("HYPERDHT_LIVE_SEED");
+    if (seed_hex && std::strlen(seed_hex) == 64) {
+        noise::Seed seed{};
+        for (int i = 0; i < 32; i++) {
+            seed[i] = static_cast<uint8_t>(
+                std::stoul(std::string(seed_hex + i * 2, 2), nullptr, 16));
+        }
+        kp = noise::generate_keypair(seed);
+        printf("  Keypair from HYPERDHT_LIVE_SEED (deterministic)\n");
+    } else {
+        kp = noise::generate_keypair();  // Random keypair for each run
+    }
 
     printf("  Server public key: ");
     for (int i = 0; i < 32; i++) printf("%02x", kp.public_key[i]);
@@ -65,8 +84,17 @@ TEST(LiveServer, WaitForConnection) {
     bool got_connection = false;
     server::ConnectionInfo conn_info;
 
+    // HYPERDHT_LIVE_STAY=1 — keep serving after the first connection instead
+    // of tearing the DHT down. A two-machine test wants several attempts
+    // against ONE announced server (the announce itself takes seconds to
+    // propagate, so restarting per attempt tests the announcer more than the
+    // punch).
+    const char* stay_env = std::getenv("HYPERDHT_LIVE_STAY");
+    const bool stay = stay_env && stay_env[0] == '1';
+    int connections = 0;
+
     srv->listen(kp, [&](const server::ConnectionInfo& info) {
-        printf("  CONNECTION RECEIVED!\n");
+        printf("  CONNECTION RECEIVED! (#%d)\n", ++connections);
         printf("    Remote pubkey: ");
         for (int i = 0; i < 8; i++) printf("%02x", info.remote_public_key[i]);
         printf("...\n");
@@ -74,15 +102,26 @@ TEST(LiveServer, WaitForConnection) {
                info.peer_address.host_string().c_str(), info.peer_address.port);
         printf("    UDX IDs: local=%u remote=%u\n",
                info.local_udx_id, info.remote_udx_id);
+        const auto& s = dht.stats();
+        printf("    punches so far: consistent=%d random=%d open=%d\n",
+               s.punches.consistent, s.punches.random, s.punches.open);
+        fflush(stdout);
 
         got_connection = true;
         conn_info = info;
 
-        // Stop after first connection
-        dht.destroy();
+        if (!stay) dht.destroy();  // Stop after first connection
     });
 
-    printf("  Listening... (waiting up to 120s for JS client)\n");
+    // HYPERDHT_LIVE_TIMEOUT_S — how long to stay up (default 300).
+    uint64_t timeout_s = 300;
+    if (const char* t = std::getenv("HYPERDHT_LIVE_TIMEOUT_S")) {
+        timeout_s = std::strtoull(t, nullptr, 10);
+        if (timeout_s == 0) timeout_s = 300;
+    }
+
+    printf("  Listening... (up to %llus, stay=%d)\n",
+           static_cast<unsigned long long>(timeout_s), stay ? 1 : 0);
     printf("  Run the JS client now!\n");
     fflush(stdout);
 
@@ -91,11 +130,11 @@ TEST(LiveServer, WaitForConnection) {
     uv_timer_init(&loop, &timeout);
     timeout.data = &dht;
     uv_timer_start(&timeout, [](uv_timer_t* t) {
-        printf("  TIMEOUT — no connection received\n");
+        printf("  Time is up — shutting down\n");
         auto* d = static_cast<HyperDHT*>(t->data);
         d->destroy();
         uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
-    }, 300000, 0);  // 5 minutes
+    }, timeout_s * 1000, 0);
 
     uv_run(&loop, UV_RUN_DEFAULT);
 

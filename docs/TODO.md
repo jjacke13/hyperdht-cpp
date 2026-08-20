@@ -964,25 +964,54 @@ has still never carried a packet against a real peer.**
       `Round on punch socket` ×2 → `Client punching (fw=2, 1 addrs)` →
       `[hp] Sending probe` ×1 → `rawStream firewall` → `Stream open`.
       **The punch loop itself is proven to work cross-NAT.** That much is solid.
-- [ ] **THE A/B AGAINST `main` IS INCONCLUSIVE — do not repeat my mistake of calling
-      it.** First `main` trial failed exactly like the field: 10 probes to a *correct*
-      address, nothing back, `Session cleanup`, phone hung 3 minutes. I wrote that up as
-      decisive. **The very next `main` trial connected 3/3, one probe each.** Running
-      tally: branch 2/2, main 3/4.
+- [x] **A/B RUN PROPERLY — THE BRANCH DOES *NOT* FIX FINDING Q.** Real phone, mobile
+      CGNAT, fast-mode ping suppressed on both arms, same server key, alternating arms:
 
-      The failure is REAL and is a faithful reproduction of Finding Q's signature — but
-      it is **intermittent**, which is what Finding Q always was. A single trial per arm
-      therefore proves nothing in either direction, and the branch has not been run
-      often enough to show it does not also fail sometimes.
+      | arm | sessions | landed | black holes | rate |
+      |---|---|---|---|---|
+      | `main` @ `ba03888` | 12 | 9 | 3 | 25% |
+      | branch | 10 | 9 | 1 | 10% |
 
-      To actually settle it: the base failure rate looks like ~25%, so this needs
-      **dozens of alternating trials per arm**, which means an automatable client on a
-      genuinely remote host (a VPS), not a phone tapped by hand. Harness for it already
-      exists: `scratchpad/arm.sh <main|branch> <runid>` swaps the server between arms
-      (same deterministic seed → same public key → the client never reconfigures), and
-      `test/js/connect_by_key.js` is a scriptable client. Per-trial verdict comes from
-      the log counts, not from "it connected": `[hp] Sending probe` (1 = landed
-      immediately, 10 = full schedule into the void) and `Stream open`.
+      25% vs 10% at these n is p≈0.6 — noise. **No improvement is demonstrable.**
+
+      The decisive datum is not the rate, it is the branch's failing session, which
+      used the ENTIRE new path and died anyway: `Session id=5 acquired a punch socket`
+      → `Punch-socket sampling done (ok=1)` → `Round on punch socket` ×3 →
+      `Client punching (fw=2, 1 addrs)` → 10 probes to a freshly-relay-observed address
+      → nothing → `Session cleanup`. So punching from a fresh per-session socket whose
+      mapping the relay observed *for that session* does **not** prevent the black hole.
+
+      **This kills "the shared announce socket's mapping goes stale/busy" as the
+      mechanism of Finding Q.** Keep the branch on its own merits (JS parity, a proven
+      cross-NAT punch loop, and the real bugs the review found) — but do not merge it
+      as a Finding Q fix, and do not tell the field it fixes the `-5`s.
+
+      Harness, reusable: `scratchpad/arm.sh <main|branch> <runid>` swaps arms (same
+      deterministic seed → same public key → the client never reconfigures);
+      `test/js/connect_by_key.js` is a scriptable client. **Read the verdict from log
+      counts, never from "it connected":** `[hp] Sending probe` (1 = landed, 10 = black
+      hole) and `Stream open`.
+
+### J.4 What the A/B actually taught us about Finding Q
+
+- **The failure is strictly bimodal.** Across 22 sessions, every single one either
+  landed on probe #1 or lost all 10. Never 2-9. That is not loss or congestion — it is
+  binary reachability of one 4-tuple, decided before the first probe and stable for the
+  whole 10-second schedule.
+- **Base rate ~10-25%**, on demand, reproducible any time by disabling the fast-mode
+  ping. Fast mode otherwise masks the punch path completely (it connects at round 1 and
+  the Holepuncher never starts) — which is exactly why this was never reproducible
+  before, and why the field only ever saw "it works when fast mode fires".
+- **Server-side causes are now largely excluded**: fresh per-session socket, correct
+  and freshly-observed destination address, sampling settled, `Client punching` with a
+  gossiped address, probes provably sent. All present in the failing runs.
+- **So the remaining suspect is the CLIENT's pinhole**, which is where Finding Q's
+  still-missing measurement always pointed: does the client's own round-1 fast-open
+  (TTL-5) priming packet actually leave its carrier NAT? If that priming is dropped,
+  there is no pinhole, every server probe dies, and the outcome is binary and
+  intermittent — matching all 22 observations. **Next test: capture at the client
+  egress.** Use a laptop tethered to mobile data as the client (the phone cannot
+  tcpdump unrooted).
 - [ ] **nospoon needs one line when its pin is bumped**: hold `info.socket_keepalive`
       alongside the peer's duplex (`~/Desktop/repos/nospoon/cpp/server.cpp:93-97`
       connects synchronously today, so it currently parks one fd per punched connection).

@@ -1571,6 +1571,26 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
         DHT_LOG("  [server] Client punching (id=%d, fw=%u, %zu addrs)\n",
                 hp_msg.id, reply.remote_firewall,
                 reply.remote_addresses.size());
+        // Diagnostic: the SAME client punch socket as seen by two observers —
+        // the relay that forwarded this round (`peer_address`, a fresh
+        // third-party observation) versus what the client itself advertises
+        // (its own NAT sampling, gossiped in `remote_addresses`). On an
+        // endpoint-INdependent (cone) NAT these agree. A persistent
+        // disagreement is endpoint-DEPENDENT mapping, i.e. a symmetric NAT
+        // that our CONSISTENT classification would be wrong about — and the
+        // server then probes a port the client's router never opened for us.
+        // This is the one number that distinguishes "client misclassified its
+        // NAT" from "the probes are being dropped in flight"; without it both
+        // look identical from here.
+        for (size_t i = 0; i < reply.remote_addresses.size(); i++) {
+            DHT_LOG("  [server]   observers: relay=%s:%u advertised[%zu]=%s:%u%s\n",
+                    peer_address.host_string().c_str(), peer_address.port,
+                    i, reply.remote_addresses[i].host_string().c_str(),
+                    reply.remote_addresses[i].port,
+                    (peer_address.port == reply.remote_addresses[i].port &&
+                     peer_address.host == reply.remote_addresses[i].host)
+                        ? "  [AGREE]" : "  [DISAGREE]");
+        }
 
         // A6: Random punch throttle
         // Enforcement happens inside handle_holepunch (returns

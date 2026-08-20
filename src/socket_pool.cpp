@@ -199,11 +199,17 @@ void SocketPool::destroy() {
     }
     for (auto* ref : refs) {
         ref->unlinger();
-        if (!ref->closed_) {
-            ref->closed_ = true;
-            ref->socket_.data = nullptr;  // H9: prevent on_socket_close UAF
-            udx_socket_close(&ref->socket_);
-        }
+        if (ref->closed_) continue;
+        ref->socket_.data = nullptr;  // H9: prevent on_socket_close UAF
+        // A ref that survives us must never take do_close's linger branch:
+        // that touches pool_.lingering_, and we are the pool.
+        ref->reusable = false;
+        // Same rule as SocketRef::do_close — udx refuses (UV_EBUSY) while a
+        // stream is still attached, and claiming `closed_` on a refusal is the
+        // lie that leaves the fd parked and the loop undrainable with nothing
+        // left to retry. Staying "not closed" lets the adopted stream's owner
+        // close this orphan through its own inactive()/release() later.
+        if (udx::close_socket_unless_busy(&ref->socket_)) ref->closed_ = true;
     }
     sockets_.clear();     // H9: pool is destroyed, entries are stale
     lingering_.clear();

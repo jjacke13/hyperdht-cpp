@@ -5,6 +5,8 @@
 #include "ffi_internal.hpp"
 #include <atomic>
 
+#include "hyperdht/udx.hpp"
+
 // ---------------------------------------------------------------------------
 // Server: create, listen, firewall, close, suspend, refresh
 // ---------------------------------------------------------------------------
@@ -351,6 +353,10 @@ int hyperdht_punch_stats_random(const hyperdht_t* dht) {
 int hyperdht_punch_stats_open(const hyperdht_t* dht) {
     if (!dht || !dht->dht) return 0;
     return dht->dht->stats().punches.open;
+}
+
+uint64_t hyperdht_busy_close_count(void) {
+    return hyperdht::udx::busy_close_count();
 }
 
 int hyperdht_ping(hyperdht_t* dht,

@@ -511,6 +511,10 @@ lib.hyperdht_punch_stats_random.restype = ctypes.c_int
 lib.hyperdht_punch_stats_open.argtypes = [ctypes.c_void_p]
 lib.hyperdht_punch_stats_open.restype = ctypes.c_int
 
+# Process-wide, not per-DHT: the sockets belong to a udx instance.
+lib.hyperdht_busy_close_count.argtypes = []
+lib.hyperdht_busy_close_count.restype = ctypes.c_uint64
+
 lib.hyperdht_relay_stats_attempts.argtypes = [ctypes.c_void_p]
 lib.hyperdht_relay_stats_attempts.restype = ctypes.c_int
 

@@ -56,6 +56,17 @@ class RelayStats(NamedTuple):
     aborts: int
 
 
+def busy_close_count() -> int:
+    """Sockets whose close was refused because a stream was still attached.
+
+    Process-wide and monotonic, not per-DHT. Zero is the healthy value; a
+    growing count means a connection's socket keepalive was dropped while its
+    stream was still live, parking one fd and one active event-loop handle
+    each time.
+    """
+    return int(_lib.hyperdht_busy_close_count())
+
+
 class Address(NamedTuple):
     """A host:port pair."""
     host: str

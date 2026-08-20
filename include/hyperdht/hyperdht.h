@@ -203,7 +203,15 @@ typedef struct {
     int is_initiator;       /**< 1 if we initiated, 0 if we accepted */
     void* raw_stream;       /**< Pre-created UDX stream (server side), or NULL */
     void* udx_socket;       /**< Socket for UDX connect (from holepunch probe), or NULL */
-    void* _internal;        /**< Opaque — do not touch. Pool socket keepalive. */
+    /**
+     * Opaque — do not touch. Holds the keepalive for the socket this
+     * connection lives on (often a per-session punch socket or a birthday
+     * holder, not a long-lived one). Freed when your connect/connection
+     * callback returns; `hyperdht_stream_open` takes ownership of it, which
+     * is why that call must happen inside the callback. See
+     * `hyperdht_stream_open`.
+     */
+    void* _internal;
 } hyperdht_connection_t;
 
 /* =========================================================================
@@ -550,6 +558,30 @@ typedef void (*hyperdht_data_cb)(const uint8_t* data, size_t len, void* userdata
  * Create an encrypted stream from an established connection.
  * Handles UDX stream setup + SecretStream header exchange automatically.
  * The stream is ready for read/write after on_open fires.
+ *
+ * CONTRACT — call this SYNCHRONOUSLY, inside the `hyperdht_connect_cb` or
+ * `hyperdht_connection_cb` that handed you `conn`. Not after it returns, and
+ * not from a later turn of the event loop.
+ *
+ * A holepunched connection frequently does NOT live on a long-lived socket:
+ * it lives on a per-session punch socket or on one of the 256 birthday
+ * holders, both owned by a session that is torn down the moment the callback
+ * returns. `conn->_internal` carries the reference that keeps that socket
+ * alive, and `hyperdht_stream_open` is what takes ownership of it; the
+ * producer frees `_internal` as soon as your callback returns. Stash the
+ * `hyperdht_connection_t` and open the stream later and the socket is already
+ * gone: `udx_socket_close` saw no attached stream, succeeded, freed the
+ * socket — and your `udx_stream_connect` writes through a dangling pointer.
+ *
+ * There is no way to hold the reference from C without opening the stream,
+ * by design: `_internal` is opaque. If you need the connection to outlive the
+ * callback, open the stream here and carry the `hyperdht_stream_t*` instead —
+ * it owns the keepalive from that point on. `hyperdht_connect_and_open_stream`
+ * does exactly this for the connect side.
+ *
+ * `hyperdht_busy_close_count()` reports violations: it counts sockets that
+ * refused to close because a stream was still attached, which is the mirror
+ * image of this mistake.
  *
  * @param dht     the HyperDHT instance that owns the connection
  * @param conn    connection info from connect or server callback
@@ -1077,6 +1109,22 @@ HYPERDHT_API int hyperdht_relay_stats_aborts(hyperdht_t* dht);
 HYPERDHT_API int hyperdht_punch_stats_consistent(const hyperdht_t* dht);
 HYPERDHT_API int hyperdht_punch_stats_random(const hyperdht_t* dht);
 HYPERDHT_API int hyperdht_punch_stats_open(const hyperdht_t* dht);
+
+/**
+ * How many times a UDP socket close was refused because a stream was still
+ * attached to it (udx returns UV_EBUSY while `socket->streams != NULL`).
+ *
+ * Process-wide and monotonic — NOT per-`dht` — because the sockets belong to
+ * a udx instance, not to a DHT. Zero is the healthy value.
+ *
+ * A non-zero, growing count means some consumer dropped a connection's socket
+ * keepalive while its stream was still live (see `hyperdht_stream_open`).
+ * Each refusal parks one fd and one active uv handle for the lifetime of the
+ * udx instance, so the event loop can no longer drain on shutdown. This is
+ * the only visibility in a Release build, where the debug logging that would
+ * otherwise report it compiles away.
+ */
+HYPERDHT_API uint64_t hyperdht_busy_close_count(void);
 
 /**
  * Ping a peer by host:port. Fires `cb(success, userdata)` when the

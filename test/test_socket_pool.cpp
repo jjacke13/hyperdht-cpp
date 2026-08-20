@@ -302,6 +302,58 @@ TEST_F(SocketPoolTest, BusyCloseLeavesRefOpenAndGuarded) {
     pool.destroy();
 }
 
+// `SocketPool::destroy()` carried the same lie `SocketRef::do_close` used to:
+// an unchecked `udx_socket_close` plus an unconditional `closed_ = true`. On
+// UV_EBUSY the socket is still open — fd parked, uv handle active, the loop
+// cannot drain — and flagging it closed makes the ref stop retrying, so
+// nothing ever closes it. Destroy must go through the checked close and leave
+// a refused ref closeable by its own later `do_close()`, without that retry
+// reaching back into the destroyed pool.
+TEST_F(SocketPoolTest, DestroyLeavesBusySocketOpenAndRetryable) {
+    SocketPool pool(&loop_, &udx_);
+    auto* ref = pool.acquire();
+    ASSERT_NE(ref, nullptr);
+    // The dangerous shape: a route made this ref reusable, so a naive retry
+    // would take do_close's linger branch and touch the dead pool.
+    ref->reusable = true;
+
+    udx_stream_t stream{};
+    ASSERT_EQ(udx_stream_init(&udx_, &stream, 7778,
+                              [](udx_stream_t*, int) {}, nullptr), 0);
+    struct sockaddr_in dest{};
+    uv_ip4_addr("127.0.0.1", 12346, &dest);
+    ASSERT_EQ(udx_stream_connect(&stream, ref->socket(), 1,
+                                 reinterpret_cast<const struct sockaddr*>(&dest)),
+              0);
+
+    uint64_t before = hyperdht::udx::busy_close_count();
+    pool.destroy();
+    EXPECT_EQ(hyperdht::udx::busy_close_count(), before + 1)
+        << "destroy must use the checked close";
+    EXPECT_FALSE(ref->is_closed()) << "ref claims closed while udx refused";
+    EXPECT_FALSE(ref->reusable)
+        << "a ref outliving its pool must never try to linger";
+
+    // The adopted stream's owner finally lets go: the orphaned ref must still
+    // be able to close itself.
+    hyperdht::udx::destroy_stream_once(&stream);
+    for (int i = 0; i < 50 && ref->socket()->streams != nullptr; i++) {
+        uv_run(&loop_, UV_RUN_NOWAIT);
+    }
+    ASSERT_EQ(ref->socket()->streams, nullptr) << "stream never detached";
+
+    ref->release();  // refs → 0 → do_close() retries
+    EXPECT_TRUE(ref->is_closed());
+
+    // Bounded, not run_loop(): before the fix the socket stays open forever
+    // and UV_RUN_DEFAULT would hang the suite instead of failing it.
+    for (int i = 0; i < 200; i++) uv_run(&loop_, UV_RUN_NOWAIT);
+    // destroy() deliberately never deletes refs (outstanding keepalives may
+    // still call inactive() on them), and socket_.data was nulled, so
+    // on_socket_close skipped remove(). This orphan is ours to reap.
+    delete ref;
+}
+
 TEST_F(SocketPoolTest, DestroyClosesAll) {
     SocketPool pool(&loop_, &udx_);
 

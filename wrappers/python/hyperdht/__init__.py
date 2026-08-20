@@ -35,6 +35,7 @@ from hyperdht._bindings import (
     Query,
     RelayStats,
     Stream,
+    busy_close_count,
 )
 from hyperdht._ffi import (
     ERR_CANCELLED,
@@ -65,6 +66,8 @@ __all__ = [
     "PunchStats",
     "RelayStats",
     "Address",
+    # Diagnostics
+    "busy_close_count",
     # Firewall constants
     "FIREWALL_UNKNOWN",
     "FIREWALL_OPEN",

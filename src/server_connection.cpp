@@ -71,6 +71,7 @@ ServerConnection::ServerConnection(ServerConnection&& other) noexcept
       punch_sampling_done(other.punch_sampling_done),
       parked_rounds(std::move(other.parked_rounds)),
       created_at(other.created_at),
+      relay_token(other.relay_token),
       upgrade(std::move(other.upgrade)) {
     other.raw_stream = nullptr;  // Transfer ownership
 }
@@ -101,6 +102,7 @@ ServerConnection& ServerConnection::operator=(ServerConnection&& other) noexcept
         punch_sampling_done = other.punch_sampling_done;
         parked_rounds = std::move(other.parked_rounds);
         created_at = other.created_at;
+        relay_token = other.relay_token;
         upgrade = std::move(other.upgrade);
     }
     return *this;

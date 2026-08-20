@@ -582,3 +582,31 @@ TEST(PeerHandshakeReply, MissingUdxTerminal) {
     EXPECT_FALSE(r.success);
     EXPECT_TRUE(r.terminal);
 }
+
+// ---------------------------------------------------------------------------
+// ServerConnection move ops must carry every field.
+//
+// `relay_token` was missing from BOTH the move constructor and the move
+// assignment, so a moved connection silently lost it. That un-gates
+// `Server::session_relay_engaged()` (server.cpp), which decides whether a
+// session's blind-relay chain is live purely by testing the token for
+// non-zero bytes — a zeroed token reads as "no relay engaged" and the relay
+// teardown/keepalive logic takes the wrong branch. Latent only because the
+// token happens to be written after the last move today.
+// ---------------------------------------------------------------------------
+
+TEST(ServerConnectionMove, CarriesRelayToken) {
+    std::array<uint8_t, 32> tok{};
+    tok.fill(0xA7);
+
+    ServerConnection a;
+    a.relay_token = tok;
+    ServerConnection moved(std::move(a));
+    EXPECT_EQ(moved.relay_token, tok) << "move ctor dropped relay_token";
+
+    ServerConnection b;
+    b.relay_token = tok;
+    ServerConnection assigned;
+    assigned = std::move(b);
+    EXPECT_EQ(assigned.relay_token, tok) << "move assign dropped relay_token";
+}

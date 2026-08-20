@@ -956,38 +956,33 @@ has still never carried a packet against a real peer.**
     the punch socket, per gotcha 19b.
   - `Client punching (id=0, fw=2, 2 addrs)` — JS accepted our reply and declared
     punching.
-- [x] **CROSS-NAT PUNCH PROVEN, AND A/B'd AGAINST `main` — 2026-08-20.** Real phone on
-      mobile CGNAT (`109.178.227.21`) → this laptop behind a home NAT (`2.86.44.35`),
-      via a scratch nospoon-cpp server on TUN `10.100.0.1`. **Fast-mode ping disabled on
-      both sides** (a temporary `disable_fast_mode_ping` member, patched identically
-      into a `main` worktree for the comparison), so the connection had to complete
-      through the real probe loop. Same server key (deterministic seed), same phone,
-      same carrier, minutes apart, only the branch differing:
+- [x] **CROSS-NAT PUNCH PROVEN ON THE BRANCH — 2026-08-20.** Real phone on mobile CGNAT
+      (`109.178.227.21`) → this laptop behind a home NAT (`2.86.44.35`), via a scratch
+      nospoon-cpp server on TUN `10.100.0.1`, with the **fast-mode ping disabled** so
+      the connection had to complete through the real probe loop. Branch connected 2/2,
+      one probe each, both rounds arriving on the per-session punch socket:
+      `Round on punch socket` ×2 → `Client punching (fw=2, 1 addrs)` →
+      `[hp] Sending probe` ×1 → `rawStream firewall` → `Stream open`.
+      **The punch loop itself is proven to work cross-NAT.** That much is solid.
+- [ ] **THE A/B AGAINST `main` IS INCONCLUSIVE — do not repeat my mistake of calling
+      it.** First `main` trial failed exactly like the field: 10 probes to a *correct*
+      address, nothing back, `Session cleanup`, phone hung 3 minutes. I wrote that up as
+      decisive. **The very next `main` trial connected 3/3, one probe each.** Running
+      tally: branch 2/2, main 3/4.
 
-      | | `main` @ `ba03888` | this branch |
-      |---|---|---|
-      | rounds arrive on | shared announce socket | **per-session punch socket** (both rounds) |
-      | `Client punching` | yes, `fw=2, 1 addrs` | yes, `fw=2, 1 addrs` |
-      | probes sent | **10** (full CONSISTENT 1 s schedule) | **1** |
-      | outcome | **all 10 vanished → `Session cleanup`** | `rawStream firewall` → `Stream open` |
+      The failure is REAL and is a faithful reproduction of Finding Q's signature — but
+      it is **intermittent**, which is what Finding Q always was. A single trial per arm
+      therefore proves nothing in either direction, and the branch has not been run
+      often enough to show it does not also fail sometimes.
 
-      `main`: `[hp] Sending probe to 109.178.227.21:1305` ×10, nothing back, phone stuck
-      on "connecting…" for 3 minutes. Branch: `[hp] Sending probe to
-      109.178.227.21:1388` ×1, connected immediately.
-
-      **This is Finding Q's exact signature** — probes leaving on a *correct* 4-tuple
-      and nothing returning — and the branch eliminates it. Mechanism: `main` probes
-      from the long-lived announce mapping (shared with announces and relay
-      keepalives); the branch probes from a fresh per-session socket whose mapping is
-      what the relay observed *for this session*, so the client's pinhole matches and
-      probe #1 lands. Logs kept at
-      `scratchpad/nospoon-test/nofast-{BRANCH,MAIN}.log` (session-local, copy them out
-      if they matter).
-- [ ] n=1 per arm. Worth repeating a few times, and on a second carrier/network, before
-      treating the A/B as settled. Earlier same-machine observation (also n=1, and
-      confounded by hairpin): `WAN_ONLY=1` + `NO_FAST_PING=1` had the JS client abort at
-      4.5 s without sending round 2, while `WAN_ONLY=1` alone got round 2 — consistent
-      with gotcha 19b, but the phone A/B above is the trustworthy evidence.
+      To actually settle it: the base failure rate looks like ~25%, so this needs
+      **dozens of alternating trials per arm**, which means an automatable client on a
+      genuinely remote host (a VPS), not a phone tapped by hand. Harness for it already
+      exists: `scratchpad/arm.sh <main|branch> <runid>` swaps the server between arms
+      (same deterministic seed → same public key → the client never reconfigures), and
+      `test/js/connect_by_key.js` is a scriptable client. Per-trial verdict comes from
+      the log counts, not from "it connected": `[hp] Sending probe` (1 = landed
+      immediately, 10 = full schedule into the void) and `Stream open`.
 - [ ] **nospoon needs one line when its pin is bumped**: hold `info.socket_keepalive`
       alongside the peer's duplex (`~/Desktop/repos/nospoon/cpp/server.cpp:93-97`
       connects synchronously today, so it currently parks one fd per punched connection).

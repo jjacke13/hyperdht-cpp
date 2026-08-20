@@ -956,20 +956,38 @@ has still never carried a packet against a real peer.**
     the punch socket, per gotcha 19b.
   - `Client punching (id=0, fw=2, 2 addrs)` — JS accepted our reply and declared
     punching.
-- [ ] **A completed cross-NAT punch is still UNPROVEN, and cannot be proven on one
-      machine.** Both ends share a public IP here, so there are only two outcomes and
-      neither is a real test: advertise LAN and the client takes the LAN shortcut
-      (connects in ~359 ms with `dht.stats.punches` all zero — the punch path never
-      runs), or set `HYPERDHT_LIVE_WAN_ONLY=1` and the punch becomes a hairpin to our
-      own public IP, which this router does not support. **Needs a genuinely remote
-      peer — the phone on mobile data is the intended test.**
-- [ ] Observation from that session, n=1 each, worth confirming in the field: with
-      `WAN_ONLY=1` **and** `NO_FAST_PING=1` the JS client aborted at 4.5 s having never
-      sent round 2, while `WAN_ONLY=1` alone (fast mode allowed) got round 2 and
-      `Client punching`. Consistent with gotcha 19b — the server must transmit toward
-      the client on round 1 before it will declare punching — and it is the mechanism
-      behind the field reports of "it only connects when fast-mode fires". Do not treat
-      as established from two runs.
+- [x] **CROSS-NAT PUNCH PROVEN, AND A/B'd AGAINST `main` — 2026-08-20.** Real phone on
+      mobile CGNAT (`109.178.227.21`) → this laptop behind a home NAT (`2.86.44.35`),
+      via a scratch nospoon-cpp server on TUN `10.100.0.1`. **Fast-mode ping disabled on
+      both sides** (a temporary `disable_fast_mode_ping` member, patched identically
+      into a `main` worktree for the comparison), so the connection had to complete
+      through the real probe loop. Same server key (deterministic seed), same phone,
+      same carrier, minutes apart, only the branch differing:
+
+      | | `main` @ `ba03888` | this branch |
+      |---|---|---|
+      | rounds arrive on | shared announce socket | **per-session punch socket** (both rounds) |
+      | `Client punching` | yes, `fw=2, 1 addrs` | yes, `fw=2, 1 addrs` |
+      | probes sent | **10** (full CONSISTENT 1 s schedule) | **1** |
+      | outcome | **all 10 vanished → `Session cleanup`** | `rawStream firewall` → `Stream open` |
+
+      `main`: `[hp] Sending probe to 109.178.227.21:1305` ×10, nothing back, phone stuck
+      on "connecting…" for 3 minutes. Branch: `[hp] Sending probe to
+      109.178.227.21:1388` ×1, connected immediately.
+
+      **This is Finding Q's exact signature** — probes leaving on a *correct* 4-tuple
+      and nothing returning — and the branch eliminates it. Mechanism: `main` probes
+      from the long-lived announce mapping (shared with announces and relay
+      keepalives); the branch probes from a fresh per-session socket whose mapping is
+      what the relay observed *for this session*, so the client's pinhole matches and
+      probe #1 lands. Logs kept at
+      `scratchpad/nospoon-test/nofast-{BRANCH,MAIN}.log` (session-local, copy them out
+      if they matter).
+- [ ] n=1 per arm. Worth repeating a few times, and on a second carrier/network, before
+      treating the A/B as settled. Earlier same-machine observation (also n=1, and
+      confounded by hairpin): `WAN_ONLY=1` + `NO_FAST_PING=1` had the JS client abort at
+      4.5 s without sending round 2, while `WAN_ONLY=1` alone got round 2 — consistent
+      with gotcha 19b, but the phone A/B above is the trustworthy evidence.
 - [ ] **nospoon needs one line when its pin is bumped**: hold `info.socket_keepalive`
       alongside the peer's duplex (`~/Desktop/repos/nospoon/cpp/server.cpp:93-97`
       connects synchronously today, so it currently parks one fd per punched connection).

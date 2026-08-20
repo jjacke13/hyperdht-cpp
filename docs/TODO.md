@@ -845,13 +845,62 @@ second parity oracle. Two workstreams:
 
 ---
 
-## J. Server per-session punch socket (branch `feat/server-punch-socket`, IN PROGRESS)
+## J. Server per-session punch socket (branch `feat/server-punch-socket`)
+
+> ### ✅ APPROVED TO MERGE — do it on/after **2026-08-23** (Vaios back from vacation)
+>
+> Decision taken 2026-08-20. **Merge it for the JS parity, NOT as a Finding Q fix.**
+> Branch HEAD `b357923`, 767/767, ASAN 0 errors across every binary, whole-branch
+> cpp-reviewer done, live JS-interop verified against real hyperdht 6.29.1 on the
+> public DHT, and a real cross-NAT punch proven against a phone on mobile CGNAT.
+>
+> **Parity actually restored** (this is the justification — each is a real divergence
+> from the JS reference that this branch closes):
+> 1. **Per-session punch socket** — JS `holepuncher.js:14` (`dht._socketPool.acquire()`),
+>    server side `server.js:436`. We punched from the persistent announce socket. This
+>    is the headline item.
+> 2. `addresses4` = `[remoteAddress] + LAN` (JS `server.js` shape) — replaced a sampler
+>    dump plus a port rewrite that produced duplicate `addr[0]==addr[1]` in the field.
+> 3. `remoteAddress()` reads the RING sampler (dht-rpc `_nat` role), not the Nat
+>    classifier, and one `ourRemoteAddr` keys firewall + holepunch + addresses4 together
+>    (`server.js:271,357-359`).
+> 4. Round replies deferred until NAT sampling settles — JS `await p.analyze()`
+>    (`server.js:518-519`).
+> 5. NAT discovery resolves on classification, not on the last straggler ping — JS
+>    `nat.js:172-179`.
+> 6. Session NAT sampler fed only by AUTHENTICATED rounds — JS `server.js:491-511`.
+>    (Also a security fix: 3 spoofed sources could otherwise pin an attacker address.)
+> 7. Fast-mode ping egresses from the punch socket — JS `holepuncher.js:77`.
+> 8. Probe echo + stream adoption on the punch socket.
+>
+> **NOT parity — beyond-JS additions, review them as such before merging:**
+> - `Server::disable_fast_mode_ping` (default **false**, no JS equivalent). Diagnostic
+>   only, but it is the ONLY way to reproduce Finding Q on demand, so it earns its
+>   place. Keep, or drop it and lose the reproduction — an explicit call to make.
+> - Bug fixes JS gets for free from GC or simply does not have: BUG B
+>   (`~Holepuncher` releasing holders + the random-punch throttle), `relay_token` in
+>   both `ServerConnection` move ops, `SocketPool::destroy` checked close,
+>   `~SecretStreamDuplex` writing through a freed `raw_stream_`,
+>   `hyperdht_busy_close_count()` on the C FFI.
+>
+> **Pre-merge checklist:**
+> - [ ] Re-run `ctest -E 'LiveServer|test_server_live'` (expect 767/767) + the ASAN
+>       per-binary sweep (expect 0 `ERROR: AddressSanitizer`; leaks unchanged).
+> - [ ] Decide explicitly on shipping `disable_fast_mode_ping`.
+> - [ ] Merge direct to `main` (this repo has no PR gate) and push.
+> - [ ] Bump nospoon's pin: `~/Desktop/repos/nospoon/cpp/hyperdht-cpp.nix` `rev` + `hash`
+>       (still on `3421264`), and add the one-line `info.socket_keepalive` hold in
+>       `nospoon/cpp/server.cpp` — the field run confirmed the predicted
+>       `socket close refused` fd parking.
+>
+> **Do NOT claim it fixes Finding Q.** A/B'd on a real CGNAT path: branch 1/14 black
+> holes vs main 3/12, p≈0.31 — not significant, and the branch's own failure used the
+> entire new path. Honest field line: *"may reduce the -5s, unproven."* Q stays open;
+> see §J.4.
 
 Plan: `docs/superpowers/plans/2026-08-17-server-punch-socket-parity.md`.
 Ledger: `.superpowers/sdd/2026-08-17-server-punch-socket-parity/progress.md` (every
 parked finding + deferred minor lives there — read it before resuming).
-State: Tasks 1-5 done, HEAD `22bf567`, 762/762. **Task 6 pending. Not merged, not
-field-tested, not shippable.**
 
 **Why:** the C++ server punched from the persistent announce socket (shared with
 announces, relay keepalives and all DHT RPC for the process lifetime); JS acquires a

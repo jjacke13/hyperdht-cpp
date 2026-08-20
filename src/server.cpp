@@ -1549,7 +1549,8 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
     // relay-observed source. The client's round-1 TTL fast-open primed its
     // NAT for exactly this packet — on well-behaved NATs the punch
     // completes here, ~1 RTT after handshake, without a round 2.
-    if ((our_fw == peer_connect::FIREWALL_CONSISTENT ||
+    if (!disable_fast_mode_ping &&
+        (our_fw == peer_connect::FIREWALL_CONSISTENT ||
          our_fw == peer_connect::FIREWALL_OPEN) &&
         reply.remote_address.has_value() &&
         has_same_addr(our_addrs, *reply.remote_address)) {

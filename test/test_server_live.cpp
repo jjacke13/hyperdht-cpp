@@ -5,11 +5,13 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <cstdlib>
 
 #include <sodium.h>
 #include <uv.h>
 
 #include "hyperdht/dht.hpp"
+#include "hyperdht/udx.hpp"
 
 using namespace hyperdht;
 
@@ -29,7 +31,36 @@ TEST(LiveServer, WaitForConnection) {
     dht.bind();
     printf("  Bound to port %u\n", dht.port());
 
+    // HYPERDHT_LIVE_WAN_ONLY=1 — stop advertising our LAN addresses, so a
+    // client on the same subnet cannot take the LAN shortcut and has to
+    // holepunch to our public address like a real remote peer. Without this,
+    // a same-machine or same-LAN cross-test connects in ~1s over 192.168.x
+    // and never exercises the punch path at all (JS `dht.stats.punches` stays
+    // all-zero, which is the tell).
+    if (const char* wan = std::getenv("HYPERDHT_LIVE_WAN_ONLY")) {
+        if (wan[0] == '1') {
+            for (const auto& a : dht.local_addresses_now()) {
+                printf("  WAN-ONLY: excluding local address %s\n",
+                       a.host_string().c_str());
+                dht.exclude_local_address(a.host_string());
+            }
+        }
+    }
+
     auto* srv = dht.create_server();
+
+    // HYPERDHT_LIVE_NO_FAST_PING=1 — suppress the fast-mode ping so the
+    // connection has to complete through the slow probe loop. Combined with
+    // WAN_ONLY above this reproduces the field-failing shape deliberately:
+    // the reports were "it only connects when fast-mode fires", which is
+    // exactly what you cannot reproduce while fast mode is allowed to fire.
+    if (const char* nf = std::getenv("HYPERDHT_LIVE_NO_FAST_PING")) {
+        if (nf[0] == '1') {
+            srv->disable_fast_mode_ping = true;
+            printf("  NO-FAST-PING: fast-mode ping suppressed; "
+                   "the punch must come from the probe loop\n");
+        }
+    }
 
     bool got_connection = false;
     server::ConnectionInfo conn_info;
@@ -71,6 +102,18 @@ TEST(LiveServer, WaitForConnection) {
     if (got_connection) {
         printf("  SUCCESS — JS client connected to C++ server!\n");
     }
+
+    // Which strategy actually ran. All-zero with a connection means the peer
+    // took a shortcut (LAN, or already-open) and the punch path was never
+    // exercised — re-run with HYPERDHT_LIVE_WAN_ONLY=1 to force it.
+    const auto& st = dht.stats();
+    printf("  punches: consistent=%d random=%d open=%d\n",
+           st.punches.consistent, st.punches.random, st.punches.open);
+    // Must be 0. Anything else means a socket close was refused because a
+    // stream was still attached, i.e. someone dropped a socket keepalive
+    // early (see hyperdht_stream_open's contract).
+    printf("  busy_close_count: %llu\n",
+           static_cast<unsigned long long>(udx::busy_close_count()));
 
     EXPECT_TRUE(got_connection) << "No connection received within 120s";
 

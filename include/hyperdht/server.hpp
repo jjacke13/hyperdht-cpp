@@ -271,6 +271,16 @@ public:
     uint64_t relay_keep_alive = 5000;  // JS default: 5000ms
     bool reusable_socket = false;      // JS default: false (holesail sets true)
 
+    // DIAGNOSTIC ONLY — never set this in production.
+    //
+    // Suppresses the fast-mode ping (JS server.js:528-537), forcing every
+    // connection down the slow probe loop instead. That matters because the
+    // fast path masks the slow one: field reports of "it only connects when
+    // fast-mode fires" are unreproducible unless you can turn fast mode off
+    // on demand. With this set, a successful connect proves the probe loop
+    // itself works end to end.
+    bool disable_fast_mode_ping = false;
+
 private:
     rpc::RpcSocket& socket_;
     router::Router& router_;

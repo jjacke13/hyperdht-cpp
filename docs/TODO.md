@@ -1005,13 +1005,29 @@ has still never carried a packet against a real peer.**
 - **Server-side causes are now largely excluded**: fresh per-session socket, correct
   and freshly-observed destination address, sampling settled, `Client punching` with a
   gossiped address, probes provably sent. All present in the failing runs.
+- **No server-side discriminator exists.** All 25 sessions were mined across handshake
+  source port, probed port, the delta between them, which relay forwarded the round,
+  which arm, and position within the run. **Nothing separates the 4 failures from the
+  21 successes** — every dimension overlaps, failures are interleaved with successes
+  rather than clustered (`id=5` fail, `7` and `10` ok, `11` fail), and the only
+  suggestive signal (probed > handshake port in 4/4 failures) is p≈0.11 against a 57%
+  baseline, i.e. nothing. Everything the server can observe looks identical in the runs
+  that work and the runs that die.
 - **So the remaining suspect is the CLIENT's pinhole**, which is where Finding Q's
   still-missing measurement always pointed: does the client's own round-1 fast-open
   (TTL-5) priming packet actually leave its carrier NAT? If that priming is dropped,
   there is no pinhole, every server probe dies, and the outcome is binary and
-  intermittent — matching all 22 observations. **Next test: capture at the client
+  intermittent — matching all 25 observations. **Next test: capture at the client
   egress.** Use a laptop tethered to mobile data as the client (the phone cannot
-  tcpdump unrooted).
+  tcpdump unrooted). Ruled out on the way: the phone is NOT running a stale client —
+  its `libhyperdht_jni.so` is dated 2026-08-04 and B2 (`f6608b7`) landed 2026-08-02 —
+  and the `1 addrs` it gossips is correct, JS-identical behaviour for a port-consistent
+  NAT (all samples collapse to one `_samplesFull` entry, so JS emits one address too).
+- **Diagnostic gap to close first:** the DHT_LOG output has **no timestamps**, so
+  nothing in these logs can be correlated with wall-clock, inter-attempt spacing, or
+  carrier events. Add a timestamp prefix to `DHT_LOG` (or run the server under
+  `systemd-cat`/journal and read it there) before the next field round — several
+  questions here were unanswerable purely for want of a clock.
 - [ ] **nospoon needs one line when its pin is bumped**: hold `info.socket_keepalive`
       alongside the peer's duplex (`~/Desktop/repos/nospoon/cpp/server.cpp:93-97`
       connects synchronously today, so it currently parks one fd per punched connection).

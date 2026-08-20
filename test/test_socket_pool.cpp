@@ -302,19 +302,23 @@ TEST_F(SocketPoolTest, BusyCloseLeavesRefOpenAndGuarded) {
     pool.destroy();
 }
 
-// `SocketPool::destroy()` carried the same lie `SocketRef::do_close` used to:
-// an unchecked `udx_socket_close` plus an unconditional `closed_ = true`. On
-// UV_EBUSY the socket is still open — fd parked, uv handle active, the loop
-// cannot drain — and flagging it closed makes the ref stop retrying, so
-// nothing ever closes it. Destroy must go through the checked close and leave
-// a refused ref closeable by its own later `do_close()`, without that retry
-// reaching back into the destroyed pool.
-TEST_F(SocketPoolTest, DestroyLeavesBusySocketOpenAndRetryable) {
+// `SocketPool::destroy()` used an UNCHECKED `udx_socket_close`, so a refusal
+// (UV_EBUSY, i.e. a stream is still attached) was swallowed whole: no counter,
+// and in a Release build no log either. It must go through the checked close.
+//
+// It must NOT also copy the other half of `SocketRef::do_close` and leave
+// `closed_` false so the next `inactive()` retries. A ref that survives
+// destroy() outlives the udx_t too — `udx_t` is a value member of RpcSocket
+// and HyperDHT declares `socket_` before `socket_pool_`, so the pool is torn
+// down first and the udx_t dies moments later in the same destructor. That
+// retry would be `udx_socket_close` on freed memory. Destroy reports the
+// refusal and then disarms the ref permanently.
+TEST_F(SocketPoolTest, DestroyCountsBusyRefusalAndDisarmsRef) {
     SocketPool pool(&loop_, &udx_);
     auto* ref = pool.acquire();
     ASSERT_NE(ref, nullptr);
-    // The dangerous shape: a route made this ref reusable, so a naive retry
-    // would take do_close's linger branch and touch the dead pool.
+    // The dangerous shape: a route made this ref reusable, so any later
+    // do_close would take the linger branch into the dead pool.
     ref->reusable = true;
 
     udx_stream_t stream{};
@@ -329,24 +333,27 @@ TEST_F(SocketPoolTest, DestroyLeavesBusySocketOpenAndRetryable) {
     uint64_t before = hyperdht::udx::busy_close_count();
     pool.destroy();
     EXPECT_EQ(hyperdht::udx::busy_close_count(), before + 1)
-        << "destroy must use the checked close";
-    EXPECT_FALSE(ref->is_closed()) << "ref claims closed while udx refused";
+        << "destroy must use the checked close so the refusal is counted";
+    EXPECT_TRUE(ref->is_closed())
+        << "a ref that outlives the udx_t must never retry its close";
     EXPECT_FALSE(ref->reusable)
         << "a ref outliving its pool must never try to linger";
 
-    // The adopted stream's owner finally lets go: the orphaned ref must still
-    // be able to close itself.
+    // The adopted stream's owner finally lets go. Every remaining ref-count
+    // path must now be inert — none of them may reach udx_socket_close.
     hyperdht::udx::destroy_stream_once(&stream);
     for (int i = 0; i < 50 && ref->socket()->streams != nullptr; i++) {
         uv_run(&loop_, UV_RUN_NOWAIT);
     }
     ASSERT_EQ(ref->socket()->streams, nullptr) << "stream never detached";
+    ref->release();      // refs → 0 → close_maybe() → must stay a no-op
+    ref->active();
+    ref->inactive();     // the keepalive-deleter path, same requirement
 
-    ref->release();  // refs → 0 → do_close() retries
-    EXPECT_TRUE(ref->is_closed());
-
-    // Bounded, not run_loop(): before the fix the socket stays open forever
-    // and UV_RUN_DEFAULT would hang the suite instead of failing it.
+    // The fd really is parked — that is the documented price of the refusal,
+    // and only an explicit close reclaims it. Doing it here is also what lets
+    // the fixture's UV_RUN_DEFAULT drain.
+    udx_socket_close(ref->socket());
     for (int i = 0; i < 200; i++) uv_run(&loop_, UV_RUN_NOWAIT);
     // destroy() deliberately never deletes refs (outstanding keepalives may
     // still call inactive() on them), and socket_.data was nulled, so

@@ -1686,6 +1686,10 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                     // Same rule as on_socket below: the winning holder's
                     // socket is owned by the puncher we are about to drop
                     // (connect.cpp:928 does this on the client side).
+                    // Ignored when the firewall tap already migrated this
+                    // stream onto the punch socket — set_socket_keepalive
+                    // refuses to replace a pin after the one-shot upgrade
+                    // (relay_upgrade.hpp).
                     if (hp.socket_keepalive) {
                         conn_ptr->upgrade->set_socket_keepalive(
                             hp.socket_keepalive);

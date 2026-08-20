@@ -204,12 +204,27 @@ void SocketPool::destroy() {
         // A ref that survives us must never take do_close's linger branch:
         // that touches pool_.lingering_, and we are the pool.
         ref->reusable = false;
-        // Same rule as SocketRef::do_close — udx refuses (UV_EBUSY) while a
-        // stream is still attached, and claiming `closed_` on a refusal is the
-        // lie that leaves the fd parked and the loop undrainable with nothing
-        // left to retry. Staying "not closed" lets the adopted stream's owner
-        // close this orphan through its own inactive()/release() later.
-        if (udx::close_socket_unless_busy(&ref->socket_)) ref->closed_ = true;
+        // Go through the CHECKED close so a refusal (UV_EBUSY — a stream is
+        // still attached) lands in udx::busy_close_count() instead of being
+        // swallowed. That counter is the only report of this in a Release
+        // build, and a refusal here means a consumer dropped a connection's
+        // socket keepalive while its stream was still live.
+        udx::close_socket_unless_busy(&ref->socket_);
+        // Then flag closed EVEN on a refusal — the opposite of
+        // SocketRef::do_close, and deliberately so. do_close leaves `closed_`
+        // false precisely so the next inactive() retries; here there is
+        // nothing safe to retry INTO. This ref is about to outlive not just
+        // the pool but the udx_t: `udx_t` is a value member of RpcSocket
+        // (rpc.hpp), and HyperDHT declares `socket_` before `socket_pool_`
+        // (dht.hpp), so the pool is torn down first and the udx_t dies moments
+        // later in the same ~HyperDHT. A late inactive() from an outstanding
+        // keepalive would otherwise reach do_close → udx_socket_close →
+        // udx__link_remove() on a freed udx_t. `closed_` makes that late call
+        // the no-op the NOTE below already relies on.
+        //
+        // The parked fd is the price, and it is unavoidable without a real
+        // reaper: nothing in this codebase calls udx_teardown().
+        ref->closed_ = true;
     }
     sockets_.clear();     // H9: pool is destroyed, entries are stale
     lingering_.clear();

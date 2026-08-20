@@ -154,6 +154,76 @@ TEST(RelayUpgradeContext, SocketKeepaliveHoldsTheMigrationTarget) {
     uv_loop_close(&loop);
 }
 
+// Once the migration has fired, the pin must not be REPLACED.
+//
+// `on_socket` is one-shot, so after the firewall tap has already moved the
+// stream onto (say) the punch socket, a later caller offering the puncher's
+// winning birthday holder is offering a socket this stream is NOT on — and its
+// own `on_socket` is a no-op. Taking that ref anyway drops the only reference
+// to the socket the stream is actually living on, and it closes underneath.
+// Both punch-success call sites do exactly this (`src/server.cpp` in the
+// puncher's on_connect, `src/connect.cpp` on the client side), which is why
+// the rule is enforced here rather than at either of them.
+TEST(RelayUpgradeContext, SocketKeepaliveIsNotReplacedAfterUpgrade) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    Udx udx(&loop);
+
+    UdxSocket relay(udx);
+    auto a = loopback(0);
+    ASSERT_EQ(relay.bind(reinterpret_cast<const struct sockaddr*>(&a)), 0);
+
+    auto punch = std::make_shared<hyperdht::holepunch::PoolSocket>(
+        &loop, udx.handle());
+    ASSERT_EQ(punch->bind(), 0);
+    std::weak_ptr<hyperdht::holepunch::PoolSocket> weak_punch = punch;
+    auto* punch_handle = punch->socket_handle();
+    struct sockaddr_in punch_addr{};
+    int len = sizeof(punch_addr);
+    udx_socket_getsockname(punch_handle,
+                           reinterpret_cast<struct sockaddr*>(&punch_addr), &len);
+
+    // The puncher's winning birthday holder — a DIFFERENT socket.
+    auto holder = std::make_shared<hyperdht::holepunch::PoolSocket>(
+        &loop, udx.handle());
+    ASSERT_EQ(holder->bind(), 0);
+    std::weak_ptr<hyperdht::holepunch::PoolSocket> weak_holder = holder;
+
+    UdxStream stream(udx, 1, [](udx_stream_t*, int) {}, nullptr);
+    auto relay_bound = bound_of(relay);
+    ASSERT_EQ(stream.connect(relay, 2,
+                             reinterpret_cast<const struct sockaddr*>(&relay_bound)),
+              0);
+
+    auto ctx = std::make_shared<UpgradeContext>(stream.handle(), 2,
+                                                relay.handle());
+    ctx->set_socket_keepalive(punch);
+    punch.reset();
+
+    // The client's direct nudge migrates the stream onto the punch socket.
+    ctx->on_firewall(punch_handle,
+                     reinterpret_cast<const struct sockaddr*>(&punch_addr));
+    ASSERT_TRUE(ctx->is_upgraded());
+
+    // Now the puncher finally wins on a holder and offers its keepalive.
+    ctx->set_socket_keepalive(holder);
+    holder.reset();
+
+    EXPECT_FALSE(weak_punch.expired())
+        << "the socket the stream migrated onto was released";
+    EXPECT_TRUE(weak_holder.expired())
+        << "a socket this stream is not on must not be pinned";
+
+    udx_stream_destroy(stream.handle());
+    uv_run(&loop, UV_RUN_NOWAIT);
+    ctx.reset();
+    EXPECT_TRUE(weak_punch.expired());
+
+    relay.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
 // A stream that was never connected: stream->socket is null. try_change_remote
 // must NOT touch udx (which would dereference null / hit the same-udx assert) —
 // it degrades to STAY_ON_RELAY. Doc hazard 6.
@@ -708,6 +778,12 @@ struct FakeRelayPeer {
         start_timer_.reset();
         node_.close();
         ep_.close();
+        // Both closes are ASYNC, and the uv handles they close live inside
+        // THIS object — libudx's on_uv_close (udx.c:140) reads back through
+        // them. The loop has to turn while we are still alive or the callback
+        // lands on freed memory. (The call sites say the same thing about
+        // `silent`; this one just never drained itself.)
+        for (int i = 0; i < 200; i++) uv_run(loop_, UV_RUN_NOWAIT);
     }
 
     Ipv4Address node_addr() {

@@ -119,7 +119,18 @@ public:
 
     // Take over the punched pool socket's keepalive (doc hazard 3) so the
     // direct socket stays pinned for the emitted stream's whole life.
+    //
+    // Never REPLACES an existing pin once the migration has fired. `on_socket`
+    // is one-shot, so after the firewall tap has already moved the stream onto
+    // one socket, a later caller — the puncher finally winning on a birthday
+    // holder — is offering a socket this stream is NOT on, and its own
+    // `on_socket` is a no-op. Taking that ref would drop the only reference to
+    // the socket the stream is actually living on, closing it underneath.
+    // Both punch-success call sites (src/server.cpp in the puncher's
+    // on_connect, src/connect.cpp on the client side) hit this, so the rule
+    // lives here rather than in either of them.
     void set_socket_keepalive(std::shared_ptr<void> ka) {
+        if (upgraded_ && socket_keepalive_) return;
         socket_keepalive_ = std::move(ka);
     }
 

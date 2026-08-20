@@ -18,6 +18,7 @@
 #include "hyperdht/compact.hpp"
 #include "hyperdht/holepunch.hpp"
 #include "hyperdht/messages.hpp"
+#include "hyperdht/routing_table.hpp"
 #include "hyperdht/udx.hpp"
 
 using hyperdht::compact::Ipv4Address;
@@ -25,6 +26,37 @@ using hyperdht::holepunch::PoolSocket;
 using hyperdht::udx::Udx;
 using hyperdht::udx::UdxSocket;
 namespace messages = hyperdht::messages;
+
+namespace {
+
+uint16_t port_of(udx_socket_t* s) {
+    struct sockaddr_in a{};
+    int len = sizeof(a);
+    udx_socket_getsockname(s, reinterpret_cast<struct sockaddr*>(&a), &len);
+    return ntohs(a.sin_port);
+}
+
+// Reply straight back on the socket a datagram arrived on. Used by the
+// throwaway responders below, which have no fixture to lean on.
+void send_raw(udx_socket_t* s, const std::vector<uint8_t>& data,
+              const struct sockaddr_in* to) {
+    struct SendCtx {
+        udx_socket_send_t req{};
+        std::vector<uint8_t> buf;
+    };
+    auto* ctx = new SendCtx;
+    ctx->buf = data;
+    ctx->req.data = ctx;
+    uv_buf_t b = uv_buf_init(reinterpret_cast<char*>(ctx->buf.data()),
+                             static_cast<unsigned int>(ctx->buf.size()));
+    udx_socket_send(&ctx->req, s, &b, 1,
+                    reinterpret_cast<const struct sockaddr*>(to),
+                    [](udx_socket_send_t* r, int) {
+                        delete static_cast<SendCtx*>(r->data);
+                    });
+}
+
+}  // namespace
 
 class PoolSocketRequests : public ::testing::Test {
   protected:
@@ -288,4 +320,122 @@ TEST_F(PoolSocketRequests, RequestWithoutConsumerIsDropped) {
 
     EXPECT_EQ(pool_->nat_sampler().sampled(), 0);
     EXPECT_FALSE(received_.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// discover_pool_addresses must resolve the MOMENT the classification lands,
+// not when the last straggler ping gives up.
+//
+// JS `nat.js:172-179` resolves `analyzing` from inside `add()`: as soon as the
+// firewall becomes CONSISTENT/OPEN (typically the 3rd sample) or
+// `sampled >= _minSamples`. It never waits for outstanding pings.
+//
+// We used to fire only when every target had answered or exhausted its
+// retries. On a server that is the gate in front of every parked PEER_HOLEPUNCH
+// round: one dead node in the routing table held the reply for
+// attempts x per-attempt timeout, which routinely outlives the client's own
+// round budget — it aborts with -5 and the server answers a tid nobody is
+// waiting for.
+// ---------------------------------------------------------------------------
+
+TEST_F(PoolSocketRequests, DiscoverSettlesOnClassificationNotOnStragglers) {
+    // Four nodes that answer instantly and agree on our address (three
+    // matching samples is already CONSISTENT), plus black holes that never
+    // answer at all.
+    struct Responder {
+        std::unique_ptr<UdxSocket> sock;
+        uint16_t port = 0;
+        Ipv4Address observed{};
+    };
+    std::vector<std::unique_ptr<Responder>> live;
+    auto observed = Ipv4Address::from_string("203.0.113.9", 40404);
+
+    for (int i = 0; i < 4; i++) {
+        auto r = std::make_unique<Responder>();
+        r->sock = std::make_unique<UdxSocket>(*udx_);
+        struct sockaddr_in any{};
+        uv_ip4_addr("127.0.0.1", 0, &any);
+        EXPECT_EQ(r->sock->bind(reinterpret_cast<const struct sockaddr*>(&any)), 0);
+        r->observed = observed;
+        r->port = port_of(r->sock->handle());
+        r->sock->handle()->data = r.get();
+        EXPECT_EQ(r->sock->recv_start(
+            [](udx_socket_t* s, ssize_t nread, const uv_buf_t* buf,
+               const struct sockaddr* addr) {
+                auto* self = static_cast<Responder*>(s->data);
+                if (!self || nread <= 0 || !addr) return;
+                messages::Request req;
+                messages::Response resp;
+                if (messages::decode_message(
+                        reinterpret_cast<const uint8_t*>(buf->base),
+                        static_cast<size_t>(nread), req, resp) !=
+                    messages::REQUEST_ID) {
+                    return;
+                }
+                if (req.command != messages::CMD_PING || !req.internal) return;
+                messages::Response out;
+                out.tid = req.tid;
+                out.from.addr = self->observed;  // wire `to` = how it sees us
+                const auto* in =
+                    reinterpret_cast<const struct sockaddr_in*>(addr);
+                send_raw(s, messages::encode_response(out), in);
+            }), 0);
+        live.push_back(std::move(r));
+    }
+
+    // Seven table entries so discover fills MAX_TARGETS from the table alone
+    // and never falls back to the public bootstrap nodes. skip stays 0 below
+    // eight entries, so the four responders are all within the chosen slice.
+    hyperdht::routing::RoutingTable table(hyperdht::routing::NodeId{});
+    int seeded = 0;
+    for (auto& r : live) {
+        hyperdht::routing::Node n;
+        n.id.fill(static_cast<uint8_t>(++seeded));
+        n.host = "127.0.0.1";
+        n.port = r->port;
+        table.add(n);
+    }
+    // Black holes: ports nothing is bound to. These are what used to hold the
+    // whole campaign hostage.
+    for (uint16_t p : {(uint16_t)9001, (uint16_t)9002, (uint16_t)9003}) {
+        hyperdht::routing::Node n;
+        n.id.fill(static_cast<uint8_t>(++seeded));
+        n.host = "127.0.0.1";
+        n.port = p;
+        table.add(n);
+    }
+
+    bool done = false;
+    bool ok = false;
+    uv_update_time(&loop_);
+    uint64_t started = uv_now(&loop_);
+    uint64_t settled_at = 0;
+
+    hyperdht::holepunch::discover_pool_addresses(
+        *pool_, table, Ipv4Address::from_string("127.0.0.1", 9004),
+        [&](bool result) {
+            done = true;
+            ok = result;
+            uv_update_time(&loop_);
+            settled_at = uv_now(&loop_);
+        });
+
+    run_loop_until([&] { return done; }, 4000);
+    ASSERT_TRUE(done) << "discover never resolved";
+    EXPECT_TRUE(ok) << "four agreeing samples must be a usable verdict";
+
+    // The black holes get MAX_REQUEST_ATTEMPTS tries at >= 200 ms each
+    // (RpcSocket::timeout_for's floor), so waiting for them cannot come in
+    // under 600 ms. Loopback replies land in single-digit ms.
+    EXPECT_LT(settled_at - started, 300u)
+        << "settled in " << (settled_at - started)
+        << " ms — that is straggler time, not classification time";
+
+    // The campaign's own requests are still outstanding; draining them here
+    // keeps TearDown's close from racing an inflight retry timer.
+    run_loop_until([] { return false; }, 50);
+    pool_->close();
+    run_loop_until([] { return false; }, 50);
+    for (auto& r : live) r->sock->close();
+    run_loop_until([] { return false; }, 50);
 }

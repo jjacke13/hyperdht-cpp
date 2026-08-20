@@ -153,14 +153,19 @@ inline bool destroy_stream_once(udx_stream_t* stream) {
 // keeps a late datagram from reaching a destroyed owner.
 //
 // Returns true when the close was issued (caller may drop the handle), false
-// on refusal (caller MUST keep treating the socket as open and owned). libudx
-// has no close-when-idle hook — finalize auto-closes only during
-// `udx_teardown()` (udx.c:448-451) — so a refusal is not retried here; the
-// owner retries on its next close attempt, and the socket is otherwise reaped
-// at teardown.
+// on refusal (caller MUST keep treating the socket as open and owned).
 //
-// A refusal means an adopted stream's owner dropped its socket keepalive
-// early; `busy_close_count()` makes that visible in shipped builds, where
+// A refusal is NOT retried here, and there is no safety net behind it. libudx
+// has no close-when-idle hook; its finalize auto-close runs only inside
+// `udx_teardown()` (udx.c:448-451), and NOTHING in this codebase calls
+// `udx_teardown()`. So the only retry is the owner's own next close attempt
+// (`SocketRef::do_close` on the following `inactive()`), and where even that
+// is unsafe — `SocketPool::destroy()`, where the ref is about to outlive the
+// udx_t — the fd stays parked for the life of the process.
+//
+// A refusal therefore always means a real defect upstream: an adopted
+// stream's owner dropped its socket keepalive while the stream was still
+// live. `busy_close_count()` is how that surfaces in shipped builds, where
 // DHT_LOG compiles to a no-op (debug.hpp:19).
 //
 // Both live in udx.cpp, NOT inline: a Release shared build sets

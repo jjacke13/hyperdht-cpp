@@ -1006,11 +1006,20 @@ void PoolSocket::handle_message(const uint8_t* data, size_t len,
                 // resp.from.addr = wire `to` field = our external address as
                 // this peer saw it. Added before the callback runs: the
                 // discovery campaign's on_response reads sampled().
-                char host[INET_ADDRSTRLEN];
-                uv_ip4_name(addr, host, sizeof(host));
-                nat_sampler_.add(
-                    resp.from.addr,
-                    Ipv4Address::from_string(host, ntohs(addr->sin_port)));
+                //
+                // The tid match alone is not enough to sample on. TIDs are
+                // sequential from a random seed and this socket's address is
+                // handed to the connecting client in the handshake reply, so
+                // guessing one is cheap — and this sampler is what the round
+                // reply advertises as the server's firewall and addresses.
+                // Require the reply to come from where we sent the request.
+                // Only the SAMPLE is gated: a legitimately multi-homed node
+                // answering from another port still completes its request,
+                // it just does not get a vote on our NAT view.
+                auto source = Ipv4Address::from_string(host, ntohs(addr->sin_port));
+                if (source == inf->dest) {
+                    nat_sampler_.add(resp.from.addr, source);
+                }
 
                 // Feed the per-peer RTT EMA so subsequent requests adapt
                 // their timeout. Mirrors JS dht-rpc/lib/io.js:116-118 where
@@ -1321,12 +1330,39 @@ void discover_pool_addresses(
     // doesn't hang. In that case `ok` is false and the puncher's analyze()
     // will see UNKNOWN and either retry (fix 1) or abort.
     constexpr size_t MIN_SAMPLES = 4;
-    auto finish = [ctx]() {
+
+    // Resolve now, whatever is still in flight. JS `nat.js:172-179` resolves
+    // `analyzing` from inside `add()`, the moment the classification lands
+    // (CONSISTENT/OPEN — typically the 3rd sample) or `sampled >= _minSamples`.
+    // It never waits for stragglers. Outstanding pings keep running and their
+    // samples still land in the sampler; they just stop holding the caller.
+    auto settle = [ctx](bool ok) {
+        if (ctx->done) return;
+        ctx->done = true;
+        if (ctx->on_done) ctx->on_done(ok);
+    };
+
+    // Called after each reply is sampled. Same two exit conditions as JS.
+    auto settle_if_decided = [ctx, settle]() {
+        if (ctx->done) return;
+        const auto& nat = ctx->pool->nat_sampler();
+        if (nat.firewall() == peer_connect::FIREWALL_CONSISTENT ||
+            nat.firewall() == peer_connect::FIREWALL_OPEN ||
+            nat.sampled() >= static_cast<int>(MIN_SAMPLES)) {
+            settle(true);
+        }
+    };
+
+    // Last resort: every ping has replied or timed out and we still could not
+    // decide. Resolve anyway so the caller never hangs — `ok` is false and the
+    // puncher's analyze() sees UNKNOWN and either retries or aborts.
+    // Waiting for THIS was the bug: the slowest of MAX_TARGETS targets, each
+    // retried MAX_REQUEST_ATTEMPTS times, gated every parked holepunch round
+    // behind one dead node while the client's own round timeout ran out.
+    auto exhausted = [ctx, settle]() {
         if (ctx->done) return;
         if (--ctx->pending <= 0) {
-            ctx->done = true;
-            bool ok = ctx->pool->nat_sampler().sampled() >= MIN_SAMPLES;
-            if (ctx->on_done) ctx->on_done(ok);
+            settle(ctx->pool->nat_sampler().sampled() >= static_cast<int>(MIN_SAMPLES));
         }
     };
 
@@ -1377,11 +1413,16 @@ void discover_pool_addresses(
         ping.to.addr = target;
 
         pool.request(ping,
-            [ctx, finish](const messages::Response&) { finish(); },
-            [ctx, finish](uint16_t) { finish(); });
+            [ctx, exhausted, settle_if_decided](const messages::Response&) {
+                // The sample is already in (PoolSocket::handle_message adds it
+                // inside the tid match, before this callback).
+                settle_if_decided();
+                exhausted();
+            },
+            [ctx, exhausted](uint16_t) { exhausted(); });
     }
 
-    finish();  // Decrement initial +1
+    exhausted();  // Decrement initial +1
 }
 
 // ---------------------------------------------------------------------------

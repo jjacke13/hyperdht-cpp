@@ -1002,6 +1002,15 @@ void SecretStreamDuplex::on_udx_close(udx_stream_t* s, int err) {
     // Break the back-pointer so a late UDX callback doesn't find `this`
     // mid-destruction.
     s->data = nullptr;
+    // And drop OUR pointer to it. This callback is libudx telling us the
+    // stream is finished; `finalize_maybe` (udx.c:359) frees the
+    // udx_stream_t on a later loop turn, which can easily precede
+    // ~SecretStreamDuplex — and the destructor's `raw_stream_->data =
+    // nullptr` (this file, above) would then be a write into freed memory.
+    // Every other user of `raw_stream_` is already gated behind the
+    // `destroyed_` flag set on the next line, so there is nothing left that
+    // needs the pointer after this point.
+    self->raw_stream_ = nullptr;
     self->destroyed_ = true;
     // Prefer the error code the caller supplied to destroy() (if any) —
     // libudx always passes 0 here even when we aborted for a protocol

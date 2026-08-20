@@ -940,8 +940,36 @@ has still never carried a packet against a real peer.**
       `socket_` before `socket_pool_`), so a late `inactive()` retrying the close is
       `udx_socket_close` on freed memory. A first version of this change shipped
       exactly that hazard and the reviewer caught it.
-- [ ] **Live cross-test + JS interop — NOT DONE, needs a network.** This is the only
-      thing standing between the branch and a merge. Everything else is verified.
+- [x] **JS interop — DONE 2026-08-20, against real hyperdht 6.29.1 and the real public
+      DHT** (`./build-debug/test_server_live` + `node test/js/connect_by_key.js <key>`).
+      JS client connected to the C++ server in 1352 ms. The new path is confirmed live,
+      end to end, against real relays:
+  - `Session id=0 acquired a punch socket` — the gate fires on a relayed handshake.
+  - `Round parked until sampling settles (id=0, 1 queued)` then `Punch-socket sampling
+    done (id=0, ok=1)` — the deferral works and **the early-settle fix is visible in the
+    log: it resolved after 3 of 7 sampling replies, with the other 4 still in flight.**
+    That is the HIGH-1 fix doing its job on a real network.
+  - `Round on punch socket (id=0) from 88.99.3.86:58180` — the relay forwards the
+    client's round straight to the per-session socket. This is the whole point of the
+    branch and it is now proven on the wire, not just in tests.
+  - `Fast-mode ping to 2.86.44.35:19708 (peer_address, punch socket)` — egresses from
+    the punch socket, per gotcha 19b.
+  - `Client punching (id=0, fw=2, 2 addrs)` — JS accepted our reply and declared
+    punching.
+- [ ] **A completed cross-NAT punch is still UNPROVEN, and cannot be proven on one
+      machine.** Both ends share a public IP here, so there are only two outcomes and
+      neither is a real test: advertise LAN and the client takes the LAN shortcut
+      (connects in ~359 ms with `dht.stats.punches` all zero — the punch path never
+      runs), or set `HYPERDHT_LIVE_WAN_ONLY=1` and the punch becomes a hairpin to our
+      own public IP, which this router does not support. **Needs a genuinely remote
+      peer — the phone on mobile data is the intended test.**
+- [ ] Observation from that session, n=1 each, worth confirming in the field: with
+      `WAN_ONLY=1` **and** `NO_FAST_PING=1` the JS client aborted at 4.5 s having never
+      sent round 2, while `WAN_ONLY=1` alone (fast mode allowed) got round 2 and
+      `Client punching`. Consistent with gotcha 19b — the server must transmit toward
+      the client on round 1 before it will declare punching — and it is the mechanism
+      behind the field reports of "it only connects when fast-mode fires". Do not treat
+      as established from two runs.
 - [ ] **nospoon needs one line when its pin is bumped**: hold `info.socket_keepalive`
       alongside the peer's duplex (`~/Desktop/repos/nospoon/cpp/server.cpp:93-97`
       connects synchronously today, so it currently parks one fd per punched connection).

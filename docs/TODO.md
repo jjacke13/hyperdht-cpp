@@ -1054,6 +1054,22 @@ has still never carried a packet against a real peer.**
 - **Server-side causes are now largely excluded**: fresh per-session socket, correct
   and freshly-observed destination address, sampling settled, `Client punching` with a
   gossiped address, probes provably sent. All present in the failing runs.
+- **THE JS CONTROL SETTLES IT: this failure mode is NOT a hyperdht-cpp bug.** Ran the
+  nospoon-**JS** server (`nix build .#nospoon-js`) on the same laptop, same config,
+  same seed ⇒ same public key, so the phone reconfigured nothing. **JS fails from the
+  hotel exactly as our C++ does, and succeeds from mobile exactly as our C++ does:**
+
+  | server on the laptop | from hotel | from mobile |
+  |---|---|---|
+  | C++ branch (fast on/off) | FAIL 0/82 | OK |
+  | C++ main (fast on) | FAIL 0/12 | — |
+  | **JS reference impl** | **FAIL** | **OK** |
+
+  Stock hyperdht suffers this identically. Before calling any future punch black-hole
+  "our bug", run this control — it is cheap and decisive. **Scope limit:** this proves
+  the DETERMINISTIC hotel case is implementation-independent; it does NOT prove the
+  older INTERMITTENT mobile-CGNAT Q (10-25%) is the same phenomenon, which has never
+  been JS-controlled.
 - **A 100% reproducible instance exists (2026-08-20/21), and it exonerates the branch.**
   One hotel wifi (`94.66.118.207`) fails absolutely against this laptop while the same
   phone on mobile data connects on the first probe. Controlled properly after two false

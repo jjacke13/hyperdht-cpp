@@ -847,12 +847,27 @@ second parity oracle. Two workstreams:
 
 ## J. Server per-session punch socket (branch `feat/server-punch-socket`)
 
-> ### ✅ APPROVED TO MERGE — do it on/after **2026-08-23** (Vaios back from vacation)
+> ### ✅ MERGED to `main` 2026-08-22 (fast-forward, branch HEAD `cfb4101`)
 >
-> Decision taken 2026-08-20. **Merge it for the JS parity, NOT as a Finding Q fix.**
-> Branch HEAD `b357923`, 767/767, ASAN 0 errors across every binary, whole-branch
-> cpp-reviewer done, live JS-interop verified against real hyperdht 6.29.1 on the
-> public DHT, and a real cross-NAT punch proven against a phone on mobile CGNAT.
+> Merged for the JS parity, **NOT as a Finding Q fix** — see §J.4, the JS control
+> proved that failure mode is not a hyperdht-cpp bug at all. Pre-merge gate re-run at
+> merge time: **767/767, 0 ASAN errors** across holepunch / socket_pool / server /
+> server_punch_socket / relay_upgrade / pool_socket_requests / secret_stream / router /
+> server_handshake. `Server::disable_fast_mode_ping` was **kept** (defaults false,
+> zero runtime cost, documented diagnostic-only) — it is what made Finding Q
+> reproducible and what let us control the comparison against the reference server.
+>
+> **Field validation before merge:** live JS-interop against real hyperdht 6.29.1 on
+> the public DHT; a real cross-NAT punch against a phone on mobile CGNAT; and ~100
+> phone sessions across two client networks and three server builds.
+>
+> **Still to do after this merge:**
+> - [ ] Push `main` (29 commits ahead of `origin/main` at merge time).
+> - [ ] Bump nospoon's pin `~/Desktop/repos/nospoon/cpp/hyperdht-cpp.nix` `rev` + `hash`
+>       (still `3421264`) — needs the push first, it fetches from GitHub by rev.
+> - [ ] Add the one-line `info.socket_keepalive` hold in `nospoon/cpp/server.cpp`; the
+>       field run confirmed the predicted `socket close refused` fd parking.
+> - [ ] BUG A (§J.1) is still open and unrelated to this branch.
 >
 > **Parity actually restored** (this is the justification — each is a real divergence
 > from the JS reference that this branch closes):

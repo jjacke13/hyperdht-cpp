@@ -1054,6 +1054,18 @@ has still never carried a packet against a real peer.**
 - **Server-side causes are now largely excluded**: fresh per-session socket, correct
   and freshly-observed destination address, sampling settled, `Client punching` with a
   gossiped address, probes provably sent. All present in the failing runs.
+- **A 100% reproducible instance exists (2026-08-20/21), and it exonerates the branch.**
+  One hotel wifi (`94.66.118.207`) fails absolutely against this laptop while the same
+  phone on mobile data connects on the first probe. Controlled properly after two false
+  starts: fast mode ON **and** OFF both fail (57 and 25 sessions), and running `main`
+  with fast mode on — config-identical to the Pi5 that the hotel CAN reach — also fails
+  (0/12). **So it is not the punch socket, not fast mode, and not any code on this
+  branch.** The broken thing is the `hotel ↔ home-ISP` network pair specifically:
+  `hotel ↔ Pi5-ISP (91.220.171.23)` works and `mobile ↔ home-ISP` works, and both
+  servers are `fw=2` needing a real punch, so no "one end is open" story explains it.
+  Mapping and addressing are excluded by measurement too — the new
+  `observers: relay=… advertised=…` line printed AGREE throughout, and sessions probing
+  the relay-verified address still lost 20 probes each.
 - **No server-side discriminator exists.** All 25 sessions were mined across handshake
   source port, probed port, the delta between them, which relay forwarded the round,
   which arm, and position within the run. **Nothing separates the 4 failures from the

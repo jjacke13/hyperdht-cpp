@@ -2,8 +2,13 @@ name: Windows
 
 on:
   push:
-    branches: ['feat/windows-ci']
+    # 'main' matters: without it this workflow only ran on release tags, and a
+    # POSIX-only include broke every Windows build for six weeks (2026-07-11 ..
+    # 2026-08-22) before a tag push surfaced it.
+    branches: ['main', 'feat/windows-ci']
     tags: ['v*']
+  pull_request:
+    branches: ['main']
   workflow_dispatch:
 
 jobs:

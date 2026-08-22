@@ -1013,15 +1013,15 @@ has still never carried a packet against a real peer.**
     done (id=0, ok=1)` — the deferral works and **the early-settle fix is visible in the
     log: it resolved after 3 of 7 sampling replies, with the other 4 still in flight.**
     That is the HIGH-1 fix doing its job on a real network.
-  - `Round on punch socket (id=0) from 88.99.3.86:58180` — the relay forwards the
+  - `Round on punch socket (id=0) from RELAY-1` — the relay forwards the
     client's round straight to the per-session socket. This is the whole point of the
     branch and it is now proven on the wire, not just in tests.
-  - `Fast-mode ping to 2.86.44.35:19708 (peer_address, punch socket)` — egresses from
+  - `Fast-mode ping to SERVER-A:19708 (peer_address, punch socket)` — egresses from
     the punch socket, per gotcha 19b.
   - `Client punching (id=0, fw=2, 2 addrs)` — JS accepted our reply and declared
     punching.
 - [x] **CROSS-NAT PUNCH PROVEN ON THE BRANCH — 2026-08-20.** Real phone on mobile CGNAT
-      (`109.178.227.21`) → this laptop behind a home NAT (`2.86.44.35`), via a scratch
+      (`CLIENT-MOBILE`) → this laptop behind a home NAT (`SERVER-A`), via a scratch
       nospoon-cpp server on TUN `10.100.0.1`, with the **fast-mode ping disabled** so
       the connection had to complete through the real probe loop. Branch connected 2/2,
       one probe each, both rounds arriving on the per-session punch socket:
@@ -1086,13 +1086,13 @@ has still never carried a packet against a real peer.**
   older INTERMITTENT mobile-CGNAT Q (10-25%) is the same phenomenon, which has never
   been JS-controlled.
 - **A 100% reproducible instance exists (2026-08-20/21), and it exonerates the branch.**
-  One hotel wifi (`94.66.118.207`) fails absolutely against this laptop while the same
+  One hotel wifi (`CLIENT-WIFI-B`) fails absolutely against this laptop while the same
   phone on mobile data connects on the first probe. Controlled properly after two false
   starts: fast mode ON **and** OFF both fail (57 and 25 sessions), and running `main`
   with fast mode on — config-identical to the Pi5 that the hotel CAN reach — also fails
   (0/12). **So it is not the punch socket, not fast mode, and not any code on this
   branch.** The broken thing is the `hotel ↔ home-ISP` network pair specifically:
-  `hotel ↔ Pi5-ISP (91.220.171.23)` works and `mobile ↔ home-ISP` works, and both
+  `hotel ↔ Pi5-ISP (SERVER-B)` works and `mobile ↔ home-ISP` works, and both
   servers are `fw=2` needing a real punch, so no "one end is open" story explains it.
   Mapping and addressing are excluded by measurement too — the new
   `observers: relay=… advertised=…` line printed AGREE throughout, and sessions probing

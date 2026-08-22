@@ -1179,11 +1179,21 @@ TEST(QueryWalk, DownHintEmittedToReferrerOnTimeout) {
     const auto dead = Ipv4Address::from_string("127.0.0.1", 46099);  // unbound
     int dh_count = 0;
     std::vector<uint8_t> dh_value;
+    bool done = false;
+    // The DOWN_HINT is fire-and-forget, so it can still be in flight when the
+    // walk reports done. Wait for BOTH before stopping the loop — waiting on
+    // `done` alone races the very thing this test asserts, which made it fail
+    // intermittently under parallel CI load (~2 s in, well inside the
+    // deadline, so it read as an assertion failure rather than a timeout).
+    bool settled = false;
+    auto mark = [&] { settled = done && dh_count >= 1; };
+
     ReplyNode ref(&loop, 46061, [&](const Request& req, ReplyNode& self)
                       -> std::optional<Response> {
         if (req.internal && req.command == CMD_DOWN_HINT) {
             dh_count++;
             if (req.value) dh_value = *req.value;
+            mark();
             return std::nullopt;              // fire-and-forget
         }
         // LOOKUP walk: refer the client to the (dead) node.
@@ -1196,13 +1206,12 @@ TEST(QueryWalk, DownHintEmittedToReferrerOnTimeout) {
     RpcSocket client(&loop, cid); client.bind(0);
     NodeId target{}; target.fill(0x44);
 
-    bool done = false;
     auto q = Query::create(client, target, CMD_LOOKUP);
     q->set_retries(1);                        // dead node gives up in ~2s
     q->add_bootstrap(ref.addr());
-    q->on_done([&](int, const std::vector<QueryReply>&) { done = true; });
+    q->on_done([&](int, const std::vector<QueryReply>&) { done = true; mark(); });
     q->start();
-    run_with_deadline(loop, &done, 6000, {ref.sock.get(), &client});
+    run_with_deadline(loop, &settled, 6000, {ref.sock.get(), &client});
 
     EXPECT_TRUE(done);
     EXPECT_GE(dh_count, 1) << "a DOWN_HINT must be sent to the referrer";

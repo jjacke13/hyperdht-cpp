@@ -1,8 +1,9 @@
 // Relay → direct upgrade — changeRemote state machine. See relay_upgrade.hpp.
 
+// No <netinet/in.h> here either — it does not exist under MSVC. The header
+// above already reaches sockaddr_in through <udx.h> -> <uv.h>, which resolves
+// to winsock2 on Windows and netinet on POSIX.
 #include "hyperdht/relay_upgrade.hpp"
-
-#include <netinet/in.h>
 
 #include <cstring>
 

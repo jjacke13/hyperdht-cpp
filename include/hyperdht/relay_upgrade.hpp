@@ -16,9 +16,11 @@
 // the call site because it needs a per-stream context slot that the emitted
 // stream's SecretStreamDuplex owns — see that doc's "Lifetime hazards".
 
+// `struct sockaddr` reaches us through <udx.h> -> <uv.h>, which resolves to
+// winsock2 on Windows and netinet on POSIX. Do NOT include <netinet/in.h>
+// directly: it does not exist under MSVC and breaks the Windows build. Every
+// other header here relies on the same transitive path.
 #include <udx.h>
-
-#include <netinet/in.h>
 
 #include <cstdint>
 #include <functional>

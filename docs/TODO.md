@@ -614,8 +614,61 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
   re-verify after this session's large diff). The teardown leaks previously
   logged here as "pre-existing, in libuv/libudx internals" were pinned down
   2026-07-28 — see TD1-TD3 below. **Two of the three are ours, not libuv's.**
-- [ ] Fuzzing: run each `fuzz/` harness (compact, handshake_msg, holepunch_msg,
-  messages, noise_payload) ≥30 min under libFuzzer; fix crashes.
+- [x] **Fuzzing (2026-08-25): 9 harnesses, 30 min each, 1.677 B runs, zero
+  findings.** No crashes, no ASAN reports, no UB. Final coverage per target:
+  protomux 893, noise_payload 399, messages 385, noise_handshake 223,
+  holepunch_msg 219, handshake_msg 165, compact 108, blind_relay 88,
+  secret_stream 75.
+  - Four harnesses added. `fuzz_noise_handshake` is the important one:
+    `NoiseIK::recv` on the responder side is the deepest PRE-AUTH surface in
+    the library — every PEER_HANDSHAKE carries attacker-chosen `msg.noise`
+    bytes and nothing authenticates upstream of it, because the handshake IS
+    the authentication. (`fuzz_noise_payload` only decodes the payload struct
+    of an ALREADY-SUCCESSFUL handshake — a different thing.)
+  - `fuzz_protomux` (`Mux::on_data` — varint framing, channel dispatch,
+    OPEN/CLOSE/REJECT, `handle_batch`) is the deepest target overall: 400
+    corpus entries against ~24 for the flat decoders. `fuzz_blind_relay`
+    (`decode_pair`/`decode_unpair`) closed the last uncovered header-level wire
+    decoder. `fuzz_secret_stream` is thin by nature — most of its body is
+    libsodium AEAD, so a clean run there means little.
+  - `decode_holepunch_payload` needs no separate target: `fuzz_holepunch_msg`
+    already exercises it.
+  - **Crypto-gated targets are worthless unseeded.** Random bytes never pass
+    Poly1305, so an unseeded fuzzer only ever exercises pre-MAC length/slicing
+    code. `fuzz/gen_seeds.cpp` emits a valid msg1 / header / encrypted frame
+    into the corpus; seeding lifted `fuzz_noise_handshake` from a 3-unit
+    plateau to cov 144 in 20 s.
+  - **A harness can be clean because it tests nothing.** Both crypto harnesses
+    were initially broken in ways a passing 30-min run hid, and the flat
+    coverage number was the only symptom:
+    - `fuzz_secret_stream` fed the stream its OWN header to `receive_header`.
+      `local_id_` uses NS_INITIATOR and `remote_id_` NS_RESPONDER
+      (`src/secret_stream.cpp:40-48`), so it always failed, `is_ready()` stayed
+      false, and `decrypt()` returned at its first line — 390 M runs tested the
+      guard, not the AEAD. Fix: synthesize the header from a role/key-swapped
+      peer instance.
+    - `fuzz_noise_handshake`'s `is_complete()` branch was dead for every input:
+      one responder `recv()` advances `message_index_` 0->1, completion needs
+      >=2 (`src/noise_wrap.cpp:424,507`). Fix: reply with `send()` (msg2) as
+      `finalize_handshake` does.
+    Verify a harness by whether coverage MOVES when you fix it, not by whether
+    the run is green.
+  - **Run with `UBSAN_OPTIONS=halt_on_error=1`.** The build enables
+    `-fsanitize=undefined`, but UBSan defaults to print-and-continue, so a UB
+    finding neither stops the fuzzer nor fails the run.
+  - `fuzz/CMakeLists.txt` now uses `fuzzer-no-link` globally with
+    `-fsanitize=fuzzer` per fuzz target. Plain `fuzzer` globally gave every
+    executable libFuzzer's `main()`, so any helper with its own `main`
+    (`gen_seeds`) failed to link.
+  - Corpora persist in `fuzz/corpus/<target>/` (gitignored) so runs compound
+    instead of restarting from zero; crash reproducers land in
+    `fuzz/artifacts/`.
+- [ ] Fuzzing, still uncovered: `rpc_handlers` per-command parse of `req.value`
+  (announce record + signature paths, token-gated but the token is only
+  address-bound), and libudx packet parsing (`deps/libudx/src/udx.c` — every
+  inbound datagram; upstream has functional tests and CI but no fuzzing and no
+  sanitizer flags anywhere in its tree). A CI job running each target ~5 min on
+  PRs would catch parser regressions at the point they land.
 - [ ] Stress: 100 concurrent JS clients vs one C++ server; measure success rate +
   memory growth; confirm the probe-listener multi-slot fix holds.
 - [ ] Soak: 12h+ connection, data every 5 min; verify NAT pinhole + SecretStream

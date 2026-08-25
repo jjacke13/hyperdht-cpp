@@ -65,3 +65,7 @@ result-*
 # Session / agent scratch
 .claude/
 asan_rust/
+
+# libFuzzer working data — corpora and crash artifacts are regenerable
+fuzz/corpus/
+fuzz/artifacts/

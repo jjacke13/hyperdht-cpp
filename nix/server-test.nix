@@ -5,7 +5,7 @@
 
 pkgs.stdenv.mkDerivation {
   pname = "hyperdht-server-test";
-  version = "0.3.1";
+  version = "0.5.0";
   src = sourceFilter;
   postUnpack = libudxPostUnpack;
 

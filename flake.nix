@@ -32,12 +32,6 @@
           static  = hyperdhtLib.mkHyperdht {};
           inherit shared;
 
-          holesail = import ./nix/holesail.nix {
-            inherit pkgs;
-            sharedLib = shared;
-            src = self;
-          };
-
           echo-server = import ./nix/echo-server.nix {
             inherit pkgs;
             staticLib = hyperdhtLib.mkHyperdht {};
@@ -134,7 +128,7 @@
               echo "  python3: $(python3 --version)"
               echo ""
               echo "  cd examples/python"
-              echo "  python3 holesail_server.py --live 8080"
+              echo "  python3 example.py server"
             '';
           };
 
@@ -189,12 +183,6 @@
       );
 
       # ── NixOS module ─────────────────────────────────────────────────
-
-      nixosModules.holesail = { config, lib, pkgs, ... }: {
-        imports = [ ./nix/module.nix ];
-        config.services.holesail.package = lib.mkDefault
-          self.packages.${pkgs.system}.holesail;
-      };
 
       nixosModules.echo-server = { config, lib, pkgs, ... }: {
         imports = [ ./nix/echo-module.nix ];

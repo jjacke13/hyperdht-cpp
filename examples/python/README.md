@@ -84,18 +84,11 @@ python3 example.py server
 python3 example.py connect <public_key_hex>
 ```
 
-### P2P tunnel (holesail-compatible)
+### P2P tunnel
 
-```bash
-# Start a local web server
-python3 webserver.py &
-
-# Expose it over HyperDHT
-python3 holesail_server.py --live 8080
-
-# Connect from anywhere (JS holesail or mobile app)
-holesail --connect hs://0000...
-```
+The Python tunnel server (`holesail_server.py` + `webserver.py`) was removed —
+**holesail-cpp** supersedes it: a native C++ implementation of the same thing,
+with its own test suite and sanitizer CI. Use that for tunnels.
 
 ## Examples
 
@@ -107,8 +100,6 @@ holesail --connect hs://0000...
 | `storage_demo.py` | Immutable and mutable key-value storage on the live DHT |
 | `ping_demo.py` | Direct UDP ping to any DHT node |
 | `example.py` | Server + client + keygen (the main demo) |
-| `holesail_server.py` | P2P tunnel server with `--live`, `--seed`, `--secure` |
-| `webserver.py` | Minimal HTTP server for holesail testing |
 | `test_wrapper.py` | 22 automated tests for the Python wrapper |
 
 ## Important: threading and callback rules

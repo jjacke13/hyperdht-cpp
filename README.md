@@ -52,7 +52,7 @@ Without Nix: install `cmake`, `ninja`, `libsodium`, `libuv`, then the same cmake
 | [C API reference](docs/C-API.md) | 90 functions, opaque-pointer pattern, callback-based async |
 | [C++ API reference](docs/CPP-API.md) | RAII wrappers, error codes, single-threaded event loop |
 | [Rust wrapper](docs/BUILDING-RUST.md) | `hyperdht-sys` (bindgen) + safe `hyperdht` crate, async/await API |
-| [Python examples](examples/python/) | Server, client, holesail tunnel, 22 wrapper tests |
+| [Python examples](examples/python/) | Server, client, 22 wrapper tests |
 | [ESP32 guide](examples/esp32/) | Build, flash, run HyperDHT on ESP32-S3 (echo server + client) |
 | [Android example](examples/android/) | Kotlin/JNI wrapper with echo test app |
 | [Wire protocol spec](PROTOCOL.md) | Reverse-engineered from JS, 12 sections |

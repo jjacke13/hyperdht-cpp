@@ -491,13 +491,19 @@ void SecretStreamDuplex::start() {
 // ---------------------------------------------------------------------------
 // pause_read / resume_read — read-side backpressure
 //
-// Detaching the udx read callback stops us acking new reliable data, which
-// closes the peer's congestion window: the correct way to stall a producer
-// that is faster than whatever consumes on_message. Unordered datagrams
-// (udx_stream_recv_start) keep flowing — they are lossy by contract.
+// This does NOT stall the peer. Detaching the udx read callback would, in
+// theory, but libudx acks a data packet before it checks on_read
+// (udx.c:1345-1353), so a stopped read acknowledges data and then discards
+// it. Backpressure therefore lives above udx, as it does in JS: the udx read
+// stays armed, bytes pile up in recv_buf_, and frame extraction is what
+// stops. Unordered datagrams keep flowing — they are lossy by contract.
+//
+// Consequence: a paused stream buys memory, not flow control. The sender
+// keeps sending at full rate, so recv_buf_ is capped by kMaxPausedBacklog
+// and a peer that overruns it gets the stream destroyed.
 //
 // Both are no-ops outside the started window: before start() there is no
-// udx read to stop, and after destroy() the raw stream is already gone.
+// read to arm, and after destroy() the raw stream is already gone.
 // ---------------------------------------------------------------------------
 
 void SecretStreamDuplex::pause_read() {
@@ -517,14 +523,34 @@ void SecretStreamDuplex::pause_read() {
 void SecretStreamDuplex::resume_read() {
     if (!started_ || destroyed_ || !read_paused_) return;
     read_paused_ = false;
-    // Drain what arrived while paused. Re-checking read_paused_ each turn
-    // matters: the consumer may pause again from inside on_data, and the
-    // remaining frames must stay buffered rather than being delivered anyway.
-    while (!destroyed_ && !read_paused_ && try_extract_frame()) {
-    }
-    if (end_pending_ && !destroyed_ && !read_paused_) {
+    // drain_frames() returns false when `this` has been freed underneath us
+    // — a malformed frame in the backlog reaches destroy(), and the FFI
+    // layer deletes the Duplex from inside on_close. Every member access
+    // below that point would be a use-after-free.
+    if (!drain_frames()) return;
+    if (end_pending_ && !read_paused_) {
         end_pending_ = false;
         if (on_end_) on_end_();
+    }
+}
+
+// Extract frames until the buffer runs short, the consumer pauses, or the
+// stream dies. Returns false when `this` is gone.
+//
+// The liveness token, not destroyed_, is what makes this safe: destroyed_
+// lives inside the object that try_extract_frame() may have freed, so
+// reading it to decide whether the object still exists is itself the bug.
+bool SecretStreamDuplex::drain_frames() {
+    auto alive = alive_;
+    while (true) {
+        // Check liveness BEFORE anything reads a member. try_extract_frame()
+        // returns false on the destroy path too, so testing its result first
+        // would report success out of a freed object.
+        if (!*alive) return false;
+        if (destroyed_ || read_paused_) return true;
+        const bool more = try_extract_frame();
+        if (!*alive) return false;
+        if (!more) return true;
     }
 }
 
@@ -697,7 +723,16 @@ void SecretStreamDuplex::fire_close(int err) {
         on_upgrade_close_ = nullptr;
         tap();
     }
-    if (on_close_) on_close_(err);
+    // Move it out before invoking: consumers free the Duplex from here
+    // (ffi_internal.hpp stream_fire_close), which would otherwise destroy
+    // this std::function while it is still on the stack. Same reason the
+    // upgrade tap above is moved. Everything after this line is a
+    // use-after-free — fire_close must do nothing else.
+    if (on_close_) {
+        auto cb = std::move(on_close_);
+        on_close_ = nullptr;
+        cb(err);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -756,12 +791,13 @@ void SecretStreamDuplex::process_incoming_bytes(const uint8_t* data, size_t len)
     recv_buf_.insert(recv_buf_.end(), data, data + len);
 
     // Paused: bytes stay in recv_buf_ and are extracted by resume_read().
-    if (read_paused_) return;
-
-    // Extract as many complete frames as possible.
-    while (!destroyed_ && try_extract_frame()) {
-        // loop
+    // Cap the backlog — a paused stream no longer slows the sender down.
+    if (read_paused_) {
+        if (recv_buf_.size() > kMaxPausedBacklog) destroy(-11);
+        return;
     }
+
+    drain_frames();  // may free the object; nothing may follow it here
 }
 
 bool SecretStreamDuplex::try_extract_frame() {
@@ -830,7 +866,8 @@ void SecretStreamDuplex::handle_frame(std::vector<uint8_t> msg) {
         // data before the header exchange completes. The window is
         // normally sub-RTT (1-2 messages), so 64 is very generous.
         // JS mitigates this via Node.js Readable highWaterMark backpressure.
-        // Long-term fix: read-side backpressure (udx_stream_read_stop).
+        // NOT fixable with udx_stream_read_stop — that acks and discards
+        // (see the pause_read banner). pause_read() is the real lever.
         if (pending_messages_.size() > 64) {
             destroy(-7);
         }

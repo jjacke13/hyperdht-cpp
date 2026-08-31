@@ -940,3 +940,100 @@ TEST(SecretStreamDuplex, PausedReaderLosesNoBytes) {
             << "message " << m << " is out of order or missing";
     }
 }
+
+// Regression: a malformed frame inside a paused backlog must not leave
+// resume_read() touching a freed Duplex.
+//
+// try_extract_frame() -> handle_frame() calls destroy() on any protocol
+// violation (bad header, oversized frame, zero-length frame). destroy() ->
+// udx_stream_destroy() reaches on_close synchronously, and every real
+// consumer deletes the Duplex there (ffi_internal.hpp stream_fire_close).
+// The drain loop in resume_read() then re-read `destroyed_` and `end_pending_`
+// out of freed memory — remotely triggerable, since the peer chooses both the
+// frame and the moment. `alive_` is what makes it safe: `destroyed_` lives
+// inside the object whose existence is in question.
+//
+// on_close here deletes the duplex exactly as the FFI layer does, so the
+// freed access is real and ASan sees it.
+TEST(SecretStreamDuplex, MalformedFrameWhilePausedDoesNotUseAfterFree) {
+    using namespace duplex_test;
+    DuplexLoopback lb;
+    auto [ih, rh] = make_handshake_pair();
+
+    SecretStreamDuplex dup_i(&lb.stream1, ih, &lb.loop);
+    auto* dup_r = new SecretStreamDuplex(&lb.stream2, rh, &lb.loop);
+
+    struct Ctx {
+        DuplexLoopback* lb;
+        SecretStreamDuplex* i;
+        SecretStreamDuplex** r;
+        bool injected = false;
+        bool resumed = false;
+        bool r_closed = false;
+    } ctx{&lb, &dup_i, &dup_r};
+
+    dup_r->on_connect([&]() { (*ctx.r)->pause_read(); });
+    dup_r->on_close([&](int) {
+        ctx.r_closed = true;
+        // Mirror ffi_internal.hpp: the consumer frees the duplex from here.
+        delete *ctx.r;
+        *ctx.r = nullptr;
+    });
+    dup_i.on_close([&](int) {});
+
+    dup_i.start();
+    dup_r->start();
+
+    // Once connected, push a valid message and then a raw frame with a
+    // zero length prefix straight onto the wire — handle_frame() rejects
+    // that with destroy(-10) while the reader is still paused.
+    uv_idle_t idle;
+    uv_idle_init(&lb.loop, &idle);
+    idle.data = &ctx;
+    uv_idle_start(&idle, [](uv_idle_t* h) {
+        auto* c = static_cast<Ctx*>(h->data);
+        if (c->injected || !c->i->is_connected() || *c->r == nullptr) return;
+        if (!(*c->r)->is_connected()) return;
+        c->injected = true;
+        const char* msg = "before the bad frame";
+        c->i->write(reinterpret_cast<const uint8_t*>(msg), 20, nullptr);
+
+        static uint8_t bad[3] = {0, 0, 0};  // uint24_le(0) — illegal frame
+        uv_buf_t b = uv_buf_init(reinterpret_cast<char*>(bad), 3);
+        auto* wreq = static_cast<udx_stream_write_t*>(
+            std::calloc(1, static_cast<size_t>(udx_stream_write_sizeof(1))));
+        udx_stream_write(wreq, &c->lb->stream1, &b, 1,
+                         [](udx_stream_write_t* req, int, int) { std::free(req); });
+
+        uv_idle_stop(h);
+        uv_close(reinterpret_cast<uv_handle_t*>(h), nullptr);
+    });
+
+    uv_timer_t resume_timer;
+    uv_timer_init(&lb.loop, &resume_timer);
+    resume_timer.data = &ctx;
+    uv_timer_start(&resume_timer, [](uv_timer_t* t) {
+        auto* c = static_cast<Ctx*>(t->data);
+        c->resumed = true;
+        uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
+        if (*c->r) (*c->r)->resume_read();   // <-- freed itself mid-drain
+    }, 1200, 0);
+
+    uv_timer_t stop_timer;
+    uv_timer_init(&lb.loop, &stop_timer);
+    stop_timer.data = &ctx;
+    uv_timer_start(&stop_timer, [](uv_timer_t* t) {
+        auto* c = static_cast<Ctx*>(t->data);
+        uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
+        c->i->destroy(0);
+        c->lb->close_sockets();
+    }, 2200, 0);
+
+    uv_run(&lb.loop, UV_RUN_DEFAULT);
+
+    EXPECT_TRUE(ctx.injected);
+    EXPECT_TRUE(ctx.resumed);
+    EXPECT_TRUE(ctx.r_closed) << "the malformed frame must destroy the stream";
+    EXPECT_EQ(dup_r, nullptr) << "consumer freed it from on_close";
+    lb.shutdown_called = true;  // both sides already torn down
+}

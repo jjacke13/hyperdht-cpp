@@ -364,7 +364,15 @@ private:
     bool on_close_fired_ = false;
 
     // Incoming frame parser state
-    std::vector<uint8_t> recv_buf_;  // byte accumulator (up to one full frame)
+    // Byte accumulator. Holds one partial frame normally, but grows to the
+    // whole paused backlog while read_paused_ (see pause_read).
+    std::vector<uint8_t> recv_buf_;
+
+    // Ceiling on that backlog. Pausing no longer stalls the sender at the
+    // wire level, so without this a peer can make a paused stream allocate
+    // without limit. Mirrors the pending_messages_ cap: over the line is a
+    // resource violation and the stream is destroyed.
+    static constexpr size_t kMaxPausedBacklog = 4 * 1024 * 1024;
 
     // Messages received before on_connect fires (JS buffers these
     // implicitly via Node.js Readable stream internals). Replayed
@@ -413,6 +421,13 @@ private:
     void setup_secret_send();
     void send_header_frame();
     void process_incoming_bytes(const uint8_t* data, size_t len);
+
+    // Extract frames until the buffer is short or the consumer pauses.
+    // Returns false if `this` was destroyed mid-drain — callers MUST NOT
+    // touch any member after that. try_extract_frame() can reach destroy()
+    // (malformed frame) or a user callback that does, and the FFI layer
+    // deletes the Duplex synchronously from on_close.
+    bool drain_frames();
     bool try_extract_frame();    // returns true if a full frame was consumed
     void handle_frame(std::vector<uint8_t> msg);
     void maybe_fire_connect();

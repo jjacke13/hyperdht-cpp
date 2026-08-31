@@ -502,14 +502,30 @@ void SecretStreamDuplex::start() {
 
 void SecretStreamDuplex::pause_read() {
     if (!started_ || destroyed_ || read_paused_) return;
-    udx_stream_read_stop(raw_stream_);
+    // Deliberately NOT udx_stream_read_stop(): libudx's process_data_packet()
+    // increments stream->ack and then delivers only `if (stream->on_read !=
+    // NULL)` (udx.c:1345-1353, and again in the reorder drain at :1557-1566,
+    // which frees the packet either way). With the read stopped it therefore
+    // ACKNOWLEDGES incoming data to the peer and discards it — that is a sink,
+    // not backpressure, and it silently truncates any transfer big enough for
+    // a consumer to pause on. Keep reading; hold the bytes in recv_buf_ and
+    // stop extracting frames instead, which is what JS does (streamx buffers
+    // above udx rather than stopping it).
     read_paused_ = true;
 }
 
 void SecretStreamDuplex::resume_read() {
     if (!started_ || destroyed_ || !read_paused_) return;
     read_paused_ = false;
-    udx_stream_read_start(raw_stream_, on_udx_read);
+    // Drain what arrived while paused. Re-checking read_paused_ each turn
+    // matters: the consumer may pause again from inside on_data, and the
+    // remaining frames must stay buffered rather than being delivered anyway.
+    while (!destroyed_ && !read_paused_ && try_extract_frame()) {
+    }
+    if (end_pending_ && !destroyed_ && !read_paused_) {
+        end_pending_ = false;
+        if (on_end_) on_end_();
+    }
 }
 
 // JS: index.js:373-397 — _setupSecretStream() also writes the header buffer
@@ -738,6 +754,9 @@ void SecretStreamDuplex::process_incoming_bytes(const uint8_t* data, size_t len)
     // complete data frames).
     crypto_.refresh_timeout();
     recv_buf_.insert(recv_buf_.end(), data, data + len);
+
+    // Paused: bytes stay in recv_buf_ and are extracted by resume_read().
+    if (read_paused_) return;
 
     // Extract as many complete frames as possible.
     while (!destroyed_ && try_extract_frame()) {
@@ -983,6 +1002,14 @@ void SecretStreamDuplex::on_udx_read(udx_stream_t* s, ssize_t nread,
     if (nread > 0 && self->on_raw_activity_) self->on_raw_activity_();
 
     if (nread == UV_EOF) {
+        // Ordering: end-of-stream must not overtake bytes still held behind a
+        // pause. Only a pause defers it — when not paused everything
+        // extractable is already delivered and a trailing partial frame never
+        // completes, so waiting on recv_buf_ would strand on_end_ forever.
+        if (self->read_paused_) {
+            self->end_pending_ = true;
+            return;
+        }
         if (self->on_end_) self->on_end_();
         return;
     }

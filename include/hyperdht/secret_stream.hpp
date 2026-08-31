@@ -357,6 +357,9 @@ private:
     bool destroyed_ = false;
     bool read_started_ = false;
     bool read_paused_ = false;  // user called pause_read() (see above)
+    // UV_EOF that arrived while paused; delivered after recv_buf_ drains so
+    // the consumer never sees end-of-stream before the bytes preceding it.
+    bool end_pending_ = false;
     int  close_error_ = 0;
     bool on_close_fired_ = false;
 

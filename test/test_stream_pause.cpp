@@ -98,8 +98,13 @@ TEST(SecretStreamPause, IdempotentAfterStart) {
     PauseLoopback lb;
     SecretStreamDuplex duplex(&lb.stream1, DuplexHandshake{}, &lb.loop);
 
-    // The flag alone proves nothing — check the udx read state it claims to
-    // mirror, so a no-op implementation cannot pass.
+    // The udx read must stay armed across pause/resume. It used to be stopped
+    // here, and that is the bug: libudx's process_data_packet() bumps
+    // stream->ack before checking on_read (udx.c:1345-1353), so a stopped read
+    // acknowledges data to the peer and then drops it. Backpressure lives one
+    // layer up now — recv_buf_ holds the bytes and frame extraction stops.
+    // The data-level contract is covered by
+    // SecretStreamDuplex.PausedReaderLosesNoBytes.
     auto udx_reading = [&lb]() {
         return (lb.stream1.status & UDX_STREAM_READING) != 0;
     };
@@ -110,23 +115,22 @@ TEST(SecretStreamPause, IdempotentAfterStart) {
 
     duplex.pause_read();
     EXPECT_TRUE(duplex.is_read_paused());
-    EXPECT_FALSE(udx_reading()) << "pause must stop the udx read";
+    EXPECT_TRUE(udx_reading()) << "pause must NOT stop the udx read — that loses data";
     duplex.pause_read();
     EXPECT_TRUE(duplex.is_read_paused()) << "second pause must not change state";
-    EXPECT_FALSE(udx_reading());
+    EXPECT_TRUE(udx_reading());
 
     duplex.resume_read();
     EXPECT_FALSE(duplex.is_read_paused());
-    EXPECT_TRUE(udx_reading()) << "resume must re-arm the udx read";
+    EXPECT_TRUE(udx_reading());
     duplex.resume_read();
     EXPECT_FALSE(duplex.is_read_paused()) << "second resume must not change state";
     EXPECT_TRUE(udx_reading());
 
-    // A second cycle must work too — resume_read() has to leave the udx read
-    // callback genuinely re-installed, not just flip a flag.
     duplex.pause_read();
-    EXPECT_FALSE(udx_reading());
+    EXPECT_TRUE(duplex.is_read_paused());
     duplex.resume_read();
+    EXPECT_FALSE(duplex.is_read_paused());
     EXPECT_TRUE(udx_reading());
 
     duplex.destroy(0);

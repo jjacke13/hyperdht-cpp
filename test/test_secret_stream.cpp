@@ -848,3 +848,95 @@ TEST(SecretStreamDuplex, RejectsWriteBeforeConnect) {
     EXPECT_LT(rc, 0) << "write before connect must be rejected";
     // lb destructor handles stream and socket cleanup.
 }
+
+// Regression: bytes that arrive while the reader is paused must survive.
+//
+// pause_read() used to call udx_stream_read_stop(), which only nulls
+// stream->on_read. libudx's process_data_packet() increments stream->ack and
+// *then* delivers `if (stream->on_read != NULL)` (udx.c:1345-1353, and the
+// reorder drain at :1557-1566 which frees the packet either way) — so a
+// stopped read ACKNOWLEDGES data to the peer and discards it. Every transfer
+// large enough for a consumer to pause on came out silently truncated, at a
+// whole multiple of the chunk size.
+//
+// SecretStreamPause's other cases all passed throughout: they assert the
+// is_read_paused() flag, which was always correct. Only the bytes were wrong.
+TEST(SecretStreamDuplex, PausedReaderLosesNoBytes) {
+    using namespace duplex_test;
+    DuplexLoopback lb;
+    auto [ih, rh] = make_handshake_pair();
+
+    SecretStreamDuplex dup_i(&lb.stream1, ih, &lb.loop);
+    SecretStreamDuplex dup_r(&lb.stream2, rh, &lb.loop);
+
+    constexpr size_t kMessages = 200;
+    constexpr size_t kChunk = 1024;
+
+    struct Ctx {
+        DuplexLoopback* lb;
+        SecretStreamDuplex* i;
+        SecretStreamDuplex* r;
+        size_t sent = 0;
+        std::vector<uint8_t> got;
+        bool resumed = false;
+        int closes = 0;
+    } ctx{&lb, &dup_i, &dup_r};
+
+    dup_r.on_connect([&]() { dup_r.pause_read(); });
+    dup_r.on_message([&](const uint8_t* d, size_t n) { ctx.got.insert(ctx.got.end(), d, d + n); });
+
+    dup_i.on_close([&](int) { if (++ctx.closes == 2) ctx.lb->close_sockets(); });
+    dup_r.on_close([&](int) { if (++ctx.closes == 2) ctx.lb->close_sockets(); });
+
+    dup_i.start();
+    dup_r.start();
+
+    // Fill the pipe while the responder is paused, then resume and let the
+    // buffered frames drain.
+    uv_idle_t idle;
+    uv_idle_init(&lb.loop, &idle);
+    idle.data = &ctx;
+    uv_idle_start(&idle, [](uv_idle_t* h) {
+        auto* c = static_cast<Ctx*>(h->data);
+        if (!c->i->is_connected() || !c->r->is_connected()) return;
+        if (c->sent < kMessages) {
+            std::vector<uint8_t> chunk(kChunk, static_cast<uint8_t>(c->sent & 0xff));
+            c->i->write(chunk.data(), chunk.size(), nullptr);
+            c->sent++;
+            return;
+        }
+        uv_idle_stop(h);
+        uv_close(reinterpret_cast<uv_handle_t*>(h), nullptr);
+    });
+
+    uv_timer_t resume_timer;
+    uv_timer_init(&lb.loop, &resume_timer);
+    resume_timer.data = &ctx;
+    uv_timer_start(&resume_timer, [](uv_timer_t* t) {
+        auto* c = static_cast<Ctx*>(t->data);
+        c->resumed = true;
+        c->r->resume_read();
+    }, 1200, 0);
+
+    uv_timer_t stop_timer;
+    uv_timer_init(&lb.loop, &stop_timer);
+    stop_timer.data = &ctx;
+    uv_timer_start(&stop_timer, [](uv_timer_t* t) {
+        auto* c = static_cast<Ctx*>(t->data);
+        uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
+        c->lb->begin_shutdown(c->i, c->r);
+    }, 2600, 0);
+
+    uv_run(&lb.loop, UV_RUN_DEFAULT);
+    uv_close(reinterpret_cast<uv_handle_t*>(&resume_timer), nullptr);
+    uv_run(&lb.loop, UV_RUN_NOWAIT);
+
+    ASSERT_TRUE(ctx.resumed);
+    EXPECT_EQ(ctx.sent, kMessages);
+    EXPECT_EQ(ctx.got.size(), kMessages * kChunk)
+        << "bytes delivered while paused were acked to the peer and dropped";
+    for (size_t m = 0; m < kMessages && m * kChunk < ctx.got.size(); m++) {
+        EXPECT_EQ(ctx.got[m * kChunk], static_cast<uint8_t>(m & 0xff))
+            << "message " << m << " is out of order or missing";
+    }
+}

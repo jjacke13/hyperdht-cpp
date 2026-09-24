@@ -16,6 +16,7 @@
 #include <uv.h>
 
 #include <algorithm>
+#include <climits>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -876,4 +877,33 @@ TEST(ConnectPunchAddresses, PunchingRoundGossipsFullSampledSet) {
     }
     std::sort(ports.begin(), ports.end());
     EXPECT_EQ(ports, (std::vector<uint16_t>{1111, 2222}));
+}
+
+// ---------------------------------------------------------------------------
+// ConnectError::name — the library's strerror().
+//
+// Guards the "keep in sync with the constants" contract in dht.hpp: if a
+// code's mapping is edited or dropped, this fails. It cannot detect a NEWLY
+// added constant on its own, so the list below must grow with the enum —
+// which is exactly the review prompt we want.
+// ---------------------------------------------------------------------------
+TEST(ConnectErrorName, EveryCodeMapsToItsOwnName) {
+    using namespace hyperdht::ConnectError;
+    EXPECT_STREQ(name(NONE),                   "NONE");
+    EXPECT_STREQ(name(DESTROYED),              "DESTROYED");
+    EXPECT_STREQ(name(PEER_NOT_FOUND),         "PEER_NOT_FOUND");
+    EXPECT_STREQ(name(PEER_CONNECTION_FAILED), "PEER_CONNECTION_FAILED");
+    EXPECT_STREQ(name(NO_ADDRESSES),           "NO_ADDRESSES");
+    EXPECT_STREQ(name(HOLEPUNCH_FAILED),       "HOLEPUNCH_FAILED");
+    EXPECT_STREQ(name(HOLEPUNCH_TIMEOUT),      "HOLEPUNCH_TIMEOUT");
+    EXPECT_STREQ(name(RELAY_FAILED),           "RELAY_FAILED");
+    EXPECT_STREQ(name(SERVER_ERROR),           "SERVER_ERROR");
+}
+
+TEST(ConnectErrorName, UnknownCodesDoNotReturnNull) {
+    using namespace hyperdht::ConnectError;
+    // -9 is the next code anyone would add; +1 and INT_MIN cover the rest.
+    EXPECT_STREQ(name(-9), "UNKNOWN");
+    EXPECT_STREQ(name(1),  "UNKNOWN");
+    EXPECT_STREQ(name(INT_MIN), "UNKNOWN");
 }

@@ -229,6 +229,29 @@ namespace ConnectError {
     constexpr int SERVER_ERROR          = -8;  // JS: SERVER_ERROR / SERVER_INCOMPATIBLE — the
                                                // Noise-authenticated server replied with a terminal
                                                // payload (version!=1, error!=NONE, or missing udx)
+
+    // strerror() for the codes above. Returns a static string, never null;
+    // an unrecognised code gives "UNKNOWN".
+    //
+    // Without this every consumer hand-maintains the same switch and drifts
+    // when a code is added: wrappers/kotlin/.../Types.kt and
+    // wrappers/rust/hyperdht/src/error.rs each carry their own copy, and
+    // nospoon did too until this landed. Keep it in sync with the constants
+    // directly above.
+    inline const char* name(int error) {
+        switch (error) {
+            case NONE:                   return "NONE";
+            case DESTROYED:              return "DESTROYED";
+            case PEER_NOT_FOUND:         return "PEER_NOT_FOUND";
+            case PEER_CONNECTION_FAILED: return "PEER_CONNECTION_FAILED";
+            case NO_ADDRESSES:           return "NO_ADDRESSES";
+            case HOLEPUNCH_FAILED:       return "HOLEPUNCH_FAILED";
+            case HOLEPUNCH_TIMEOUT:      return "HOLEPUNCH_TIMEOUT";
+            case RELAY_FAILED:           return "RELAY_FAILED";
+            case SERVER_ERROR:           return "SERVER_ERROR";
+            default:                     return "UNKNOWN";
+        }
+    }
 }
 
 using ConnectCallback = std::function<void(int error, const ConnectResult& result)>;

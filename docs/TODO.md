@@ -5,12 +5,18 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-07-31.
+Last updated: 2026-10-13 (documentation reconciliation; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-13 documentation check**: the protomux reentrancy UAF is fixed
+  (`3421264`), and the client relay-address cache is implemented (`c196205`);
+  their entries below now reflect current source. Relay-to-direct upgrade code
+  is present on both client and server, but blind-relay pairing remains blocked
+  by BUG A (Section J.1), and the live upgrade test remains open. This check
+  does not revalidate every historical finding or test result.
 - **2026-07-31**: **announcer relay-set freeze FIXED** (`6ef85e6` gate split +
   `82d3c55` per-cycle rebuild, LOCAL, NOT PUSHED). The published relay set was
   write-once — the ANNOUNCE callback could only refresh an entry it already had
@@ -257,15 +263,11 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   a careless change hangs the duplex. No second owner is currently reachable
   (`relay_upgrade` never destroys; `ffi_stream.cpp:56,125` run before a Duplex
   exists), so this is hardening, not a known live bug.
-- [ ] **protomux UAF (NEW, found 2026-07-29 by cpp-reviewer under ASAN)** —
-  heap-use-after-free at `src/protomux.cpp:242` in `Channel::open()`, hit by
-  `Protomux.PairNotifyPerProtocol`, `Protomux.UnpairStopsNotify`,
-  `Protomux.PairFallsBackToGlobal`, `ProtomuxParity.AsymmetricIdDataRoundTrip`.
-  Pre-existing (file last touched in `5460cfa`), unrelated to the Finding J
-  diff. Likely synchronous loopback reentrancy: `Mux::write_frame` → `on_data`
-  → `dispatch_frame` frees/replaces the `Channel` while `open()` still uses
-  `this`. Note protomux was also one of the two subsystems left UNVERIFIED by
-  the 2026-07-26 parity re-verification — worth pairing the two.
+- [x] **protomux reentrancy UAF — FIXED** (`3421264`; source rechecked
+  2026-10-13). `Channel::open()` retains itself with `shared_from_this()`
+  across synchronous transport callbacks; Mux channel ownership is shared.
+  This closes the reported OPEN/reentrant REJECT lifetime hazard, not the
+  separate server/divergence-1 finding above.
 - [ ] **Finding K** — the pool-NAT sampling gate does not hold: `pool_fw` is
   read mid-flight at holepunch.cpp:1758, while the comment at
   holepunch.cpp:1777-1779 asserts sampling has completed by then. Field log
@@ -587,9 +589,12 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
   `udx_stream_change_remote` wrapped in `relay_upgrade::try_change_remote` +
   Duplex firewall tap + FFI). Covers the path-upgrade case; mid-connection NAT
   remap is out of scope (JS doesn't handle it either — onsocket is one-shot).
-- [ ] **`_relayAddressesCache`** — client-side cache of the server's relay
-  addresses keyed by server pubkey; skips the findPeer walk on reconnect (saves
-  2-3s). JS `hyperdht/index.js:55` (512-entry xache), `connect.js:323,464`.
+- [x] **`_relayAddressesCache` — IMPLEMENTED** (`c196205`; source rechecked
+  2026-10-13). `HyperDHT::cache_relay_addresses()` stores successful-connect
+  relays by server pubkey; reconnect starts handshakes from cached relays while
+  still running pipelined findPeer. The cache is capped at 512 entries with
+  unordered-map eviction, rather than JS xache LRU. See `src/dht.cpp` and
+  `src/connect.cpp`.
 - [x] **Read-side backpressure** — DONE 2026-07-28 (`a08cade`).
   `SecretStreamDuplex::pause_read/resume_read` wrap
   `udx_stream_read_stop/read_start`, exposed as `hyperdht_stream_pause/resume`

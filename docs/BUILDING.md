@@ -199,7 +199,7 @@ python3 -c "from hyperdht import HyperDHT, KeyPair; print(KeyPair.generate())"
 |------------|---------|-------------|
 | `CMAKE_BUILD_TYPE` | | `Release` for production, `Debug` for development |
 | `BUILD_SHARED_LIBS` | `OFF` | Build shared library instead of static |
-| `HYPERDHT_BUILD_TESTS` | `OFF` | Build test executables |
+| `HYPERDHT_BUILD_TESTS` | `ON` | Build test executables |
 | `HYPERDHT_DEBUG` | `OFF` | Enable debug logging macros |
 
 ---

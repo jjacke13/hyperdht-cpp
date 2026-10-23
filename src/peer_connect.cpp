@@ -337,14 +337,8 @@ static HandshakeResult validate_handshake_response(
     // JS router.js:65 — hs.mode !== REPLY.
     if (hs_resp.mode != MODE_REPLY) return result;
 
-    // JS router.js:66-67 — the reply must come from the exact address we
-    // sent the request to. The RPC layer matches responses to inflight
-    // requests by tid ONLY (rpc.cpp find_inflight) — it never compares the
-    // UDP source against the request's destination, so any host that
-    // guesses the 16-bit tid could answer. resp.remote_addr is the actual
-    // UDP source (transport-layer field set by the receive path); note
-    // resp.from is the wire `to` field — the responder's view of OUR
-    // address — not the sender's address.
+    // Keep the relay-source check at this boundary as well as in RPC.
+    // remote_addr is the UDP sender; resp.from is the responder's view of us.
     if (resp.remote_addr != relay_addr) return result;
 
     // JS router.js:68 — !hs.noise.

@@ -595,8 +595,8 @@ TEST(Query, SlowdownEngagesOnExternallySeededQuery) {
 // ---------------------------------------------------------------------------
 // §1c regression: an externally-seeded query whose seeds all fail (> 3/4 of
 // the cached nodes come back with error responses) must re-seed from the
-// routing table and continue walking. We use a pair of loopback servers:
-//   - "reject_server" accepts any incoming request and replies with error=1,
+// routing table and continue walking. We use loopback servers:
+//   - The reject servers accept incoming requests and reply with error=1,
 //     so seeded requests resolve fast and count as errors_++ (no wait for
 //     the 4s retry budget to expire).
 //   - "live_server" acts as the real DHT peer reachable via the client's
@@ -609,22 +609,23 @@ TEST(Query, TableRetryAfterExternalSeedFlood) {
     uv_loop_t loop;
     uv_loop_init(&loop);
 
-    // ---- Reject server: immediately replies with error=1 to every request.
-    //      Bound on 0.0.0.0 so that 127.0.0.X aliases on the loopback
-    //      interface all land here, letting us flood past k with unique
-    //      host:port keys while keeping exactly one server process.
+    // Each seed must reply from its queried endpoint and receiving socket.
     NodeId reject_id{};
     reject_id.fill(0xEE);
-    RpcSocket reject_server(&loop, reject_id);
-    reject_server.bind(0, "0.0.0.0");
-    reject_server.on_request([&](const Request& req) {
-        Response resp;
-        resp.tid = req.tid;
-        resp.from.addr = req.from.addr;
-        resp.id = reject_id;
-        resp.error = 1;  // Non-zero → Query counts as error, not success.
-        reject_server.reply(resp);
-    });
+    std::vector<std::unique_ptr<RpcSocket>> reject_servers;
+    for (size_t i = 0; i < routing::K; i++) {
+        auto server = std::make_unique<RpcSocket>(&loop, reject_id);
+        ASSERT_EQ(server->bind(0, "127.0.0.1"), 0);
+        server->on_request([&, socket = server.get()](const Request& req) {
+            Response resp;
+            resp.tid = req.tid;
+            resp.from.addr = req.from.addr;
+            resp.id = reject_id;
+            resp.error = 1;
+            socket->reply(resp, req.from_server);
+        });
+        reject_servers.push_back(std::move(server));
+    }
 
     // ---- Live server: real DHT node, reachable only via client's routing
     //      table. Reaching it is proof that §1c's table-retry fired.
@@ -633,8 +634,8 @@ TEST(Query, TableRetryAfterExternalSeedFlood) {
     RpcSocket live_server(&loop, live_id);
     live_server.bind(0);
     make_persistent(live_server);
-    RpcHandlers live_handlers(live_server);
-    live_handlers.install();
+    auto live_handlers = std::make_unique<RpcHandlers>(live_server);
+    live_handlers->install();
 
     // ---- Client with the live server installed as a table peer.
     NodeId client_id{};
@@ -655,18 +656,13 @@ TEST(Query, TableRetryAfterExternalSeedFlood) {
 
     // Flood the external seed with >= k reject addresses so seed_from_table
     // in start() must early-return (_addFromTable's pending >= k guard).
-    // Each entry uses a different 127.0.0.X host so the seen_ map keys
-    // stay unique while all packets actually land at the single reject
-    // server bound on 0.0.0.0:reject_port.
-    const uint16_t reject_port = reject_server.port();
+    // Unique bound ports keep the seen_ map's host:port keys distinct.
     for (int i = 0; i < static_cast<int>(routing::K); i++) {
         NodeId fake_id{};
         fake_id.fill(0x00);
         fake_id[0] = static_cast<uint8_t>(i + 1);
-        // 127.0.0.1 is the normal loopback; 127.0.0.2..20 are also loopback
-        // aliases on Linux and route to the reject_server's 0.0.0.0 bind.
         auto addr = Ipv4Address::from_string(
-            "127.0.0." + std::to_string(i + 1), reject_port);
+            "127.0.0.1", reject_servers[i]->port());
         q->add_seed_node(fake_id, addr);
     }
 
@@ -679,7 +675,7 @@ TEST(Query, TableRetryAfterExternalSeedFlood) {
         saw_from_table_flip = q->from_table();
         saw_successes = q->successes();
         saw_errors = q->errors();
-        reject_server.close();
+        for (auto& server : reject_servers) server->close();
         live_server.close();
         client.close();
     });
@@ -696,12 +692,16 @@ TEST(Query, TableRetryAfterExternalSeedFlood) {
     // so a short deadline keeps the test fast without being flaky.
     uv_timer_t timer;
     uv_timer_init(&loop, &timer);
-    struct Ctx { rpc::RpcSocket* rj; rpc::RpcSocket* lv; rpc::RpcSocket* c; };
-    Ctx ctx{&reject_server, &live_server, &client};
+    struct Ctx {
+        std::vector<std::unique_ptr<RpcSocket>>* rejects;
+        rpc::RpcSocket* lv;
+        rpc::RpcSocket* c;
+    };
+    Ctx ctx{&reject_servers, &live_server, &client};
     timer.data = &ctx;
     uv_timer_start(&timer, [](uv_timer_t* t) {
         auto* c = static_cast<Ctx*>(t->data);
-        c->rj->close();
+        for (auto& server : *c->rejects) server->close();
         c->lv->close();
         c->c->close();
         uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
@@ -726,7 +726,9 @@ TEST(Query, TableRetryAfterExternalSeedFlood) {
     // the live server reachable through the routing table.
     EXPECT_GE(saw_successes, 1) << "no live reply received after §1c retry";
 
-    uv_loop_close(&loop);
+    live_handlers.reset();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
 // ===========================================================================

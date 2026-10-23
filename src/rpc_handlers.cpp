@@ -112,6 +112,7 @@ void RpcHandlers::on_gc_tick(uv_timer_t* timer) {
     self->mutables_.gc(now, self->storage_ttl_ms_);
     self->immutables_.gc(now, self->storage_ttl_ms_);
     self->store_.gc(now);
+    if (self->router_) self->router_->gc(uv_hrtime() / 1000000);
 
     // JS index.js:608 — refreshes maxAge = opts.maxAge, same as records.
     self->refreshes_.gc(now, self->ann_ttl_ms_);

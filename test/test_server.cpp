@@ -1714,3 +1714,47 @@ TEST(ServerFfiFirewall, ReturningNonZeroRejects) {
         << "a C firewall returning non-zero must REJECT (silence)";
     EXPECT_FALSE(probe.connection_received);
 }
+
+TEST(Server, AsyncFirewallPendingLimitDuplicateBoundAndExpiry) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        rpc::RpcSocket socket(&loop, {});
+        ASSERT_EQ(socket.bind(0, "127.0.0.1"), 0);
+        router::Router router;
+        Server srv(socket, router);
+        srv.handshake_clear_wait = 100;
+        noise::Seed seed{};
+        auto kp = noise::generate_keypair(seed);
+        srv.listen(kp, [](const ConnectionInfo&) {});
+        std::vector<Server::FirewallDoneCb> decisions;
+        srv.set_firewall_async([&](const auto&, const auto&, const auto&, auto done) {
+            decisions.push_back(std::move(done));
+        });
+        int replies = 0;
+        auto dispatch = [&](const auto& req) {
+            router.handle_peer_handshake(req, [&](const auto&) { ++replies; },
+                [](const auto&, udx_socket_t*) {});
+        };
+        auto hs = make_handshake_request(kp, peer_connect::FIREWALL_CONSISTENT);
+        dispatch(hs.req);
+        for (int i = 0; i < 1000; ++i) dispatch(hs.req);
+        decisions[0](false);
+        EXPECT_EQ(replies, 33);
+        // One live session plus 255 pending authorizations fills the same budget.
+        for (int i = 0; i < 300; ++i) {
+            auto next = make_handshake_request(kp, peer_connect::FIREWALL_CONSISTENT);
+            dispatch(next.req);
+        }
+        EXPECT_EQ(decisions.size(), 256u);
+        uv_sleep(120);
+        uv_run(&loop, UV_RUN_NOWAIT);
+        for (size_t i = 1; i < decisions.size(); ++i) decisions[i](false);
+        EXPECT_EQ(replies, 33); // late completions cannot resurrect expired sessions
+        auto fresh = make_handshake_request(kp, peer_connect::FIREWALL_CONSISTENT);
+        dispatch(fresh.req);
+        EXPECT_EQ(decisions.size(), 257u);
+        srv.close(); decisions.clear(); socket.close(); uv_run(&loop, UV_RUN_DEFAULT);
+    }
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}

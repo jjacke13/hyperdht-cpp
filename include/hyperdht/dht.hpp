@@ -152,9 +152,8 @@ struct DhtOptions {
     // of `maxAge` unless the caller explicitly overrides via `storage_ttl_ms`.
     // JS parity: `mutables: { maxAge: opts.maxAge || 48h }`.
     //
-    // Currently only the storage caches are configurable in C++, so
-    // `max_age_ms` is stored for forward compatibility but isn't wired
-    // anywhere yet. Set `storage_ttl_ms` to tune mutable/immutable TTL.
+    // Router forwards share these bounds; local Server listeners stay pinned.
+    // Set `storage_ttl_ms` to tune mutable/immutable TTL separately.
     size_t max_size = 65536;
     uint64_t max_age_ms = 20 * 60 * 1000;
     uint64_t storage_ttl_ms = 48ULL * 60 * 60 * 1000;  // 48h (JS default)

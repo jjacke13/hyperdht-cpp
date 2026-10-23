@@ -93,9 +93,7 @@
 #include "hyperdht/debug.hpp"
 
 // Context stored in rawStream->data during handshake→connection window
-struct RawStreamCtx {
-    hyperdht::server::Server* server;
-};
+using hyperdht::server_connection::RawStreamCtx;
 
 // Owns the relay control connection after a relay emit (JS PR #266, hazard 2).
 // Members are destroyed in reverse declaration order — client, then mux, then
@@ -472,7 +470,9 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         if (pit != pending_handshakes_.end()) {
             DHT_LOG("  [server] Dedup: queueing duplicate on pending id=%u\n",
                     dedup_it->second);
-            pit->second.push_back(std::move(reply_fn));
+            if (pit->second.replies.size() < 32) {
+                pit->second.replies.push_back(std::move(reply_fn));
+            }
             return;
         }
         // Already processed this handshake — resend the cached reply
@@ -494,6 +494,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         handshake_dedup_.erase(dedup_it);
     }
 
+    if (connections_.size() + pending_handshakes_.size() >= 256) return;
     uint32_t hp_id = next_hp_id_++;
 
     // Get our addresses and relay info.
@@ -609,11 +610,21 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         // re-invoking the firewall (flood defence). on_handshake_result
         // resolves the entry — reply to all, or silence on reject.
         handshake_dedup_[noise_key] = hp_id;
-        pending_handshakes_[hp_id];
+        auto& authorization = pending_handshakes_[hp_id];
+        authorization.handshake = pending_shared;
+        authorization.timer = std::make_unique<async_utils::UvTimer>(socket_.loop());
+        authorization.timer->start([this, hp_id, noise_key]() {
+            pending_handshakes_.erase(hp_id);
+            auto it = handshake_dedup_.find(noise_key);
+            if (it != handshake_dedup_.end() && it->second == hp_id) {
+                handshake_dedup_.erase(it);
+            }
+        }, handshake_clear_wait);
+        std::weak_ptr<server_connection::PendingHandshake> weak_pending = pending_shared;
 
         firewall_async_(pending_shared->remote_public_key,
                         pending_shared->remote_payload, peer_address,
-                        [this, weak_alive, fired_once, pending_shared,
+                        [this, weak_alive, fired_once, weak_pending,
                          hp_id, noise_key, has_remote_addr, relayed,
                          from_address, relay_through_shared, our_addrs,
                          relay_infos, reply_fn](bool reject) mutable {
@@ -627,6 +638,8 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
 
             // (3) Early-out on close/suspend BEFORE finalize work.
             if (closed_ || suspended_) return;
+            auto pending_shared = weak_pending.lock();
+            if (!pending_shared || !pending_handshakes_.contains(hp_id)) return;
 
             auto res = server_connection::finalize_handshake(
                 std::move(*pending_shared), hp_id,
@@ -683,7 +696,7 @@ void Server::on_handshake_result(
     senders.push_back(std::move(reply_fn));
     if (auto pit = pending_handshakes_.find(hp_id);
         pit != pending_handshakes_.end()) {
-        for (auto& fn : pit->second) senders.push_back(std::move(fn));
+        for (auto& fn : pit->second.replies) senders.push_back(std::move(fn));
         pending_handshakes_.erase(pit);
     }
     // Failure paths below must also drop the dedup entry the async path

@@ -79,7 +79,7 @@ std::optional<noise::PubKey> ConnectOptions::select_relay_through(
 // ---------------------------------------------------------------------------
 
 HyperDHT::HyperDHT(uv_loop_t* loop, DhtOptions opts)
-    : loop_(loop), opts_(std::move(opts)) {
+    : loop_(loop), opts_(std::move(opts)), router_(opts_.max_size, opts_.max_age_ms) {
 
     // Resolve the default keypair — JS `opts.keyPair || createKeyPair(opts.seed)`.
     // Priority:

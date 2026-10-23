@@ -268,8 +268,11 @@ uint16_t RpcSocket::alloc_tid() {
     // C++-sentinel consequence, not a JS-parity divergence. next_tid_ can be 0
     // here from the random_device seed (constructor) or from the uint16 wrap
     // after returning 65535 — the top-of-call guard covers both.
-    if (next_tid_ == 0) next_tid_ = 1;
-    return next_tid_++;
+    do {
+        if (next_tid_ == 0) next_tid_ = 1;
+        auto tid = next_tid_++;
+        if (!find_inflight(tid) && !probe_requests_.contains(tid)) return tid;
+    } while (true);
 }
 
 bool RpcSocket::cancel_request(uint16_t tid) {
@@ -361,8 +364,15 @@ void RpcSocket::send_now(InflightRequest* req) {
     req->sent_at = uv_now(loop_);
     congestion_.send();
 
+    auto* via = active_socket();
+    req->response_sockets |= req->nat_response_socket != 0
+        ? req->nat_response_socket : (via == socket_handle() ? 2 : 1);
+    // EMBEDDED has one socket, whose callback is on_recv_client.
+#ifdef HYPERDHT_EMBEDDED
+    req->response_sockets = 1;
+#endif
     // Send the cached buffer
-    udp_send(req->buffer, req->to);
+    udp_send(req->buffer, req->to, via);
 
     // Start/restart per-request timeout timer.
     // Custom override wins (DELAYED_PING sets it to delay+grace). Otherwise use
@@ -452,6 +462,17 @@ uint16_t RpcSocket::request(const messages::Request& req,
     inflight->retries = retries;
     inflight->to = msg.to.addr;
     inflight->buffer = messages::encode_request(msg);
+#ifndef HYPERDHT_EMBEDDED
+    if (msg.internal && msg.command == messages::CMD_PING_NAT &&
+        msg.value && msg.value->size() >= 2) {
+        uint16_t port = (*msg.value)[0] | (static_cast<uint16_t>((*msg.value)[1]) << 8);
+        struct sockaddr_in client_addr{};
+        int len = sizeof(client_addr);
+        udx_socket_getsockname(&client_socket_, reinterpret_cast<struct sockaddr*>(&client_addr), &len);
+        if (port == this->port()) inflight->nat_response_socket = 2;
+        else if (port == ntohs(client_addr.sin_port)) inflight->nat_response_socket = 1;
+    }
+#endif
 
     // Init per-request timer
     uv_timer_init(loop_, &inflight->timer);
@@ -727,14 +748,6 @@ void RpcSocket::on_recv_server(udx_socket_t* socket, ssize_t nread, const uv_buf
     auto* self = static_cast<RpcSocket*>(socket->data);
     auto* addr_in = reinterpret_cast<const struct sockaddr_in*>(addr);
 
-    // During firewall probe: track which hosts reached the server socket.
-    if (self->firewall_probe_running_) {
-        char host[INET_ADDRSTRLEN];
-        uv_ip4_name(addr_in, host, sizeof(host));
-        if (self->probe_replied_hosts_.size() < 16)  // H26: cap
-            self->probe_replied_hosts_.insert(host);
-    }
-
     // Decode + dispatch first: for a firewall-probe reply this feeds
     // probe_ring_ with the server-observed `to` field (handle_message), so the
     // finish check below sees a populated sampler even when the host threshold
@@ -902,9 +915,17 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
         uv_ip4_name(addr, remote_host, sizeof(remote_host));
         auto remote_addr = compact::Ipv4Address::from_string(
             remote_host, ntohs(addr->sin_port));
-        // Expose the actual UDP source to response callbacks (JS res.from,
-        // io.js:86). Inflight matching below is by tid ONLY — consumers that
-        // need JS's reply-source check (router.js:66-67) compare this field.
+        auto* inflight = find_inflight(resp.tid);
+        const auto probe = probe_requests_.find(resp.tid);
+        const bool probe_reply = firewall_probe_running_ && from_server &&
+            probe != probe_requests_.end() && probe->second == remote_addr;
+        if (!probe_reply && (!inflight || inflight->destroyed || inflight->queued ||
+            inflight->to != remote_addr ||
+            !(inflight->response_sockets & (from_server ? 2 : 1)))) return;
+        if (probe_reply) {
+            probe_requests_.erase(probe);
+            probe_replied_hosts_.insert(remote_host);
+        }
         resp.remote_addr = remote_addr;
         nat_sampler_.add(resp.from.addr, remote_addr);
         // Feed the dht-rpc ring sampler the same observation. JS feeds
@@ -918,7 +939,7 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
         // sampler with the server-observed `to` so finish_firewall_probe can
         // check host consistency + port preservation and swap it in.
         // JS: index.js:940 — `natSampler.add(res.to.host, res.to.port)`.
-        if (from_server && firewall_probe_running_) {
+        if (probe_reply) {
             probe_ring_.add(resp.from.addr.host_string(), resp.from.addr.port);
         }
 #endif
@@ -936,7 +957,7 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
             }
         }
 
-        auto* inflight = find_inflight(resp.tid);
+        if (probe_reply) return;
         if (inflight && !inflight->destroyed) {
             tick_responses_++;
 
@@ -1325,6 +1346,7 @@ void RpcSocket::start_firewall_probe() {
     if (firewall_probe_running_ || closing_) return;
     firewall_probe_running_ = true;
     probe_replied_hosts_.clear();
+    probe_requests_.clear();
     // JS: index.js:818 — a fresh `new NatSampler()` for the probe, fed only
     // from the server socket's PING_NAT replies (see handle_message).
     probe_ring_.reset();
@@ -1360,8 +1382,11 @@ void RpcSocket::start_firewall_probe() {
         req.internal = true;
         req.command = messages::CMD_PING_NAT;
         req.value = value;
-        auto buf = messages::encode_request(req);
+        req.tid = alloc_tid();
         auto addr = compact::Ipv4Address::from_string(node.host, node.port);
+        req.to.addr = addr;
+        probe_requests_[req.tid] = addr;
+        auto buf = messages::encode_request(req);
         udp_send_on(buf, addr, &client_socket_);
     }
 
@@ -1380,6 +1405,7 @@ void RpcSocket::start_firewall_probe() {
 void RpcSocket::finish_firewall_probe() {
     if (!firewall_probe_running_) return;
     firewall_probe_running_ = false;
+    probe_requests_.clear();
     if (probe_timer_) uv_timer_stop(probe_timer_);
 
     size_t threshold = probe_threshold();

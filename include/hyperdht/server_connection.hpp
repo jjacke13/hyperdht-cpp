@@ -20,7 +20,10 @@
 #include "hyperdht/relay_upgrade.hpp"
 
 namespace hyperdht {
+namespace server { class Server; }
 namespace server_connection {
+
+struct RawStreamCtx { server::Server* server; };
 
 // ---------------------------------------------------------------------------
 // ServerConnection — per-incoming-connection state on the server side

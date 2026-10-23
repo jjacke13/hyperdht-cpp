@@ -17,7 +17,7 @@
 
 namespace hyperdht {
 
-template <typename Key, typename Value>
+template <typename Key, typename Value, typename Hash = std::hash<Key>>
 class LruCache {
 public:
     explicit LruCache(size_t max_size) : max_size_(max_size) {}
@@ -46,7 +46,7 @@ public:
     }
 
     // Lookup. Returns nullptr if not found. Promotes to front.
-    const Value* get(const Key& key) {
+    Value* get(const Key& key) {
         auto it = map_.find(key);
         if (it == map_.end()) return nullptr;
         // Promote to front (most recently used)
@@ -96,7 +96,7 @@ private:
 
     size_t max_size_;
     std::list<Entry> entries_;                                  // front = newest, back = oldest
-    std::unordered_map<Key, typename std::list<Entry>::iterator> map_;
+    std::unordered_map<Key, typename std::list<Entry>::iterator, Hash> map_;
 };
 
 }  // namespace hyperdht

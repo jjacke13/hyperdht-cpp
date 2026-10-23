@@ -41,6 +41,7 @@ ServerConnection::~ServerConnection() {
     if (raw_stream) {
         // Null the RawStreamCtx pointer so the on_close callback doesn't
         // dereference a dangling Server* after the Server is destroyed.
+        delete static_cast<RawStreamCtx*>(raw_stream->data);
         raw_stream->data = nullptr;
         // Same hazard as ~ConnState (Finding J): re-destroying a stream whose
         // teardown is already in flight aborts the process.
@@ -78,7 +79,11 @@ ServerConnection::ServerConnection(ServerConnection&& other) noexcept
 
 ServerConnection& ServerConnection::operator=(ServerConnection&& other) noexcept {
     if (this != &other) {
-        if (raw_stream) udx::destroy_stream_once(raw_stream);
+        if (raw_stream) {
+            delete static_cast<RawStreamCtx*>(raw_stream->data);
+            raw_stream->data = nullptr;
+            udx::destroy_stream_once(raw_stream);
+        }
         id = other.id;
         round = other.round;
         tx_key = other.tx_key;

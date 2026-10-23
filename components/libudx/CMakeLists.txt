@@ -3,9 +3,12 @@
 
 set(LIBUDX_DIR "${CMAKE_CURRENT_LIST_DIR}/../../deps/libudx")
 
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/HardenUdx.cmake")
+hyperdht_harden_udx("${LIBUDX_DIR}/src/udx.c" "${CMAKE_CURRENT_BINARY_DIR}/udx-hardened.c")
+
 idf_component_register(
     SRCS
-        "${LIBUDX_DIR}/src/udx.c"
+        "${CMAKE_CURRENT_BINARY_DIR}/udx-hardened.c"
         "${LIBUDX_DIR}/src/udx_bbr.c"
         "${LIBUDX_DIR}/src/udx_rate.c"
         "${LIBUDX_DIR}/src/cirbuf.c"

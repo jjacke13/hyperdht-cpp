@@ -82,8 +82,11 @@ endif()
 
 # libudx — C library from git submodule
 # libudx is always static (internal dependency, compiled into libhyperdht)
+include(cmake/HardenUdx.cmake)
+hyperdht_harden_udx("${CMAKE_CURRENT_SOURCE_DIR}/deps/libudx/src/udx.c"
+                    "${CMAKE_CURRENT_BINARY_DIR}/udx-hardened.c")
 set(UDX_SOURCES
-    deps/libudx/src/udx.c
+    "${CMAKE_CURRENT_BINARY_DIR}/udx-hardened.c"
     deps/libudx/src/cirbuf.c
     deps/libudx/src/queue.c
     deps/libudx/src/endian.c
@@ -333,6 +336,7 @@ if(HYPERDHT_BUILD_TESTS)
     add_unit_test(test_tokens)
     add_unit_test(test_messages)
     add_unit_test(test_rpc_ping)
+    add_unit_test(test_security)
     add_unit_test(test_rpc_bootstrap)
     add_unit_test(test_rpc_handlers)
     add_unit_test(test_tick)

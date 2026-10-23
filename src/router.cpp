@@ -5,8 +5,7 @@
 // JS: .analysis/js/hyperdht/lib/router.js:20-249 (whole Router class)
 //
 // C++ diffs from JS:
-//   - JS uses xache `Cache` with TTL-based eviction. C++ uses a plain
-//     std::unordered_map keyed by 32-byte target.
+//   - Remote forwards use a bounded TTL/LRU cache; local listeners are pinned.
 //   - JS Router both forwards AND originates client requests
 //     (peerHandshake / peerHolepunch). C++ Router forwards only; client-side
 //     origination lives in src/peer_connect.cpp.
@@ -164,32 +163,52 @@ bool relay_peer_holepunch(const messages::Request& req,
 }  // namespace
 
 void Router::set(const announce::TargetKey& target, ForwardEntry entry) {
-    forwards_[target] = std::move(entry);
+    if (entry.on_peer_handshake || entry.on_peer_holepunch) {
+        relays_.remove(target);
+        forwards_[target] = std::move(entry);
+    } else if (!forwards_.contains(target) && relays_.max_size() != 0) {
+        auto now = uv_hrtime() / 1000000;
+        relays_.put(target, {std::move(entry), now}, now);
+    }
+}
+
+ForwardEntry* Router::relay(const announce::TargetKey& target) const {
+    auto* cached = relays_.get(target);
+    if (!cached) return nullptr;
+    if (uv_hrtime() / 1000000 - cached->created_at > relay_ttl_ms_) {
+        relays_.remove(target);
+        return nullptr;
+    }
+    return &cached->entry;
 }
 
 ForwardEntry* Router::get(const announce::TargetKey& target) {
     auto it = forwards_.find(target);
-    if (it == forwards_.end()) return nullptr;
-    return &it->second;
+    return it == forwards_.end() ? relay(target) : &it->second;
 }
 
 void Router::remove(const announce::TargetKey& target) {
     forwards_.erase(target);
+    relays_.remove(target);
 }
 
 bool Router::has(const announce::TargetKey& target) const {
-    return forwards_.count(target) > 0;
+    return forwards_.contains(target) || relay(target) != nullptr;
 }
 
 const std::vector<uint8_t>* Router::record(const announce::TargetKey& target) const {
     auto it = forwards_.find(target);
-    if (it == forwards_.end()) return nullptr;
-    if (it->second.record.empty()) return nullptr;
-    return &it->second.record;
+    const auto* entry = it == forwards_.end() ? relay(target) : &it->second;
+    return entry && !entry->record.empty() ? &entry->record : nullptr;
+}
+
+void Router::gc(uint64_t now_ms) {
+    relays_.gc(now_ms, relay_ttl_ms_);
 }
 
 void Router::clear() {
     forwards_.clear();
+    relays_ = decltype(relays_)(relays_.max_size());
 }
 
 // ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-13 (documentation reconciliation; older snapshots below are historical).
+Last updated: 2026-10-23 (security bounds and validation; older snapshots below are historical).
 
 ---
 
@@ -374,27 +374,15 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   unexplained — `id = BLAKE2b(host, port)` makes each mapping an independent
   random point, so three mappings of one host being the global closest-3 is
   suspicious in itself; if it recurs, suspect the selection/sort, not diversity.
-- [ ] **Router forward cache has no TTL and no size cap (from the completeness
-  critic; RECHECK — scoped down 2026-07-31, still real).** `src/router.cpp` uses
-  a plain `unordered_map` erased only on explicit unset; JS uses
-  `new Cache(opts.forwards)` with maxSize 65536 / maxAge 20 min (router.js:23,
-  index.js:594-595). Two consequences: unbounded memory, and stale forwards that
-  keep relaying toward a peer that is long gone — i.e. a hyperdht-cpp node
-  becomes one of the silently-dead relays Finding M has to fail over.
-  **SCOPE (checked 2026-07-31):** NOT reachable against a firewalled client.
-  Entries arrive only via ANNOUNCE, which only reaches nodes that are in others'
-  routing tables, which requires having passed the firewall probe and gone
-  persistent — a node advertises its id only when persistent and on the server
-  socket (rpc.cpp:846), and table insertion needs that id (rpc.cpp:975-988). So
-  exposure is limited to publicly-reachable nodes (nospoon servers, anything
-  acting as a DHT node); laptop/phone clients are not exposed.
-  **Still real at that scope:** the handler requires target + token + valid
-  Ed25519 signature (rpc_handlers.cpp:593-631), which blocks spoofing but not
-  volume — the token is only address-bound and the target is `BLAKE2b(pubkey)`
-  of a SELF-generated keypair with a self-made signature, so one address can
-  mint unlimited valid targets and therefore unlimited forward entries.
-  Test: insert 100k targets, assert size <= 65536; insert one, advance 21 min,
-  assert `get()` == nullptr. Both fail today.
+- [x] **Router forward cache bounded and expired (2026-10-23).** Remote
+  forwards use the existing LRU cache with `DhtOptions::max_size` and
+  `max_age_ms`; defaults remain 65536 entries and 20 minutes. Expiry applies
+  on lookup and periodic GC; refresh resets age. Local listening Server
+  handlers stay separate so remote announcements cannot replace or evict
+  them. Focused regressions cover capacity, expiry, refresh, signed
+  announcements and listener retention. The full filtered unit suite passes
+  in Debug and Release; consumer and isolated connectivity checks accompany
+  this security change.
 - [ ] **RECHECK: the persistence gate is one-shot and cannot demote** (context
   for Finding O and for the item above; no action decided yet). Becoming a relay
   requires passing the PING_NAT firewall probe once — five routing-table nodes
@@ -1211,11 +1199,10 @@ has still never carried a packet against a real peer.**
       3/3 and in a full rerun. Untouched by this branch (`src/query.cpp` and
       `test/test_query.cpp` are identical to `main`). Give it slack or a deadline that
       is not wall-clock-tight.
-- [ ] `test_server_punch_socket` leaks 64 B / 8 allocs under ASAN — every one is the
-      `RawStreamCtx` allocated at `src/server.cpp:782`, retained because these tests
-      drive a handshake without ever completing or clearing the session. Pre-existing
-      and harness-only (`RawStreamCtx` is freed on the real connect/close paths), but
-      confirm that reading before treating the number as a regression baseline.
+- [x] Abandoned `ServerConnection` raw streams now release `RawStreamCtx` on
+      destruction and move assignment (2026-10-23). All 11
+      `test_server_punch_socket` cases pass with ASan, UBSan and leak detection;
+      this does not claim that every legacy test fixture is leak-free.
 - [ ] `SocketPoolTest.DestroyClosesAll` accounts for the whole 7488 B `test_socket_pool`
       ASAN leak: `destroy()` deliberately never deletes `SocketRef`s (an outstanding
       keepalive may still call `inactive()` on one). Expected, not a defect.

@@ -360,8 +360,12 @@ private:
     // their reply_fns on the entry. on_handshake_result flushes everyone
     // with the same reply bytes (or silence if the firewall rejected).
     // Cleared in close()/suspend() if the firewall never resolves.
-    std::unordered_map<uint32_t, std::vector<router::HandshakeReplyFn>>
-        pending_handshakes_;
+    struct PendingAuthorization {
+        std::vector<router::HandshakeReplyFn> replies;
+        std::shared_ptr<server_connection::PendingHandshake> handshake;
+        std::unique_ptr<async_utils::UvTimer> timer;
+    };
+    std::unordered_map<uint32_t, PendingAuthorization> pending_handshakes_;
 public:
     // Live session by holepunch id, or nullptr. Read-only inspection hook for
     // tests (punch socket, parked rounds) — not part of the public API.

@@ -20,6 +20,7 @@
 #include "hyperdht/announce.hpp"
 #include "hyperdht/compact.hpp"
 #include "hyperdht/messages.hpp"
+#include "hyperdht/lru_cache.hpp"
 #include "hyperdht/peer_connect.hpp"
 
 namespace hyperdht {
@@ -99,9 +100,7 @@ struct ForwardEntry {
 
     // Address to relay PEER_HANDSHAKE/HOLEPUNCH toward when this entry has no
     // local handlers (JS persistent.js:132 `relay: req.from`). Set on an
-    // announceSelf ANNOUNCE. ponytail: only the relay-forward else-branches
-    // (parity stage 2, not yet ported) consume this; stored now so that work
-    // has the data.
+    // announceSelf ANNOUNCE and consumed by the relay-forward branches.
     std::optional<compact::Ipv4Address> relay;
 };
 
@@ -111,6 +110,9 @@ struct ForwardEntry {
 
 class Router {
 public:
+    explicit Router(size_t max_relays = 65536, uint64_t relay_ttl_ms = announce::DEFAULT_TTL_MS)
+        : relays_(max_relays), relay_ttl_ms_(relay_ttl_ms) {}
+    void gc(uint64_t now_ms);
     // Register a target → entry mapping
     void set(const announce::TargetKey& target, ForwardEntry entry);
 
@@ -129,7 +131,7 @@ public:
     // Clear all entries
     void clear();
 
-    size_t size() const { return forwards_.size(); }
+    size_t size() const { return forwards_.size() + relays_.size(); }
 
     // Callback types for reply (sends RESPONSE) and relay (sends REQUEST).
     // The relay path is used when mode=FROM_RELAY: the server sends a REQUEST
@@ -161,7 +163,12 @@ public:
                                ReplyFn reply, RelayFn relay);
 
 private:
+    // Local listeners cannot be evicted by remote announcements.
     std::unordered_map<announce::TargetKey, ForwardEntry, announce::KeyHash> forwards_;
+    struct CachedForward { ForwardEntry entry; uint64_t created_at; };
+    mutable LruCache<announce::TargetKey, CachedForward, announce::KeyHash> relays_;
+    uint64_t relay_ttl_ms_;
+    ForwardEntry* relay(const announce::TargetKey& target) const;
 };
 
 }  // namespace router

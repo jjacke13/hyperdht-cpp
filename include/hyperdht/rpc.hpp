@@ -128,6 +128,8 @@ struct InflightRequest {
     // pushes every request into io.inflight immediately. Cleared by
     // drain_pending() when the request is finally sent.
     bool queued = false;
+    uint8_t response_sockets = 0; // bit 0 client, bit 1 server
+    uint8_t nat_response_socket = 0; // PING_NAT may explicitly redirect the reply
 };
 
 // ---------------------------------------------------------------------------
@@ -613,6 +615,7 @@ private:
     // JS: dht-rpc/index.js:916-963 (_checkIfFirewalled)
     bool firewall_probe_running_ = false;
     std::unordered_set<std::string> probe_replied_hosts_;
+    std::unordered_map<uint16_t, compact::Ipv4Address> probe_requests_;
     size_t probe_expected_ = 0;
     uv_timer_t* probe_timer_ = nullptr;
     void start_firewall_probe();

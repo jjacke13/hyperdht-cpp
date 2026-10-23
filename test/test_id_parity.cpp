@@ -390,7 +390,7 @@ TEST(IdParity, ValidateIdRejectsMismatch) {
         resp.tid = req.tid;
         resp.from.addr = req.from.addr;
         resp.id = bad_id;  // This won't match compute_peer_id(server_addr)
-        server.reply(resp);
+        server.reply(resp, req.from_server);
     });
 
     NodeId cid{};

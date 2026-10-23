@@ -749,8 +749,10 @@ struct SilentNodes {
 // Protomux → blind-relay.
 struct FakeRelayPeer {
     FakeRelayPeer(uv_loop_t* loop, const hyperdht::noise::Keypair& kp,
-                  const bl::Token& token, bool initiator = false)
+                  const bl::Token& token, bool initiator = false,
+                  bool open_relay = false)
         : loop_(loop), kp_(kp), token_(token), initiator_(initiator),
+          open_relay_(open_relay),
           node_(loop, node_id()), udx_(loop), ep_(udx_) {
         node_.bind(0);
         auto a = loopback(0);
@@ -814,15 +816,12 @@ struct FakeRelayPeer {
         peer_udx_id_ = cp.udx.has_value() ? cp.udx->id : 0;
         peer_addr_ = req.from.addr;
 
-        // CONSISTENT + holepunch info keeps every early-completion branch in
-        // on_handshake_success shut (direct connect / no-holepunch-info), so
-        // the connect can only finish through the rawStream firewall — the one
-        // path that fills ConnectResult::udx_socket, which the relay chain
-        // needs to connect its control stream.
+        // Exercise both punched and OPEN relay control connections; OPEN
+        // completes before the rawStream firewall can supply udx_socket.
         pc::NoisePayload rp;
         rp.version = 1;
         rp.error = pc::ERROR_NONE;
-        rp.firewall = pc::FIREWALL_CONSISTENT;
+        rp.firewall = open_relay_ ? pc::FIREWALL_OPEN : pc::FIREWALL_CONSISTENT;
         rp.addresses4.push_back(ep_addr());
         rp.udx = pc::UdxInfo{1, false, EP_UDX_ID, 0};
         rp.has_secret_stream = true;
@@ -838,14 +837,13 @@ struct FakeRelayPeer {
         pc::HandshakeMessage reply_msg;
         reply_msg.mode = pc::MODE_REPLY;
         reply_msg.noise = responder.send(rpb.data(), rpb.size());
+        if (open_relay_) reply_msg.peer_address = ep_addr();
 
         msgs::Response resp;
         resp.tid = req.tid;
         // Doubles as the wire `to` (→ hs.client_address) AND the datagram
-        // destination (rpc.cpp:558-573). No reply peer_address, so
-        // hs.server_address stays empty and the LAN shortcut — which would
-        // complete the connect with a null udx_socket — never arms
-        // (`relayed = server_addr_js != relay_addr` is false).
+        // destination (rpc.cpp:558-573). The OPEN reply also names the UDX
+        // endpoint, so the bogon-filtered loopback address has that fallback.
         resp.from.addr = req.from.addr;
         resp.value = pc::encode_handshake_msg(reply_msg);
         node_.reply(resp, req.from_server);
@@ -912,6 +910,7 @@ struct FakeRelayPeer {
     hyperdht::noise::Keypair kp_;
     bl::Token token_;
     bool initiator_;
+    bool open_relay_;
     hyperdht::rpc::RpcSocket node_;
     hyperdht::udx::Udx udx_;
     hyperdht::udx::UdxSocket ep_;
@@ -926,7 +925,7 @@ struct FakeRelayPeer {
 
 }  // namespace ru_relay_emit
 
-TEST(ServerRelayEmit, UpgradeHoldsTheSessionPunchSocket) {
+static void run_server_relay_emit(bool open_relay) {
     using namespace ru_relay_emit;
     using hyperdht::server::ConnectionInfo;
 
@@ -939,7 +938,8 @@ TEST(ServerRelayEmit, UpgradeHoldsTheSessionPunchSocket) {
     bl::Token token{};
     token.fill(0x33);
 
-    auto relay = std::make_unique<FakeRelayPeer>(&loop, relay_kp, token);
+    auto relay = std::make_unique<FakeRelayPeer>(&loop, relay_kp, token, false,
+                                                open_relay);
 
     hyperdht::HyperDHT dht(&loop);            // empty bootstrap — offline
     ASSERT_EQ(dht.bind(), 0);
@@ -1070,7 +1070,15 @@ TEST(ServerRelayEmit, UpgradeHoldsTheSessionPunchSocket) {
     uv_loop_close(&loop);
 }
 
-TEST(ClientRelayEmit, SendsPairAfterEncryptedControlStreamConnects) {
+TEST(ServerRelayEmit, UpgradeHoldsTheSessionPunchSocket) {
+    run_server_relay_emit(false);
+}
+
+TEST(ServerRelayEmit, OpenRelayPairsAndKeepsSessionPunchSocket) {
+    run_server_relay_emit(true);
+}
+
+static void run_client_relay_emit(bool open_relay) {
     using namespace ru_relay_emit;
 
     uv_loop_t loop;
@@ -1078,7 +1086,8 @@ TEST(ClientRelayEmit, SendsPairAfterEncryptedControlStreamConnects) {
     auto relay_kp = hyperdht::noise::generate_keypair();
     auto target_kp = hyperdht::noise::generate_keypair();
     auto token = bl::generate_token();
-    auto relay = std::make_unique<FakeRelayPeer>(&loop, relay_kp, token, true);
+    auto relay = std::make_unique<FakeRelayPeer>(&loop, relay_kp, token, true,
+                                                open_relay);
 
     hyperdht::routing::NodeId id{};
     hyperdht::rpc::RpcSocket target(&loop, id);
@@ -1154,6 +1163,14 @@ TEST(ClientRelayEmit, SendsPairAfterEncryptedControlStreamConnects) {
     target.close();
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
+}
+
+TEST(ClientRelayEmit, SendsPairAfterEncryptedControlStreamConnects) {
+    run_client_relay_emit(false);
+}
+
+TEST(ClientRelayEmit, OpenRelayPairsAfterEncryptedControlStreamConnects) {
+    run_client_relay_emit(true);
 }
 
 TEST(ConnectRelayRequests, ReusesNoiseRequestAcrossRelays) {

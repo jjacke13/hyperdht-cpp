@@ -1088,7 +1088,7 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
         duplex_opts.keep_alive_ms = state->relay_keep_alive;
 
         // Connect the raw stream to the relay node's address
-        if (relay_result.udx_socket && relay_result.raw_stream) {
+        if (relay_result.raw_stream) {
             struct sockaddr_in relay_addr{};
             relay_addr.sin_family = AF_INET;
             relay_addr.sin_port = htons(relay_result.peer_address.port);
@@ -1096,7 +1096,8 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
                         relay_result.peer_address.port,
                         &relay_addr);
             udx_stream_connect(relay_result.raw_stream,
-                               relay_result.udx_socket,
+                               relay_result.udx_socket ? relay_result.udx_socket
+                                   : state->dht->socket().socket_handle(),
                                relay_result.remote_udx_id,
                                reinterpret_cast<const struct sockaddr*>(&relay_addr));
         }

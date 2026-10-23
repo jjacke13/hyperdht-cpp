@@ -937,13 +937,14 @@ void Server::on_handshake_result(
             DHT_LOG("  [server] Connected to relay node, pairing\n");
 
             // Connect the relay raw stream
-            if (relay_result.udx_socket && relay_result.raw_stream) {
+            if (relay_result.raw_stream) {
                 struct sockaddr_in addr{};
                 addr.sin_family = AF_INET;
                 uv_ip4_addr(relay_result.peer_address.host_string().c_str(),
                             relay_result.peer_address.port, &addr);
                 udx_stream_connect(relay_result.raw_stream,
-                                   relay_result.udx_socket,
+                                   relay_result.udx_socket ? relay_result.udx_socket
+                                       : dht_ptr->socket().socket_handle(),
                                    relay_result.remote_udx_id,
                                    reinterpret_cast<const struct sockaddr*>(&addr));
             }

@@ -998,15 +998,25 @@ separately eliminated. Full case: memory `server_punch_socket_parity`, `Q2-EVIDE
   Production client/server regressions require an actual PAIR request; the server
   fixture no longer sends an unsolicited reply. A local relay carried encrypted
   data both ways. All three suites and isolated consumer connectivity checks pass
-  with public and NAT server placements; those lab checks exercised default direct
-  paths, not blind-relay DATA. Remaining: verify the nullable control socket on the
-  public/OPEN relay path, propagate negative transport writes, and validate DATA
-  through a publicly reachable relay plus relay failure and direct upgrade.
+  with public and NAT server placements. **Public/OPEN control socket fixed
+  2026-10-23:** when the handshake has no selected pool socket, both relay
+  callers connect the control stream using the node's DHT socket. All three
+  suites and forced-relay DATA checks pass with a public application server and
+  both NAT-board server placements, exact encrypted payload hashes, no direct
+  board DATA, and public/NAT unused-relay-identity negatives. These negatives do
+  not cover packet loss to a running relay. Remaining: propagate negative
+  transport writes and live-verify relay-to-direct upgrade.
   **Client request reuse fixed 2026-10-23:** all routes of one connect now share
-  the same Noise request, so server deduplication cannot create competing relay
-  sessions. Reply validation uses an isolated state copy per attempt. Regressions,
-  all three suites and public/NAT/LAN consumer checks pass; multi-route reuse was
-  reproduced locally, not naturally observed in those lab runs.
+  the same Noise request, so pending routes can deduplicate onto one server
+  session. Reply validation uses an isolated state copy per attempt. Regressions,
+  all three suites and public/NAT/LAN consumer checks pass. A forced-relay NAT
+  capture also verifies identical complete Noise requests through two DHT routes
+  and one deduplicated pending server session.
+  **Separate remaining lifetime gap:** after a direct connection is emitted,
+  C++ removes its handshake dedup entry immediately; JS retains it until the
+  delayed clear. A late second route created an extra session in the LAN lab
+  after the first connection was already passing payload. No payload failure
+  was observed; retaining completed-handshake dedup needs its own focused fix.
 
 ### J.2 Task 6
 

@@ -5,7 +5,7 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-23 (security bounds and validation; older snapshots below are historical).
+Last updated: 2026-10-24 (relay transport errors; older snapshots below are historical).
 
 ---
 
@@ -1004,8 +1004,16 @@ separately eliminated. Full case: memory `server_punch_socket_parity`, `Q2-EVIDE
   suites and forced-relay DATA checks pass with a public application server and
   both NAT-board server placements, exact encrypted payload hashes, no direct
   board DATA, and public/NAT unused-relay-identity negatives. These negatives do
-  not cover packet loss to a running relay. Remaining: propagate negative
-  transport writes and live-verify relay-to-direct upgrade.
+  not cover packet loss to a running relay. Remaining: live-verify
+  relay-to-direct upgrade.
+  **Transport-write errors fixed 2026-10-24:** both relay control writers destroy
+  the encrypted stream on a rejected write; stream closure tears down the mux
+  and fails pending pairing through the existing deferred abort path. The
+  parallel direct attempt remains available. Client/server regressions force a
+  rejected PAIR write and require failure before the pairing watchdog.
+  All three suites and isolated default/forced-relay connectivity checks pass
+  with public and NAT server placements. All 35 ESP32-S3 component files compile
+  with ESP-IDF 5.5.2; firmware linking and board operation remain unverified.
   **Client request reuse fixed 2026-10-23:** all routes of one connect now share
   the same Noise request, so pending routes can deduplicate onto one server
   session. Reply validation uses an isolated state copy per attempt. Regressions,
@@ -1022,6 +1030,19 @@ separately eliminated. Full case: memory `server_punch_socket_parity`, `Q2-EVIDE
   completed reply without creating another session. Forced-relay DATA also
   passes. All 35 ESP32-S3 component sources compile with ESP-IDF 5.5.2 and
   exceptions/RTTI disabled; firmware linking and board operation remain untested.
+
+### Deferred connectivity verification
+
+These checks remain unverified by the October lab fixes:
+
+- Distinct NAT networks, mobile/CGNAT paths and network handover.
+- Windows/macOS/Linux interoperability in supported client/server roles;
+  repair the skipped IPv6 fixture and test real IPv6 paths.
+- Live relay-to-direct migration with uninterrupted payload, interruption and
+  recovery of a running relay, and longer-session soak tests.
+- ESP32-S3 firmware linking, flashing and an actual board connection.
+
+Broader sanitizer runs with leak detection disabled do not establish leak freedom.
 
 ### J.2 Task 6
 

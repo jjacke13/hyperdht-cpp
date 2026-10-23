@@ -977,14 +977,17 @@ void Server::on_handshake_result(
             // Protomux over SecretStream
             auto relay_mux = std::make_shared<protomux::Mux>(
                 [duplex = relay_duplex.get()](const uint8_t* data, size_t len) -> bool {
-                    duplex->write(data, len, nullptr);
-                    return true;
+                    const int err = duplex->write(data, len, nullptr);
+                    if (err < 0) duplex->destroy(err);
+                    return err >= 0;
                 });
 
             relay_duplex->on_message(
                 [mux = relay_mux.get()](const uint8_t* data, size_t len) {
                     if (mux && !mux->is_destroyed()) mux->on_data(data, len);
                 });
+            relay_duplex->on_close(
+                [mux = relay_mux.get()](int) { mux->destroy(); });
             // BlindRelayClient on Protomux channel
             std::vector<uint8_t> channel_id(
                 relay_result.remote_public_key.begin(),

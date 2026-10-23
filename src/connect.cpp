@@ -1111,8 +1111,9 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
             [duplex = state->relay->duplex.get()](
                 const uint8_t* data, size_t len) -> bool {
                 if (!duplex) return false;
-                duplex->write(data, len, nullptr);
-                return true;
+                const int err = duplex->write(data, len, nullptr);
+                if (err < 0) duplex->destroy(err);
+                return err >= 0;
             });
 
         state->relay->duplex->on_message(
@@ -1122,6 +1123,8 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
                     mux->on_data(data, len);
                 }
             });
+        state->relay->duplex->on_close(
+            [mux = state->relay->mux.get()](int) { mux->destroy(); });
 
         // Step 4: Create BlindRelayClient over the Protomux channel.
         // JS: relay.Client.from(relaySocket, { id: relaySocket.publicKey })

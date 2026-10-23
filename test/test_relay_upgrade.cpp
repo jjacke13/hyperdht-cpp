@@ -789,6 +789,7 @@ struct FakeRelayPeer {
     }
 
     unsigned pair_requests = 0;
+    std::function<void(uint32_t)> before_channel_open;
 
   private:
     static hyperdht::routing::NodeId node_id() {
@@ -884,11 +885,18 @@ struct FakeRelayPeer {
         duplex_->on_message([this](const uint8_t* d, size_t n) {
             if (mux_ && !mux_->is_destroyed()) mux_->on_data(d, n);
         });
-        duplex_->on_connect([this]() { open_relay_channel(); });
+        if (before_channel_open) {
+            mux_->on_notify([this](const auto&, const auto&, const uint8_t*, size_t) {
+                open_relay_channel();
+            });
+        } else {
+            duplex_->on_connect([this]() { open_relay_channel(); });
+        }
         duplex_->start();
     }
 
     void open_relay_channel() {
+        if (before_channel_open) before_channel_open(peer_udx_id_);
         std::vector<uint8_t> id(kp_.public_key.begin(), kp_.public_key.end());
         auto* channel = mux_->create_channel(bl::PROTOCOL_NAME, id, false);
         ASSERT_NE(channel, nullptr);
@@ -925,7 +933,20 @@ struct FakeRelayPeer {
 
 }  // namespace ru_relay_emit
 
-static void run_server_relay_emit(bool open_relay) {
+// Reject the next production PAIR write with UV_EPIPE, without closing the
+// control stream first: this distinguishes write-error handling from timeout.
+static void reject_relay_write(hyperdht::HyperDHT& dht, uint32_t id) {
+    for (auto* socket = dht.socket().udx_handle()->sockets; socket; socket = socket->next) {
+        for (auto* stream = socket->streams; stream; stream = stream->next) {
+            if (stream->local_id != id) continue;
+            stream->status |= UDX_STREAM_ENDING;
+            return;
+        }
+    }
+    FAIL() << "relay control stream not found";
+}
+
+static void run_server_relay_emit(bool open_relay, bool fail_write = false) {
     using namespace ru_relay_emit;
     using hyperdht::server::ConnectionInfo;
 
@@ -947,6 +968,9 @@ static void run_server_relay_emit(bool open_relay) {
     silent->seed(dht);
     dht.add_node(relay->node_addr());
     dht.cache_relay_addresses(relay_kp.public_key, {relay->node_addr()});
+    if (fail_write) {
+        relay->before_channel_open = [&](uint32_t id) { reject_relay_write(dht, id); };
+    }
 
     auto* srv = dht.create_server();
     ASSERT_NE(srv, nullptr);
@@ -1034,6 +1058,20 @@ static void run_server_relay_emit(bool open_relay) {
         << "a relayed handshake must acquire a punch socket";
     std::weak_ptr<hyperdht::holepunch::PoolSocket> weak = session->punch_socket;
 
+    if (fail_write) {
+        ru_choreo::pump_until(&loop, [&] { return dht.relay_stats().aborts != 0; }, 1000);
+        EXPECT_EQ(dht.relay_stats().aborts, 1u);
+        EXPECT_EQ(relay->pair_requests, 0u);
+        EXPECT_FALSE(emitted);
+        EXPECT_NE(srv->session(hp_id), nullptr) << "direct attempt must survive relay failure";
+        dht.destroy();
+        relay.reset();
+        silent.reset();
+        uv_run(&loop, UV_RUN_DEFAULT);
+        uv_loop_close(&loop);
+        return;
+    }
+
     ru_choreo::pump_until(&loop, [&] { return emitted; }, 8000);
     EXPECT_EQ(relay->pair_requests, 1u);
     EXPECT_TRUE(emitted) << "the relay pairing never emitted a connection";
@@ -1078,7 +1116,11 @@ TEST(ServerRelayEmit, OpenRelayPairsAndKeepsSessionPunchSocket) {
     run_server_relay_emit(true);
 }
 
-static void run_client_relay_emit(bool open_relay) {
+TEST(ServerRelayEmit, FailedControlWriteAbortsRelayWithoutClearingDirectAttempt) {
+    run_server_relay_emit(true, true);
+}
+
+static void run_client_relay_emit(bool open_relay, bool fail_write = false) {
     using namespace ru_relay_emit;
 
     uv_loop_t loop;
@@ -1134,6 +1176,9 @@ static void run_client_relay_emit(bool open_relay) {
     silent->seed(dht);
     dht.cache_relay_addresses(relay_kp.public_key, {relay->node_addr()});
     dht.cache_relay_addresses(target_kp.public_key, {target_addr});
+    if (fail_write) {
+        relay->before_channel_open = [&](uint32_t id) { reject_relay_write(dht, id); };
+    }
     hyperdht::ConnectOptions opts;
     opts.relay_through = relay_kp.public_key;
     opts.relay_token = token;
@@ -1141,18 +1186,25 @@ static void run_client_relay_emit(bool open_relay) {
     opts.local_connection = false;
     opts.holepunch_veto = [](auto, auto, const auto&, const auto&) { return false; };
     bool done = false;
+    unsigned completions = 0;
     hyperdht::ConnectResult result;
     dht.connect(target_kp.public_key, opts, [&](int err, const auto& conn) {
-        EXPECT_EQ(err, 0);
+        EXPECT_EQ(err, fail_write ? hyperdht::ConnectError::RELAY_FAILED : 0);
+        ++completions;
         result = conn;
         done = true;
     });
-    ru_choreo::pump_until(&loop, [&] { return done; }, 8000);
-    EXPECT_EQ(relay->pair_requests, 1u);
+    ru_choreo::pump_until(&loop, [&] { return done; }, fail_write ? 1000 : 8000);
+    EXPECT_EQ(relay->pair_requests, fail_write ? 0u : 1u);
     EXPECT_TRUE(done);
-    EXPECT_TRUE(result.success);
-    EXPECT_EQ(result.peer_address, relay->ep_addr());
-    EXPECT_TRUE(result.upgrade);
+    EXPECT_EQ(completions, 1u);
+    EXPECT_EQ(result.success, !fail_write);
+    if (!fail_write) {
+        EXPECT_EQ(result.peer_address, relay->ep_addr());
+        EXPECT_TRUE(result.upgrade);
+    } else {
+        EXPECT_EQ(dht.relay_stats().aborts, 1u);
+    }
     if (result.upgrade)
         std::static_pointer_cast<UpgradeContext>(result.upgrade)->on_stream_closed();
     if (result.raw_stream) hyperdht::udx::destroy_stream_once(result.raw_stream);
@@ -1171,6 +1223,10 @@ TEST(ClientRelayEmit, SendsPairAfterEncryptedControlStreamConnects) {
 
 TEST(ClientRelayEmit, OpenRelayPairsAfterEncryptedControlStreamConnects) {
     run_client_relay_emit(true);
+}
+
+TEST(ClientRelayEmit, FailedControlWriteCompletesWithoutWaitingForRelayTimeout) {
+    run_client_relay_emit(true, true);
 }
 
 TEST(ConnectRelayRequests, ReusesNoiseRequestAcrossRelays) {

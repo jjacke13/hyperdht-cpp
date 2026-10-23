@@ -26,6 +26,7 @@
 #include "hyperdht/announcer.hpp"
 #include "hyperdht/compact.hpp"
 #include "hyperdht/async_utils.hpp"
+#include "hyperdht/lru_cache.hpp"
 #include "hyperdht/noise_wrap.hpp"
 #include "hyperdht/peer_connect.hpp"
 #include "hyperdht/router.hpp"
@@ -347,6 +348,20 @@ private:
     // same session instead of creating duplicates. Maps noise_hex → hp_id.
     // Entries removed when connection completes or times out.
     std::unordered_map<std::string, uint32_t> handshake_dedup_;
+
+    // Retain replies through JS's clear-wait without retaining completed streams.
+    struct CompletedHandshake {
+        std::vector<uint8_t> reply_noise;
+        std::weak_ptr<holepunch::PoolSocket> punch_socket;
+    };
+#ifdef HYPERDHT_EMBEDDED
+    LruCache<std::string, CompletedHandshake> completed_handshakes_{16};
+#else
+    LruCache<std::string, CompletedHandshake> completed_handshakes_{256};
+#endif
+    void remember_completed_handshake(
+        const std::string& noise_key,
+        const server_connection::ServerConnection& conn);
 
     // Pending punches: connections waiting for the client's UDX packet
     // to arrive via the rawStream firewall. Maps local_udx_id → hp_id.

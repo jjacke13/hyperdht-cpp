@@ -87,6 +87,11 @@ public:
     bool empty() const { return map_.empty(); }
     size_t max_size() const { return max_size_; }
 
+    void clear() {
+        map_.clear();
+        entries_.clear();
+    }
+
 private:
     struct Entry {
         Key key;

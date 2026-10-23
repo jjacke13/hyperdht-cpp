@@ -1012,11 +1012,16 @@ separately eliminated. Full case: memory `server_punch_socket_parity`, `Q2-EVIDE
   all three suites and public/NAT/LAN consumer checks pass. A forced-relay NAT
   capture also verifies identical complete Noise requests through two DHT routes
   and one deduplicated pending server session.
-  **Separate remaining lifetime gap:** after a direct connection is emitted,
-  C++ removes its handshake dedup entry immediately; JS retains it until the
-  delayed clear. A late second route created an extra session in the LAN lab
-  after the first connection was already passing payload. No payload failure
-  was observed; retaining completed-handshake dedup needs its own focused fix.
+  **Completed-handshake dedup fixed 2026-10-23:** retain encrypted replies for
+  the existing clear-wait interval after direct emission (default 10 s), with
+  weak socket references and a bounded cache (256 desktop / 16 embedded).
+  Active sessions and stream ownership keep their existing cleanup. Regressions
+  cover identical replies, expiry without duplicate refresh, closed-socket
+  fallback and suspend. Public/NAT and both LAN directions pass, including
+  payload past the grace interval; a naturally late LAN request reused the
+  completed reply without creating another session. Forced-relay DATA also
+  passes. All 35 ESP32-S3 component sources compile with ESP-IDF 5.5.2 and
+  exceptions/RTTI disabled; firmware linking and board operation remain untested.
 
 ### J.2 Task 6
 

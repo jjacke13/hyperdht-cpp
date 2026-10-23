@@ -98,6 +98,8 @@ components/
 - Routing table bucket size reduced from k=20 to k=10
 - Congestion window reduced from 80 to 16
 - No exceptions, no RTTI (`-fno-exceptions -fno-rtti`)
+- Completed-handshake reply cache limited to 16 entries (256 on desktop),
+  using weak socket references to avoid retaining connections
 
 The ESP-IDF component CMakeLists is at `components/hyperdht/CMakeLists.txt`. It references the source files directly from the repo root's `src/` directory, so rebuilding after library changes requires no extra steps.
 

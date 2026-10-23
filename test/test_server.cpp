@@ -214,6 +214,102 @@ void run_loop_for(uv_loop_t* loop, uint64_t ms) {
 
 }  // namespace
 
+static void check_completed_handshake_dedup(bool open_client) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    rpc::RpcSocket socket(&loop, {});
+    ASSERT_EQ(socket.bind(0), 0);
+    router::Router router;
+    Server srv(socket, router);
+    srv.handshake_clear_wait = 200;
+    auto kp = noise::generate_keypair();
+    std::vector<ConnectionInfo> emitted;
+    srv.listen(kp, [&](const ConnectionInfo& info) { emitted.push_back(info); });
+    int firewall_calls = 0;
+    srv.set_firewall([&](const auto&, const auto&, const auto&) {
+        ++firewall_calls;
+        return false;
+    });
+    auto hs = make_handshake_request(kp, open_client
+        ? peer_connect::FIREWALL_OPEN : peer_connect::FIREWALL_CONSISTENT);
+    auto msg = peer_connect::decode_handshake_msg(hs.req.value->data(),
+                                                  hs.req.value->size());
+    auto peer = compact::Ipv4Address::from_string("127.0.0.1", 5000);
+    std::vector<std::vector<uint8_t>> replies;
+    std::vector<udx_socket_t*> egress;
+    auto dispatch = [&]() {
+        router.get(*hs.req.target)->on_peer_handshake(msg.noise, peer, peer, true,
+            [&](std::vector<uint8_t> reply, udx_socket_t* via) {
+                replies.push_back(std::move(reply));
+                egress.push_back(via);
+            });
+    };
+    dispatch();
+    std::shared_ptr<holepunch::PoolSocket> punch_socket;
+    auto complete_pending = [&](uint32_t id) {
+        if (open_client) return;
+        auto* conn = srv.session(id);
+        ASSERT_NE(conn, nullptr);
+        punch_socket = conn->punch_socket;
+#ifndef HYPERDHT_EMBEDDED
+        ASSERT_TRUE(punch_socket);
+#endif
+        struct sockaddr_in from{};
+        uv_ip4_addr("127.0.0.1", 5000, &from);
+        srv.on_raw_stream_firewall(conn->raw_stream,
+                                  punch_socket ? punch_socket->socket_handle()
+                                               : socket.socket_handle(),
+                                  reinterpret_cast<const struct sockaddr*>(&from));
+    };
+    complete_pending(0);
+    ASSERT_EQ(emitted.size(), 1u);
+    EXPECT_EQ(srv.session(0), nullptr);
+    ASSERT_EQ(replies.size(), 1u);
+    auto first_reply = replies.front();
+    auto first_egress = egress.front();
+    dispatch();
+    ASSERT_EQ(replies.size(), 2u);
+    EXPECT_EQ(replies.back(), first_reply);
+    EXPECT_EQ(egress.back(), first_egress);
+    EXPECT_EQ(firewall_calls, 1);
+    EXPECT_EQ(emitted.size(), 1u);
+
+    if (punch_socket) {
+        punch_socket->close();
+        dispatch();
+        EXPECT_EQ(egress.back(), nullptr) << "a cached reply must not use a closed socket";
+        EXPECT_EQ(replies.back(), first_reply);
+    }
+    run_loop_for(&loop, 80);
+    dispatch();
+    EXPECT_EQ(firewall_calls, 1);
+    run_loop_for(&loop, 160);
+    dispatch();
+    EXPECT_EQ(firewall_calls, 2) << "duplicates must not extend the grace period";
+    EXPECT_NE(replies.back(), first_reply);
+    complete_pending(1);
+    srv.suspend();
+    srv.resume();
+    dispatch();
+    EXPECT_EQ(firewall_calls, 3) << "suspend must discard completed replies";
+
+    for (auto& info : emitted) udx::destroy_stream_once(info.raw_stream);
+    srv.close(true, nullptr);
+    emitted.clear();
+    punch_socket.reset();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+TEST(Server, CompletedHandshakeDedupAfterRawStreamArrival) {
+    check_completed_handshake_dedup(false);
+}
+
+TEST(Server, CompletedHandshakeDedupForOpenClient) {
+    check_completed_handshake_dedup(true);
+}
+
 // server-1 — JS: server.js:251,258-261 + router.js:99. A firewall-rejected
 // handshake sends ZERO packets (silence, not a Noise error reply). The
 // rejected session stays for dedup — duplicate noise gets the same silence

@@ -312,6 +312,7 @@ void Server::close(bool force, std::function<void()> on_done) {
     // Clear active connections (ServerConnection destructor handles raw_stream)
     connections_.clear();
     handshake_dedup_.clear();
+    completed_handshakes_.clear();
     // server-3: drop pending async-firewall entries (queued reply_fns are
     // simply released; the continuation's closed_ guard makes a late
     // firewall completion a no-op).
@@ -376,6 +377,7 @@ void Server::suspend(LogFn log) {
     session_timers_.clear();
     connections_.clear();
     handshake_dedup_.clear();
+    completed_handshakes_.clear();
     pending_punch_streams_.clear();
     // server-3: drop pending async-firewall entries (see close()).
     pending_handshakes_.clear();
@@ -460,6 +462,14 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     // JS: server.js:464-473 (_onpeerhandshake) k = noise.toString('hex');
     //     if (_connects.has(k)) reuse session. We resend cached reply_noise.
     auto noise_key = to_hex(noise.data(), noise.size());
+    completed_handshakes_.gc(uv_now(socket_.loop()), handshake_clear_wait);
+    if (auto* completed = completed_handshakes_.get(noise_key)) {
+        auto socket = completed->punch_socket.lock();
+        DHT_LOG("  [server] Dedup: reusing completed handshake\n");
+        reply_fn(std::vector<uint8_t>(completed->reply_noise),
+                 socket && !socket->is_closing() ? socket->socket_handle() : nullptr);
+        return;
+    }
     auto dedup_it = handshake_dedup_.find(noise_key);
     if (dedup_it != handshake_dedup_.end()) {
         // server-3 — JS: server.js:464-473. Firewall decision still in
@@ -823,6 +833,7 @@ void Server::on_handshake_result(
     if (client_open) {
         auto peer_addr = conn_ptr->remote_payload.addresses4[0];
         DHT_LOG("  [server] Client is OPEN, connecting directly\n");
+        remember_completed_handshake(noise_key, *conn_ptr);
         on_socket(*conn_ptr, peer_addr);
         return;
     }
@@ -1245,6 +1256,14 @@ void Server::on_handshake_result(
     session_timers_[hp_id] = std::move(session_timer);
 
     DHT_LOG( "  [server] Handshake complete (id=%d), waiting for holepunch\n", hp_id);
+}
+
+void Server::remember_completed_handshake(
+    const std::string& noise_key,
+    const server_connection::ServerConnection& conn) {
+    const auto now = uv_now(socket_.loop());
+    completed_handshakes_.gc(now, handshake_clear_wait);
+    completed_handshakes_.put(noise_key, {conn.reply_noise, conn.punch_socket}, now);
 }
 
 // ---------------------------------------------------------------------------
@@ -1699,7 +1718,11 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
                 // Take ownership and clean up before calling on_socket
                 auto conn_ptr = std::move(it->second);
                 for (auto dit = handshake_dedup_.begin(); dit != handshake_dedup_.end(); ++dit) {
-                    if (dit->second == session_id) { handshake_dedup_.erase(dit); break; }
+                    if (dit->second == session_id) {
+                        remember_completed_handshake(dit->first, *conn_ptr);
+                        handshake_dedup_.erase(dit);
+                        break;
+                    }
                 }
                 if (conn_ptr->raw_stream) {
                     pending_punch_streams_.erase(conn_ptr->raw_stream->local_id);
@@ -2030,7 +2053,11 @@ void Server::on_raw_stream_firewall(udx_stream_t* stream, udx_socket_t* socket,
     // Take ownership and clean up
     auto conn_ptr = std::move(it->second);
     for (auto dit = handshake_dedup_.begin(); dit != handshake_dedup_.end(); ++dit) {
-        if (dit->second == hp_id) { handshake_dedup_.erase(dit); break; }
+        if (dit->second == hp_id) {
+            remember_completed_handshake(dit->first, *conn_ptr);
+            handshake_dedup_.erase(dit);
+            break;
+        }
     }
     // Cancel session timer (UvTimer RAII handles stop + close)
     session_timers_.erase(hp_id);

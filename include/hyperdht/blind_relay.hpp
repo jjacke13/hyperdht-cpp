@@ -185,8 +185,11 @@ private:
         uint32_t local_stream_id;
         OnPairedCb on_paired;
         OnErrorCb on_error;
+        bool sent = false;
     };
     std::unordered_map<std::string, PairRequest> requests_;
+    void flush_pairs();
+    void send_pair(const std::string& key);
 
     // Message handlers.
     // Note: there is no on_unpair handler. Like JS (index.js:319-321), the

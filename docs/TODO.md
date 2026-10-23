@@ -993,9 +993,11 @@ separately eliminated. Full case: memory `server_punch_socket_parity`, `Q2-EVIDE
   non-functional.** `src/server.cpp:955-1012` and `src/connect.cpp:1119-1145` write the
   Protomux OPEN **in the same frame as `duplex->start()`**, where
   `SecretStreamDuplex::write` returns `-2` (`!connected_` — needs the peer header) and the
-  Mux **discards the failure**; and they call `pair()` before the channel is open, where
-  `Channel::send` refuses and `BlindRelayClient::pair` discards the false. No retry path
-  exists. JS has neither guard. Measured: production order never pairs; deferring both
+  Mux **discards the failure**. **Channel-ready PAIR fixed 2026-10-23:**
+  `BlindRelayClient` retains requests until the channel opens and sends each once;
+  cancellation and synchronous client destruction have regression coverage.
+  The encrypted-stream readiness bug still blocks the full chain. JS has neither
+  guard. Measured before these fixes: production order never pairs; deferring both
   pairs fine. **This is the mitigation `Q2-EVIDENCE` and the handoff recommend for the
   Finding Q outages — it does not work today.** Also makes the relay→direct keepalive
   call site (`server.cpp:1138`) unreachable at runtime.

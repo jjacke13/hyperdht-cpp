@@ -184,6 +184,9 @@ BlindRelayClient::BlindRelayClient(protomux::Channel* channel)
     unpair_msg_type_ = channel_->add_message({});
 
     // Set up channel lifecycle callbacks
+    channel_->on_open = [this, weak_alive](const uint8_t*, size_t) {
+        if (!weak_alive.expired()) flush_pairs();
+    };
     channel_->on_close = [this, weak_alive]() {
         if (weak_alive.expired()) return;
         closed_ = true;
@@ -206,6 +209,7 @@ BlindRelayClient::~BlindRelayClient() {
     // Clear channel callbacks to break ref cycles — but only if the
     // channel hasn't already been destroyed by the Mux teardown.
     if (!destroyed_ && channel_) {
+        channel_->on_open = nullptr;
         channel_->on_close = nullptr;
         channel_->on_destroy = nullptr;
     }
@@ -219,8 +223,8 @@ void BlindRelayClient::open(const uint8_t* handshake, size_t handshake_len) {
 void BlindRelayClient::pair(bool is_initiator, const Token& token,
                              uint32_t local_stream_id,
                              OnPairedCb on_paired, OnErrorCb on_error) {
-    if (destroyed_) {
-        if (on_error) on_error(RelayError::CHANNEL_DESTROYED);
+    if (destroyed_ || closed_) {
+        if (on_error) on_error(destroyed_ ? RelayError::CHANNEL_DESTROYED : RelayError::CHANNEL_CLOSED);
         return;
     }
 
@@ -233,20 +237,40 @@ void BlindRelayClient::pair(bool is_initiator, const Token& token,
 
     requests_[key] = PairRequest{is_initiator, token, local_stream_id,
                                   std::move(on_paired), std::move(on_error)};
+    if (channel_->is_open()) send_pair(key);
+}
+
+void BlindRelayClient::flush_pairs() {
+    // A synchronous pair response can cancel requests or destroy this client.
+    std::weak_ptr<bool> alive = alive_;
+    std::vector<std::string> keys;
+    keys.reserve(requests_.size());
+    for (const auto& [key, req] : requests_) keys.push_back(key);
+    for (const auto& key : keys) {
+        if (alive.expired()) return;
+        send_pair(key);
+    }
+}
+
+void BlindRelayClient::send_pair(const std::string& key) {
+    if (closed_ || destroyed_) return;
+    auto it = requests_.find(key);
+    if (it == requests_.end() || it->second.sent) return;
+    auto& req = it->second;
+    req.sent = true;
 
     // Send Pair message
     // JS: client._pair.send({ isInitiator, token, id: stream.id, seq: 0 })
     PairMessage msg;
-    msg.is_initiator = is_initiator;
-    msg.token = token;
-    msg.id = local_stream_id;
+    msg.is_initiator = req.is_initiator;
+    msg.token = req.token;
+    msg.id = req.local_stream_id;
     msg.seq = 0;
 
     auto encoded = encode_pair(msg);
-    channel_->send(pair_msg_type_, encoded.data(), encoded.size());
-
     DHT_LOG("  [blind-relay-client] Sent pair: initiator=%d, token=%s, id=%u\n",
-            is_initiator, key.substr(0, 8).c_str(), local_stream_id);
+            msg.is_initiator, key.substr(0, 8).c_str(), msg.id);
+    channel_->send(pair_msg_type_, encoded.data(), encoded.size());
 }
 
 void BlindRelayClient::unpair(const Token& token) {

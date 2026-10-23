@@ -166,13 +166,16 @@ TEST(BlindRelayToken, HexAllZeros) {
 struct MuxPair {
     std::vector<std::vector<uint8_t>> a_to_b;
     std::vector<std::vector<uint8_t>> b_to_a;
+    bool synchronous = false;
 
     protomux::Mux mux_a{[this](const uint8_t* data, size_t len) -> bool {
-        a_to_b.emplace_back(data, data + len);
+        if (synchronous) mux_b.on_data(data, len);
+        else a_to_b.emplace_back(data, data + len);
         return true;
     }};
     protomux::Mux mux_b{[this](const uint8_t* data, size_t len) -> bool {
-        b_to_a.emplace_back(data, data + len);
+        if (synchronous) mux_a.on_data(data, len);
+        else b_to_a.emplace_back(data, data + len);
         return true;
     }};
 
@@ -206,21 +209,90 @@ TEST(BlindRelayClient, CreateAndOpen) {
     EXPECT_FALSE(client.is_closed());
 }
 
-TEST(BlindRelayClient, PairSendsMessage) {
+TEST(BlindRelayClient, PairWaitsForRemoteOpen) {
     MuxPair mux;
     auto* ch = mux.mux_a.create_channel(PROTOCOL_NAME);
     BlindRelayClient client(ch);
     client.open();
+    mux.flush();
 
     Token token;
     token.fill(0x42);
     bool paired = false;
-    client.pair(true, token, 100,
-                [&paired](uint32_t remote_id) { paired = true; },
-                nullptr);
+    client.pair(true, token, 100, [&](uint32_t id) { paired = id == 900; });
+    EXPECT_TRUE(mux.a_to_b.empty());
 
-    // The pair message should have been written to the mux
-    EXPECT_FALSE(mux.a_to_b.empty());
+    int received = 0;
+    auto* peer = mux.mux_b.create_channel(PROTOCOL_NAME);
+    peer->add_message({[&](const uint8_t* data, size_t len) {
+        auto msg = decode_pair(data, len);
+        ASSERT_TRUE(msg.has_value());
+        EXPECT_TRUE(msg->is_initiator);
+        EXPECT_EQ(msg->token, token);
+        EXPECT_EQ(msg->id, 100u);
+        ++received;
+        msg->id = 900;
+        auto reply = encode_pair(*msg);
+        EXPECT_TRUE(peer->send(0, reply.data(), reply.size()));
+    }});
+    peer->open();
+    mux.flush();
+    mux.flush();
+    mux.flush();
+    EXPECT_EQ(received, 1);
+    EXPECT_TRUE(paired);
+}
+
+TEST(BlindRelayClient, CancelledPairIsNotSentWhenChannelOpens) {
+    MuxPair mux;
+    auto* ch = mux.mux_a.create_channel(PROTOCOL_NAME);
+    BlindRelayClient client(ch);
+    client.open();
+    mux.flush();
+    Token token{};
+    int errors = 0;
+    client.pair(true, token, 100, [](uint32_t) {}, [&](int err) {
+        EXPECT_EQ(err, RelayError::PAIRING_CANCELLED);
+        ++errors;
+    });
+    client.unpair(token);
+    int received = 0;
+    auto* peer = mux.mux_b.create_channel(PROTOCOL_NAME);
+    peer->add_message({[&](const uint8_t*, size_t) { ++received; }});
+    peer->open();
+    mux.flush();
+    mux.flush();
+    EXPECT_EQ(errors, 1);
+    EXPECT_EQ(received, 0);
+}
+
+TEST(BlindRelayClient, OpenFlushToleratesClientDestructionFromPairResponse) {
+    MuxPair mux;
+    int received = 0;
+    auto* peer = mux.mux_b.create_channel(PROTOCOL_NAME);
+    peer->add_message({[&](const uint8_t* data, size_t len) {
+        ++received;
+        EXPECT_TRUE(peer->send(0, data, len));
+    }});
+    auto client = std::make_unique<BlindRelayClient>(mux.mux_a.create_channel(PROTOCOL_NAME));
+    client->open();
+    mux.flush();
+    int paired = 0;
+    for (uint8_t i = 1; i <= 2; ++i) {
+        Token token{};
+        token[0] = i;
+        client->pair(true, token, i, [&](uint32_t) {
+            ++paired;
+            client.reset();
+        });
+    }
+    peer->open();
+    mux.synchronous = true;
+    mux.flush();
+
+    EXPECT_EQ(received, 1);
+    EXPECT_EQ(paired, 1);
+    EXPECT_EQ(client, nullptr);
 }
 
 TEST(BlindRelayClient, DuplicatePairFails) {

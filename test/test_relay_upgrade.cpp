@@ -1155,3 +1155,41 @@ TEST(ClientRelayEmit, SendsPairAfterEncryptedControlStreamConnects) {
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }
+
+TEST(ConnectRelayRequests, ReusesNoiseRequestAcrossRelays) {
+    using namespace ru_relay_emit;
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    hyperdht::routing::NodeId first_id{}, second_id{};
+    first_id.fill(0x61);
+    second_id.fill(0x62);
+    hyperdht::rpc::RpcSocket first(&loop, first_id), second(&loop, second_id);
+    ASSERT_EQ(first.bind(0), 0);
+    ASSERT_EQ(second.bind(0), 0);
+    std::vector<std::vector<uint8_t>> requests;
+    auto capture = [&](const msgs::Request& req) {
+        if (req.command != msgs::CMD_PEER_HANDSHAKE || !req.value) return;
+        requests.push_back(pc::decode_handshake_msg(req.value->data(),
+                                                    req.value->size()).noise);
+    };
+    first.on_request(capture);
+    second.on_request(capture);
+    hyperdht::HyperDHT dht(&loop);
+    ASSERT_EQ(dht.bind(), 0);
+    auto silent = std::make_unique<SilentNodes>(&loop);
+    silent->seed(dht);
+    auto remote = hyperdht::noise::generate_keypair().public_key;
+    dht.cache_relay_addresses(remote, {
+        Ipv4Address::from_string("127.0.0.1", first.port()),
+        Ipv4Address::from_string("127.0.0.1", second.port())});
+    dht.connect(remote, [](int, const auto&) {});
+    ru_choreo::pump_until(&loop, [&] { return requests.size() >= 2; }, 1000);
+    EXPECT_EQ(requests.size(), 2u);
+    if (requests.size() == 2) EXPECT_EQ(requests[0], requests[1]);
+    dht.destroy();
+    first.close();
+    second.close();
+    silent.reset();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}

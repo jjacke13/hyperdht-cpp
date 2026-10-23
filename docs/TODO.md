@@ -1002,6 +1002,11 @@ separately eliminated. Full case: memory `server_punch_socket_parity`, `Q2-EVIDE
   paths, not blind-relay DATA. Remaining: verify the nullable control socket on the
   public/OPEN relay path, propagate negative transport writes, and validate DATA
   through a publicly reachable relay plus relay failure and direct upgrade.
+  **Client request reuse fixed 2026-10-23:** all routes of one connect now share
+  the same Noise request, so server deduplication cannot create competing relay
+  sessions. Reply validation uses an isolated state copy per attempt. Regressions,
+  all three suites and public/NAT/LAN consumer checks pass; multi-route reuse was
+  reproduced locally, not naturally observed in those lab runs.
 
 ### J.2 Task 6
 

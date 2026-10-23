@@ -12,6 +12,7 @@
 #include "hyperdht/peer_connect.hpp"
 #include "hyperdht/rpc.hpp"
 #include "hyperdht/server_connection.hpp"
+#include "../src/peer_connect_internal.hpp"
 
 using namespace hyperdht;
 using namespace hyperdht::server_connection;
@@ -338,6 +339,7 @@ struct ReplyCfg {
     bool include_udx = true;
     bool reply_from_rogue = false;     // reply from a different socket/port
     bool client_reusable = false;      // connect-3: opts.reusableSocket
+    bool retry_corrupt_reply = false;
 };
 
 struct ReplyCtx {
@@ -405,6 +407,7 @@ peer_connect::HandshakeResult run_reply_scenario(
     ctx.rogue = &rogue;
 
     bool reply_sent = false;
+    std::vector<uint8_t> first_request;
     relay.on_request([&](const messages::Request& req) {
         if (!req.value.has_value()) {
             ADD_FAILURE() << "PEER_HANDSHAKE request carried no value";
@@ -413,6 +416,10 @@ peer_connect::HandshakeResult run_reply_scenario(
         }
         auto hs = peer_connect::decode_handshake_msg(
             req.value->data(), req.value->size());
+        if (cfg.retry_corrupt_reply) {
+            if (!reply_sent) first_request = hs.noise;
+            else EXPECT_EQ(first_request, hs.noise);
+        }
 
         // Real Noise IK responder so the reply decrypts and completes.
         const auto& prol = dht_messages::ns_peer_handshake();
@@ -442,6 +449,7 @@ peer_connect::HandshakeResult run_reply_scenario(
         rp.has_secret_stream = true;
         auto rp_bytes = peer_connect::encode_noise_payload(rp);
         auto msg2 = responder.send(rp_bytes.data(), rp_bytes.size());
+        if (cfg.retry_corrupt_reply && !reply_sent) msg2.back() ^= 1;
 
         peer_connect::HandshakeMessage reply_msg;
         reply_msg.mode = cfg.mode;
@@ -463,16 +471,29 @@ peer_connect::HandshakeResult run_reply_scenario(
     });
 
     auto relay_addr = compact::Ipv4Address::from_string("127.0.0.1", relay.port());
-    peer_connect::peer_handshake(
+    auto prepared = cfg.retry_corrupt_reply ? peer_connect::prepare_handshake(
+        client_kp, server_kp.public_key, 42, cfg.client_reusable,
+        peer_connect::FIREWALL_UNKNOWN, {}, std::nullopt) : nullptr;
+    bool retried = false;
+    peer_connect::OnHandshakeCallback on_done;
+    on_done = [&](const peer_connect::HandshakeResult& r) {
+        if (prepared && !retried) {
+            EXPECT_FALSE(r.success);
+            EXPECT_FALSE(r.terminal);
+            retried = true;
+            peer_connect::peer_handshake(client, relay_addr, prepared, on_done);
+            return;
+        }
+        ctx.result = r;
+        ctx.done = true;
+        reply_cleanup(&ctx);
+    };
+    if (prepared) peer_connect::peer_handshake(client, relay_addr, prepared, on_done);
+    else peer_connect::peer_handshake(
         client, relay_addr, client_kp, server_kp.public_key,
         /*our_udx_id=*/42, /*reusable_socket=*/cfg.client_reusable,
         peer_connect::FIREWALL_UNKNOWN, /*addresses4=*/{},
-        /*relay_through=*/std::nullopt,
-        [&](const peer_connect::HandshakeResult& r) {
-            ctx.result = r;
-            ctx.done = true;
-            reply_cleanup(&ctx);
-        });
+        /*relay_through=*/std::nullopt, on_done);
 
     uv_timer_t timer;
     uv_timer_init(&loop, &timer);
@@ -510,6 +531,12 @@ TEST(PeerHandshakeReply, WellFormedReplySucceeds) {
     EXPECT_FALSE(r.terminal);
     ASSERT_TRUE(r.remote_payload.udx.has_value());
     EXPECT_EQ(r.remote_payload.udx->id, 777u);
+}
+
+TEST(PeerHandshakeReply, CorruptReplyDoesNotPoisonPreparedRequest) {
+    ReplyCfg cfg;
+    cfg.retry_corrupt_reply = true;
+    EXPECT_TRUE(run_reply_scenario(cfg).success);
 }
 
 // connect-3 — JS connect.js:406: the client's noisePayload advertises

@@ -20,6 +20,7 @@
 #include "hyperdht/relay_upgrade.hpp"
 #include "hyperdht/secret_stream.hpp"
 #include "hyperdht/udx.hpp"
+#include "peer_connect_internal.hpp"
 
 // Context stored in client rawStream->data during handshake->connection window.
 // Matches JS: rawStream created at connect() time with firewall callback.
@@ -54,6 +55,7 @@ struct ConnState {
     compact::Ipv4Address relay_addr;  // Relay used by the winning handshake
     std::vector<compact::Ipv4Address> relays;  // All relays discovered
     peer_connect::HandshakeResult hs_result;
+    std::shared_ptr<const peer_connect::HandshakeRequest> hs_request;
     std::shared_ptr<query::Query> query;
     std::weak_ptr<bool> alive;  // Sentinel — expired if HyperDHT destroyed
     rpc::RpcSocket* socket = nullptr;  // Raw pointer, guarded by alive
@@ -284,6 +286,17 @@ static LocalHandshakeInfo build_local_handshake_info(
     return info;
 }
 
+static auto prepare_handshake(std::shared_ptr<ConnState> state) {
+    if (!state->hs_request) {
+        auto info = build_local_handshake_info(state);
+        // JS memoizes the complete Noise request, so every route shares a session.
+        state->hs_request = peer_connect::prepare_handshake(
+            state->keypair, state->remote_pk, state->our_udx_id,
+            state->reusable_socket, info.firewall, info.addresses4, info.relay_through);
+    }
+    return state->hs_request;
+}
+
 // ---------------------------------------------------------------------------
 // §AUDIT-2: fire_handshake — start a single PEER_HANDSHAKE through a relay.
 // Called as findPeer results stream in (pipelining) or from cached relays.
@@ -295,17 +308,12 @@ static void fire_handshake(std::shared_ptr<ConnState> state,
     state->handshakes_in_flight++;
     state->handshakes_started++;
 
-    // JS: connect.js:386-411 — one payload for all attempts.
-    auto info = build_local_handshake_info(state);
-
     DHT_LOG("  [connect] fire_handshake via %s:%u (%d in flight)\n",
             relay_addr.host_string().c_str(), relay_addr.port,
             state->handshakes_in_flight);
 
     peer_connect::peer_handshake(*state->socket, relay_addr,
-        state->keypair, state->remote_pk, state->our_udx_id,
-        state->reusable_socket,
-        info.firewall, info.addresses4, info.relay_through,
+        prepare_handshake(state),
         [state, relay_addr](const peer_connect::HandshakeResult& hs) {
             state->handshakes_in_flight--;
             if (state->completed) return;  // First-success or destruction guard
@@ -593,11 +601,8 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
             // including this route path (connect.js:386-411): same
             // firewall/addresses/relayThrough as fire_handshake.
             auto route_addr = route->address;
-            auto info = build_local_handshake_info(state);
             peer_connect::peer_handshake(*socket_, route_addr,
-                keypair, remote_pk, state->our_udx_id,
-                state->reusable_socket,
-                info.firewall, info.addresses4, info.relay_through,
+                prepare_handshake(state),
                 [state, route_addr](const peer_connect::HandshakeResult& hs) {
                     if (state->completed || state->alive.expired()) return;
                     if (hs.success) {

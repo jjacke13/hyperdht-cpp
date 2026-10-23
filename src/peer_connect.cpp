@@ -5,6 +5,7 @@
 // Input validation: relay_count in NoisePayload capped at 128.
 
 #include "hyperdht/peer_connect.hpp"
+#include "peer_connect_internal.hpp"
 
 #include <sodium.h>
 
@@ -401,21 +402,25 @@ void peer_handshake(rpc::RpcSocket& socket,
                    addresses4, std::nullopt, std::move(on_done));
 }
 
-// Overload with relayThrough in the Noise payload (Phase E)
-void peer_handshake(rpc::RpcSocket& socket,
-                    const compact::Ipv4Address& relay_addr,
+struct HandshakeRequest {
+    noise::NoiseIK noise;
+    noise::PubKey remote_public_key;
+    messages::Request message;
+
+    HandshakeRequest(const noise::Keypair& keypair, const noise::PubKey& remote)
+        : noise(true, keypair, prologue().data(), prologue().size(), &remote),
+          remote_public_key(remote) {}
+};
+
+std::shared_ptr<const HandshakeRequest> prepare_handshake(
                     const noise::Keypair& our_keypair,
                     const noise::PubKey& remote_pubkey,
                     uint32_t our_udx_id,
                     bool reusable_socket,
                     uint32_t firewall,
                     const std::vector<compact::Ipv4Address>& addresses4,
-                    const std::optional<RelayThroughInfo>& relay_through,
-                    OnHandshakeCallback on_done) {
-    // Create Noise IK initiator with real prologue
-    auto noise_ik = std::make_shared<noise::NoiseIK>(true, our_keypair,
-                                                      prologue().data(), prologue().size(),
-                                                      &remote_pubkey);
+                    const std::optional<RelayThroughInfo>& relay_through) {
+    auto request = std::make_shared<HandshakeRequest>(our_keypair, remote_pubkey);
 
     // Build noisePayload for msg1
     NoisePayload payload;
@@ -429,7 +434,7 @@ void peer_handshake(rpc::RpcSocket& socket,
     payload.relay_through = relay_through;  // Phase E: include relayThrough
 
     auto payload_bytes = encode_noise_payload(payload);
-    auto noise_msg1 = noise_ik->send(payload_bytes.data(), payload_bytes.size());
+    auto noise_msg1 = request->noise.send(payload_bytes.data(), payload_bytes.size());
 
     HandshakeMessage hs_msg;
     hs_msg.mode = MODE_FROM_CLIENT;
@@ -439,20 +444,46 @@ void peer_handshake(rpc::RpcSocket& socket,
     std::array<uint8_t, 32> target{};
     crypto_generichash(target.data(), 32, remote_pubkey.data(), 32, nullptr, 0);
 
-    messages::Request req;
-    req.to.addr = relay_addr;
+    auto& req = request->message;
     req.command = messages::CMD_PEER_HANDSHAKE;
     req.target = target;
     req.value = std::move(hs_value);
 
+    return request;
+}
+
+void peer_handshake(rpc::RpcSocket& socket,
+                    const compact::Ipv4Address& relay_addr,
+                    std::shared_ptr<const HandshakeRequest> request,
+                    OnHandshakeCallback on_done) {
+    auto req = request->message;
+    req.to.addr = relay_addr;
+
     socket.request(req,
-        [noise_ik, on_done, remote_pubkey, relay_addr](const messages::Response& resp) {
-            on_done(validate_handshake_response(resp, relay_addr, *noise_ik,
-                                                remote_pubkey));
+        [request, on_done, relay_addr](const messages::Response& resp) {
+            // A bad reply must not corrupt the shared state for another route.
+            auto noise = request->noise;
+            on_done(validate_handshake_response(resp, relay_addr, noise,
+                                                request->remote_public_key));
         },
         [on_done](uint16_t) {
             on_done(HandshakeResult{});  // success=false, terminal=false
         });
+}
+
+void peer_handshake(rpc::RpcSocket& socket,
+                    const compact::Ipv4Address& relay_addr,
+                    const noise::Keypair& our_keypair,
+                    const noise::PubKey& remote_pubkey,
+                    uint32_t our_udx_id,
+                    bool reusable_socket,
+                    uint32_t firewall,
+                    const std::vector<compact::Ipv4Address>& addresses4,
+                    const std::optional<RelayThroughInfo>& relay_through,
+                    OnHandshakeCallback on_done) {
+    peer_handshake(socket, relay_addr,
+        prepare_handshake(our_keypair, remote_pubkey, our_udx_id, reusable_socket,
+                          firewall, addresses4, relay_through), std::move(on_done));
 }
 
 }  // namespace peer_connect

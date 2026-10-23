@@ -819,6 +819,14 @@ void Server::on_handshake_result(
 
     auto conn_ptr = std::make_unique<server_connection::ServerConnection>(std::move(conn));
 
+    // JS: server.js:390-394 — if client is OPEN, connect directly
+    if (client_open) {
+        auto peer_addr = conn_ptr->remote_payload.addresses4[0];
+        DHT_LOG("  [server] Client is OPEN, connecting directly\n");
+        on_socket(*conn_ptr, peer_addr);
+        return;
+    }
+
     // Phase E: Start blind relay if either side has relayThrough.
     // JS: server.js:397-399 — if (relayThrough || remotePayload.relayThrough)
     //     this._relayConnection(hs, relayThrough, remotePayload, h)
@@ -1178,14 +1186,6 @@ void Server::on_handshake_result(
                     }
                 });
         });
-    }
-
-    // JS: server.js:390-394 — if client is OPEN, connect directly
-    if (client_open) {
-        auto peer_addr = conn_ptr->remote_payload.addresses4[0];
-        DHT_LOG("  [server] Client is OPEN, connecting directly\n");
-        on_socket(*conn_ptr, peer_addr);
-        return;
     }
 
     // JS: server.js:430-432 — if server has public addr, skip Holepuncher.

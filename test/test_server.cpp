@@ -13,6 +13,7 @@
 #include "hyperdht/router.hpp"
 #include "hyperdht/rpc.hpp"
 #include "hyperdht/server.hpp"
+#include "hyperdht/udx.hpp"
 
 #include <hyperdht/hyperdht.h>
 
@@ -163,7 +164,8 @@ struct ClientHs {
 
 ClientHs make_handshake_request(const noise::Keypair& server_kp,
                                 uint32_t client_fw,
-                                uint8_t client_seed_byte = 0x22) {
+                                uint8_t client_seed_byte = 0x22,
+                                std::optional<peer_connect::RelayThroughInfo> relay = std::nullopt) {
     ClientHs out;
     noise::Seed client_seed{};
     client_seed.fill(client_seed_byte);
@@ -176,6 +178,7 @@ ClientHs make_handshake_request(const noise::Keypair& server_kp,
     peer_connect::NoisePayload cp;
     cp.version = 1;
     cp.firewall = client_fw;
+    cp.relay_through = relay;
     cp.udx = peer_connect::UdxInfo{1, false, 12345, 0};
     cp.has_secret_stream = true;
     cp.addresses4.push_back(
@@ -1456,6 +1459,43 @@ TEST(Server, RemoteAddressUsesRingSamplerNotStaleClassifier) {
     dht.destroy();
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
+}
+
+TEST(Server, OpenClientSkipsBlindRelayBootstrap) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        HyperDHT dht(&loop);
+        ASSERT_EQ(dht.socket().bind(0, "127.0.0.1"), 0);
+        Server srv(dht.socket(), dht.router(), &dht);
+        noise::Seed seed{};
+        seed.fill(0x31);
+        auto kp = noise::generate_keypair(seed);
+        int connections = 0;
+        udx_stream_t* adopted = nullptr;
+        srv.listen(kp, [&](const ConnectionInfo& info) {
+            ++connections;
+            adopted = info.raw_stream;
+            EXPECT_EQ(info.peer_address,
+                      compact::Ipv4Address::from_string("10.0.0.1", 5000));
+        });
+        peer_connect::RelayThroughInfo relay;
+        relay.public_key.fill(0x55);
+        relay.token.fill(0x66);
+        auto hs = make_handshake_request(kp, peer_connect::FIREWALL_OPEN, 0x32, relay);
+        EXPECT_TRUE(dht.router().handle_peer_handshake(
+            hs.req, [](const messages::Response&) {},
+            [](const messages::Request&, udx_socket_t*) {}));
+        EXPECT_EQ(connections, 1);
+        EXPECT_NE(adopted, nullptr);
+        EXPECT_EQ(dht.relay_stats().attempts, 0);
+        EXPECT_EQ(dht.relay_stats().aborts, 0);
+        if (adopted) udx::destroy_stream_once(adopted);
+        srv.close();
+        dht.destroy();
+        uv_run(&loop, UV_RUN_DEFAULT);
+    }
+    EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
 // ---------------------------------------------------------------------------

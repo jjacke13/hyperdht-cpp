@@ -95,6 +95,7 @@ TEST(RelayUpgrade, FreshStreamConfirmsNowCallbackNeverFires) {
     uv_loop_close(&loop);
 }
 
+
 // The relay→direct migration is an ADOPTION: the client's direct nudge fires
 // the firewall tap with the server session's punch socket, and changeRemote
 // binds the live relayed stream to it. The session that owns that socket is
@@ -690,19 +691,8 @@ TEST(RelayUpgradeContext, DeferredConfirmArmsAfterDrain) {
 // UpgradeContext, and the clear-wait backstop that reaps the session while the
 // relayed stream lives on. Only the relay PEER is faked.
 //
-// ONE DEVIATION, forced by a live bug (reported, not fixed here): this server
-// never actually puts its pair request on the wire. Both relay chains write
-// the Protomux OPEN in the same frame as `duplex->start()`, where
-// SecretStreamDuplex::write refuses everything until the header exchange
-// completes (secret_stream.cpp:577 → rc -2), then call BlindRelayClient::pair()
-// before the channel is open, where Channel::send refuses too
-// (protomux.cpp:264). JS has neither guard: NoiseSecretStream is a Duplex that
-// buffers pre-handshake writes, and protomux `send()` only checks `closed`
-// (protomux/index.js:253-255) because the RECEIVER buffers messages for a
-// not-yet-opened channel — which our Mux also implements. So the fake relay
-// opens its channel and sends the pair reply unprompted: exactly the bytes a
-// relay would have sent had the request arrived, leaving everything from
-// `on_paired` onwards — the code under test — untouched.
+// The fake relay replies only after receiving a real PAIR, so this also
+// exercises OPEN waiting for the encrypted control stream's header exchange.
 // ===========================================================================
 
 namespace ru_relay_emit {
@@ -759,8 +749,8 @@ struct SilentNodes {
 // Protomux → blind-relay.
 struct FakeRelayPeer {
     FakeRelayPeer(uv_loop_t* loop, const hyperdht::noise::Keypair& kp,
-                  const bl::Token& token)
-        : loop_(loop), kp_(kp), token_(token),
+                  const bl::Token& token, bool initiator = false)
+        : loop_(loop), kp_(kp), token_(token), initiator_(initiator),
           node_(loop, node_id()), udx_(loop), ep_(udx_) {
         node_.bind(0);
         auto a = loopback(0);
@@ -795,6 +785,8 @@ struct FakeRelayPeer {
         ep_.getsockname(reinterpret_cast<struct sockaddr*>(&a), &len);
         return Ipv4Address::from_string("127.0.0.1", ntohs(a.sin_port));
     }
+
+    unsigned pair_requests = 0;
 
   private:
     static hyperdht::routing::NodeId node_id() {
@@ -902,30 +894,24 @@ struct FakeRelayPeer {
         std::vector<uint8_t> id(kp_.public_key.begin(), kp_.public_key.end());
         auto* channel = mux_->create_channel(bl::PROTOCOL_NAME, id, false);
         ASSERT_NE(channel, nullptr);
-        channel->add_message({});   // 0 = pair
+        channel->add_message({[this, channel](const uint8_t* data, size_t len) {
+            auto pm = bl::decode_pair(data, len);
+            ASSERT_TRUE(pm.has_value());
+            EXPECT_EQ(pm->is_initiator, initiator_);
+            EXPECT_EQ(pm->token, token_);
+            ++pair_requests;
+            pm->id = PAIRED_ID;
+            auto payload = bl::encode_pair(*pm);
+            EXPECT_TRUE(channel->send(0, payload.data(), payload.size()));
+        }});
         channel->add_message({});   // 1 = unpair
         channel->open();
-
-        bl::PairMessage pm;
-        pm.is_initiator = false;    // the client proposed the relay
-        pm.token = token_;
-        pm.id = PAIRED_ID;
-        pm.seq = 0;
-        auto payload = bl::encode_pair(pm);
-
-        // Hand-framed [localId][messageType][payload] — Channel::send() is
-        // gated on the remote OPEN, which never arrives (see the header note).
-        ASSERT_LT(channel->local_id(), 0xfdu);
-        std::vector<uint8_t> frame;
-        frame.push_back(static_cast<uint8_t>(channel->local_id()));
-        frame.push_back(0);
-        frame.insert(frame.end(), payload.begin(), payload.end());
-        duplex_->write(frame.data(), frame.size(), nullptr);
     }
 
     uv_loop_t* loop_;
     hyperdht::noise::Keypair kp_;
     bl::Token token_;
+    bool initiator_;
     hyperdht::rpc::RpcSocket node_;
     hyperdht::udx::Udx udx_;
     hyperdht::udx::UdxSocket ep_;
@@ -1049,7 +1035,16 @@ TEST(ServerRelayEmit, UpgradeHoldsTheSessionPunchSocket) {
     std::weak_ptr<hyperdht::holepunch::PoolSocket> weak = session->punch_socket;
 
     ru_choreo::pump_until(&loop, [&] { return emitted; }, 8000);
-    ASSERT_TRUE(emitted) << "the relay pairing never emitted a connection";
+    EXPECT_EQ(relay->pair_requests, 1u);
+    EXPECT_TRUE(emitted) << "the relay pairing never emitted a connection";
+    if (!emitted) {
+        dht.destroy();
+        relay.reset();
+        silent.reset();
+        uv_run(&loop, UV_RUN_DEFAULT);
+        uv_loop_close(&loop);
+        return;
+    }
     ASSERT_TRUE(emitted_upgrade) << "relay emit carried no upgrade context";
 
     // The session — sole owner of the punch socket — is reaped by the
@@ -1071,6 +1066,92 @@ TEST(ServerRelayEmit, UpgradeHoldsTheSessionPunchSocket) {
     dht.destroy();
     relay.reset();
     silent.reset();   // its uv_close callbacks need a live loop
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+}
+
+TEST(ClientRelayEmit, SendsPairAfterEncryptedControlStreamConnects) {
+    using namespace ru_relay_emit;
+
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    auto relay_kp = hyperdht::noise::generate_keypair();
+    auto target_kp = hyperdht::noise::generate_keypair();
+    auto token = bl::generate_token();
+    auto relay = std::make_unique<FakeRelayPeer>(&loop, relay_kp, token, true);
+
+    hyperdht::routing::NodeId id{};
+    hyperdht::rpc::RpcSocket target(&loop, id);
+    target.bind(0);
+    auto target_addr = Ipv4Address::from_string("127.0.0.1", target.port());
+    target.on_request([&](const msgs::Request& req) {
+        msgs::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = req.from.addr;
+        if ((req.internal && req.command == msgs::CMD_PING) ||
+            req.command == msgs::CMD_PEER_HOLEPUNCH) {
+            target.reply(resp, req.from_server);
+            return;
+        }
+        if (req.command != msgs::CMD_PEER_HANDSHAKE || !req.value) return;
+        const auto& prologue = hyperdht::dht_messages::ns_peer_handshake();
+        hyperdht::noise::NoiseIK responder(false, target_kp,
+                                           prologue.data(), prologue.size());
+        auto hs = pc::decode_handshake_msg(req.value->data(), req.value->size());
+        ASSERT_TRUE(responder.recv(hs.noise.data(), hs.noise.size()).has_value());
+        pc::NoisePayload payload;
+        payload.version = 1;
+        payload.firewall = pc::FIREWALL_CONSISTENT;
+        payload.udx = pc::UdxInfo{1, false, 12345, 0};
+        payload.has_secret_stream = true;
+        payload.addresses4.push_back(target_addr);
+        payload.holepunch = pc::HolepunchInfo{};
+        payload.holepunch->id = 1;
+        pc::RelayInfo ri;
+        ri.relay_address = target_addr;
+        ri.peer_address = target_addr;
+        payload.holepunch->relays.push_back(ri);
+        auto plain = pc::encode_noise_payload(payload);
+        pc::HandshakeMessage reply;
+        reply.mode = pc::MODE_REPLY;
+        reply.noise = responder.send(plain.data(), plain.size());
+        resp.value = pc::encode_handshake_msg(reply);
+        target.reply(resp, req.from_server);
+    });
+
+    hyperdht::HyperDHT dht(&loop);
+    ASSERT_EQ(dht.bind(), 0);
+    auto silent = std::make_unique<SilentNodes>(&loop);
+    silent->seed(dht);
+    dht.cache_relay_addresses(relay_kp.public_key, {relay->node_addr()});
+    dht.cache_relay_addresses(target_kp.public_key, {target_addr});
+    hyperdht::ConnectOptions opts;
+    opts.relay_through = relay_kp.public_key;
+    opts.relay_token = token;
+    opts.fast_open = false;
+    opts.local_connection = false;
+    opts.holepunch_veto = [](auto, auto, const auto&, const auto&) { return false; };
+    bool done = false;
+    hyperdht::ConnectResult result;
+    dht.connect(target_kp.public_key, opts, [&](int err, const auto& conn) {
+        EXPECT_EQ(err, 0);
+        result = conn;
+        done = true;
+    });
+    ru_choreo::pump_until(&loop, [&] { return done; }, 8000);
+    EXPECT_EQ(relay->pair_requests, 1u);
+    EXPECT_TRUE(done);
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.peer_address, relay->ep_addr());
+    EXPECT_TRUE(result.upgrade);
+    if (result.upgrade)
+        std::static_pointer_cast<UpgradeContext>(result.upgrade)->on_stream_closed();
+    if (result.raw_stream) hyperdht::udx::destroy_stream_once(result.raw_stream);
+    result.upgrade.reset();
+    dht.destroy();
+    relay.reset();
+    silent.reset();
+    target.close();
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }

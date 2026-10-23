@@ -1117,8 +1117,6 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
                 }
             });
 
-        state->relay->duplex->start();
-
         // Step 4: Create BlindRelayClient over the Protomux channel.
         // JS: relay.Client.from(relaySocket, { id: relaySocket.publicKey })
         std::vector<uint8_t> channel_id(
@@ -1138,7 +1136,12 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
         }
 
         state->relay->client = std::make_unique<blind_relay::BlindRelayClient>(channel);
-        state->relay->client->open();
+        // SecretStream rejects writes until its header exchange completes.
+        state->relay->duplex->on_connect([weak = std::weak_ptr<ConnState>(state)]() {
+            auto st = weak.lock();
+            if (st && !st->completed && !st->alive.expired() && st->relay)
+                st->relay->client->open();
+        });
 
         // Step 5: Pair our rawStream through the relay.
         // JS: c.relayClient.pair(isInitiator, token, c.rawStream)
@@ -1244,6 +1247,7 @@ static void start_relay_path(std::shared_ptr<ConnState> state,
                 }
                 state->complete_error(ConnectError::RELAY_FAILED);
             });
+        state->relay->duplex->start();
     });
 }
 

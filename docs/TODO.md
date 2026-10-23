@@ -989,18 +989,19 @@ separately eliminated. Full case: memory `server_punch_socket_parity`, `Q2-EVIDE
   *no* random punch (CONSISTENT+RANDOM sprays included) could start. Test
   `Holepuncher.DropWithoutDestroyReleasesHoldersAndThrottle`, red-verified on both
   assertions. 763/763.
-- [ ] **BUG A (HIGH) — the blind-relay chain cannot pair, so `relayThrough` is
-  non-functional.** `src/server.cpp:955-1012` and `src/connect.cpp:1119-1145` write the
-  Protomux OPEN **in the same frame as `duplex->start()`**, where
-  `SecretStreamDuplex::write` returns `-2` (`!connected_` — needs the peer header) and the
-  Mux **discards the failure**. **Channel-ready PAIR fixed 2026-10-23:**
+- [ ] **BUG A (HIGH) — finish and live-verify blind-relay fallback.**
+  **Readiness fixed 2026-10-23:** both production relay callers prepare the
+  channel and pairing callbacks before starting SecretStream, then send Protomux
+  OPEN only after the encrypted header exchange completes.
   `BlindRelayClient` retains requests until the channel opens and sends each once;
   cancellation and synchronous client destruction have regression coverage.
-  The encrypted-stream readiness bug still blocks the full chain. JS has neither
-  guard. Measured before these fixes: production order never pairs; deferring both
-  pairs fine. **This is the mitigation `Q2-EVIDENCE` and the handoff recommend for the
-  Finding Q outages — it does not work today.** Also makes the relay→direct keepalive
-  call site (`server.cpp:1138`) unreachable at runtime.
+  Production client/server regressions require an actual PAIR request; the server
+  fixture no longer sends an unsolicited reply. A local relay carried encrypted
+  data both ways. All three suites and isolated consumer connectivity checks pass
+  with public and NAT server placements; those lab checks exercised default direct
+  paths, not blind-relay DATA. Remaining: verify the nullable control socket on the
+  public/OPEN relay path, propagate negative transport writes, and validate DATA
+  through a publicly reachable relay plus relay failure and direct upgrade.
 
 ### J.2 Task 6
 

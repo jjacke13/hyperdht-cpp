@@ -973,8 +973,6 @@ void Server::on_handshake_result(
                 [mux = relay_mux.get()](const uint8_t* data, size_t len) {
                     if (mux && !mux->is_destroyed()) mux->on_data(data, len);
                 });
-            relay_duplex->start();
-
             // BlindRelayClient on Protomux channel
             std::vector<uint8_t> channel_id(
                 relay_result.remote_public_key.begin(),
@@ -992,7 +990,11 @@ void Server::on_handshake_result(
             }
 
             auto relay_client = std::make_shared<blind_relay::BlindRelayClient>(channel);
-            relay_client->open();
+            // SecretStream rejects writes until its header exchange completes.
+            relay_duplex->on_connect(
+                [weak = std::weak_ptr<blind_relay::BlindRelayClient>(relay_client)]() {
+                    if (auto client = weak.lock()) client->open();
+                });
 
             // server-8 — register the watchdog's teardown now that the
             // chain exists. client->destroy() drops the stored pair
@@ -1185,6 +1187,7 @@ void Server::on_handshake_result(
                         }, 0);
                     }
                 });
+            relay_duplex->start();
         });
     }
 

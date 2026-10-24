@@ -48,11 +48,16 @@ TEST(Security, RelayExpiryAndRefreshApplyOnRead) {
     uv_sleep(15);
     EXPECT_EQ(r.record(key(1)), nullptr);
     EXPECT_FALSE(r.has(key(1)));
-    r.set(key(1), entry);
-    uv_sleep(5);
-    r.set(key(1), entry);
-    uv_sleep(7);
-    EXPECT_NE(r.record(key(1)), nullptr);
+    // Advance GC time instead of requiring a read within a few milliseconds.
+    router::Router refreshed(2);
+    refreshed.set(key(1), entry);
+    refreshed.set(key(2), entry);
+    const auto before_refresh = uv_hrtime() / 1000000;
+    uv_sleep(2);
+    refreshed.set(key(1), entry);
+    refreshed.gc(before_refresh + announce::DEFAULT_TTL_MS + 1);
+    EXPECT_NE(refreshed.record(key(1)), nullptr);
+    EXPECT_FALSE(refreshed.has(key(2)));
 }
 
 TEST(Security, SignedAnnouncementAndRefreshRespectRelayLimit) {

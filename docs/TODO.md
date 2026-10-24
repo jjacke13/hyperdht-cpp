@@ -5,12 +5,16 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-24 (live relay-to-direct verification; older snapshots below are historical).
+Last updated: 2026-10-24 (verified-key announcement identity; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-24 announcement identity:** ordinary stored announcements now
+  replace and remove by verified peer public key within each target, including
+  refresh and local clear. Signed UDP storage and public/NAT consumer checks pass;
+  see the announcement identity entry below.
 - **2026-10-24 relay verification:** blind-relay pairing, OPEN control sockets,
   transport-write failure propagation and handshake dedup are fixed. Live
   relay-to-direct migration passes with both a public and a NAT application
@@ -118,15 +122,11 @@ Full run: 14/16 subsystems (messages + protomux finders failed on output-cap,
 UNVERIFIED this pass), 11 material findings, ALL skeptic-confirmed (high conf).
 The 12 HIGH and all 6 claimed-open items above survived independently — zero
 FALSE_DONE. Behavioral parity estimate ~93%. Net-new, none previously ledgered:
-- [ ] **server/divergence-1 (HIGH — potential UAF)** — blind relay starts
-  (server.cpp:754) BEFORE the OPEN/direct shortcut returns (JS server.js:394
-  returns first). In relayThrough + OPEN-client + pairing-within-15s: the OPEN
-  on_socket transfers+nulls conn.raw_stream and returns at server.cpp:1099
-  WITHOUT storing the session; the pending relay continuation then
-  `udx_stream_connect()`+`emit_connection()` a 2nd time on that now user-owned
-  stream (the `connections_.find` guard is empty — session never stored). Fix:
-  return before starting relay for OPEN clients, OR cancel the pending relay on
-  the OPEN path. Add a relayThrough+OPEN regression test. **NOT YET FIXED.**
+- [x] **server/divergence-1 (HIGH — potential UAF)** — fixed 2026-10-23
+  (`e6adc4c`). The OPEN-client direct shortcut returns before starting blind
+  relay setup, preventing a relay continuation from reusing the emitted stream.
+  The regression requires one direct emission and no relay pairing; all three
+  suites and isolated public/NAT connectivity checks pass.
 - [ ] **connect/divergence-1 (LOW)** — reusableSocket route-shortcut callback
   (connect.cpp:580-591) ignores `hs.terminal`, running a full findPeer walk
   where JS terminates SERVER_ERROR (can return PEER_NOT_FOUND instead). Fix:
@@ -378,6 +378,19 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   unexplained — `id = BLAKE2b(host, port)` makes each mapping an independent
   random point, so three mappings of one host being the global closest-3 is
   suspicious in itself; if it recurs, suspect the selection/sort, not diversity.
+- [x] **Announcement record identity uses verified public keys (2026-10-24).**
+  Within each target, full announce and refresh replace the same key after an
+  endpoint change; different keys sharing an endpoint coexist. Signed unannounce
+  removes only its verified key, even from a different endpoint. Self-announce
+  cleanup and local lookup-and-unannounce also remove by key. The stored sender
+  address remains metadata; wire records, C ABI, TTL and capacity are unchanged.
+  Regressions cover replacement, coexistence, key isolation, refresh, local clear,
+  expiry and capacity. A private persistent C++ node verifies six UDP storage
+  operations with matching request/reply payloads in both endpoint captures.
+  All three suites and Nospoon connectivity checks pass with a public server and
+  a NAT server; x86_64/aarch64 static builds and all 35 ESP32-S3 component files
+  compile. Firmware/board checks remain deferred. Low-level C++ store users must
+  rebuild and supply the peer key; the C interface is unchanged.
 - [x] **Router forward cache bounded and expired (2026-10-23).** Remote
   forwards use the existing LRU cache with `DhtOptions::max_size` and
   `max_age_ms`; defaults remain 65536 entries and 20 minutes. Expiry applies

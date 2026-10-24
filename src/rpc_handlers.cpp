@@ -34,6 +34,7 @@
 
 #include "hyperdht/rpc_handlers.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstring>
@@ -691,7 +692,7 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
                 router_->set(target, std::move(entry));
             }
         }
-        store_.remove(target, req.from.addr);
+        store_.remove(target, ann.peer->public_key);
     } else {
         // JS persistent.js:140-142 — bump gate. currentBump defaults 0; a
         // bump only sticks if it's strictly greater AND within the wall-clock
@@ -709,6 +710,7 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
         // `hyperdht/index.js:607,599`. Defaults to 20 min when the caller
         // leaves the option at its default value.
         announce::PeerAnnouncement stored;
+        stored.public_key = ann.peer->public_key;
         stored.from = req.from.addr;
         stored.value = std::move(record);
         stored.created_at = uv_now(socket_.loop());
@@ -759,6 +761,10 @@ void RpcHandlers::handle_refresh(const std::array<uint8_t, 32>& token,
 
     // Copy — the remove() below invalidates `found`.
     RefreshEntry entry = *found;
+    // The cached bare record was signature-verified; its first 32 bytes are the key.
+    std::array<uint8_t, 32> public_key{};
+    assert(entry.record.size() >= public_key.size());
+    std::copy_n(entry.record.begin(), public_key.size(), public_key.begin());
 
     if (entry.announce_self) {
         // JS persistent.js:82-89 — repopulate the router forward entry
@@ -777,10 +783,11 @@ void RpcHandlers::handle_refresh(const std::array<uint8_t, 32>& token,
                 router_->set(entry.target, std::move(fwd));
             }
         }
-        store_.remove(entry.target, req.from.addr);
+        store_.remove(entry.target, public_key);
     } else {
         // JS persistent.js:91 — records.add(k, publicKey, record).
         announce::PeerAnnouncement stored;
+        stored.public_key = public_key;
         stored.from = req.from.addr;
         stored.value = entry.record;
         stored.created_at = uv_now(socket_.loop());
@@ -810,7 +817,7 @@ void RpcHandlers::handle_refresh(const std::array<uint8_t, 32>& token,
 // JS: .analysis/js/hyperdht/lib/persistent.js:53-70 (onunannounce)
 //     .analysis/js/hyperdht/lib/persistent.js:45-51 (unannounce helper)
 //
-// Mirrors JS: removes the AnnounceStore record for this sender AND, when the
+// Mirrors JS: removes the AnnounceStore record for this verified key AND, when the
 // unannouncing key hashes to the target (a self-announce), the relay-only
 // router entry that handle_announce created. A locally-listening Server's
 // router entry is left untouched (it owns its lifecycle via Server::close()).
@@ -868,8 +875,7 @@ void RpcHandlers::handle_unannounce(const messages::Request& req) {
         }
     }
 
-    // Remove the announcement from this sender
-    store_.remove(target, req.from.addr);
+    store_.remove(target, ann.peer->public_key);
 
     messages::Response resp;
     resp.tid = req.tid;

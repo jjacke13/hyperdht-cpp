@@ -17,6 +17,7 @@
 #include <uv.h>
 
 #include "hyperdht/announce_sig.hpp"
+#include "hyperdht/dht.hpp"
 #include "hyperdht/dht_messages.hpp"
 #include "hyperdht/dht_ops.hpp"
 #include "hyperdht/noise_wrap.hpp"
@@ -28,6 +29,93 @@ using namespace hyperdht::rpc;
 using namespace hyperdht::messages;
 using namespace hyperdht::compact;
 using namespace hyperdht::routing;
+
+TEST(Unannounce, PersistentNodeClearsItsOwnCachedKeyBeforeLookup) {
+    uv_loop_t loop{};
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        HyperDHT node(&loop);
+        ASSERT_EQ(node.bind(), 0);
+        // libudx reads the watcher after on_close; the fixture frees it after draining.
+        std::unique_ptr<udx_interface_event_t> watcher(node.socket().udx_handle()->listeners);
+        ASSERT_NE(watcher, nullptr);
+        ASSERT_EQ(watcher->next, nullptr);
+        watcher->on_close = nullptr;
+        // The loopback node simulates a public persistent storage node.
+        auto address = Ipv4Address::from_string("127.0.0.1", node.port());
+        for (int i = 1; i <= 3; ++i) {
+            node.socket().nat_sampler().add(address,
+                Ipv4Address::from_string("10.0.0." + std::to_string(i), 49737));
+            node.socket().ring_sampler().add(address.host_string(), address.port);
+        }
+        node.socket().force_check_persistent();
+        RpcSocket client(&loop, {}), other(&loop, {});
+        ASSERT_EQ(client.bind(0, "127.0.0.1"), 0);
+        ASSERT_EQ(other.bind(0, "127.0.0.1"), 0);
+        noise::Seed seed{};
+        seed.fill(1); const auto topic = noise::generate_keypair(seed);
+        seed.fill(2); const auto first = noise::generate_keypair(seed);
+        seed.fill(3); const auto second = noise::generate_keypair(seed);
+        NodeId target{};
+        crypto_generichash(target.data(), target.size(), topic.public_key.data(),
+            topic.public_key.size(), nullptr, 0);
+        uv_timer_t timeout{};
+        bool cleaned = false, checked = false;
+        auto cleanup = [&] {
+            if (cleaned) return;
+            cleaned = true;
+            node.destroy(); client.close(); other.close();
+            // Drain the stopped interface watcher while its UDX owner is alive.
+            udx_teardown(node.socket().udx_handle());
+            uv_close(reinterpret_cast<uv_handle_t*>(&timeout), nullptr);
+        };
+        std::function<void()> expire = cleanup;
+        ASSERT_EQ(uv_timer_init(&loop, &timeout), 0);
+        timeout.data = &expire;
+        uv_timer_start(&timeout, [](uv_timer_t* t) {
+            (*static_cast<std::function<void()>*>(t->data))();
+        }, 2000, 0);
+        auto announce = [&](RpcSocket& sender, const noise::Keypair& kp,
+                            std::function<void(const Response&)> done) {
+            Request req;
+            req.to.addr = address; req.command = CMD_ANNOUNCE; req.target = target;
+            req.token = node.socket().token_store().create("127.0.0.1");
+            dht_messages::AnnounceMessage ann;
+            dht_messages::PeerRecord peer; peer.public_key = kp.public_key; ann.peer = peer;
+            ann.signature = announce_sig::sign_announce(target, node.socket().table().id(),
+                req.token->data(), req.token->size(), ann, kp);
+            req.value = dht_messages::encode_announce_msg(ann);
+            sender.request(req, std::move(done), [&](uint16_t) { cleanup(); });
+        };
+        announce(client, first, [&](const Response&) {
+            announce(other, second, [&](const Response&) {
+                auto clear = node.lookup_and_unannounce(topic.public_key, first, {}, {});
+                if (clear) clear->destroy();
+                Request lookup;
+                lookup.to.addr = address; lookup.command = CMD_LOOKUP; lookup.target = target;
+                client.request(lookup, [&](const Response& response) {
+                    checked = true;
+                    EXPECT_TRUE(response.value.has_value());
+                    if (response.value) {
+                        const auto result = dht_messages::decode_lookup_reply(
+                            response.value->data(), response.value->size());
+                        EXPECT_EQ(result.peers.size(), 1u);
+                        if (result.peers.size() == 1) {
+                            const auto peer = dht_messages::decode_peer_record(
+                                result.peers[0].data(), result.peers[0].size());
+                            EXPECT_EQ(peer.public_key, second.public_key);
+                        }
+                    }
+                    cleanup();
+                }, [&](uint16_t) { cleanup(); });
+            });
+        });
+        uv_run(&loop, UV_RUN_DEFAULT);
+        EXPECT_TRUE(checked);
+    }
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
 
 // Transition an RpcSocket to persistent (so it serves LOOKUP/ANNOUNCE/
 // UNANNOUNCE). Copied from test_rpc_handlers.cpp's helper.

@@ -16,7 +16,6 @@
 //   - JS uses the npm `record-cache` package (TTL + per-key max + LRU).
 //   - C++ implementation is a plain unordered_map<TargetKey, vector>
 //     with manual gc(). Eviction is oldest-by-created_at on overflow.
-//   - JS keys remove() by publicKey; C++ removes by source `from` address.
 
 #include "hyperdht/announce.hpp"
 
@@ -33,10 +32,9 @@ void AnnounceStore::put(const TargetKey& target, const PeerAnnouncement& ann) {
     }
     auto& peers = store_[target];
 
-    // Replace existing from same address
+    // Replace existing from the same public key, even after an endpoint change.
     for (auto& existing : peers) {
-        if (existing.from.host_string() == ann.from.host_string()
-            && existing.from.port == ann.from.port) {
+        if (existing.public_key == ann.public_key) {
             existing = ann;
             return;
         }
@@ -56,15 +54,14 @@ void AnnounceStore::put(const TargetKey& target, const PeerAnnouncement& ann) {
     peers.push_back(ann);
 }
 
-bool AnnounceStore::remove(const TargetKey& target, const compact::Ipv4Address& from) {
+bool AnnounceStore::remove(const TargetKey& target, const std::array<uint8_t, 32>& public_key) {
     auto it = store_.find(target);
     if (it == store_.end()) return false;
 
     auto& peers = it->second;
-    auto host = from.host_string();
     auto removed = std::remove_if(peers.begin(), peers.end(),
         [&](const PeerAnnouncement& a) {
-            return a.from.host_string() == host && a.from.port == from.port;
+            return a.public_key == public_key;
         });
 
     if (removed == peers.end()) return false;

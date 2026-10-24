@@ -424,6 +424,109 @@ static std::vector<uint8_t> build_signed_announce(
     return hyperdht::dht_messages::encode_announce_msg(ann);
 }
 
+class AnnouncementIdentity : public ::testing::Test {
+protected:
+    uv_loop_t loop{};
+    std::unique_ptr<RpcSocket> socket;
+    std::unique_ptr<RpcHandlers> handlers;
+    hyperdht::announce::TargetKey target{};
+    hyperdht::noise::Keypair first, second;
+
+    void SetUp() override {
+        ASSERT_EQ(uv_loop_init(&loop), 0);
+        socket = std::make_unique<RpcSocket>(&loop, NodeId{});
+        ASSERT_EQ(socket->bind(0, "127.0.0.1"), 0);
+        make_persistent(*socket);
+        handlers = std::make_unique<RpcHandlers>(*socket);
+        target.fill(0xAA);
+        hyperdht::noise::Seed seed{};
+        seed.fill(1); first = hyperdht::noise::generate_keypair(seed);
+        seed.fill(2); second = hyperdht::noise::generate_keypair(seed);
+    }
+
+    void TearDown() override {
+        handlers.reset();
+        socket->close();
+        uv_run(&loop, UV_RUN_DEFAULT);
+        socket.reset();
+        EXPECT_EQ(uv_loop_close(&loop), 0);
+    }
+
+    void send(const hyperdht::noise::Keypair& kp, const char* host, uint16_t port,
+              uint32_t command = CMD_ANNOUNCE,
+              std::optional<std::array<uint8_t, 32>> refresh = std::nullopt,
+              bool refresh_only = false, bool corrupt_signature = false) {
+        Request req;
+        req.command = command;
+        req.target = target;
+        req.from.addr = Ipv4Address::from_string(host, port);
+        req.token = socket->token_store().create(host);
+        if (refresh_only) {
+            hyperdht::dht_messages::AnnounceMessage ann;
+            ann.refresh = refresh;
+            req.value = hyperdht::dht_messages::encode_announce_msg(ann);
+        } else {
+            req.value = build_signed_announce(kp, target, socket->table().id(),
+                *req.token, command == CMD_UNANNOUNCE, refresh);
+            if (corrupt_signature) req.value->back() ^= 1;
+        }
+        handlers->handle(req);
+    }
+};
+
+TEST_F(AnnouncementIdentity, SameKeyReplacesRecordAfterEndpointChange) {
+    send(first, "127.0.0.1", 31001);
+    send(first, "127.0.0.2", 31002);
+    const auto records = handlers->store().get(target);
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records[0].from, Ipv4Address::from_string("127.0.0.2", 31002));
+}
+
+TEST_F(AnnouncementIdentity, DifferentKeysAtSameEndpointCoexist) {
+    send(first, "127.0.0.1", 31001);
+    send(second, "127.0.0.1", 31001);
+    EXPECT_EQ(handlers->store().get(target).size(), 2u);
+}
+
+TEST_F(AnnouncementIdentity, UnannounceFromNewEndpointRemovesOnlySignedKey) {
+    send(first, "127.0.0.1", 31001);
+    send(second, "127.0.0.1", 31002);
+    send(first, "127.0.0.2", 31003, CMD_UNANNOUNCE);
+    const auto records = handlers->store().get(target);
+    ASSERT_EQ(records.size(), 1u);
+    const auto peer = hyperdht::dht_messages::decode_peer_record(
+        records[0].value.data(), records[0].value.size());
+    EXPECT_EQ(peer.public_key, second.public_key);
+}
+
+TEST_F(AnnouncementIdentity, AnotherKeyAtSameEndpointCannotRemoveRecord) {
+    send(first, "127.0.0.1", 31001);
+    send(second, "127.0.0.1", 31001, CMD_UNANNOUNCE);
+    EXPECT_EQ(handlers->store().get(target).size(), 1u);
+    send(first, "127.0.0.1", 31001, CMD_UNANNOUNCE, std::nullopt, false, true);
+    EXPECT_EQ(handlers->store().get(target).size(), 1u);
+}
+
+TEST_F(AnnouncementIdentity, RefreshFromNewEndpointReplacesOriginalKey) {
+    std::array<uint8_t, 32> preimage{}, hash{};
+    preimage.fill(0x7E);
+    crypto_generichash(hash.data(), hash.size(), preimage.data(), preimage.size(), nullptr, 0);
+    send(first, "127.0.0.1", 31001, CMD_ANNOUNCE, hash);
+    send(second, "127.0.0.1", 31002);
+    send(first, "127.0.0.2", 31003, CMD_ANNOUNCE, preimage, true);
+    const auto records = handlers->store().get(target);
+    ASSERT_EQ(records.size(), 2u);
+    for (const auto& record : records) {
+        const auto peer = hyperdht::dht_messages::decode_peer_record(
+            record.value.data(), record.value.size());
+        if (peer.public_key == first.public_key) {
+            EXPECT_EQ(record.from, Ipv4Address::from_string("127.0.0.2", 31003));
+        }
+    }
+    send(first, "127.0.0.3", 31004, CMD_UNANNOUNCE);
+    EXPECT_EQ(handlers->store().get(target).size(), 1u);
+}
+
 // Run the two-phase test: PING then action
 static void run_announce_test(AnnounceCtx& ctx, uv_loop_t& loop,
                                std::function<void(AnnounceCtx*)> on_token) {
@@ -712,7 +815,7 @@ TEST(RpcHandlers, AnnounceRefreshPreimageReaddsRecord) {
                 // Wipe the stored record so refresh #1 visibly re-adds it.
                 auto anns = c->handlers->store().get(tkey);
                 if (anns.size() == 1) {
-                    c->handlers->store().remove(tkey, anns[0].from);
+                    c->handlers->store().remove(tkey, anns[0].public_key);
                     removed_before_refresh =
                         c->handlers->store().get(tkey).empty();
                 }

@@ -80,19 +80,13 @@ std::shared_ptr<query::Query> HyperDHT::lookup_and_unannounce(
     routing::NodeId target{};
     crypto_generichash(target.data(), 32, public_key.data(), 32, nullptr, 0);
 
-    // JS index.js:203-206 — if this node is itself a persistent store, unlink
-    // our own local record before hitting the network
-    // (`this._persistent.unannounce(target, keyPair.publicKey)`,
-    // persistent.js:45-51). Our target IS BLAKE2b(publicKey), so this is
-    // always the self-announce case: drop the relay-only router entry that a
-    // self-ANNOUNCE created (persistent.js:49 `_router.delete`). Never clobber
-    // a live local Server's entry (it owns its own lifecycle via Server::close).
-    // (JS also removes from the records cache keyed by pubkey; the C++
-    // AnnounceStore is keyed by sender address, so a by-pubkey removal has no
-    // clean analog and stale self-records are left to TTL expiry.)
+    // JS index.js:203-206 — remove the signing key's local cached record before
+    // walking the network (`_persistent.unannounce(target, keyPair.publicKey)`).
+    // Keep the relay-only forward cleanup and the local Server lifecycle guard.
     if (socket_ && !socket_->is_ephemeral()) {
         announce::TargetKey tk{};
         std::copy(target.begin(), target.end(), tk.begin());
+        if (handlers_) handlers_->store().remove(tk, keypair.public_key);
         auto* entry = router_.get(tk);
         if (entry && !entry->on_peer_handshake) {
             router_.remove(tk);

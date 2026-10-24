@@ -30,6 +30,7 @@ struct PeerAnnouncement {
     std::vector<uint8_t> value;         // Announcement payload (noisePayload etc.)
     uint64_t created_at = 0;            // Timestamp when stored
     uint64_t ttl = DEFAULT_TTL_MS;      // Time to live
+    std::array<uint8_t, 32> public_key{}; // Verified peer identity
 };
 
 // ---------------------------------------------------------------------------
@@ -58,11 +59,11 @@ struct KeyHash {
 class AnnounceStore {
 public:
     // Store a peer announcement at a target key.
-    // Replaces existing announcement from the same address.
+    // Replaces existing announcement from the same public key.
     void put(const TargetKey& target, const PeerAnnouncement& ann);
 
-    // Remove a peer announcement from a target key (by sender address).
-    bool remove(const TargetKey& target, const compact::Ipv4Address& from);
+    // Remove a peer announcement from a target key by public key.
+    bool remove(const TargetKey& target, const std::array<uint8_t, 32>& public_key);
 
     // Get all announcements for a target key (returned by value for safety).
     std::vector<PeerAnnouncement> get(const TargetKey& target) const;

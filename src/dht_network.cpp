@@ -318,19 +318,8 @@ void HyperDHT::stop_interface_watcher() {
     }
     // Null the data pointer so any pending callback is a no-op.
     interface_watcher_->data = nullptr;
-    // Do NOT call udx_interface_event_close() here — the udx_t teardown
-    // (triggered by socket_->close()) will close all attached interface
-    // events automatically (libudx/src/udx.c:1879). Calling close manually
-    // AND letting teardown close it causes the close callback to fire after
-    // the udx_t is freed -> use-after-free in ref_dec(event->udx).
-    //
-    // Trade-off accepted: the `udx_interface_event_t` heap struct leaks
-    // ~232 bytes per HyperDHT instance at process exit, because libudx
-    // teardown closes its listener handles but our `on_udx_interface_close`
-    // deleter never fires in that path. Fixable only by patching libudx
-    // to invoke the user close callback from its teardown loop. Since
-    // the leak is bounded per process lifetime (one per HyperDHT)
-    // and not per-operation, we accept it.
+    // RpcSocket::close() tears down UDX and closes the watcher exactly once;
+    // its asynchronous on_udx_interface_close callback deletes the allocation.
     interface_watcher_ = nullptr;
 }
 

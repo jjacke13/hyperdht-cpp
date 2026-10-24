@@ -5,12 +5,19 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-24 (verified-key announcement identity; older snapshots below are historical).
+Last updated: 2026-10-24 (UDX shutdown; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-24 UDX shutdown:** close now tears down attached and unconnected
+  streams before their DHT storage is released. Generated UDX guards avoid
+  duplicate closes and watcher callback lifetime errors; pending connect owners
+  and pool retries stop referring to finalized handles. Core and consumer suites,
+  both static CPU builds, ten Holesail TCP/UDP placements and three Nospoon
+  public/NAT/LAN placements pass, including normal application exits. TD2 is fixed;
+  TD1/TD3 and broader platform/soak verification remain open.
 - **2026-10-24 announcement identity:** ordinary stored announcements now
   replace and remove by verified peer public key within each target, including
   refresh and local clear. Signed UDP storage and public/NAT consumer checks pass;
@@ -257,16 +264,10 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   NOTE: `blind_relay.cpp`'s destroy sites are NOT exposed — for a `relayed`
   stream `udx_stream_destroy` calls `close_stream_internal` synchronously in
   one call (upstream `fa576bd` made it so deliberately), so there is no window.
-- [ ] **Finding J follow-up** — convert `SecretStreamDuplex::destroy()`
-  (src/secret_stream.cpp:666) to the same guard. It owns the live,
-  post-handshake application stream — the one most likely to have traffic
-  queued at teardown, so the `UV_EAGAIN` window is most plausible there. NOT
-  done with the main fix because that call is load-bearing for control flow
-  (the destroy is what triggers `on_udx_close` → `fire_close`), so skipping it
-  needs a deliberate decision about who fires the close notification and when;
-  a careless change hangs the duplex. No second owner is currently reachable
-  (`relay_upgrade` never destroys; `ffi_stream.cpp:56,125` run before a Duplex
-  exists), so this is hardening, not a known live bug.
+- [x] **Finding J follow-up — DONE 2026-10-24.** The generated UDX copy
+  now guards `DESTROYING` at `udx_stream_destroy()` itself, covering
+  `SecretStreamDuplex::destroy()` and bulk teardown without changing the
+  pending close callback that delivers `on_udx_close` → `fire_close`.
 - [x] **protomux reentrancy UAF — FIXED** (`3421264`; source rechecked
   2026-10-13). `Channel::open()` retains itself with `shared_from_this()`
   across synchronous transport callbacks; Mux channel ownership is shared.
@@ -724,21 +725,16 @@ network change) — there they accumulate. holesail-cpp scopes them in its
     unbuffered while `printf` is block-buffered when piped, which interleaves
     the transcript misleadingly and can make a callback look like it never ran.
 
-- [ ] **TD2 — every DHT orphans a stopped-but-unclosed `uv_timer_t`.** The
-  interface-watcher timer (`HyperDHT::start_interface_watcher`) is stopped but
-  never `uv_close`d: `active=0 closing=0 ref=1`. The knock-on effect is the
-  bigger problem — **`uv_loop_close()` then returns `EBUSY` permanently**, so
-  libuv cannot free the loop's own internals either and embedders cannot cleanly
-  close or reuse a loop. ~1237 bytes + 4 allocations per DHT, plus the loop.
-  VERIFIED with a zero-holesail program following `hyperdht.h`'s own
-  create → listen → destroy → `uv_run` → free recipe verbatim. holesail-cpp
-  works around it by `uv_walk`-closing the orphan before `uv_loop_close()`
-  (`drain_and_close()` in its `src/cli.cpp`); that workaround should become
-  unnecessary.
-  **INDEPENDENTLY RE-CONFIRMED 2026-07-29** (separate repro, hyperdht-cpp only):
-  after `hyperdht_destroy` + full drain, `uv_walk` reports exactly one leftover
-  handle — `type=timer active=0 closing=0 has_ref=1`, matching the description
-  verbatim — and `uv_loop_close()` returns `-16 (EBUSY)`. This one is solid.
+- [x] **TD2 — FIXED 2026-10-24: the stopped interface watcher now closes.**
+  `RpcSocket::close()` calls `udx_teardown()`, closing streams, sockets and
+  listeners while their owner remains alive for the loop drain. The generated
+  watcher close callback uses its saved UDX pointer after the user deleter.
+  `HyperDHT.CreateAndDestroy` now requires `uv_loop_close() == 0`; that lifecycle
+  and seven UDX tests pass ASan/UBSan with leak checking enabled. Eighteen relay
+  tests also pass sanitizers with leak checking disabled; this does not establish
+  all-project leak freedom. The original July reproduction left one inactive,
+  unclosed timer and returned `UV_EBUSY` after a full drain. The consumer's
+  defensive `uv_walk` fallback remains unchanged.
 
 - [ ] **TD3 — in-flight connect/stream state dropped when `hyperdht_destroy`
   beats a graceful close round-trip.** Frames: `HyperDHT::do_connect`,

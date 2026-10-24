@@ -927,7 +927,11 @@ PoolSocket::PoolSocket(uv_loop_t* loop, udx_t* udx,
     // uv_close was the prior shape and left a dangling entry in
     // udx_t.sockets — next udx_socket_close on a sibling tripped UAF
     // (ASAN-caught 2026-05-20 during wifi-toggle teardown).
-    udx_socket_init(udx, socket_, [](udx_socket_t* s) { delete s; });
+    udx_socket_init(udx, socket_, [](udx_socket_t* s) {
+        // UDX teardown may close us while the owner still has retry timers.
+        if (auto* self = static_cast<PoolSocket*>(s->data)) self->close();
+        delete s;
+    });
     socket_->data = this;
     next_tid_ = static_cast<uint16_t>(randombytes_uniform(0xFFFF));
 }
@@ -1293,8 +1297,9 @@ void PoolSocket::close() {
                     "attached; leaving the socket open\n");
             return;
         }
-        socket_ = nullptr;
     }
+    socket_ = nullptr;
+    bound_ = false;
 }
 
 // ---------------------------------------------------------------------------

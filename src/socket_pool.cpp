@@ -222,8 +222,8 @@ void SocketPool::destroy() {
         // udx__link_remove() on a freed udx_t. `closed_` makes that late call
         // the no-op the NOTE below already relies on.
         //
-        // The parked fd is the price, and it is unavoidable without a real
-        // reaper: nothing in this codebase calls udx_teardown().
+        // RpcSocket::close() subsequently tears down UDX and closes parked fds.
+        // Keep the ref allocated for any late inactive() from a stream holder.
         ref->closed_ = true;
     }
     sockets_.clear();     // H9: pool is destroyed, entries are stale

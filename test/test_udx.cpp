@@ -6,6 +6,8 @@
 #include <string>
 
 #include "hyperdht/udx.hpp"
+#include "hyperdht/rpc.hpp"
+#include "hyperdht/holepunch.hpp"
 
 using namespace hyperdht::udx;
 
@@ -50,6 +52,132 @@ TEST(UdxInit, SocketBindAndClose) {
     // Run the loop to drain close callbacks while udx/sock are still alive
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
+}
+
+TEST(UdxClose, RpcCloseDrainsStreamsBeforeOwnerIsFreed) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        hyperdht::rpc::RpcSocket rpc(&loop, {});
+        ASSERT_EQ(rpc.bind(0, "127.0.0.1"), 0);
+        int finalized = 0;
+        udx_stream_t attached{}, detached{};
+        for (auto* stream : {&attached, &detached}) {
+            ASSERT_EQ(udx_stream_init(rpc.udx_handle(), stream,
+                stream == &attached ? 1 : 2, nullptr,
+                [](udx_stream_t* s) { ++*static_cast<int*>(s->data); }), 0);
+            stream->data = &finalized;
+        }
+        auto remote = loopback_addr(rpc.port());
+        ASSERT_EQ(udx_stream_connect(&attached, rpc.socket_handle(), 3,
+            reinterpret_cast<const sockaddr*>(&remote)), 0);
+
+        rpc.close();
+        rpc.close();
+        for (int i = 0; i < 50 && finalized != 2; ++i) {
+            uv_run(&loop, UV_RUN_NOWAIT);
+            uv_sleep(1);
+        }
+        EXPECT_EQ(finalized, 2);
+        EXPECT_TRUE(udx_is_idle(rpc.udx_handle()));
+
+        // Keep the failing implementation's cleanup safe and bounded too.
+        for (auto* stream : {&attached, &detached}) destroy_stream_once(stream);
+        for (auto* socket : {rpc.client_socket_handle(), rpc.socket_handle()}) {
+            if (!(socket->status & UDX_SOCKET_CLOSED)) udx_socket_close(socket);
+        }
+        uv_run(&loop, UV_RUN_DEFAULT);
+    }
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+TEST(UdxClose, InterfaceCloseCallbackCanDeleteItsHandle) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    Udx udx(&loop);
+    bool closed = false;
+    auto* watcher = new udx_interface_event_t{};
+    ASSERT_EQ(udx_interface_event_init(udx.handle(), watcher,
+        [](udx_interface_event_t* handle) {
+            *static_cast<bool*>(handle->data) = true;
+            delete handle;
+        }), 0);
+    watcher->data = &closed;
+    udx_teardown(udx.handle());
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_TRUE(closed);
+    EXPECT_TRUE(udx_is_idle(udx.handle()));
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+TEST(UdxClose, StreamCloseCallbackCanCloseItsSocket) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    Udx udx(&loop);
+    UdxSocket socket(udx);
+    auto address = loopback_addr(0);
+    ASSERT_EQ(socket.bind(reinterpret_cast<const sockaddr*>(&address)), 0);
+    address = get_bound_addr(socket);
+    UdxStream stream(udx, 1, [](udx_stream_t* s, int) {
+        EXPECT_EQ(static_cast<UdxSocket*>(s->data)->close(), 0);
+    }, nullptr);
+    stream.handle()->data = &socket;
+    ASSERT_EQ(stream.connect(socket, 2, reinterpret_cast<const sockaddr*>(&address)), 0);
+    udx_teardown(udx.handle());
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_TRUE(udx_is_idle(udx.handle()));
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+TEST(UdxClose, RpcCloseDoesNotRepeatAnInProgressDestroy) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        hyperdht::rpc::RpcSocket rpc(&loop, {});
+        ASSERT_EQ(rpc.bind(0, "127.0.0.1"), 0);
+        udx_stream_t stream{};
+        ASSERT_EQ(udx_stream_init(rpc.udx_handle(), &stream, 1, nullptr, nullptr), 0);
+        auto remote = loopback_addr(rpc.port());
+        ASSERT_EQ(udx_stream_connect(&stream, rpc.socket_handle(), 2,
+            reinterpret_cast<const sockaddr*>(&remote)), 0);
+        // This is the state while libuv still owes a queued destroy-send callback.
+        stream.status |= UDX_STREAM_DESTROYING;
+        rpc.close();
+        udx_teardown(rpc.udx_handle());
+        EXPECT_FALSE(stream.status & UDX_STREAM_CLOSED);
+        // Finish the simulated pending destroy while its owner is still alive.
+        stream.status &= ~UDX_STREAM_DESTROYING;
+        destroy_stream_once(&stream);
+        uv_run(&loop, UV_RUN_DEFAULT);
+        EXPECT_TRUE(udx_is_idle(rpc.udx_handle()));
+    }
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+TEST(UdxClose, UdxTeardownCancelsPoolRetriesBeforeFreeingSocket) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    Udx udx(&loop);
+    hyperdht::holepunch::PoolSocket pool(&loop, udx.handle());
+    ASSERT_EQ(pool.bind(), 0);
+    sockaddr_in address{};
+    int len = sizeof(address);
+    ASSERT_EQ(udx_socket_getsockname(pool.socket_handle(),
+        reinterpret_cast<sockaddr*>(&address), &len), 0);
+    hyperdht::messages::Request request;
+    request.internal = true;
+    request.command = hyperdht::messages::CMD_PING;
+    request.to.addr = hyperdht::compact::Ipv4Address::from_string(
+        "127.0.0.1", ntohs(address.sin_port));
+    pool.request(request, [](const auto&) { ADD_FAILURE(); });
+    udx_teardown(udx.handle());
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_TRUE(pool.is_closing());
+    EXPECT_FALSE(pool.is_bound());
+    EXPECT_EQ(pool.socket_handle(), nullptr);
+    EXPECT_TRUE(udx_is_idle(udx.handle()));
+    pool.send_probe(request.to.addr);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
 // ---------------------------------------------------------------------------

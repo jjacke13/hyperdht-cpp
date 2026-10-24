@@ -660,11 +660,8 @@ void RpcSocket::close() {
     }
 #endif
 
-    // Close socket(s). EMBEDDED: single-socket build, only client_socket_.
-    if (client_bound_) udx_socket_close(&client_socket_);
-#ifndef HYPERDHT_EMBEDDED
-    if (server_bound_) udx_socket_close(&server_socket_);
-#endif
+    // Socket close alone refuses attached streams; their timers would outlive us.
+    udx_teardown(&udx_);
 }
 
 // ---------------------------------------------------------------------------

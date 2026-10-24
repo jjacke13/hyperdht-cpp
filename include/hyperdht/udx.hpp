@@ -114,8 +114,8 @@ class UdxStream {
 // destroy_stream_once — tear down a raw stream we own, tolerating a teardown
 // that is already under way. Returns true if a destroy was actually issued.
 //
-// `udx_stream_destroy()` guards on UDX_STREAM_CLOSED but NEVER on
-// UDX_STREAM_DESTROYING (deps/libudx/src/udx.c:2709-2720). Those are not the
+// The vendored `udx_stream_destroy()` guards only on UDX_STREAM_CLOSED;
+// our generated copy also guards UDX_STREAM_DESTROYING. Those are not the
 // same window. On the slow send path — `uv_udp_try_send` returns UV_EAGAIN, so
 // the destroy packet goes out via `uv_udp_send` — `close_stream_internal()` is
 // deferred to that send's completion callback, leaving the stream
@@ -155,13 +155,12 @@ inline bool destroy_stream_once(udx_stream_t* stream) {
 // Returns true when the close was issued (caller may drop the handle), false
 // on refusal (caller MUST keep treating the socket as open and owned).
 //
-// A refusal is NOT retried here, and there is no safety net behind it. libudx
-// has no close-when-idle hook; its finalize auto-close runs only inside
-// `udx_teardown()` (udx.c:448-451), and NOTHING in this codebase calls
-// `udx_teardown()`. So the only retry is the owner's own next close attempt
+// A refusal is not retried here. libudx auto-closes idle sockets only during
+// `udx_teardown()`, which RpcSocket::close() calls at final DHT shutdown.
+// Until then the retry is the owner's next close attempt
 // (`SocketRef::do_close` on the following `inactive()`), and where even that
 // is unsafe — `SocketPool::destroy()`, where the ref is about to outlive the
-// udx_t — the fd stays parked for the life of the process.
+// udx_t — the fd stays parked until final UDX teardown.
 //
 // A refusal therefore always means a real defect upstream: an adopted
 // stream's owner dropped its socket keepalive while the stream was still

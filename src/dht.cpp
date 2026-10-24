@@ -822,12 +822,9 @@ void HyperDHT::destroy(DestroyOptions opts, std::function<void()> on_done) {
     //
     // IMPORTANT: callers MUST run `uv_run(loop, UV_RUN_DEFAULT)` after
     // `destroy()` before destructing this HyperDHT. The interface
-    // watcher's close callback path reads `event->udx` (a pointer into
-    // `RpcSocket::udx_` which is an embedded struct member, not heap);
-    // once the RpcSocket is destructed that pointer is dangling. Draining
-    // the loop lets libudx's internal `on_interface_event_close` fire
-    // while the socket is still alive, so `ref_dec(event->udx)` writes
-    // to a valid struct.
+    // watcher and streams retain a pointer into `RpcSocket::udx_` until
+    // their asynchronous close callbacks finish. Keep that storage alive
+    // while draining the loop.
     stop_interface_watcher();
 
     // JS parity (index.js:123-127): graceful close vs force.
@@ -857,6 +854,9 @@ void HyperDHT::destroy(DestroyOptions opts, std::function<void()> on_done) {
     // implicitly by ~HyperDHT, which runs AFTER the test's final
     // `uv_loop_close()` -> the uv_close was posted to a dead loop.
     handlers_.reset();
+
+    // Detach pool holders before UDX closes their sockets beneath live keepalives.
+    if (socket_pool_) socket_pool_->destroy();
 
     // Close socket
     if (socket_) {

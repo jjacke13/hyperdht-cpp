@@ -50,7 +50,7 @@ TEST(HyperDHT, CreateAndDestroy) {
 
     // Run the loop to drain close callbacks while dht is still alive
     uv_run(&loop, UV_RUN_DEFAULT);
-    uv_loop_close(&loop);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
 // JS parity: hyperdht/index.js:585-592 ships a built-in filterNode that

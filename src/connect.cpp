@@ -24,9 +24,11 @@
 
 // Context stored in client rawStream->data during handshake->connection window.
 // Matches JS: rawStream created at connect() time with firewall callback.
+namespace hyperdht { struct ConnState; }
 struct ClientRawStreamCtx {
     std::weak_ptr<bool> alive;
     std::function<void(udx_stream_t*, udx_socket_t*, const struct sockaddr*)> on_firewall;
+    std::weak_ptr<hyperdht::ConnState> state;
 };
 
 // Firewall callback for client-side rawStream. Fires when the server's
@@ -145,7 +147,7 @@ struct ConnState {
 
     ~ConnState() {
         // Clean up rawStream if not transferred to ConnectResult.
-        // Context is freed by the stream's on_close callback (RAII).
+        // Context is freed by the stream's on_finalize callback (RAII).
         //
         // Finding J: this runs from inside a `uv_close` callback whenever the
         // last ConnState reference is dropped by the destruction of the
@@ -497,7 +499,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
     // we miss the server's first packet and fall through to holepunch.
     {
         auto* raw = new udx_stream_t;
-        auto* raw_ctx = new ClientRawStreamCtx{state->alive, nullptr};
+        auto* raw_ctx = new ClientRawStreamCtx{state->alive, nullptr, state};
         std::weak_ptr<ConnState> weak_state = state;
         raw_ctx->on_firewall = [weak_state](
             udx_stream_t* stream, udx_socket_t* sock,
@@ -573,7 +575,11 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                             // RAII: delete context when stream closes, regardless
                             // of which callback path fires (firewall, recv, or error).
                             if (s->data) {
-                                delete static_cast<ClientRawStreamCtx*>(s->data);
+                                auto* ctx = static_cast<ClientRawStreamCtx*>(s->data);
+                                // A pending query can keep ConnState alive past UDX finalization.
+                                if (auto st = ctx->state.lock(); st && st->raw_stream == s)
+                                    st->raw_stream = nullptr;
+                                delete ctx;
                                 s->data = nullptr;
                             }
                             delete s;

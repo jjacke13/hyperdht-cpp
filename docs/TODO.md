@@ -5,12 +5,16 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-24 (relay transport errors; older snapshots below are historical).
+Last updated: 2026-10-24 (live relay-to-direct verification; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-24 relay verification:** blind-relay pairing, OPEN control sockets,
+  transport-write failure propagation and handshake dedup are fixed. Live
+  relay-to-direct migration passes with both a public and a NAT application
+  server, preserving encrypted payload and the original streams; see Section J.1.
 - **2026-10-13 documentation check**: the protomux reentrancy UAF is fixed
   (`3421264`), and the client relay-address cache is implemented (`c196205`);
   their entries below now reflect current source. Relay-to-direct upgrade code
@@ -989,7 +993,7 @@ separately eliminated. Full case: memory `server_punch_socket_parity`, `Q2-EVIDE
   *no* random punch (CONSISTENT+RANDOM sprays included) could start. Test
   `Holepuncher.DropWithoutDestroyReleasesHoldersAndThrottle`, red-verified on both
   assertions. 763/763.
-- [ ] **BUG A (HIGH) — finish and live-verify blind-relay fallback.**
+- [x] **BUG A (HIGH) — blind-relay fallback implemented and live-verified.**
   **Readiness fixed 2026-10-23:** both production relay callers prepare the
   channel and pairing callbacks before starting SecretStream, then send Protomux
   OPEN only after the encrypted header exchange completes.
@@ -1004,8 +1008,21 @@ separately eliminated. Full case: memory `server_punch_socket_parity`, `Q2-EVIDE
   suites and forced-relay DATA checks pass with a public application server and
   both NAT-board server placements, exact encrypted payload hashes, no direct
   board DATA, and public/NAT unused-relay-identity negatives. These negatives do
-  not cover packet loss to a running relay. Remaining: live-verify
-  relay-to-direct upgrade.
+  not cover packet loss to a running relay.
+  **Live relay-to-direct upgrade verified 2026-10-24:** one isolated run with
+  a public application server and one with a NAT application server, both using
+  a public persistent OPEN relay. A temporary direct-path gate requires real
+  encrypted relay traffic before allowing the normal holepunch path. Exact
+  8192-byte echo and 32-byte reverse hashes match through 32 and 37 numbered
+  round trips respectively, including at least three relayed and twenty direct
+  rounds per run. Each endpoint opens its encrypted connection once; the original
+  UDX streams survive migration without reconnecting. Each endpoint's packet
+  capture proves direct traffic arrived before its relay control FIN, followed
+  by direct DATA. Artifact hashes,
+  effective commands and kernel executable paths match; both hosts return to
+  byte-identical network/firewall snapshots with owned rules and lab processes
+  removed. This verifies the existing upgrade code; no library change was needed.
+  It does not cover relay outage recovery, other network/OS combinations or soak.
   **Transport-write errors fixed 2026-10-24:** both relay control writers destroy
   the encrypted stream on a rejected write; stream closure tears down the mux
   and fails pending pairing through the existing deferred abort path. The
@@ -1038,8 +1055,7 @@ These checks remain unverified by the October lab fixes:
 - Distinct NAT networks, mobile/CGNAT paths and network handover.
 - Windows/macOS/Linux interoperability in supported client/server roles;
   repair the skipped IPv6 fixture and test real IPv6 paths.
-- Live relay-to-direct migration with uninterrupted payload, interruption and
-  recovery of a running relay, and longer-session soak tests.
+- Interruption and recovery of a running relay, and longer-session soak tests.
 - ESP32-S3 firmware linking, flashing and an actual board connection.
 
 Broader sanitizer runs with leak detection disabled do not establish leak freedom.

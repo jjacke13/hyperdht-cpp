@@ -26,6 +26,7 @@ set(HDHT_SRCS
     "${HDHT_DIR}/src/peer_connect.cpp"
     "${HDHT_DIR}/src/holepunch.cpp"
     "${HDHT_DIR}/src/blind_relay.cpp"
+    "${HDHT_DIR}/src/relay_upgrade.cpp"
     # Query + announce
     "${HDHT_DIR}/src/query.cpp"
     "${HDHT_DIR}/src/announce.cpp"

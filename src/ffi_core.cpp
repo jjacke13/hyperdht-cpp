@@ -202,12 +202,8 @@ void hyperdht_destroy(hyperdht_t* dht, hyperdht_close_cb cb, void* userdata) {
         return;
     }
 
-    // Schedule close. The caller MUST:
-    // 1. Call uv_run() to drain pending close callbacks
-    // 2. Then call hyperdht_free() to release memory
-    // The callback fires synchronously to signal destruction started.
-    dht->dht->destroy();
-    if (cb) cb(userdata);
+    // The callback waits for withdrawal, but libuv still needs a close drain.
+    dht->dht->destroy([cb, userdata] { if (cb) cb(userdata); });
 }
 
 void hyperdht_destroy_force(hyperdht_t* dht,
@@ -223,8 +219,7 @@ void hyperdht_destroy_force(hyperdht_t* dht,
     }
     hyperdht::HyperDHT::DestroyOptions opts;
     opts.force = true;
-    dht->dht->destroy(opts);
-    if (cb) cb(userdata);
+    dht->dht->destroy(opts, [cb, userdata] { if (cb) cb(userdata); });
 }
 
 void hyperdht_free(hyperdht_t* dht) {

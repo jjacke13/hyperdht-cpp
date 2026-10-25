@@ -27,9 +27,8 @@
 //     drift and re-announce early (JS discards the pong body,
 //     announcer.js:114-121). Deliberate divergence; rate-limited.
 //
-// Lifetime safety: all async callbacks capture a weak_ptr<bool> alive_
-// sentinel. stop_impl() sets *alive_ = false and resets current_query_
-// so outstanding RPC responses become no-ops when the Announcer is destroyed.
+// Lifetime safety: callbacks that use this capture the weak alive_ sentinel.
+// Withdrawal state outlives the owner; keep the RPC socket alive until completion.
 
 #include "hyperdht/announcer.hpp"
 
@@ -41,6 +40,30 @@
 
 namespace hyperdht {
 namespace announcer {
+
+struct Announcer::Withdrawals {
+    bool active = true;
+    bool stopping = false;
+    size_t pending = 0;
+    std::vector<std::function<void()>> callbacks;
+
+    void complete() {
+        auto ready = std::move(callbacks);
+        for (auto& cb : ready) cb();
+    }
+    void settle() {
+        if (--pending == 0) complete();
+    }
+    void wait(std::function<void()> cb) {
+        if (!cb) return;
+        if (!active || pending == 0) cb();
+        else callbacks.push_back(std::move(cb));
+    }
+    void cancel() {
+        active = false;
+        complete();
+    }
+};
 
 // Re-announce interval: ~5 minutes
 constexpr uint64_t REANNOUNCE_MS = 5 * 60 * 1000;
@@ -82,7 +105,9 @@ Announcer::~Announcer() {
 
 void Announcer::start() {
     if (running_) return;
-    if (withdrawal_alive_) *withdrawal_alive_ = false;
+    auto weak = std::weak_ptr<bool>(alive_);
+    if (withdrawals_) withdrawals_->cancel();
+    if (weak.expired()) return;
     running_ = true;
 
     // Re-arm the C7 sentinel. stop_impl() sets *alive_ = false to make every
@@ -111,13 +136,20 @@ void Announcer::start() {
 }
 
 void Announcer::stop(std::function<void()> on_done) {
+    auto state = withdrawals_;
+    // Hold completion until local cleanup and every stop-time request is queued.
+    if (state) { ++state->pending; state->stopping = true; }
     stop_impl(/*send_unannounce=*/true);
-    if (on_done) on_done();
+    if (!state) { if (on_done) on_done(); return; }
+    state->wait(std::move(on_done));
+    state->settle();
 }
 
 void Announcer::stop_without_unannounce() {
-    if (withdrawal_alive_) *withdrawal_alive_ = false;
+    auto state = withdrawals_;
+    if (state) state->active = false;
     stop_impl(/*send_unannounce=*/false);
+    if (state) state->cancel();
 }
 
 // Shared teardown for stop() and stop_without_unannounce(). Splitting
@@ -156,6 +188,12 @@ void Announcer::stop_impl(bool send_unannounce) {
     if (send_unannounce) {
         for (const auto& relay : active_relays_) {
             unannounce_node(relay);
+        }
+        // A stop can land after some commits acked but before cycle publication.
+        for (const auto& relay : cycle_relays_) {
+            bool published = false;
+            for (const auto& old : active_relays_) published |= old.addr == relay.addr;
+            if (!published) unannounce_node(relay);
         }
     }
     active_relays_.clear();
@@ -401,8 +439,8 @@ void Announcer::ping_relays() {
 
 void Announcer::update() {
     if (updating_ || !running_) return;
-    if (withdrawal_alive_) *withdrawal_alive_ = false;
-    withdrawal_alive_ = std::make_shared<bool>(true);
+    if (withdrawals_) withdrawals_->cancel();
+    withdrawals_ = std::make_shared<Withdrawals>();
     updating_ = true;
 
     const uint64_t gen = ++cycle_gen_;
@@ -565,13 +603,25 @@ void Announcer::commit(const query::QueryReply& node, uint64_t gen) {
     req.token = token;
     req.value = std::move(ann_value);
 
+    auto state = withdrawals_;
+    ++state->pending;
+    auto done = [state] { state->settle(); };
     auto weak = std::weak_ptr<bool>(alive_);  // C7: sentinel
     uint16_t tid = socket_.request(req,
-        [weak, this, node, gen](const messages::Response& resp) {
-            if (auto a = weak.lock(); !a || !*a) return;
+        [weak, this, node, gen, state, done](const messages::Response& resp) {
+            if (state->stopping) {
+                // An ANNOUNCE already in flight may store a record after stop().
+                if (state->active && !resp.error && !weak.expired()) {
+                    RelayNode relay;
+                    relay.addr = node.from_addr;
+                    unannounce_node(relay);
+                }
+                return done();
+            }
+            if (auto a = weak.lock(); !a || !*a) return done();
             // Cancelled cycle: neither track the (stale peer_addr) relay
             // nor touch the new cycle's settle counter.
-            if (gen != cycle_gen_) return;
+            if (gen != cycle_gen_) return done();
             DHT_LOG("  [announcer] ANNOUNCE accepted by %s:%u — "
                     "relay observed us at %s:%u\n",
                     node.from_addr.host_string().c_str(), node.from_addr.port,
@@ -597,13 +647,16 @@ void Announcer::commit(const query::QueryReply& node, uint64_t gen) {
             gate_upsert(relay.addr, uv_now(socket_.loop()));
 
             commit_settled();
+            done();
         },
-        [weak, this, node, gen](uint16_t) {
-            if (auto a = weak.lock(); !a || !*a) return;
+        [weak, this, node, gen, state, done](uint16_t) {
+            if (state->stopping) return done();
+            if (auto a = weak.lock(); !a || !*a) return done();
             DHT_LOG("  [announcer] ANNOUNCE timeout from %s:%u\n",
                     node.from_addr.host_string().c_str(), node.from_addr.port);
-            if (gen != cycle_gen_) return;
+            if (gen != cycle_gen_) return done();
             commit_settled();
+            done();
         });
     // Dropped by the congestion queue (tid == 0): neither callback will
     // fire — settle now so the cycle's publish gate can't wedge.
@@ -611,6 +664,7 @@ void Announcer::commit(const query::QueryReply& node, uint64_t gen) {
         DHT_LOG("  [announcer] ANNOUNCE to %s:%u dropped (congestion)\n",
                 node.from_addr.host_string().c_str(), node.from_addr.port);
         commit_settled();
+        done();
     }
 }
 
@@ -628,13 +682,18 @@ void Announcer::unannounce_node(const RelayNode& relay, std::function<void()> on
     req.command = messages::CMD_FIND_PEER;
     req.target = target_;
 
-    // stop() invalidates alive_ and Server::close releases this Announcer.
-    auto done = [on_done = std::move(on_done)] { if (on_done) on_done(); };
+    // Copied signing state also permits releasing the Announcer after stop().
+    auto state = withdrawals_;
+    ++state->pending;
+    auto done = [state, on_done = std::move(on_done)] {
+        if (on_done) on_done();
+        state->settle();
+    };
     auto tid = socket_.request(req,
         [socket = &socket_, keypair = keypair_, target = target_, addr = relay.addr,
-         active = withdrawal_alive_, done](
+         state, done](
                 const messages::Response& resp) {
-            if (!*active || resp.error || !resp.token || !resp.id ||
+            if (!state->active || resp.error || !resp.token || !resp.id ||
                 !resp.value || resp.value->empty()) {
                 done();
                 return;

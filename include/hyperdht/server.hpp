@@ -166,7 +166,8 @@ public:
     // connections.
     //
     // `force = false` (default): announcer emits UNANNOUNCE to its
-    // active relays before tearing down — peers learn we're gone.
+    // active relays and waits for pending announcements/withdrawals to settle
+    // before on_done. Keep the owner/socket alive and run the event loop.
     //
     // `force = true`: skip UNANNOUNCE emission; still stops libuv
     // handles so the event loop can drain. Matches JS

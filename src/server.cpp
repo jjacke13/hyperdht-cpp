@@ -159,9 +159,7 @@ Server::Server(rpc::RpcSocket& socket, router::Router& router, HyperDHT* dht)
     : socket_(socket), router_(router), dht_(dht) {}
 
 Server::~Server() {
-    if (listening_ && !closed_) {
-        close();
-    }
+    if (listening_ || announcer_) close(true);
     // Belt-and-suspenders: even if close() was called already, ensure
     // any async continuation lambdas holding a weak_ptr to alive_ see
     // `expired()`-equivalent semantics via the stored bool flipping
@@ -265,7 +263,10 @@ void Server::close(std::function<void()> on_done) {
 
 void Server::close(bool force, std::function<void()> on_done) {
     if (closed_) {
-        if (on_done) on_done();
+        if (announcer_) {
+            if (force) announcer_->stop_without_unannounce();
+            announcer_->stop(std::move(on_done));
+        } else if (on_done) on_done();
         return;
     }
     closed_ = true;
@@ -277,16 +278,10 @@ void Server::close(bool force, std::function<void()> on_done) {
     // `this` after the Server has been destroyed.
     *alive_ = false;
 
-    // Stop announcer
-    // JS parity: `force = true` skips the UNANNOUNCE RPC emissions but
-    // still shuts the timers down (otherwise the event loop can't drain).
+    // Stop new announce cycles before clearing connections; join completion below.
     if (announcer_) {
-        if (force) {
-            announcer_->stop_without_unannounce();
-        } else {
-            announcer_->stop();
-        }
-        announcer_.reset();
+        if (force) announcer_->stop_without_unannounce();
+        else announcer_->stop();
     }
 
     // server-8: abort in-flight blind-relay pairings (watchdog timers +
@@ -318,7 +313,11 @@ void Server::close(bool force, std::function<void()> on_done) {
     // firewall completion a no-op).
     pending_handshakes_.clear();
 
-    if (on_done) on_done();
+    // Retain the announcer so a pending commit can still withdraw a late record.
+    // Finish local cleanup first: a completion callback can re-enter close().
+    if (announcer_) {
+        announcer_->stop(std::move(on_done));
+    } else if (on_done) on_done();
 }
 
 void Server::refresh() {

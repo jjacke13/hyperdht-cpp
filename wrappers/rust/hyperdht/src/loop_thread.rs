@@ -1254,6 +1254,9 @@ fn teardown(dht: *mut hyperdht_t, async_ptr: *mut uv_async_t, loop_ptr: *mut uv_
             }
         }
 
+        // Cancel any unfinished withdrawal before the bounded drain's sweep.
+        hyperdht_destroy_force(dht, None, ptr::null_mut());
+
         // 4. If anything is still open (streams mid-close, stuck timers,
         //    UDX retransmits waiting for ACK), force-close every remaining
         //    handle. This is the standard libuv shutdown idiom.

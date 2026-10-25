@@ -216,9 +216,7 @@ HyperDHT::HyperDHT(uv_loop_t* loop, DhtOptions opts)
 }
 
 HyperDHT::~HyperDHT() {
-    if (!destroyed_) {
-        destroy();
-    }
+    destroy(DestroyOptions{.force = true});
 }
 
 // ---------------------------------------------------------------------------
@@ -796,8 +794,15 @@ void HyperDHT::destroy(std::function<void()> on_done) {
 }
 
 void HyperDHT::destroy(DestroyOptions opts, std::function<void()> on_done) {
-    if (destroyed_) {
+    if (destroy_complete_) {
         if (on_done) on_done();
+        return;
+    }
+    if (on_done) destroy_callbacks_.push_back(std::move(on_done));
+    if (destroyed_) {
+        if (opts.force) {
+            for (auto& srv : servers_) srv->close(true);
+        }
         return;
     }
     destroyed_ = true;
@@ -827,21 +832,22 @@ void HyperDHT::destroy(DestroyOptions opts, std::function<void()> on_done) {
     // while draining the loop.
     stop_interface_watcher();
 
-    // JS parity (index.js:123-127): graceful close vs force.
-    //
-    // In JS, `force=true` skips `await server.close()` entirely, which
-    // means the announcer never emits UNANNOUNCE and peers continue to
-    // consider us active until their records expire.
-    //
-    // In C++ our close() is synchronous, so we cannot "not-await" it —
-    // but we can still honour the intent by telling the announcer to
-    // stop silently (skip the unannounce emission). Closing the server
-    // is still required even under force=true, otherwise libuv timers
-    // and rawStream handles keep the event loop alive and the caller's
-    // final `uv_run(...)` never returns.
-    for (auto& srv : servers_) {
-        srv->close(opts.force /* force = skip unannounce */);
+    // JS index.js:123-127 awaits all servers before closing the transport.
+    // Force-close cancels their waits but still releases local handles.
+    auto pending = std::make_shared<size_t>(servers_.size());
+    if (*pending == 0) {
+        finish_destroy();
+        return;
     }
+    for (auto& srv : servers_) {
+        srv->close(opts.force, [this, pending] {
+            if (--*pending == 0) finish_destroy();
+        });
+    }
+}
+
+void HyperDHT::finish_destroy() {
+    if (destroy_complete_) return;
 
     // Clear router
     router_.clear();
@@ -863,7 +869,9 @@ void HyperDHT::destroy(DestroyOptions opts, std::function<void()> on_done) {
         socket_->close();
     }
 
-    if (on_done) on_done();
+    destroy_complete_ = true;
+    auto ready = std::move(destroy_callbacks_);
+    for (auto& cb : ready) cb();
 }
 
 }  // namespace hyperdht

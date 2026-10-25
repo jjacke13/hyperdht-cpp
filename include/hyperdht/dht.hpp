@@ -863,7 +863,9 @@ public:
     //
     // `force = false` (default): gracefully close every active server —
     // each announcer sends UNANNOUNCE records so peers learn we went
-    // away, then pending sessions are cleared.
+    // away. Completion waits for the withdrawal replies or timeouts before
+    // closing the RPC socket. Keep this object alive while draining libuv's
+    // remaining close callbacks, including after on_done fires.
     //
     // `force = true`: skip the announcer graceful shutdown and tear down
     // the socket immediately. Faster but leaves stale announce records
@@ -1025,6 +1027,8 @@ private:
     std::vector<std::unique_ptr<server::Server>> servers_;
     bool bound_ = false;
     bool destroyed_ = false;
+    bool destroy_complete_ = false;
+    std::vector<std::function<void()>> destroy_callbacks_;
     bool suspended_ = false;
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);  // Sentinel for async safety
     holepunch::PunchStats punch_stats_;
@@ -1108,6 +1112,7 @@ private:
     void fire_persistent();
     void start_interface_watcher();
     void stop_interface_watcher();
+    void finish_destroy();
     static void on_udx_interface_event(udx_interface_event_t* handle, int status);
     static void on_udx_interface_close(udx_interface_event_t* handle);
 };

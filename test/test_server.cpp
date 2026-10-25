@@ -22,6 +22,22 @@
 using namespace hyperdht;
 using namespace hyperdht::server;
 
+TEST(Server, UnusedDestructorPreservesUnrelatedRoute) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    rpc::RpcSocket socket(&loop, routing::NodeId{});
+    ASSERT_EQ(socket.bind(0), 0);
+    router::Router router;
+    router.set(routing::NodeId{}, router::ForwardEntry{});
+    {
+        Server unused(socket, router);
+    }
+    EXPECT_EQ(router.size(), 1u);
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
 TEST(Server, ListenAndClose) {
     uv_loop_t loop;
     uv_loop_init(&loop);

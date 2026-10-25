@@ -319,12 +319,13 @@ HYPERDHT_API int hyperdht_is_destroyed(const hyperdht_t* dht);
  *   2. Call hyperdht_free() to release memory
  *
  * WARNING — CALLBACK FIRES BEFORE DRAIN:
- *   The callback fires synchronously to signal that teardown has been
- *   scheduled — NOT that it is complete. libuv close handles are still
+ *   The callback fires after pending announcements and withdrawals settle
+ *   (reply or timeout) and transport close is scheduled. It may be asynchronous.
+ *   libuv close handles are still
  *   pending when cb runs. Do NOT call hyperdht_free() inside cb — the
  *   object is still alive and referenced by libuv. The correct pattern:
  *
- *     hyperdht_destroy(dht, my_cb, NULL);   // schedules teardown, fires cb
+ *     hyperdht_destroy(dht, my_cb, NULL);   // begins graceful teardown
  *     uv_run(&loop, UV_RUN_DEFAULT);        // drains all close callbacks
  *     hyperdht_free(dht);                   // NOW safe to free
  *
@@ -333,7 +334,7 @@ HYPERDHT_API int hyperdht_is_destroyed(const hyperdht_t* dht);
  * platforms (Android/iOS), never call this from the UI/main thread —
  * it will freeze the screen. Use a background thread or dispatch queue.
  *
- * @param cb      optional callback, fires synchronously (teardown scheduled)
+ * @param cb      optional callback, after withdrawal and scheduling close
  * @param userdata passed to cb
  */
 HYPERDHT_API void hyperdht_destroy(hyperdht_t* dht, hyperdht_close_cb cb, void* userdata);
@@ -454,7 +455,8 @@ HYPERDHT_API void hyperdht_server_set_firewall(hyperdht_server_t* srv,
                                    hyperdht_firewall_cb cb,
                                    void* userdata);
 
-/** Stop listening and unannounce. */
+/** Stop listening; cb waits for withdrawal settlement. Run the event loop.
+ * Consumes srv: do not reuse the handle, including while cb is pending. */
 HYPERDHT_API void hyperdht_server_close(hyperdht_server_t* srv,
                            hyperdht_close_cb cb,
                            void* userdata);

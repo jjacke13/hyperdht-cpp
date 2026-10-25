@@ -5,12 +5,23 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-25 (retired-relay cleanup; older snapshots below are historical).
+Last updated: 2026-10-25 (awaited graceful withdrawal; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-25 graceful shutdown:** Announcer, Server, HyperDHT and C API
+  completion now wait for pending announcements and withdrawals to settle.
+  Force cancels the wait; callers still retain storage through libuv's close
+  drain. Nospoon/Holesail teardown and bounded Rust cleanup follow that contract.
+  The filtered core suite (795 pass, two skips), twenty focused sanitizer cases,
+  consumer suites, both static CPU builds and the ESP32 component compile pass.
+  Sixteen selected Rust tests pass; the separate pre-existing `drop_midflight`
+  test has a stale API call and was not repaired. Fifteen isolated live cases
+  pass: withdrawal success/timeout, public/NAT/LAN consumer connectivity and
+  33 clean native exits. ESP32 firmware/runtime and broader platform checks
+  remain unverified.
 - **2026-10-25 retired relays:** a successful replacement cycle withdraws from
   relays it no longer uses, then allows the next refresh. Failed empty cycles
   retain the working set; force-stop cancels a pending withdrawal. Nine focused
@@ -18,7 +29,7 @@ Last updated: 2026-10-25 (retired-relay cleanup; older snapshots below are histo
   static CPU builds and the ESP32 component compile pass. Fifteen isolated live
   cases pass, including replacement/failed-replacement controls, encrypted echo,
   fresh Nospoon/Holesail connectivity and 35 clean native app exits. Awaited
-  whole-DHT shutdown remains the separate follow-up below.
+  whole-DHT shutdown is covered above.
 - **2026-10-25 withdrawal tokens:** stop-time withdrawal obtains a fresh
   FIND_PEER token and replying node ID before signing UNANNOUNCE. Copied
   signing state survives Announcer release; restarting cancels an old pending
@@ -26,7 +37,7 @@ Last updated: 2026-10-25 (retired-relay cleanup; older snapshots below are histo
   pass with ASan/UBSan and leak checking. Core and consumer suites, both static
   CPU builds, the ESP32 component compile and fourteen isolated live cases pass,
   including 31 clean native app exits. Retired-relay cleanup is now covered
-  above; awaited whole-DHT withdrawal remains open below.
+  above; awaited whole-DHT withdrawal is covered above too.
 - **2026-10-24 UDX shutdown:** close now tears down attached and unconnected
   streams before their DHT storage is released. Generated UDX guards avoid
   duplicate closes and watcher callback lifetime errors; pending connect owners
@@ -443,11 +454,14 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   commits nothing, and preserve the lenient relay gate. Regressions and isolated
   live positive/failed-replacement controls cover removal, retention and force
   cancellation. An unreachable relay still expires its record normally.
-- [ ] **Await graceful withdrawal on whole-DHT destruction.** Stop callbacks
-  still report local cleanup, and whole-DHT destruction closes the RPC socket
-  immediately rather than awaiting the two requests. Withdrawal remains
-  best-effort while the socket lives. Review consumer lifecycle contracts
-  separately before changing completion timing.
+- [x] **Await graceful withdrawal on whole-DHT destruction** — fixed
+  2026-10-25 (JS index.js:123-127, server.js:88-129, announcer.js:88-104).
+  Completion waits for pending ANNOUNCE commits, per-cycle retirement and
+  stop-time withdrawal before closing transport. Force cancels the wait.
+  Completion still precedes libuv close draining; callers retain storage for
+  that drain. Regression, sanitizer and isolated live success/timeout controls
+  pass, alongside rebuilt Nospoon/Holesail public/NAT/LAN connectivity and
+  clean shutdown checks.
 - [ ] **`refresh()` has no `_refreshing` latch** (announcer.cpp vs
   announcer.js:76-79) — a health/drift refresh landing mid-cycle is dropped,
   costing <=5s until the next ping tick. Low.

@@ -75,7 +75,8 @@ public:
     Announcer& operator=(const Announcer&) = delete;
 
     void start();
-    // Callback reports local cleanup; withdrawal is best-effort while socket lives.
+    // Callback waits for pending announcements and withdrawals to settle.
+    // Keep the RPC socket alive and run the loop until it fires.
     void stop(std::function<void()> on_done = nullptr);
 
     // Force-stop: tear down timers and relays WITHOUT emitting
@@ -178,7 +179,8 @@ private:
     // cleared on stop.
     std::vector<RelayNode> active_relays_;
     // A new cycle cancels old withdrawals before they can remove a new record.
-    std::shared_ptr<bool> withdrawal_alive_;
+    struct Withdrawals;
+    std::shared_ptr<Withdrawals> withdrawals_;
 
     // This cycle's acks, staged until the cycle settles. JS builds the same
     // list as a fresh local `const relays = []` (announcer.js:172) and assigns

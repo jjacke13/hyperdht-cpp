@@ -444,7 +444,7 @@ TEST_P(AnnouncerWithdrawal, UsesFreshTokenAfterOwnerDestruction) {
 
 INSTANTIATE_TEST_SUITE_P(ReplyValidation, AnnouncerWithdrawal, ::testing::Range(0, 7));
 
-class AnnouncerRetirement : public ::testing::TestWithParam<bool> {};
+class AnnouncerRetirement : public ::testing::TestWithParam<int> {};
 
 TEST_P(AnnouncerRetirement, WithdrawsRetiredRelayAfterReplacementSettles) {
     uv_loop_t loop;
@@ -493,7 +493,7 @@ TEST_P(AnnouncerRetirement, WithdrawsRetiredRelayAfterReplacementSettles) {
     for (int i : {0, 1, 3}) seed_table(client, *nodes[i]);
     Announcer ann(client, kp, target);
     int phase = 0;
-    bool waited = false, removed = false, retained = false;
+    bool waited = false, removed = false, retained = false, stopped = false;
     uint64_t empty_gen = 0;
     struct Poll {
         std::function<void()> tick;
@@ -512,11 +512,17 @@ TEST_P(AnnouncerRetirement, WithdrawsRetiredRelayAfterReplacementSettles) {
             auto gen = ann.cycle_gen_for_test();
             ann.refresh();
             EXPECT_EQ(ann.cycle_gen_for_test(), gen) << "retirement must settle before another cycle";
-            if (GetParam()) ann.stop_without_unannounce();
+            if (GetParam() == 1) ann.stop_without_unannounce();
+            if (GetParam() == 2) {
+                ann.stop([&] { stopped = true; });
+                EXPECT_FALSE(stopped);
+                phase = 6;
+                return;
+            }
             nodes[3]->hold_withdrawal = false;
             nodes[3]->handlers->handle(*nodes[3]->held);
             nodes[3]->held.reset();
-            phase = GetParam() ? 5 : 2;
+            phase = GetParam() == 1 ? 5 : 2;
         } else if (phase == 2 && !ann.is_updating_for_test()) {
             removed = nodes[3]->router.record(target) == nullptr;
             EXPECT_TRUE(ann.is_relay(nodes[3]->addr)) << "cached clients keep the lenient relay gate";
@@ -544,6 +550,18 @@ TEST_P(AnnouncerRetirement, WithdrawsRetiredRelayAfterReplacementSettles) {
             EXPECT_EQ(nodes[3]->unannounces, 0) << "force-stop cancels the pending retirement";
             phase = 4;
             uv_stop(&loop);
+        } else if (phase == 6) {
+            for (int i = 0; i < 3; ++i) if (nodes[i]->router.record(target)) return;
+            EXPECT_FALSE(stopped) << "stop also waits for the older retirement";
+            nodes[3]->hold_withdrawal = false;
+            nodes[3]->handlers->handle(*nodes[3]->held);
+            nodes[3]->held.reset();
+            phase = 7;
+        } else if (phase == 7 && stopped) {
+            for (const auto& node : nodes) EXPECT_EQ(node->router.record(target), nullptr);
+            removed = true;
+            phase = 4;
+            uv_stop(&loop);
         }
     };
     uv_timer_init(&loop, &poll.timer);
@@ -556,8 +574,8 @@ TEST_P(AnnouncerRetirement, WithdrawsRetiredRelayAfterReplacementSettles) {
     uv_run(&loop, UV_RUN_DEFAULT);
     EXPECT_EQ(phase, 4);
     EXPECT_TRUE(waited);
-    EXPECT_EQ(removed, !GetParam());
-    EXPECT_TRUE(retained) << "an empty replacement cycle must not withdraw working relays";
+    EXPECT_EQ(removed, GetParam() != 1);
+    if (GetParam() != 2) EXPECT_TRUE(retained) << "an empty replacement cycle must not withdraw working relays";
     ann.stop_without_unannounce();
     for (auto& node : nodes) {
         node->handlers.reset();
@@ -570,7 +588,7 @@ TEST_P(AnnouncerRetirement, WithdrawsRetiredRelayAfterReplacementSettles) {
     EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
-INSTANTIATE_TEST_SUITE_P(ForceStop, AnnouncerRetirement, ::testing::Bool());
+INSTANTIATE_TEST_SUITE_P(ForceStop, AnnouncerRetirement, ::testing::Range(0, 3));
 
 // ============================================================================
 // D1 (publish-after-settle) — relays_ must be published from THIS cycle's

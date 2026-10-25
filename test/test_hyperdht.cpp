@@ -17,6 +17,7 @@
 #include "hyperdht/rpc.hpp"
 #include "hyperdht/secret_stream.hpp"
 #include "hyperdht/udx.hpp"
+#include "../src/ffi_internal.hpp"
 
 using namespace hyperdht;
 
@@ -2130,3 +2131,136 @@ TEST(HyperDHT, MaxAgeMsAccessorMatchesConfiguredValue) {
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
 }
+
+
+// Normal completion waits for both withdrawal RPCs; force also releases waiters.
+class GracefulWithdrawal : public ::testing::TestWithParam<int> {};
+TEST_P(GracefulWithdrawal, DhtCompletionFollowsWithdrawalSettlement) {
+    const int mode = GetParam();
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    rpc::RpcSocket store(&loop, routing::NodeId{});
+    ASSERT_EQ(store.bind(0), 0);
+    auto addr = compact::Ipv4Address::from_string("127.0.0.1", store.port());
+    store.set_ephemeral(false);
+    store.set_firewalled(false);
+    store.table().rebuild_with_id(rpc::compute_peer_id(addr));
+    router::Router router;
+    auto handlers = std::make_unique<rpc::RpcHandlers>(store, &router);
+    hyperdht_t* dht = hyperdht_create(&loop, nullptr);
+    ASSERT_NE(dht, nullptr);
+    ASSERT_EQ(hyperdht_bind(dht, 0), 0);
+    ASSERT_EQ(hyperdht_add_node(dht, "127.0.0.1", store.port()), 0);
+    hyperdht_server_t* servers[2];
+    routing::NodeId targets[2];
+    for (int i = 0; i < 2; ++i) {
+        hyperdht_keypair_t kp;
+        hyperdht_keypair_generate(&kp);
+        crypto_generichash(targets[i].data(), 32, kp.public_key, 32, nullptr, 0);
+        servers[i] = hyperdht_server_create(dht);
+        ASSERT_EQ(hyperdht_server_listen(servers[i], &kp, [](const hyperdht_connection_t*, void*) {}, nullptr), 0);
+    }
+    bool withdrawing = false;
+    std::optional<messages::Request> held;
+    std::vector<messages::Request> pending_announces;
+    store.on_request([&](const auto& req) {
+        if (mode == 8 && !withdrawing && !req.internal &&
+                req.command == messages::CMD_ANNOUNCE) {
+            if (std::none_of(pending_announces.begin(), pending_announces.end(),
+                    [&](const auto& old) { return old.tid == req.tid; }))
+                pending_announces.push_back(req);
+            return;
+        }
+        if (withdrawing && !req.internal) {
+            if (req.command == messages::CMD_FIND_PEER) {
+                if (mode == 3) return;  // timeout the token fetch
+                if (mode == 6) { held = req; return; }
+                if (mode == 1 || mode == 2) {
+                    messages::Response resp;
+                    resp.from = req.from; resp.tid = req.tid;
+                    resp.id = store.table().id();
+                    resp.value = std::vector<uint8_t>{1};
+                    if (mode == 2) resp.error = messages::ERR_INVALID_TOKEN;
+                    store.reply(resp, req.from_server);
+                    return;
+                }
+            }
+            if (mode == 4 && req.command == messages::CMD_UNANNOUNCE) return;
+        }
+        handlers->handle(req);
+    });
+    struct Context {
+        router::Router* router;
+        routing::NodeId* targets;
+        int mode, callbacks = 0, server_callbacks = 0;
+    } ctx{&router, targets, mode};
+    auto done = [](void* data) {
+        auto& c = *static_cast<Context*>(data);
+        for (int i = 0; i < 2; ++i) {
+            if (c.mode == 0 || c.mode == 7 || c.mode == 8) EXPECT_EQ(c.router->record(c.targets[i]), nullptr);
+            else EXPECT_NE(c.router->record(c.targets[i]), nullptr);
+        }
+        ++c.callbacks;
+    };
+    struct Poll { uv_timer_t timer; std::function<void()> tick; } poll;
+    int phase = 0;
+    bool finished = false;
+    uv_timer_init(&loop, &poll.timer);
+    poll.timer.data = &poll;
+    poll.tick = [&] {
+        bool ready = mode == 8 ? pending_announces.size() == 2 :
+            router.record(targets[0]) && router.record(targets[1]) &&
+            dht->dht->socket().inflight_count() == 0;
+        if (phase == 0 && ready) {
+            withdrawing = true;
+            phase = 1;
+            if (mode == 7) {
+                hyperdht_server_close(servers[0], [](void* data) {
+                    auto& c = *static_cast<Context*>(data);
+                    EXPECT_EQ(c.router->record(c.targets[0]), nullptr);
+                    ++c.server_callbacks;
+                }, &ctx);
+                servers[0] = nullptr;
+                EXPECT_EQ(ctx.server_callbacks, 0);
+            }
+            if (mode == 5) hyperdht_destroy_force(dht, done, &ctx);
+            else hyperdht_destroy(dht, done, &ctx);
+            hyperdht_destroy(dht, done, &ctx);  // repeated call joins the same close
+            EXPECT_EQ(ctx.callbacks, mode == 5 ? 2 : 0);
+            if (mode == 5) EXPECT_TRUE(hyperdht_is_destroyed(dht));
+            for (const auto& req : pending_announces) handlers->handle(req);
+            pending_announces.clear();
+        }
+        if (phase == 1 && mode == 6 && held) {
+            EXPECT_EQ(ctx.callbacks, 0);
+            hyperdht_destroy_force(dht, done, &ctx);
+            EXPECT_EQ(ctx.callbacks, 3);
+            handlers->handle(*held);  // a late token reply cannot emit UNANNOUNCE
+            held.reset();
+            phase = 2;
+        }
+        if (phase && ctx.callbacks == (mode == 6 ? 3 : 2)) {
+            EXPECT_EQ(ctx.server_callbacks, mode == 7 ? 1 : 0);
+            finished = true;
+            uv_stop(&loop);
+        }
+    };
+    uv_timer_start(&poll.timer, [](uv_timer_t* t) { static_cast<Poll*>(t->data)->tick(); }, 1, 1);
+    uv_timer_t deadline;
+    uv_timer_init(&loop, &deadline);
+    uv_timer_start(&deadline, [](uv_timer_t* t) { uv_stop(t->loop); }, 15000, 0);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_TRUE(finished);
+    hyperdht_destroy_force(dht, nullptr, nullptr);
+    for (auto* srv : servers) if (srv) hyperdht_server_close_force(srv, nullptr, nullptr);
+    handlers.reset();
+    store.close();
+    for (auto* t : {&poll.timer, &deadline}) {
+        uv_timer_stop(t);
+        uv_close(reinterpret_cast<uv_handle_t*>(t), nullptr);
+    }
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(dht);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+INSTANTIATE_TEST_SUITE_P(Outcome, GracefulWithdrawal, ::testing::Range(0, 9));

@@ -342,6 +342,107 @@ std::array<uint8_t, 32> make_target(const noise::Keypair& kp) {
 
 }  // namespace
 
+class AnnouncerWithdrawal : public ::testing::TestWithParam<int> {};
+
+TEST_P(AnnouncerWithdrawal, UsesFreshTokenAfterOwnerDestruction) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    FakeNode node(&loop, 0x11);
+    node.sock.set_ephemeral(false);
+    node.sock.table().rebuild_with_id(node.id);
+    router::Router router;
+    auto handlers = std::make_unique<rpc::RpcHandlers>(node.sock, &router);
+    rpc::RpcSocket client(&loop, FakeNode::make_node_id(0x22));
+    ASSERT_EQ(client.bind(0), 0);
+    seed_table(client, node);
+    auto kp = make_keypair(0x42);
+    auto target = make_target(kp);
+    auto ann = std::make_unique<Announcer>(client, kp, target);
+    const int mode = GetParam();  // 0: valid; 1-4: bad reply; 5: close; 6: restart
+    bool withdrawing = false;
+    bool settled = false;
+    int fresh_requests = 0;
+    int unannounces = 0;
+    std::optional<messages::Request> delayed;
+    node.sock.on_request([&](const messages::Request& req) {
+        if (withdrawing && !req.internal && req.command == messages::CMD_FIND_PEER) {
+            ++fresh_requests;
+            if (mode == 6 && fresh_requests == 1) {
+                delayed = req;
+                return;
+            }
+            if (mode == 5) {
+                client.close();
+                return;
+            }
+            if (mode >= 1 && mode <= 4) {
+                messages::Response resp;
+                resp.tid = req.tid;
+                resp.from.addr = req.from.addr;
+                if (mode != 2) resp.id = node.id;
+                if (mode != 3) resp.token = node.sock.token_store().create(req.from.addr.host_string());
+                if (mode != 1) resp.value = *router.record(target);
+                if (mode == 4) resp.error = 1;
+                node.sock.reply(resp, req.from_server);
+                return;
+            }
+        }
+        if (!req.internal && req.command == messages::CMD_UNANNOUNCE) ++unannounces;
+        handlers->handle(req);
+        if (mode == 6 && delayed && req.command == messages::CMD_ANNOUNCE) {
+            handlers->handle(*delayed);  // Old withdrawal reply follows the new announce.
+            delayed.reset();
+        }
+    });
+
+    struct Poll {
+        std::function<void()> tick;
+        uv_timer_t timer{};
+    } poll;
+    poll.tick = [&] {
+        if (!withdrawing && !ann->relays().empty()) {
+            ASSERT_NE(router.record(target), nullptr);
+            // Expire the commit-time token without a wall-clock wait.
+            node.sock.token_store().rotate();
+            node.sock.token_store().rotate();
+            withdrawing = true;
+            ann->stop();
+            if (mode == 6) ann->start();
+            else ann.reset();  // Server::close also releases its Announcer immediately.
+        }
+        if (withdrawing && client.inflight_count() == 0) {
+            settled = true;
+            uv_stop(&loop);
+        }
+    };
+    uv_timer_init(&loop, &poll.timer);
+    poll.timer.data = &poll;
+    uv_timer_start(&poll.timer, [](uv_timer_t* t) {
+        static_cast<Poll*>(t->data)->tick();
+    }, 5, 5);
+    uv_timer_t deadline;
+    uv_timer_init(&loop, &deadline);
+    uv_timer_start(&deadline, [](uv_timer_t* t) { uv_stop(t->loop); }, 3000, 0);
+    ann->start();
+    uv_run(&loop, UV_RUN_DEFAULT);
+
+    EXPECT_TRUE(settled);
+    EXPECT_EQ(fresh_requests, mode == 6 ? 2 : 1);
+    EXPECT_EQ(unannounces, mode == 0 ? 1 : 0);
+    EXPECT_EQ(router.record(target) == nullptr, mode == 0);
+    if (ann) ann->stop_without_unannounce();
+    ann.reset();
+    handlers.reset();
+    node.sock.close();
+    client.close();
+    uv_close(reinterpret_cast<uv_handle_t*>(&poll.timer), nullptr);
+    uv_close(reinterpret_cast<uv_handle_t*>(&deadline), nullptr);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(ReplyValidation, AnnouncerWithdrawal, ::testing::Range(0, 7));
+
 // ============================================================================
 // D1 (publish-after-settle) — relays_ must be published from THIS cycle's
 // ANNOUNCE responses, within the FIRST update cycle. The old ordering ran

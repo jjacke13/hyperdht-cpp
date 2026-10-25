@@ -82,6 +82,7 @@ Announcer::~Announcer() {
 
 void Announcer::start() {
     if (running_) return;
+    if (withdrawal_alive_) *withdrawal_alive_ = false;
     running_ = true;
 
     // Re-arm the C7 sentinel. stop_impl() sets *alive_ = false to make every
@@ -152,6 +153,7 @@ void Announcer::stop_impl(bool send_unannounce) {
     }
 
     if (send_unannounce) {
+        withdrawal_alive_ = std::make_shared<bool>(true);
         for (const auto& relay : active_relays_) {
             unannounce_node(relay);
         }
@@ -559,10 +561,6 @@ void Announcer::commit(const query::QueryReply& node, uint64_t gen) {
 
             RelayNode relay;
             relay.addr = node.from_addr;
-            relay.node_id = node.from_id;
-            if (node.token.has_value()) {
-                relay.token = *node.token;
-            }
             // peer_addr = resp.from.addr = wire `to` field = our address as
             // seen by this specific relay node. Critical for CGNAT where
             // different relays may see us on different ports.
@@ -603,31 +601,38 @@ void Announcer::commit(const query::QueryReply& node, uint64_t gen) {
 //
 // JS: .analysis/js/hyperdht/lib/announcer.js:205-238 (_unannounce)
 //     JS first issues a FIND_PEER to acquire a fresh token from the
-//     relay, then sends UNANNOUNCE. C++ reuses the token captured at
-//     commit() time, so it skips the extra round-trip.
+//     relay, then signs UNANNOUNCE with that reply's token and node id.
 // ---------------------------------------------------------------------------
 
 void Announcer::unannounce_node(const RelayNode& relay) {
-    dht_messages::AnnounceMessage ann;
-    dht_messages::PeerRecord peer;
-    peer.public_key = keypair_.public_key;
-    ann.peer = peer;
-
-    auto signature = announce_sig::sign_unannounce(
-        target_, relay.node_id, relay.token.data(), relay.token.size(),
-        ann, keypair_);
-    ann.signature = signature;
-
-    auto ann_value = dht_messages::encode_announce_msg(ann);
-
     messages::Request req;
     req.to.addr = relay.addr;
-    req.command = messages::CMD_UNANNOUNCE;
+    req.command = messages::CMD_FIND_PEER;
     req.target = target_;
-    req.token = relay.token;
-    req.value = std::move(ann_value);
 
-    socket_.request(req, [](const messages::Response&) {}, [](uint16_t) {});
+    // stop() invalidates alive_ and Server::close releases this Announcer.
+    socket_.request(req,
+        [socket = &socket_, keypair = keypair_, target = target_, addr = relay.addr,
+         active = withdrawal_alive_](
+                const messages::Response& resp) {
+            if (!*active || resp.error || !resp.token || !resp.id ||
+                !resp.value || resp.value->empty()) return;
+
+            dht_messages::AnnounceMessage ann;
+            dht_messages::PeerRecord peer;
+            peer.public_key = keypair.public_key;
+            ann.peer = peer;
+            ann.signature = announce_sig::sign_unannounce(
+                target, *resp.id, resp.token->data(), resp.token->size(), ann, keypair);
+
+            messages::Request unann;
+            unann.to.addr = addr;
+            unann.command = messages::CMD_UNANNOUNCE;
+            unann.target = target;
+            unann.token = *resp.token;
+            unann.value = dht_messages::encode_announce_msg(ann);
+            socket->request(unann, [](const messages::Response&) {}, [](uint16_t) {});
+        }, [](uint16_t) {});
 }
 
 // ---------------------------------------------------------------------------

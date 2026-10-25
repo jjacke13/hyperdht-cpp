@@ -5,12 +5,20 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-24 (UDX shutdown; older snapshots below are historical).
+Last updated: 2026-10-25 (fresh-token withdrawal; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-25 withdrawal tokens:** stop-time withdrawal obtains a fresh
+  FIND_PEER token and replying node ID before signing UNANNOUNCE. Copied
+  signing state survives Announcer release; restarting cancels an old pending
+  withdrawal before it can erase the resumed record. Seven focused regressions
+  pass with ASan/UBSan and leak checking. Core and consumer suites, both static
+  CPU builds, the ESP32 component compile and fourteen isolated live cases pass,
+  including 31 clean native app exits. Retired-relay cleanup and awaited
+  whole-DHT withdrawal remain open; see the entries below.
 - **2026-10-24 UDX shutdown:** close now tears down attached and unconnected
   streams before their DHT storage is released. Generated UDX guards avoid
   duplicate closes and watcher callback lifetime errors; pending connect owners
@@ -415,12 +423,19 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   physical host could occupy multiple announce slots (Finding O). Any
   host-diversity work should be designed against this, not against the naive
   "one node = one entry" model.
-- [ ] **Per-cycle UNANNOUNCE not ported** (announcer.js:191-196). Deliberate:
-  C++ reuses the commit-time token, which the receiver rejects after ~15s
-  (rpc_handlers.cpp:819-821), so it would emit provably-rejected datagrams and
-  any test would pass vacuously. Port JS's 2-RTT `_unannounce` (FIND_PEER for a
-  fresh token, announcer.js:205-238) first; until then the existing stop-time
-  UNANNOUNCE is also a placebo.
+- [x] **Fresh-token stop-time UNANNOUNCE** — fixed 2026-10-25. FIND_PEER
+  obtains the current token and node ID before signing UNANNOUNCE, matching
+  JS's two-request `_unannounce` (announcer.js:205-238). Reject incomplete/error
+  replies; preserve copied signing state after Announcer destruction; cancel
+  old withdrawal continuations on restart. Signed-handler regressions and a
+  live aged-token negative/control prove the record is actually removed.
+- [ ] **Per-cycle UNANNOUNCE not ported** (announcer.js:191-196). Retired-relay
+  cleanup remains separate from the fresh-token stop-time fix above.
+- [ ] **Await graceful withdrawal on whole-DHT destruction.** Stop callbacks
+  still report local cleanup, and whole-DHT destruction closes the RPC socket
+  immediately rather than awaiting the two requests. Withdrawal remains
+  best-effort while the socket lives. Review consumer lifecycle contracts
+  separately before changing completion timing.
 - [ ] **`refresh()` has no `_refreshing` latch** (announcer.cpp vs
   announcer.js:76-79) — a health/drift refresh landing mid-cycle is dropped,
   costing <=5s until the next ping tick. Low.

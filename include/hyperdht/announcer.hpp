@@ -12,7 +12,8 @@
 //
 // Lifetime: all async callbacks (find_peer, commit, ping_relays) capture a
 // weak_ptr<bool> alive_ sentinel. stop_impl() invalidates the sentinel and
-// resets current_query_ so callbacks become no-ops after destruction.
+// resets current_query_ so callbacks become no-ops after destruction. Stop-time
+// withdrawals instead own copied signing state and live until RPC completion.
 
 #include <array>
 #include <cstdint>
@@ -74,6 +75,7 @@ public:
     Announcer& operator=(const Announcer&) = delete;
 
     void start();
+    // Callback reports local cleanup; withdrawal is best-effort while socket lives.
     void stop(std::function<void()> on_done = nullptr);
 
     // Force-stop: tear down timers and relays WITHOUT emitting
@@ -170,13 +172,13 @@ private:
     struct RelayNode {
         compact::Ipv4Address addr;         // Relay node's address
         compact::Ipv4Address peer_addr;    // Our address as seen by this relay (from `to` field)
-        std::array<uint8_t, 32> node_id;
-        std::array<uint8_t, 32> token;
     };
     // The relay set we are currently advertising (built into relays_ by
     // build_relays()). Built only by maybe_publish(), from cycle_relays_;
     // cleared on stop.
     std::vector<RelayNode> active_relays_;
+    // A restart cancels old withdrawals before they can remove the new record.
+    std::shared_ptr<bool> withdrawal_alive_;
 
     // This cycle's acks, staged until the cycle settles. JS builds the same
     // list as a fresh local `const relays = []` (announcer.js:172) and assigns

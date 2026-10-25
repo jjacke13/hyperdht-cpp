@@ -94,7 +94,14 @@ std::shared_ptr<query::Query> lookup(rpc::RpcSocket& socket,
                                       query::OnReplyCallback on_reply,
                                       query::OnDoneCallback on_done) {
     auto q = query::Query::create(socket, target, messages::CMD_LOOKUP);
-    q->on_reply(std::move(on_reply));
+    q->on_reply([on_reply = std::move(on_reply)](const query::QueryReply& reply) {
+        if (!on_reply || !reply.value) return;
+        dht_messages::LookupRawReply parsed;
+        // JS mapLookup rejects the whole reply on any peer or bump codec failure.
+        if (dht_messages::decode_lookup_reply(reply.value->data(), reply.value->size(), parsed)) {
+            on_reply(reply);
+        }
+    });
     q->on_done(std::move(on_done));
     add_default_bootstrap(*q, socket);
     q->start();
@@ -235,17 +242,17 @@ std::shared_ptr<query::Query> lookup_and_unannounce(
     // map (per reply): unannounce our stale record. JS index.js:216-237.
     q->on_reply([&socket, target, keypair, our_pk, tracker, on_reply](
                     const query::QueryReply& reply) {
+        if (!reply.value) return;
+        dht_messages::LookupRawReply parsed;
+        if (!dht_messages::decode_lookup_reply(reply.value->data(), reply.value->size(), parsed)) return;
         if (on_reply) on_reply(reply);
 
         // JS: `if (!data.token) return`; `if (!data.from.id) return`.
         if (!reply.token.has_value()) return;
         routing::NodeId zero_id{};
         if (reply.from_id == zero_id) return;
-        if (!reply.value.has_value() || reply.value->empty()) return;
 
         // found = ≥20 records OR our key present (JS index.js:221-224).
-        auto parsed = dht_messages::decode_lookup_reply(
-            reply.value->data(), reply.value->size());
         bool found = parsed.peers.size() >= announce::MAX_PEERS_PER_TARGET;
         for (size_t i = 0; !found && i < parsed.peers.size(); ++i) {
             auto pr = dht_messages::decode_peer_record(

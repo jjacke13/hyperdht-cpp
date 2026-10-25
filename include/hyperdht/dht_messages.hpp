@@ -108,6 +108,8 @@ struct LookupRawReply {
 
 std::vector<uint8_t> encode_lookup_reply(const LookupRawReply& r);
 LookupRawReply decode_lookup_reply(const uint8_t* data, size_t len);
+// Checked overload: false on peer/bump codec errors or existing count limits.
+bool decode_lookup_reply(const uint8_t* data, size_t len, LookupRawReply& reply);
 
 }  // namespace dht_messages
 }  // namespace hyperdht

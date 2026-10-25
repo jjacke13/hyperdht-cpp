@@ -55,9 +55,11 @@ std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
                                          const std::vector<SeedNode>* seed_nodes = nullptr);
 
 // ---------------------------------------------------------------------------
-// lookup — generic iterative query with a custom command
+// lookup — LOOKUP walk for peer records at a target
 // ---------------------------------------------------------------------------
 
+// on_reply forwards raw bytes only after peer/bump decoding succeeds (JS
+// mapLookup). on_done/closest_replies retain all successful routing replies.
 std::shared_ptr<query::Query> lookup(rpc::RpcSocket& socket,
                                       const routing::NodeId& target,
                                       query::OnReplyCallback on_reply,
@@ -107,7 +109,7 @@ std::shared_ptr<query::Query> announce(rpc::RpcSocket& socket,
 //
 // `user_commit`: the announce commit for the clear-announce path (dhttop-6),
 // or nullptr for a plain unannounce (JS noop commit). `on_reply` forwards
-// each raw reply to the caller (may be nullptr).
+// each successfully decoded raw lookup reply to the caller (may be nullptr).
 std::shared_ptr<query::Query> lookup_and_unannounce(
     rpc::RpcSocket& socket,
     const routing::NodeId& target,

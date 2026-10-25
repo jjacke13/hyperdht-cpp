@@ -312,11 +312,17 @@ std::vector<uint8_t> encode_lookup_reply(const LookupRawReply& r) {
 }
 
 LookupRawReply decode_lookup_reply(const uint8_t* data, size_t len) {
-    State state = State::for_decode(data, len);
     LookupRawReply r;
+    decode_lookup_reply(data, len, r);
+    return r;
+}
+
+bool decode_lookup_reply(const uint8_t* data, size_t len, LookupRawReply& r) {
+    State state = State::for_decode(data, len);
+    r = {};
 
     uint64_t count = Uint::decode(state);
-    if (state.error || count > 1024) return r;  // Cap at 1024 (20 per target * safety margin)
+    if (state.error || count > 1024) return false;  // Cap at 1024 (20 per target * safety margin)
     r.peers.reserve(static_cast<size_t>(count));
 
     // Each record is self-delimiting (fixed32 + ipv4Array). Decode its fields
@@ -324,9 +330,9 @@ LookupRawReply decode_lookup_reply(const uint8_t* data, size_t len) {
     for (uint64_t i = 0; i < count && !state.error; i++) {
         size_t rec_start = state.start;
         Fixed32::decode(state);                              // publicKey
-        if (state.error) { r.peers.clear(); return r; }
+        if (state.error) { r.peers.clear(); return false; }
         Array<Ipv4Addr, Ipv4Address>::decode(state);         // relayAddresses
-        if (state.error) { r.peers.clear(); return r; }
+        if (state.error) { r.peers.clear(); return false; }
         r.peers.emplace_back(data + rec_start, data + state.start);
     }
 
@@ -335,7 +341,7 @@ LookupRawReply decode_lookup_reply(const uint8_t* data, size_t len) {
         r.bump = Uint::decode(state);
     }
 
-    return r;
+    return !state.error;
 }
 
 }  // namespace dht_messages

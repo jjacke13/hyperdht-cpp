@@ -5,18 +5,23 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-25 (findPeer record validation; older snapshots below are historical).
+Last updated: 2026-10-25 (lookup record validation; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-25 lookup results:** lookup and lookup-and-unannounce validate
+  the complete peer array and optional bump before forwarding raw reply bytes
+  or deciding to withdraw, matching JS mapLookup. Closest routing replies and
+  the original decoder entry point remain available. Query/storage failure
+  reporting remains open.
 - **2026-10-25 findPeer results:** the shared findPeer callback path decodes
   peer records before forwarding raw reply bytes, matching JS mapFindPeer's
   rejection of codec failures. Routing/closest replies remain unfiltered, so
   missing records still supply announcement relays and tokens. The existing
   unchecked decoder remains available; the checked overload reports failure.
-  Generic lookup decoding and query/storage failure reporting remain open.
+  Lookup decoding is covered above; query/storage failure reporting remains open.
 - **2026-10-25 graceful shutdown:** Announcer, Server, HyperDHT and C API
   completion now wait for pending announcements and withdrawals to settle.
   Force cancels the wait; callers still retain storage through libuv's close

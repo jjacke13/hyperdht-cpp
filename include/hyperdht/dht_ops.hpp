@@ -40,6 +40,8 @@ struct SeedNode {
 // order via Query::add_seed_node before start(). Used by the Announcer to
 // re-hit the SAME relay nodes each reannounce cycle (JS announcer.js:156
 // `nodes: this._closestNodes`).
+// on_reply receives raw bytes only for successfully decoded peer records, like
+// JS mapFindPeer. on_done/closest_replies retain all successful routing replies.
 std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
                                          const uint8_t* public_key, size_t pk_len,
                                          query::OnReplyCallback on_reply,

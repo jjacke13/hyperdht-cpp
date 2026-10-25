@@ -47,6 +47,8 @@ struct PeerRecord {
 
 std::vector<uint8_t> encode_peer_record(const PeerRecord& p);
 PeerRecord decode_peer_record(const uint8_t* data, size_t len);
+// Checked overload: false if either field is truncated or exceeds codec limits.
+bool decode_peer_record(const uint8_t* data, size_t len, PeerRecord& peer);
 
 // ---------------------------------------------------------------------------
 // AnnounceMessage — the value field of ANNOUNCE/UNANNOUNCE requests

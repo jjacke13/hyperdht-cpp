@@ -90,13 +90,17 @@ std::vector<uint8_t> encode_peer_record(const PeerRecord& p) {
 }
 
 PeerRecord decode_peer_record(const uint8_t* data, size_t len) {
-    State state = State::for_decode(data, len);
     PeerRecord p;
-
-    p.public_key = Fixed32::decode(state);
-    if (state.error) return p;
-    p.relay_addresses = Array<Ipv4Addr, Ipv4Address>::decode(state);
+    decode_peer_record(data, len, p);
     return p;
+}
+
+bool decode_peer_record(const uint8_t* data, size_t len, PeerRecord& p) {
+    State state = State::for_decode(data, len);
+    p.public_key = Fixed32::decode(state);
+    if (state.error) return false;
+    p.relay_addresses = Array<Ipv4Addr, Ipv4Address>::decode(state);
+    return !state.error;
 }
 
 // ---------------------------------------------------------------------------

@@ -53,7 +53,14 @@ std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
     std::copy(target.begin(), target.end(), target_id.begin());
 
     auto q = query::Query::create(socket, target_id, messages::CMD_FIND_PEER);
-    q->on_reply(std::move(on_reply));
+    q->on_reply([on_reply = std::move(on_reply)](const query::QueryReply& reply) {
+        if (!on_reply || !reply.value) return;
+        dht_messages::PeerRecord peer;
+        // JS mapFindPeer drops codec failures; closest replies still seed announces.
+        if (dht_messages::decode_peer_record(reply.value->data(), reply.value->size(), peer)) {
+            on_reply(reply);
+        }
+    });
     q->on_done(std::move(on_done));
     // JS announcer.js:156 — `nodes: this._closestNodes` reseeds the walk with
     // the previous cycle's closest nodes (query.js:47-67 frontier pre-seed).

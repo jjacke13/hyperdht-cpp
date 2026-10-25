@@ -177,7 +177,7 @@ private:
     // build_relays()). Built only by maybe_publish(), from cycle_relays_;
     // cleared on stop.
     std::vector<RelayNode> active_relays_;
-    // A restart cancels old withdrawals before they can remove the new record.
+    // A new cycle cancels old withdrawals before they can remove a new record.
     std::shared_ptr<bool> withdrawal_alive_;
 
     // This cycle's acks, staged until the cycle settles. JS builds the same
@@ -246,7 +246,7 @@ private:
     void commit(const query::QueryReply& node, uint64_t gen);
     void commit_settled();   // decrement pending_commits_ + maybe_publish
     void maybe_publish();    // query_done_ && pending==0 → build_relays
-    void unannounce_node(const RelayNode& relay);
+    void unannounce_node(const RelayNode& relay, std::function<void()> on_done = nullptr);
     void gate_upsert(const compact::Ipv4Address& addr, uint64_t now);
     void build_relays();
     void ping_relays();

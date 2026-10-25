@@ -6,6 +6,7 @@
 #include <sodium.h>
 #include <uv.h>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -442,6 +443,134 @@ TEST_P(AnnouncerWithdrawal, UsesFreshTokenAfterOwnerDestruction) {
 }
 
 INSTANTIATE_TEST_SUITE_P(ReplyValidation, AnnouncerWithdrawal, ::testing::Range(0, 7));
+
+class AnnouncerRetirement : public ::testing::TestWithParam<bool> {};
+
+TEST_P(AnnouncerRetirement, WithdrawsRetiredRelayAfterReplacementSettles) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    struct StoredNode : FakeNode {
+        router::Router router;
+        std::unique_ptr<rpc::RpcHandlers> handlers;
+        bool omit_token = false;
+        bool hold_withdrawal = false;
+        int unannounces = 0;
+        std::optional<messages::Request> held;
+        StoredNode(uv_loop_t* loop, uint8_t fill) : FakeNode(loop, fill) {
+            sock.set_ephemeral(false);
+            sock.table().rebuild_with_id(id);
+            handlers = std::make_unique<rpc::RpcHandlers>(sock, &router);
+            sock.on_request([this](const messages::Request& req) {
+                if (!req.internal && req.command == messages::CMD_FIND_PEER) {
+                    ++find_peer_count;
+                    if (hold_withdrawal && find_peer_count >= 3) {
+                        held = req;
+                        return;
+                    }
+                    if (omit_token) {
+                        messages::Response resp;
+                        resp.tid = req.tid;
+                        resp.from.addr = req.from.addr;
+                        resp.id = id;
+                        sock.reply(resp, req.from_server);
+                        return;
+                    }
+                }
+                if (!req.internal && req.command == messages::CMD_UNANNOUNCE) ++unannounces;
+                handlers->handle(req);
+            });
+        }
+    };
+    std::vector<std::unique_ptr<StoredNode>> nodes;
+    for (int i = 0; i < 4; ++i) nodes.push_back(std::make_unique<StoredNode>(&loop, 0x10 + i));
+    auto kp = make_keypair(0x42);
+    auto target = make_target(kp);
+    std::sort(nodes.begin(), nodes.end(), [&](const auto& a, const auto& b) {
+        return routing::compare_distance(target, a->id, b->id) < 0;
+    });
+    rpc::RpcSocket client(&loop, FakeNode::make_node_id(0x22));
+    ASSERT_EQ(client.bind(0), 0);
+    for (int i : {0, 1, 3}) seed_table(client, *nodes[i]);
+    Announcer ann(client, kp, target);
+    int phase = 0;
+    bool waited = false, removed = false, retained = false;
+    uint64_t empty_gen = 0;
+    struct Poll {
+        std::function<void()> tick;
+        uv_timer_t timer{};
+    } poll;
+    poll.tick = [&] {
+        if (phase == 0 && !ann.is_updating_for_test() && ann.relays().size() == 3) {
+            ASSERT_NE(nodes[3]->router.record(target), nullptr);
+            nodes[3]->hold_withdrawal = true;
+            seed_table(client, *nodes[2]);
+            phase = 1;
+            ann.refresh();
+        } else if (phase == 1 && nodes[3]->held) {
+            EXPECT_NE(nodes[2]->router.record(target), nullptr);
+            waited = ann.is_updating_for_test();
+            auto gen = ann.cycle_gen_for_test();
+            ann.refresh();
+            EXPECT_EQ(ann.cycle_gen_for_test(), gen) << "retirement must settle before another cycle";
+            if (GetParam()) ann.stop_without_unannounce();
+            nodes[3]->hold_withdrawal = false;
+            nodes[3]->handlers->handle(*nodes[3]->held);
+            nodes[3]->held.reset();
+            phase = GetParam() ? 5 : 2;
+        } else if (phase == 2 && !ann.is_updating_for_test()) {
+            removed = nodes[3]->router.record(target) == nullptr;
+            EXPECT_TRUE(ann.is_relay(nodes[3]->addr)) << "cached clients keep the lenient relay gate";
+            for (int i = 0; i < 3; ++i) {
+                EXPECT_NE(nodes[i]->router.record(target), nullptr);
+                EXPECT_EQ(nodes[i]->unannounces, 0);
+            }
+            EXPECT_EQ(nodes[3]->unannounces, 1);
+            for (auto& node : nodes) node->omit_token = true;
+            empty_gen = ann.cycle_gen_for_test();
+            phase = 3;
+            ann.refresh();
+        } else if (phase == 3 && ann.cycle_gen_for_test() > empty_gen && !ann.is_updating_for_test()) {
+            retained = ann.relays().size() == 3;
+            for (int i = 0; i < 3; ++i) {
+                retained = retained && nodes[i]->router.record(target) != nullptr;
+                EXPECT_EQ(nodes[i]->unannounces, 0);
+            }
+            phase = 4;
+            uv_stop(&loop);
+        } else if (phase == 5 && client.inflight_count() == 0) {
+            removed = nodes[3]->router.record(target) == nullptr;
+            retained = true;
+            for (int i = 0; i < 3; ++i) retained &= nodes[i]->router.record(target) != nullptr;
+            EXPECT_EQ(nodes[3]->unannounces, 0) << "force-stop cancels the pending retirement";
+            phase = 4;
+            uv_stop(&loop);
+        }
+    };
+    uv_timer_init(&loop, &poll.timer);
+    poll.timer.data = &poll;
+    uv_timer_start(&poll.timer, [](uv_timer_t* t) { static_cast<Poll*>(t->data)->tick(); }, 5, 5);
+    uv_timer_t deadline;
+    uv_timer_init(&loop, &deadline);
+    uv_timer_start(&deadline, [](uv_timer_t* t) { uv_stop(t->loop); }, 3000, 0);
+    ann.start();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(phase, 4);
+    EXPECT_TRUE(waited);
+    EXPECT_EQ(removed, !GetParam());
+    EXPECT_TRUE(retained) << "an empty replacement cycle must not withdraw working relays";
+    ann.stop_without_unannounce();
+    for (auto& node : nodes) {
+        node->handlers.reset();
+        node->sock.close();
+    }
+    client.close();
+    uv_close(reinterpret_cast<uv_handle_t*>(&poll.timer), nullptr);
+    uv_close(reinterpret_cast<uv_handle_t*>(&deadline), nullptr);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(ForceStop, AnnouncerRetirement, ::testing::Bool());
 
 // ============================================================================
 // D1 (publish-after-settle) — relays_ must be published from THIS cycle's

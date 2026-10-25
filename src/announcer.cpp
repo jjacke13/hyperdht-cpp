@@ -10,7 +10,7 @@
 //     C++ uses two libuv timers: bg_timer_ (REANNOUNCE_MS = 5 min) and
 //     ping_timer_ (RELAY_PING_MS = 5 s).
 //   - JS keeps three rotating Maps in `_serverRelays[3]`. C++ keeps a
-//     single `active_relays_` vector and replaces entries on commit.
+//     single `active_relays_` vector plus a time-limited lenient gate.
 //   - JS picks the 3 best replies via `pickBest` (slice(0,3)) and commits
 //     only to those. C++ matches this: update() commits to the closest
 //     PICK_BEST (3) replies of the walk (field Finding H — committing to
@@ -116,6 +116,7 @@ void Announcer::stop(std::function<void()> on_done) {
 }
 
 void Announcer::stop_without_unannounce() {
+    if (withdrawal_alive_) *withdrawal_alive_ = false;
     stop_impl(/*send_unannounce=*/false);
 }
 
@@ -153,7 +154,6 @@ void Announcer::stop_impl(bool send_unannounce) {
     }
 
     if (send_unannounce) {
-        withdrawal_alive_ = std::make_shared<bool>(true);
         for (const auto& relay : active_relays_) {
             unannounce_node(relay);
         }
@@ -390,7 +390,7 @@ void Announcer::ping_relays() {
 //   on_done           — query_done_ = true, saves closest_nodes_ for the
 //                       next cycle's seed, then maybe_publish().
 //   maybe_publish()   — when query_done_ && pending_commits_ == 0:
-//                       build_relays() (publish) + updating_ = false.
+//                       publish, retire replaced relays, then clear updating_.
 //
 // The zero-commit cycle (no token replies) publishes at on_done since
 // pending_commits_ is already 0. A cycle cancelled by notify_online()/
@@ -401,6 +401,8 @@ void Announcer::ping_relays() {
 
 void Announcer::update() {
     if (updating_ || !running_) return;
+    if (withdrawal_alive_) *withdrawal_alive_ = false;
+    withdrawal_alive_ = std::make_shared<bool>(true);
     updating_ = true;
 
     const uint64_t gen = ++cycle_gen_;
@@ -469,12 +471,18 @@ void Announcer::commit_settled() {
 void Announcer::maybe_publish() {
     if (!query_done_ || pending_commits_ != 0) return;
 
+    std::vector<RelayNode> retired;
     if (running_) {
         if (!cycle_relays_.empty()) {
             DHT_LOG("  [announcer] cycle settled (%d commits) — publishing %zu "
                     "relays (was %zu, gate=%zu)\n",
                     cycle_commits_total_, cycle_relays_.size(),
                     active_relays_.size(), gate_.size());
+            for (const auto& old : active_relays_) {
+                bool kept = false;
+                for (const auto& next : cycle_relays_) kept |= old.addr == next.addr;
+                if (!kept) retired.push_back(old);
+            }
             active_relays_ = std::move(cycle_relays_);
             build_relays();
         } else {
@@ -493,7 +501,17 @@ void Announcer::maybe_publish() {
     }
 
     cycle_relays_.clear();  // moved-from vectors are valid but unspecified
-    updating_ = false;
+    if (retired.empty()) {
+        updating_ = false;
+        return;
+    }
+    // Serialize retirement with the next cycle, as JS awaits _unannounceAll.
+    auto pending = std::make_shared<size_t>(retired.size());
+    auto done = [weak = std::weak_ptr<bool>(alive_), this, gen = cycle_gen_, pending] {
+        if (--*pending != 0) return;
+        if (auto a = weak.lock(); a && *a && gen == cycle_gen_) updating_ = false;
+    };
+    for (const auto& relay : retired) unannounce_node(relay, done);
 }
 
 // ---------------------------------------------------------------------------
@@ -604,19 +622,23 @@ void Announcer::commit(const query::QueryReply& node, uint64_t gen) {
 //     relay, then signs UNANNOUNCE with that reply's token and node id.
 // ---------------------------------------------------------------------------
 
-void Announcer::unannounce_node(const RelayNode& relay) {
+void Announcer::unannounce_node(const RelayNode& relay, std::function<void()> on_done) {
     messages::Request req;
     req.to.addr = relay.addr;
     req.command = messages::CMD_FIND_PEER;
     req.target = target_;
 
     // stop() invalidates alive_ and Server::close releases this Announcer.
-    socket_.request(req,
+    auto done = [on_done = std::move(on_done)] { if (on_done) on_done(); };
+    auto tid = socket_.request(req,
         [socket = &socket_, keypair = keypair_, target = target_, addr = relay.addr,
-         active = withdrawal_alive_](
+         active = withdrawal_alive_, done](
                 const messages::Response& resp) {
             if (!*active || resp.error || !resp.token || !resp.id ||
-                !resp.value || resp.value->empty()) return;
+                !resp.value || resp.value->empty()) {
+                done();
+                return;
+            }
 
             dht_messages::AnnounceMessage ann;
             dht_messages::PeerRecord peer;
@@ -631,8 +653,10 @@ void Announcer::unannounce_node(const RelayNode& relay) {
             unann.target = target;
             unann.token = *resp.token;
             unann.value = dht_messages::encode_announce_msg(ann);
-            socket->request(unann, [](const messages::Response&) {}, [](uint16_t) {});
-        }, [](uint16_t) {});
+            if (socket->request(unann, [done](const messages::Response&) { done(); },
+                    [done](uint16_t) { done(); }) == 0) done();
+        }, [done](uint16_t) { done(); });
+    if (tid == 0) done();
 }
 
 // ---------------------------------------------------------------------------

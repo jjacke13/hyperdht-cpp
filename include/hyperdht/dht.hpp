@@ -718,6 +718,7 @@ public:
     struct ImmutablePutResult {
         std::array<uint8_t, 32> hash{};
         std::vector<query::QueryReply> closest_nodes;
+        int error = query::QUERY_OK;  // Commit status; JS rejects failed puts.
     };
     using ImmutablePutCallback = std::function<void(const ImmutablePutResult&)>;
     std::shared_ptr<query::Query> immutable_put(
@@ -757,6 +758,7 @@ public:
         uint64_t seq = 0;
         std::array<uint8_t, 64> signature{};
         std::vector<query::QueryReply> closest_nodes;
+        int error = query::QUERY_OK;  // Commit status; JS rejects failed puts.
     };
     using MutablePutCallback = std::function<void(const MutablePutResult&)>;
     std::shared_ptr<query::Query> mutable_put(

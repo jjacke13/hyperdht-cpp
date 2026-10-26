@@ -801,6 +801,104 @@ TEST(HyperDHT, Pool) {
 //   - seq ordering semantics
 // ---------------------------------------------------------------------------
 
+// JS puts await query.finished(): failed commits must reach both public APIs.
+TEST(HyperDHT, PutCompletionPreservesQueryErrors) {
+    for (bool c_api : {false, true}) {
+        for (bool mutable_value : {false, true}) {
+            // Success, a tokenless closest node, and no successful walk replies.
+            for (int outcome = 0; outcome < 3; ++outcome) {
+                SCOPED_TRACE(::testing::Message() << c_api << '/' << mutable_value
+                                                << '/' << outcome);
+                uv_loop_t loop;
+                ASSERT_EQ(uv_loop_init(&loop), 0);
+                routing::NodeId id{};
+                rpc::RpcSocket store(&loop, id);
+                ASSERT_EQ(store.bind(0), 0);
+                make_persistent(store);
+                auto addr = compact::Ipv4Address::from_string("127.0.0.1", store.port());
+                id = rpc::compute_peer_id(addr);
+                int commits = 0;
+                store.on_request([&](const messages::Request& req) {
+                    messages::Response resp;
+                    resp.tid = req.tid;
+                    resp.from.addr = req.from.addr;
+                    resp.id = id;
+                    if (req.command == messages::CMD_IMMUTABLE_PUT ||
+                        req.command == messages::CMD_MUTABLE_PUT) {
+                        ++commits;
+                    } else if (outcome == 0) {
+                        resp.token = store.token_store().create(req.from.addr.host_string());
+                    } else if (outcome == 2) {
+                        resp.error = messages::ERR_UNKNOWN_COMMAND;
+                    }
+                    store.reply(resp, req.from_server);
+                });
+                auto* client = hyperdht_create(&loop, nullptr);
+                ASSERT_NE(client, nullptr);
+                ASSERT_EQ(hyperdht_bind(client, 0), 0);
+                routing::Node node;
+                node.id = id;
+                node.host = addr.host_string();
+                node.port = addr.port;
+                ASSERT_TRUE(client->dht->socket().table().add(node)); // Loopback only.
+                const std::vector<uint8_t> value{'p', 'u', 't'};
+                noise::Seed seed{};
+                seed.fill(0x37);
+                auto kp = noise::generate_keypair(seed);
+                struct Completion { int calls = 0; int error = -1; } done;
+                std::shared_ptr<query::Query> q;
+                if (c_api) {
+                    auto cb = +[](int error, void* ud) {
+                        auto& result = *static_cast<Completion*>(ud);
+                        ++result.calls;
+                        result.error = error;
+                    };
+                    hyperdht_keypair_t c_kp;
+                    std::memcpy(c_kp.public_key, kp.public_key.data(), 32);
+                    std::memcpy(c_kp.secret_key, kp.secret_key.data(), 64);
+                    EXPECT_EQ(mutable_value
+                        ? hyperdht_mutable_put(client, &c_kp, value.data(), value.size(), 7, cb, &done)
+                        : hyperdht_immutable_put(client, value.data(), value.size(), cb, &done), 0);
+                    hyperdht_keypair_zero(&c_kp);
+                } else if (mutable_value) {
+                    q = client->dht->mutable_put(kp, value, 7,
+                        [&](const HyperDHT::MutablePutResult& r) {
+                            ++done.calls;
+                            done.error = r.error;
+                            EXPECT_EQ(r.public_key, kp.public_key);
+                            EXPECT_EQ(r.seq, 7u);
+                            EXPECT_TRUE(announce_sig::verify_mutable(r.signature, r.seq,
+                                value.data(), value.size(), r.public_key));
+                        });
+                } else {
+                    q = client->dht->immutable_put(value,
+                        [&](const HyperDHT::ImmutablePutResult& r) {
+                            ++done.calls;
+                            done.error = r.error;
+                            EXPECT_EQ(r.hash, dht_ops::hash_public_key(value.data(), value.size()));
+                        });
+                }
+                const auto deadline = uv_hrtime() + 2000000000ULL;
+                while (!done.calls && uv_hrtime() < deadline) {
+                    uv_run(&loop, UV_RUN_NOWAIT);
+                    uv_sleep(1);
+                }
+                EXPECT_EQ(done.calls, 1);
+                EXPECT_EQ(done.error, outcome == 0 ? query::QUERY_OK
+                                                  : query::QUERY_ERR_TOO_FEW_NODES);
+                EXPECT_EQ(commits, outcome == 0 ? 1 : 0);
+                hyperdht_destroy_force(client, nullptr, nullptr);
+                store.close();
+                uv_run(&loop, UV_RUN_DEFAULT);
+                EXPECT_EQ(done.calls, 1); // Teardown must not complete twice.
+                q.reset();
+                hyperdht_free(client);
+                EXPECT_EQ(uv_loop_close(&loop), 0);
+            }
+        }
+    }
+}
+
 TEST(HyperDHT, ImmutablePutReturnsValidQuery) {
     uv_loop_t loop;
     uv_loop_init(&loop);

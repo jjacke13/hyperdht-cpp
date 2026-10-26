@@ -5,12 +5,18 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-25 (lookup record validation; older snapshots below are historical).
+Last updated: 2026-10-26 (storage put error reporting; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-26 storage put results:** immutable/mutable put results expose
+  the existing query commit error, and the C callbacks forward that status
+  instead of always reporting success. Callback signatures and the C ABI
+  stay unchanged; C++ consumers must rebuild for the appended result field.
+  This matches JS puts awaiting query.finished(); transport-level replies
+  retain the existing JS success policy. Other query/storage gaps remain open.
 - **2026-10-25 lookup results:** lookup and lookup-and-unannounce validate
   the complete peer array and optional bump before forwarding raw reply bytes
   or deciding to withdraw, matching JS mapLookup. Closest routing replies and

@@ -12,8 +12,8 @@ int hyperdht_immutable_put(hyperdht_t* dht,
 
     std::vector<uint8_t> val(value, value + len);
     dht->dht->immutable_put(val,
-        [cb, userdata](const hyperdht::HyperDHT::ImmutablePutResult&) {
-            if (cb) cb(0, userdata);
+        [cb, userdata](const hyperdht::HyperDHT::ImmutablePutResult& result) {
+            if (cb) cb(result.error, userdata);
         });
     return 0;
 }
@@ -53,8 +53,8 @@ int hyperdht_mutable_put(hyperdht_t* dht,
 
     std::vector<uint8_t> val(value, value + len);
     dht->dht->mutable_put(cpp_kp, val, seq,
-        [cb, userdata](const hyperdht::HyperDHT::MutablePutResult&) {
-            if (cb) cb(0, userdata);
+        [cb, userdata](const hyperdht::HyperDHT::MutablePutResult& result) {
+            if (cb) cb(result.error, userdata);
         });
     sodium_memzero(cpp_kp.secret_key.data(), 64);  // C10
     return 0;

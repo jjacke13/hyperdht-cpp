@@ -193,9 +193,10 @@ std::shared_ptr<query::Query> HyperDHT::immutable_put(
 
     return dht_ops::immutable_put(*socket_, value,
         [on_done = std::move(on_done), result = std::move(result)](
-                int /*error*/, const std::vector<query::QueryReply>& closest) mutable {
+                int error, const std::vector<query::QueryReply>& closest) mutable {
             DHT_LOG("  [dht] immutable_put done: %zu closest nodes\n",
                     closest.size());
+            result.error = error;
             result.closest_nodes = closest;
             if (on_done) on_done(result);
         });
@@ -271,9 +272,10 @@ std::shared_ptr<query::Query> HyperDHT::mutable_put(
 
     return dht_ops::mutable_put(*socket_, keypair, value, seq,
         [on_done = std::move(on_done), result = std::move(result)](
-                int /*error*/, const std::vector<query::QueryReply>& closest) mutable {
+                int error, const std::vector<query::QueryReply>& closest) mutable {
             DHT_LOG("  [dht] mutable_put done: %zu closest nodes\n",
                     closest.size());
+            result.error = error;
             result.closest_nodes = closest;
             if (on_done) on_done(result);
         });

@@ -483,6 +483,7 @@ typedef void (*hyperdht_done_cb)(int error, void* userdata);
 
 /**
  * Store an immutable value on the DHT (target = BLAKE2b(value)).
+ * @param cb  called once with 0 on commit success, 1 if no commit succeeded
  * @return 0 on success (async), negative on error
  */
 HYPERDHT_API int hyperdht_immutable_put(hyperdht_t* dht,
@@ -507,6 +508,7 @@ HYPERDHT_API int hyperdht_immutable_get(hyperdht_t* dht,
  * @param kp      keypair (signs the value)
  * @param value   data to store
  * @param seq     sequence number (must increase for updates)
+ * @param cb      called once with 0 on commit success, 1 if no commit succeeded
  * @return 0 on success (async), negative on error
  */
 HYPERDHT_API int hyperdht_mutable_put(hyperdht_t* dht,

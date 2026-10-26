@@ -5,12 +5,18 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-26 (storage put error reporting; older snapshots below are historical).
+Last updated: 2026-10-26 (forced-persistent startup; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-26 forced-persistent startup:** generic `ephemeral=false` starts
+  ephemeral and awaits the existing address/firewall check during bootstrap,
+  matching JS `_forcePersistent`. Success adopts the verified endpoint's routing
+  ID before ready; failure stays ephemeral. The explicit bootstrapper factory
+  retains its trusted-address initialization. The full two-pass bootstrap loop
+  remains deferred; this change does not add it.
 - **2026-10-26 storage put results:** immutable/mutable put results expose
   the existing query commit error, and the C callbacks forward that status
   instead of always reporting success. Callback signatures and the C ABI
@@ -840,9 +846,8 @@ before any full "core frozen" sign-off:
   arrives AFTER the session connected+cleaned on round 1. Benign; downgrade
   the log level or match it against a recently-completed session so it doesn't
   read as an error in field captures.
-- [ ] `immutable_put`/`mutable_put` result callbacks still swallow the commit
-  error (their callback signatures lack an error field — unlike announce/put
-  which now report failure via OnDoneCallback).
+- [x] `immutable_put`/`mutable_put` commit errors reach C++ results and C done
+  callbacks (`6bc02b1`, 2026-10-26); callback signatures remain unchanged.
 - [ ] Wrapper build CI: Python/Kotlin/Rust announce-ABI change (`f37ef1d`) is
   UNVERIFIED — no wrapper build in the C++ gate. Add a wrapper-build check.
 - [x] Tighten connect-3 wording in the sweep docs so it's not read as

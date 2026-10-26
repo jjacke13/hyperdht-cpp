@@ -107,7 +107,7 @@ typedef struct {
 /** Options for creating a HyperDHT instance */
 typedef struct {
     uint16_t port;          /**< Bind port (0 = ephemeral) */
-    int ephemeral;          /**< 1 = ephemeral node (default), 0 = persistent */
+    int ephemeral;          /**< 1 = adaptive (default), 0 = verify persistence at bootstrap */
 
     /**
      * §2: auto-bootstrap against the 3 canonical public HyperDHT nodes

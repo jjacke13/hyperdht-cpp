@@ -1527,22 +1527,125 @@ TEST(HyperDHT, DefaultNodeStartsEphemeralAndAdaptive) {
     uv_loop_close(&loop);
 }
 
-TEST(HyperDHT, ForcedPersistentStartsNonEphemeralNonAdaptive) {
-    // opts.ephemeral=false (JS _forcePersistent): start non-ephemeral so the
-    // node holds/advertises a stable id, and non-adaptive so it skips the
-    // periodic re-check + wakeup revert.
+TEST(HyperDHT, ForcedPersistentStartsEphemeralNonAdaptive) {
+    // JS starts ephemeral even with _forcePersistent, until bootstrap verifies
+    // the address. Explicit ephemeral still disables periodic adaptation.
     uv_loop_t loop;
     uv_loop_init(&loop);
 
     DhtOptions opts;
     opts.ephemeral = false;
     HyperDHT dht(&loop, opts);
-    EXPECT_FALSE(dht.socket().is_ephemeral());
+    EXPECT_TRUE(dht.socket().is_ephemeral());
     EXPECT_FALSE(dht.socket().is_adaptive());
 
     dht.destroy();
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
+}
+
+class ForcedPersistentBootstrap : public ::testing::TestWithParam<int> {};
+
+TEST_P(ForcedPersistentBootstrap, VerifiesAddressBeforeReady) {
+    // 0: reachable; 1: PING_NAT dropped; 2: destroyed during the probe;
+    // 3: already known reachable, reusing the existing address sample.
+    const int mode = GetParam();
+    const bool reachable = mode == 0 || mode == 3;
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    rpc::RpcSocket bootstrap(&loop, {});
+    ASSERT_EQ(bootstrap.bind(0, "127.0.0.1"), 0);
+    make_persistent(bootstrap);
+    DhtOptions opts;
+    opts.host = "127.0.0.1";
+    opts.ephemeral = false;
+    opts.bootstrap = {compact::Ipv4Address::from_string("127.0.0.1", bootstrap.port())};
+    HyperDHT dht(&loop, opts);
+    if (mode == 3) dht.socket().set_firewalled(false);
+    uv_timer_t deadline;
+    ASSERT_EQ(uv_timer_init(&loop, &deadline), 0);
+    bool finished = false;
+    auto finish = [&]() {
+        if (finished) return;
+        finished = true;
+        uv_timer_stop(&deadline);
+        uv_close(reinterpret_cast<uv_handle_t*>(&deadline), nullptr);
+        dht.destroy();
+        bootstrap.close();
+    };
+    deadline.data = &finish;
+    ASSERT_EQ(uv_timer_start(&deadline, [](uv_timer_t* t) {
+        ADD_FAILURE() << "bootstrap/probe did not finish within its bound";
+        (*static_cast<decltype(finish)*>(t->data))();
+    }, 7500, 0), 0);
+    int ready = 0, persistent = 0, probes = 0;
+    bool saw_id = false;
+    bootstrap.on_request([&](const messages::Request& req) {
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = req.from.addr;
+        resp.id = bootstrap.table().id();
+        if (req.command == messages::CMD_FIND_NODE) {
+            EXPECT_FALSE(req.id.has_value());
+            EXPECT_FALSE(dht.is_persistent());
+        } else if (req.command == messages::CMD_PING_NAT) {
+            ++probes;
+            EXPECT_EQ(ready, 0);
+            EXPECT_FALSE(dht.is_persistent());
+            if (mode == 1) return;
+            if (mode == 2) { finish(); return; }
+            ASSERT_TRUE(req.value && req.value->size() == 2);
+            resp.from.addr.port = (*req.value)[0] | ((*req.value)[1] << 8);
+        } else if (req.command == messages::CMD_PING) {
+            const auto expected = rpc::compute_peer_id(req.from.addr);
+            EXPECT_EQ(req.id, expected);
+            EXPECT_EQ(req.from.addr.port, dht.socket().port());
+            saw_id = req.id == expected;
+        }
+        bootstrap.reply(resp, req.from_server);
+    });
+    dht.on_persistent([&]() { ++persistent; EXPECT_EQ(ready, 0); });
+    dht.on_bootstrapped([&]() {
+        ++ready;
+        EXPECT_EQ(probes, mode == 3 ? 0 : 1);
+        EXPECT_EQ(dht.is_persistent(), reachable);
+        if (!reachable) { finish(); return; }
+        const auto address = compact::Ipv4Address::from_string("127.0.0.1", dht.socket().port());
+        EXPECT_EQ(dht.socket().table().id(), rpc::compute_peer_id(address));
+        messages::Request ping;
+        ping.internal = true;
+        ping.command = messages::CMD_PING;
+        ping.to.addr = opts.bootstrap[0];
+        dht.socket().request(ping, [&](const messages::Response&) { finish(); },
+            [&](uint16_t) { ADD_FAILURE() << "persistent ping timed out"; finish(); });
+    });
+    EXPECT_FALSE(dht.is_persistent());
+    ASSERT_EQ(dht.bind(), 0);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(ready, mode == 2 ? 0 : 1);
+    EXPECT_EQ(persistent, reachable ? 1 : 0);
+    EXPECT_EQ(probes, mode == 3 ? 0 : 1);
+    EXPECT_EQ(saw_id, reachable);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(Reachability, ForcedPersistentBootstrap,
+                        ::testing::Values(0, 1, 2, 3));
+
+TEST(HyperDHT, ForcedPersistentWithoutAddressStaysEphemeral) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    DhtOptions opts;
+    opts.ephemeral = false;
+    HyperDHT dht(&loop, opts);
+    int ready = 0;
+    dht.on_bootstrapped([&]() { ++ready; EXPECT_FALSE(dht.is_persistent()); });
+    ASSERT_EQ(dht.bind(), 0);
+    EXPECT_EQ(ready, 1);
+    EXPECT_FALSE(dht.is_persistent());
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
 TEST(HyperDHT, ForcedEphemeralIsNonAdaptive) {

@@ -613,6 +613,7 @@ void RpcSocket::start_tick() {
 void RpcSocket::close() {
     if (closing_) return;
     closing_ = true;
+    on_firewall_probe_done_ = nullptr;
 
     auto free_timer = [](uv_handle_t* h) {
         delete reinterpret_cast<uv_timer_t*>(h);
@@ -1279,23 +1280,36 @@ void RpcSocket::trigger_refresh() {
 
 // JS: dht-rpc/index.js:801-875 (_updateNetworkState).
 //
-// Now matches JS: when NAT sampler says CONSISTENT, we run a firewall
+// Matches JS: when the ring sampler has a consistent address, run a firewall
 // probe (PING_NAT from client_socket_, replies expected on server_socket_)
 // before committing to the persistent transition. This correctly detects
 // port-restricted cone NATs that map consistently but block unsolicited
 // inbound — JS: _checkIfFirewalled (index.js:916-963).
 //
 // Idempotency: once `ephemeral_` has flipped to false, this is a no-op.
-void RpcSocket::check_persistent() {
+void RpcSocket::check_persistent(OnStateCallback on_done) {
 #ifdef HYPERDHT_EMBEDDED
     // ESP32 is always behind home WiFi NAT and never goes persistent. The
     // firewall probe, persistent transition, and the second socket are all
     // skipped on this build — see HYPERDHT_EMBEDDED in rpc.cpp::bind() and
     // RpcSocket::active_socket().
+    if (on_done) on_done();
     return;
 #else
-    if (!ephemeral_) return;
-    if (firewall_probe_running_) return;  // probe already in flight
+    if (closing_ || !ephemeral_) {
+        if (on_done) on_done();
+        return;
+    }
+    if (firewall_probe_running_) {
+        if (on_done) {
+            auto previous = std::move(on_firewall_probe_done_);
+            on_firewall_probe_done_ = [previous = std::move(previous), on_done = std::move(on_done)]() {
+                if (previous) previous();
+                on_done();
+            };
+        }
+        return;
+    }
 
     // JS: index.js:805 — `const { host, port } = this._nat` (the ring
     // sampler). The ring's threshold gating is what makes `port() == 0`
@@ -1307,26 +1321,23 @@ void RpcSocket::check_persistent() {
         DHT_LOG("  [rpc] check_persistent: no address yet (host=%s port=%u)\n",
                 current_host.c_str(), ring_sampler_.port());
         stable_ticks_ = STABLE_TICKS_MORE;
+        if (on_done) on_done();
         return;
     }
 
     stable_ticks_ = STABLE_TICKS_MORE;
     last_nat_host_ = current_host;
 
-    // Firewall TYPE still comes from the hyperdht-Nat classifier (nat_sampler_)
-    // — its holepunch/server/connect consumers rely on it. This is the
-    // accepted C++ divergence noted on nat_sampler_.
-    uint32_t fw = nat_sampler_.firewall();
-    const char* fw_str = fw == 0 ? "UNKNOWN" : fw == 1 ? "OPEN" :
-                         fw == 2 ? "CONSISTENT" : fw == 3 ? "RANDOM" : "?";
-    DHT_LOG("  [rpc] check_persistent: host=%s:%u firewall=%s (%u)\n",
-            current_host.c_str(), ring_sampler_.port(), fw_str, fw);
-
-    if (fw == 2 /* CONSISTENT */ || fw == 1 /* OPEN */) {
-        // Don't transition immediately — run firewall probe first.
-        // JS: index.js:821 — `const firewalled = this.firewalled && (await this._checkIfFirewalled(natSampler))`
-        start_firewall_probe();
+    if (!firewalled_) {
+        // JS reuses its confirmed sampler when the socket is already reachable.
+        do_persistent_transition();
+        if (on_done) on_done();
+        return;
     }
+    // JS gates on the ring's address, then verifies the server socket; it does
+    // not require the separate holepunch NAT classifier to finish sampling.
+    on_firewall_probe_done_ = std::move(on_done);
+    start_firewall_probe();
 #endif  // HYPERDHT_EMBEDDED
 }
 
@@ -1352,7 +1363,7 @@ void RpcSocket::start_firewall_probe() {
     probe_expected_ = nodes.size();
     if (nodes.empty()) {
         DHT_LOG("  [rpc] firewall probe: no nodes to probe\n");
-        firewall_probe_running_ = false;
+        finish_firewall_probe();
         return;
     }
 
@@ -1404,6 +1415,7 @@ void RpcSocket::finish_firewall_probe() {
     firewall_probe_running_ = false;
     probe_requests_.clear();
     if (probe_timer_) uv_timer_stop(probe_timer_);
+    auto done = std::move(on_firewall_probe_done_);
 
     size_t threshold = probe_threshold();
     bool is_firewalled = probe_replied_hosts_.size() < threshold;
@@ -1415,6 +1427,7 @@ void RpcSocket::finish_firewall_probe() {
     if (is_firewalled) {
         firewalled_ = true;
         // Stay ephemeral — retry on next stable_ticks_ cycle
+        if (done) done();
         return;
     }
 
@@ -1427,6 +1440,7 @@ void RpcSocket::finish_firewall_probe() {
         DHT_LOG("  [rpc] firewall probe: host mismatch (client=%s server=%s) → FIREWALLED\n",
                 ring_sampler_.host().c_str(), probe_ring_.host().c_str());
         firewalled_ = true;
+        if (done) done();
         return;
     }
 
@@ -1439,6 +1453,7 @@ void RpcSocket::finish_firewall_probe() {
         DHT_LOG("  [rpc] firewall probe: port remapped (server local=%u external=%u) → FIREWALLED\n",
                 server_local, probe_ring_.port());
         firewalled_ = true;
+        if (done) done();
         return;
     }
 
@@ -1448,6 +1463,7 @@ void RpcSocket::finish_firewall_probe() {
 
     // Not firewalled — proceed with persistent transition
     do_persistent_transition();
+    if (done) done();
 }
 
 std::vector<routing::Node> RpcSocket::collect_probe_nodes(size_t max) {
@@ -1465,7 +1481,7 @@ std::vector<routing::Node> RpcSocket::collect_probe_nodes(size_t max) {
 // the firewall probe callback and force_check_persistent() can use it.
 //
 // JS: index.js:824 — `this.firewalled = this.io.firewalled = false`
-// After the firewall probe succeeds (or we're forced persistent),
+// After the firewall probe succeeds (or the test hook bypasses it),
 // firewalled_ flips to false and all traffic switches to server_socket_.
 void RpcSocket::do_persistent_transition() {
     if (!ephemeral_) return;

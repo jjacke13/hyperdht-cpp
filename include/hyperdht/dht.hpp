@@ -162,9 +162,9 @@ struct DhtOptions {
     // id and never advertise one; a persistent node does. Left UNSET by default
     // (adaptive: start ephemeral, transition to persistent once the firewall
     // probe confirms reachability). Set explicitly to force it:
-    //   ephemeral = false → JS `_forcePersistent`: start non-ephemeral, hold id,
-    //                       and (with adaptive computed false) skip the periodic
-    //                       re-check + wakeup revert.
+    //   ephemeral = false → JS `_forcePersistent`: attempt persistence during
+    //                       bootstrap after verifying the address; skip the
+    //                       periodic re-check + wakeup revert.
     //   ephemeral = true  → force ephemeral: never transition (adaptive false).
     // JS index.js:53 — `adaptive = typeof opts.ephemeral !== 'boolean' &&
     // opts.adaptive !== false`. Setting `ephemeral` at all makes the node

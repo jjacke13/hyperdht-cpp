@@ -115,15 +115,11 @@ HyperDHT::HyperDHT(uv_loop_t* loop, DhtOptions opts)
     // JS index.js:53 — `adaptive = typeof opts.ephemeral !== 'boolean' &&
     // opts.adaptive !== false`. When the caller pins `ephemeral` explicitly the
     // node is non-adaptive (no periodic re-check, no wakeup revert). A
-    // forced-persistent node (ephemeral == false, JS `_forcePersistent`) also
-    // starts non-ephemeral so it holds and advertises a stable id — the
-    // bootstrapper's address-based id is finalised in bootstrapper() below.
+    // forced-persistent node still starts ephemeral (JS index.js:51) and
+    // attempts the verified transition during bootstrap (index.js:392-398).
     const bool adaptive = !opts_.ephemeral.has_value() && opts_.adaptive;
     socket_->set_adaptive(adaptive);
     socket_->set_quick_firewall(opts_.quick_firewall);
-    if (opts_.ephemeral.has_value()) {
-        socket_->set_ephemeral(*opts_.ephemeral);
-    }
 
     // filterNode: install the JS hardcoded testnet blocklist
     // (hyperdht/index.js:585-592) plus any caller-provided filter. Both
@@ -424,14 +420,9 @@ std::unique_ptr<HyperDHT> HyperDHT::bootstrapper(
         // immediately and can compute its address-based id.
         dht->socket_->ring_sampler().add(self_addr.host_string(),
                                          self_addr.port);
-        // tick-5: the bootstrapper is forced-persistent (opts.ephemeral=false →
-        // set_ephemeral(false) in the ctor), so do_persistent_transition never
-        // runs to rebuild the table id. Finalise the address-based id here from
-        // the just-seeded ring sampler. JS: the bootstrapper goes persistent
-        // during _bootstrap via _updateNetworkState → peer.id(host,port)
-        // (index.js:831). Combined with the outgoing-id gate (sweep-miss-b), a
-        // non-firewalled bootstrapper now advertises the correct id in its own
-        // requests, so peers add it to their routing tables.
+        // Preserve the bootstrapper's explicit trusted-address initialization;
+        // ordinary forced-persistent nodes must first verify their address.
+        dht->socket_->set_ephemeral(false);
         dht->socket_->adopt_address_id_from_ring();
     }
 

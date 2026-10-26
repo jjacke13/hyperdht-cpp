@@ -323,9 +323,8 @@ public:
     void set_adaptive(bool v) { adaptive_ = v; stable_ticks_ = v ? STABLE_TICKS_INIT : 0; }
     bool is_adaptive() const { return adaptive_; }
 
-    // JS index.js:51,71 — apply `opts.ephemeral`. A forced-persistent node
-    // (opts.ephemeral === false) starts non-ephemeral. Set at construction,
-    // before bind()/the first tick.
+    // Explicit state override for bootstrapper()/low-level callers. Generic
+    // opts.ephemeral=false must verify its address via check_persistent().
     void set_ephemeral(bool v) { ephemeral_ = v; }
 
     // JS index.js:70 `_quickFirewall = opts.quickFirewall !== false`.
@@ -358,6 +357,11 @@ public:
 
     // Reset the refresh timer (called by query engine when queries are active)
     void reset_refresh_timer() { refresh_ticks_ = REFRESH_TICKS; }
+
+    // Verify reachability and adopt the address-based id. Completion runs on
+    // success or failure (possibly synchronously); close cancels it. Bootstrap
+    // uses this for JS _forcePersistent instead of waiting for adaptive ticks.
+    void check_persistent(OnStateCallback on_done = nullptr);
 
     // Force an immediate ephemeral → persistent transition, bypassing
     // the firewall probe. Exposed for tests that need deterministic
@@ -608,12 +612,12 @@ private:
     void do_wakeup();
     void ping_some();
     void trigger_refresh();
-    void check_persistent();
     void do_persistent_transition();
 
     // Firewall probe — verifies server socket is reachable before persistent transition
     // JS: dht-rpc/index.js:916-963 (_checkIfFirewalled)
     bool firewall_probe_running_ = false;
+    OnStateCallback on_firewall_probe_done_;
     std::unordered_set<std::string> probe_replied_hosts_;
     std::unordered_map<uint16_t, compact::Ipv4Address> probe_requests_;
     size_t probe_expected_ = 0;

@@ -52,9 +52,9 @@ void HyperDHT::on_bootstrapped(BootstrappedCallback cb) {
 //     observable `onlyFirewall` effect, which is what shaves up to ~20 min off
 //     firewall determination for a reachable node. DEFERRED (reported): the full
 //     2-pass loop and the `testNat`-gated second `_updateNetworkState`. The
-//     ephemeral→persistent transition itself still runs through the existing
-//     stable-ticks → RingSampler firewall-probe path (that separate, later probe
-//     is NOT touched here).
+//     Default adaptive nodes still transition through stable ticks. Explicit
+//     ephemeral=false instead awaits the existing probe after this walk, as
+//     JS _forcePersistent does; the full two-pass bootstrap remains deferred.
 // ---------------------------------------------------------------------------
 
 void HyperDHT::start_bootstrap_walk() {
@@ -95,31 +95,29 @@ void HyperDHT::start_bootstrap_walk() {
     // JS: index.js:406-432 (`_bootstrap` ondata).
     q->on_reply([this, weak_alive](const query::QueryReply& reply) {
         if (weak_alive.expired()) return;
+        if (opts_.ephemeral == false) return;  // JS skips quick-firewall when forced
         socket_->quick_firewall_ping(reply.from_addr);
     });
 
     q->on_done([this, weak_alive](int /*error*/,
                                   const std::vector<query::QueryReply>& closest) {
         if (weak_alive.expired()) return;
-        // JS `_bootstrap:402` — flip the flag, then emit `ready`.
-        socket_->set_bootstrapped(true);
-        DHT_LOG("  [dht] bootstrap: walk complete, %zu closest replies, "
-                "routing table size=%zu\n",
-                closest.size(), socket_->table().size());
-
-        // Drop our strong ref BEFORE firing the user callback. This way,
-        // if the user's `on_bootstrapped` callback re-enters HyperDHT
-        // (e.g. calls `destroy()` or starts a new query), it never sees
-        // a non-null `bootstrap_query_` after the walk has conceptually
-        // finished. The Query itself is pinned for the duration of this
-        // callback by Query's internal `shared_from_this()` self-capture,
-        // so dropping our reference here is safe.
+        // Release the query before the asynchronous probe or a reentrant ready.
         bootstrap_query_.reset();
-
-        if (on_bootstrapped_) {
-            auto once = std::move(on_bootstrapped_);
-            once();
-        }
+        auto ready = [this, weak_alive, count = closest.size()]() {
+            if (weak_alive.expired() || destroyed_) return;
+            // JS `_bootstrap:402` — flip the flag, then emit `ready`.
+            socket_->set_bootstrapped(true);
+            DHT_LOG("  [dht] bootstrap: walk complete, %zu closest replies, "
+                    "routing table size=%zu\n", count, socket_->table().size());
+            if (on_bootstrapped_) {
+                auto once = std::move(on_bootstrapped_);
+                once();
+            }
+        };
+        // JS _bootstrap awaits _updateNetworkState(false) for _forcePersistent.
+        if (opts_.ephemeral == false) socket_->check_persistent(std::move(ready));
+        else ready();
     });
 
     bootstrap_query_ = q;

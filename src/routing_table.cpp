@@ -7,7 +7,11 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#ifdef HYPERDHT_EMBEDDED
+#include <sodium.h>
+#else
 #include <random>
+#endif
 
 namespace hyperdht {
 namespace routing {
@@ -211,9 +215,14 @@ const Node* RoutingTable::random() const {
     if (size_ == 0) return nullptr;
 
     // Generate random index [0, size_)
+#ifdef HYPERDHT_EMBEDDED
+    // GCC TLS consumes every IDF task's stack, including the small idle stack.
+    size_t n = randombytes_uniform(static_cast<uint32_t>(size_));
+#else
     static thread_local std::mt19937 rng(std::random_device{}());
     std::uniform_int_distribution<size_t> dist(0, size_ - 1);
     size_t n = dist(rng);
+#endif
 
     // Walk through buckets to find the n-th node
     for (const auto& bucket : buckets_) {

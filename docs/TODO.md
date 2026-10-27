@@ -5,12 +5,19 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-27 (first live cached route; older snapshots below are historical).
+Last updated: 2026-10-27 (direct connection sockets; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-27 direct socket results:** OPEN, no-holepunch and LAN results
+  report the main UDX socket already selected by consumers' fallback. This
+  enables the existing route cache when both sides opt in. No socket ownership
+  or C ABI layout change is introduced. A non-relayed cached main route
+  completes directly after its handshake, matching JS instead of entering
+  holepunching; actual firewall observations retain priority and relay setup
+  retains its order. Pooled-socket cached retry remains separate work.
 - **2026-10-27 cache insertion:** retain the first live route for each peer,
   matching JS socket-pool.js. Later successful sockets are marked reusable
   without replacing that route; removal or socket closure permits a fresh one.

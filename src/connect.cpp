@@ -221,7 +221,8 @@ struct ConnState {
 // Forward declarations for helper functions extracted from do_connect.
 // See definitions below.
 static void on_handshake_success(std::shared_ptr<ConnState> state,
-                                  const peer_connect::HandshakeResult& hs);
+                                  const peer_connect::HandshakeResult& hs,
+                                  bool cached_main_route = false);
 static void start_relay_path(std::shared_ptr<ConnState> state,
                               bool is_initiator,
                               noise::PubKey relay_pk,
@@ -607,10 +608,12 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
             // including this route path (connect.js:386-411): same
             // firewall/addresses/relayThrough as fire_handshake.
             auto route_addr = route->address;
+            const bool cached_main_route = route->socket == socket_->socket_handle();
             peer_connect::peer_handshake(*socket_, route_addr,
                 prepare_handshake(state),
-                [state, route_addr](const peer_connect::HandshakeResult& hs) {
-                    if (state->completed || state->alive.expired()) return;
+                [state, route_addr, cached_main_route](const peer_connect::HandshakeResult& hs) {
+                    auto alive = state->alive.lock();
+                    if (state->completed || !alive || !*alive) return;
                     if (hs.terminal) {
                         state->complete_error(ConnectError::SERVER_ERROR);
                         return;
@@ -618,7 +621,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                     if (hs.success) {
                         state->relay_addr = route_addr;
                         state->hs_result = hs;
-                        on_handshake_success(state, hs);
+                        on_handshake_success(state, hs, cached_main_route);
                         return;
                     }
                     // Route failed — fall through to findPeer
@@ -669,7 +672,8 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
 // inside connectThroughNode)
 // ---------------------------------------------------------------------------
 static void on_handshake_success(std::shared_ptr<ConnState> state,
-                                  const peer_connect::HandshakeResult& hs) {
+                                  const peer_connect::HandshakeResult& hs,
+                                  bool cached_main_route) {
     // Replay cached firewall event if server's first packet arrived before
     // the handshake reply. JS: connect.js:493-496
     //   if (c.serverSocket) { c.onsocket(c.serverSocket, ...); return }
@@ -740,9 +744,13 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
     // connect-5 — pass the serverAddress fallback for getFirstRemoteAddress
     // semantics (connect.js:196-203,212-221).
     holepunch::HolepunchResult hp_result;
-    if (holepunch::try_direct_connect(hs, hp_result, server_addr_js)) {
-        DHT_LOG("  [connect] *** DIRECT CONNECT (server OPEN) → %s:%u "
+    // JS connect.js:499-501: a non-relayed cached main address is already reachable.
+    const bool direct_main = cached_main_route && server_addr_js == state->relay_addr;
+    if (direct_main) hp_result.address = state->relay_addr;
+    if (direct_main || holepunch::try_direct_connect(hs, hp_result, server_addr_js)) {
+        DHT_LOG("  [connect] *** DIRECT CONNECT (%s) → %s:%u "
                 "(no holepunch, no pool socket) ***\n",
+                direct_main ? "cached main route" : "server OPEN",
                 hp_result.address.host_string().c_str(), hp_result.address.port);
         ConnectResult result;
         result.success = true;
@@ -751,6 +759,7 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
         result.handshake_hash = hs.handshake_hash;
         result.remote_public_key = hs.remote_public_key;
         result.peer_address = hp_result.address;
+        result.udx_socket = state->socket->socket_handle();
         result.local_udx_id = state->our_udx_id;
         if (hs.remote_payload.udx.has_value()) {
             result.remote_udx_id = hs.remote_payload.udx->id;
@@ -780,6 +789,7 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
         result.handshake_hash = hs.handshake_hash;
         result.remote_public_key = hs.remote_public_key;
         result.peer_address = direct_addr;
+        result.udx_socket = state->socket->socket_handle();
         result.local_udx_id = state->our_udx_id;
         if (hs.remote_payload.udx.has_value()) {
             result.remote_udx_id = hs.remote_payload.udx->id;
@@ -885,7 +895,8 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
                 assert(state->dht && "ConnState::dht must be set");
                 state->dht->ping(lan_addr,
                     [state, lan_addr](bool ok) {
-                        if (state->completed) return;
+                        auto alive = state->alive.lock();
+                        if (state->completed || !alive || !*alive) return;
                         if (!ok) {
                             // JS connect.js:244-247 — ping failure aborts the
                             // connect (HOLEPUNCH_ABORTED); the holepunch was
@@ -905,6 +916,7 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
                         result.remote_public_key =
                             state->hs_result.remote_public_key;
                         result.peer_address = lan_addr;
+                        result.udx_socket = state->socket->socket_handle();
                         result.local_udx_id = state->our_udx_id;
                         if (state->hs_result.remote_payload.udx.has_value()) {
                             result.remote_udx_id =

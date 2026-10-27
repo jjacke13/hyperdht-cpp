@@ -196,7 +196,7 @@ struct ConnectResult {
     uint32_t remote_udx_id = 0;
     uint32_t local_udx_id = 0;
     udx_stream_t* raw_stream = nullptr;   // Pre-created during handshake (like JS rawStream)
-    udx_socket_t* udx_socket = nullptr;   // Socket for UDX connect (JS: ref.socket from probe)
+    udx_socket_t* udx_socket = nullptr;   // Selected UDX socket (main or pooled)
     // Keeps the pool socket alive for the UDX stream's lifetime. Caller must
     // hold this as long as the stream is using udx_socket.
     std::shared_ptr<void> socket_keepalive;

@@ -202,7 +202,7 @@ typedef struct {
     uint16_t peer_port;
     int is_initiator;       /**< 1 if we initiated, 0 if we accepted */
     void* raw_stream;       /**< Pre-created UDX stream (server side), or NULL */
-    void* udx_socket;       /**< Socket for UDX connect (from holepunch probe), or NULL */
+    void* udx_socket;       /**< Selected UDX socket (main or pooled), or NULL for the main-socket fallback */
     /**
      * Opaque — do not touch. Holds the keepalive for the socket this
      * connection lives on (often a per-session punch socket or a birthday

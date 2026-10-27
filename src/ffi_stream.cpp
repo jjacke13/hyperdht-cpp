@@ -67,7 +67,7 @@ hyperdht_stream_t* hyperdht_stream_open(
             int sock_len = sizeof(sock_addr);
             udx_socket_getsockname(sock, reinterpret_cast<struct sockaddr*>(&sock_addr), &sock_len);
             DHT_LOG("  [ffi-stream] stream connecting via %s socket (port %u) → %s:%u\n",
-                    conn->udx_socket ? "holepunch" : "server_socket",
+                    conn->udx_socket ? "selected" : "server_socket",
                     ntohs(sock_addr.sin_port), conn->peer_host, conn->peer_port);
 
             udx_stream_connect(raw, sock,

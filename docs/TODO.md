@@ -5,12 +5,19 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-27 (C/Kotlin connection error mapping; older snapshots below are historical).
+Last updated: 2026-10-27 (storage read completion errors; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-27 read completion errors:** immutable/mutable get results retain
+  the existing query completion status, and C get/get_ex callbacks forward it.
+  Explicit C cancellation keeps priority; ordinary misses remain successful.
+  Kotlin immutableGet rejects a nonzero completion instead of returning null.
+  No query, timeout, early-success or wire policy changes are introduced.
+  C++ consumers must rebuild for the appended result fields; the C ABI is
+  unchanged. Immediate JNI returns and general error descriptions remain open.
 - **2026-10-27 C/Kotlin connection errors:** C++ terminal server-handshake
   failures map to the additive C/Kotlin `SERVER_ERROR` code (-9), with a native
   description. Existing C++ codes and C query cancellation (-8) are preserved;

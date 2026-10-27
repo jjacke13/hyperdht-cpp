@@ -12,6 +12,7 @@
 
 #include "hyperdht/announce_sig.hpp"
 #include "hyperdht/dht.hpp"
+#include "hyperdht/dht_messages.hpp"
 #include "hyperdht/holepunch.hpp"
 #include "hyperdht/hyperdht.h"
 #include "hyperdht/rpc.hpp"
@@ -898,6 +899,137 @@ TEST(HyperDHT, PutCompletionPreservesQueryErrors) {
         }
     }
 }
+
+// JS get iteration propagates query failures, but an ordinary miss is null.
+// Use the existing optional commit hook to produce a real completion error;
+// ordinary read misses / remote errors must not become TOO_FEW_NODES.
+struct StorageReadCase { int api; bool mutable_value; int outcome; };
+class StorageReadErrors : public ::testing::TestWithParam<StorageReadCase> {};
+
+TEST_P(StorageReadErrors, PreservesStatusAndValueSemantics) {
+    const auto [api, mutable_value, outcome] = GetParam();
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    rpc::RpcSocket store(&loop, {});
+    ASSERT_EQ(store.bind(0, "127.0.0.1"), 0);
+    make_persistent(store);
+    const auto addr = compact::Ipv4Address::from_string("127.0.0.1", store.port());
+    const auto id = rpc::compute_peer_id(addr);
+    const std::vector<uint8_t> value{'r', 'e', 'a', 'd'};
+    noise::Seed seed{}; seed.fill(0x38);
+    const auto kp = noise::generate_keypair(seed);
+    const auto target = mutable_value ? kp.public_key
+        : dht_ops::hash_public_key(value.data(), value.size());
+    store.on_request([&](const messages::Request& req) {
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = req.from.addr;
+        resp.id = id;
+        if (outcome == 5) resp.error = messages::ERR_UNKNOWN_COMMAND;
+        if (outcome == 0 || outcome == 4) {
+            if (mutable_value) {
+                dht_messages::MutableGetResponse r;
+                r.seq = 7; r.value = value;
+                r.signature = announce_sig::sign_mutable(7, value.data(), value.size(), kp);
+                resp.value = dht_messages::encode_mutable_get_resp(r);
+            } else resp.value = value;
+        }
+        store.reply(resp, req.from_server);
+    });
+    auto* client = hyperdht_create(&loop, nullptr);
+    ASSERT_NE(client, nullptr);
+    ASSERT_EQ(hyperdht_bind(client, 0), 0);
+    routing::Node node;
+    node.id = id; node.host = "127.0.0.1"; node.port = addr.port;
+    ASSERT_TRUE(client->dht->socket().table().add(node));
+    struct Completion {
+        int calls = 0, error = -100, values = 0;
+        std::vector<uint8_t> value;
+    } done;
+    auto on_value = +[](const uint8_t* bytes, size_t len, void* ud) {
+        auto& d = *static_cast<Completion*>(ud);
+        ++d.values; d.value.assign(bytes, bytes + len);
+    };
+    auto on_mutable = +[](uint64_t seq, const uint8_t* bytes, size_t len,
+                          const uint8_t*, void* ud) {
+        EXPECT_EQ(seq, 7u);
+        auto& d = *static_cast<Completion*>(ud);
+        ++d.values; d.value.assign(bytes, bytes + len);
+    };
+    auto on_done = +[](int error, void* ud) {
+        auto& d = *static_cast<Completion*>(ud);
+        ++d.calls; d.error = error;
+    };
+    std::shared_ptr<query::Query> q;
+    hyperdht_query_t* handle = nullptr;
+    if (api == 0) {
+        if (mutable_value) {
+            q = client->dht->mutable_get(kp.public_key, 0, true,
+                [&](const dht_ops::MutableResult& r) {
+                    on_mutable(r.seq, r.value.data(), r.value.size(), r.signature.data(), &done);
+                }, [&](const HyperDHT::MutableGetResult& r) {
+                    on_done(r.error, &done);
+                    EXPECT_EQ(r.found, outcome == 0);
+                    if (r.found) { EXPECT_EQ(r.seq, 7u); EXPECT_EQ(r.value, value); }
+                });
+        } else {
+            q = client->dht->immutable_get(target,
+                [&](const std::vector<uint8_t>& v) { on_value(v.data(), v.size(), &done); },
+                [&](const HyperDHT::ImmutableGetResult& r) {
+                    on_done(r.error, &done);
+                    EXPECT_EQ(r.found, outcome == 0);
+                    if (r.found) EXPECT_EQ(r.value, value);
+                });
+        }
+    } else if (api == 1) {
+        ASSERT_EQ(mutable_value
+            ? hyperdht_mutable_get(client, target.data(), 0, on_mutable, on_done, &done)
+            : hyperdht_immutable_get(client, target.data(), on_value, on_done, &done), 0);
+    } else {
+        handle = mutable_value
+            ? hyperdht_mutable_get_ex(client, target.data(), 0, on_mutable, on_done, &done)
+            : hyperdht_immutable_get_ex(client, target.data(), on_value, on_done, &done);
+        ASSERT_NE(handle, nullptr);
+        q = handle->state->q;
+    }
+    if (outcome == 2) {
+        ASSERT_NE(q, nullptr);
+        // The tokenless closest node fails the query's optional commit phase.
+        q->set_commit([](const query::QueryReply&, rpc::OnResponseCallback,
+                         rpc::OnTimeoutCallback) { ADD_FAILURE() << "tokenless commit dispatched"; });
+    } else if (outcome == 3) hyperdht_query_cancel(handle);
+    else if (outcome == 4) { hyperdht_query_free(handle); handle = nullptr; }
+    const auto deadline = uv_hrtime() + 2000000000ULL;
+    while (uv_hrtime() < deadline && (q ? !q->is_done() : done.calls == 0)) {
+        uv_run(&loop, UV_RUN_NOWAIT); uv_sleep(1);
+    }
+    EXPECT_EQ(done.calls, outcome == 4 ? 0 : 1);
+    if (outcome != 4) {
+        EXPECT_EQ(done.error, outcome == 2 ? query::QUERY_ERR_TOO_FEW_NODES
+                            : outcome == 3 ? HYPERDHT_ERR_CANCELLED : query::QUERY_OK);
+        EXPECT_EQ(done.values, outcome == 0 ? 1 : 0);
+        if (outcome == 0) EXPECT_EQ(done.value, value);
+    }
+    hyperdht_destroy_force(client, nullptr, nullptr);
+    store.close(); uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(done.calls, outcome == 4 ? 0 : 1);
+    // Release this white-box fixture's explicit query ownership after callbacks.
+    if (q) { q->on_done(nullptr); q->on_reply(nullptr); }
+    if (handle) { handle->state->q.reset(); hyperdht_query_free(handle); }
+    q.reset(); hyperdht_free(client);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(ReadStatus, StorageReadErrors, ::testing::ValuesIn([] {
+    std::vector<StorageReadCase> cases;
+    for (int api = 0; api < 3; ++api) for (bool m : {false, true})
+        for (int outcome = 0; outcome < 6; ++outcome) {
+            if (api != 2 && (outcome == 3 || outcome == 4)) continue;
+            if (api == 1 && outcome == 2) continue;
+            cases.push_back({api, m, outcome});
+        }
+    return cases;
+}()));
 
 TEST(HyperDHT, ImmutablePutReturnsValidQuery) {
     uv_loop_t loop;

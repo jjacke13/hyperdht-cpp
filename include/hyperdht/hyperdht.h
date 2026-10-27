@@ -478,7 +478,8 @@ typedef void (*hyperdht_mutable_cb)(uint64_t seq,
                                      const uint8_t signature[64],
                                      void* userdata);
 
-/** Callback for put operations — called when complete. */
+/** Query completion status: 0 on success (including a read miss), a positive
+ *  query failure code, or HYPERDHT_ERR_CANCELLED for a cancelled _ex query. */
 typedef void (*hyperdht_done_cb)(int error, void* userdata);
 
 /**
@@ -494,7 +495,7 @@ HYPERDHT_API int hyperdht_immutable_put(hyperdht_t* dht,
  * Retrieve an immutable value by its content hash.
  * @param target   32-byte BLAKE2b hash of the value
  * @param cb       called for each verified result
- * @param done_cb  called when query completes
+ * @param done_cb  called once with the query status; a normal miss has error=0
  * @return 0 on success (async), negative on error
  */
 HYPERDHT_API int hyperdht_immutable_get(hyperdht_t* dht,
@@ -522,7 +523,7 @@ HYPERDHT_API int hyperdht_mutable_put(hyperdht_t* dht,
  * @param public_key  32-byte public key
  * @param min_seq     minimum sequence number to accept (0 = any)
  * @param cb          called for each verified result
- * @param done_cb     called when query completes
+ * @param done_cb     called once with the query status; a normal miss has error=0
  * @return 0 on success (async), negative on error
  */
 HYPERDHT_API int hyperdht_mutable_get(hyperdht_t* dht,

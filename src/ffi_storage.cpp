@@ -34,8 +34,8 @@ int hyperdht_immutable_get(hyperdht_t* dht,
             if (cb) cb(value.data(), value.size(), userdata);
         },
         // on_done — once at completion
-        [done_cb, userdata](const hyperdht::HyperDHT::ImmutableGetResult&) {
-            if (done_cb) done_cb(0, userdata);
+        [done_cb, userdata](const hyperdht::HyperDHT::ImmutableGetResult& result) {
+            if (done_cb) done_cb(result.error, userdata);
         });
     return 0;
 }
@@ -78,8 +78,8 @@ int hyperdht_mutable_get(hyperdht_t* dht,
                        r.signature.data(), userdata);
         },
         // on_done — once at completion
-        [done_cb, userdata](const hyperdht::HyperDHT::MutableGetResult&) {
-            if (done_cb) done_cb(0, userdata);
+        [done_cb, userdata](const hyperdht::HyperDHT::MutableGetResult& result) {
+            if (done_cb) done_cb(result.error, userdata);
         });
     return 0;
 }
@@ -101,11 +101,10 @@ hyperdht_query_t* hyperdht_immutable_get_ex(hyperdht_t* dht,
             if (!state->done_cb) return;  // detached via free
             if (cb) cb(value.data(), value.size(), state->userdata);
         },
-        // Immutable's done signature differs but make_done_fn adapts via auto&
-        [state](const hyperdht::HyperDHT::ImmutableGetResult&) {
+        [state](const hyperdht::HyperDHT::ImmutableGetResult& result) {
             state->done = true;
             if (state->done_cb) {
-                int err = state->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
+                int err = state->cancelled ? HYPERDHT_ERR_CANCELLED : result.error;
                 state->done_cb(err, state->userdata);
             }
         });
@@ -131,10 +130,10 @@ hyperdht_query_t* hyperdht_mutable_get_ex(hyperdht_t* dht,
             if (cb) cb(r.seq, r.value.data(), r.value.size(),
                        r.signature.data(), state->userdata);
         },
-        [state](const hyperdht::HyperDHT::MutableGetResult&) {
+        [state](const hyperdht::HyperDHT::MutableGetResult& result) {
             state->done = true;
             if (state->done_cb) {
-                int err = state->cancelled ? HYPERDHT_ERR_CANCELLED : 0;
+                int err = state->cancelled ? HYPERDHT_ERR_CANCELLED : result.error;
                 state->done_cb(err, state->userdata);
             }
         });

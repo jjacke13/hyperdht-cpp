@@ -738,6 +738,7 @@ public:
     struct ImmutableGetResult {
         bool found = false;
         std::vector<uint8_t> value;
+        int error = query::QUERY_OK;  // Completion status; not-found alone is success.
     };
     using ImmutableValueCallback = std::function<void(const std::vector<uint8_t>&)>;
     using ImmutableGetCallback = std::function<void(const ImmutableGetResult&)>;
@@ -783,6 +784,7 @@ public:
         uint64_t seq = 0;
         std::vector<uint8_t> value;
         std::array<uint8_t, 64> signature{};
+        int error = query::QUERY_OK;  // Completion status; not-found alone is success.
     };
     using MutableValueCallback =
         std::function<void(const dht_ops::MutableResult&)>;

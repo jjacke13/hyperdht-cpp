@@ -23,3 +23,11 @@ c++ -std=c++20 -shared -fPIC -pthread \
 "$JAVA_HOME/bin/java" -Xcheck:jni -Djava.library.path="$BUILD_DIR" \
   -cp "$BUILD_DIR/kotlin-errors.jar:$COROUTINES_JAR" com.hyperdht.ConnectErrorsKt
 ```
+
+For the read-completion test, add `test/kotlin/read_callback_fixture.cpp` and
+`-Wl,--wrap=hyperdht_immutable_get` to the host JNI link command. Compile
+`test/kotlin/ReadErrors.kt` instead of `ConnectErrors.kt` and run
+`com.hyperdht.ReadErrorsTest`. This GNU-linker fixture injects C completion
+callbacks to test the real JNI/Kotlin handler; it is not a transport test.
+Real UDP/query-completion tests are `ReadStatus/StorageReadErrors.*` in
+`test_hyperdht`, including explicit cancellation and normal read misses.

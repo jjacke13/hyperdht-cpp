@@ -263,7 +263,10 @@ class HyperDHT(
         val deferred = CompletableDeferred<ByteArray?>()
         var result: ByteArray? = null
         val valCb = ValueCallback { value -> result = value }
-        val doneCb = DoneCallback { _ -> deferred.complete(result) }
+        val doneCb = DoneCallback { error ->
+            if (error != 0) deferred.completeExceptionally(DhtException(error))
+            else deferred.complete(result)
+        }
         onLoop { Native.immutableGet(handle, target, valCb, doneCb) }
         return deferred.await()
     }

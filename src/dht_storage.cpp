@@ -237,7 +237,8 @@ std::shared_ptr<query::Query> HyperDHT::immutable_get(
             }
         },
         [on_done = std::move(on_done), result](
-                int /*error*/, const std::vector<query::QueryReply>&) {
+                int error, const std::vector<query::QueryReply>&) {
+            result->error = error;
             DHT_LOG("  [dht] immutable_get done: found=%d\n",
                     result->found ? 1 : 0);
             if (on_done) on_done(*result);
@@ -344,7 +345,8 @@ std::shared_ptr<query::Query> HyperDHT::mutable_get(
             }
         },
         [on_done = std::move(on_done), result](
-                int /*error*/, const std::vector<query::QueryReply>&) {
+                int error, const std::vector<query::QueryReply>&) {
+            result->error = error;
             DHT_LOG("  [dht] mutable_get done: found=%d seq=%llu\n",
                     result->found ? 1 : 0,
                     static_cast<unsigned long long>(result->seq));

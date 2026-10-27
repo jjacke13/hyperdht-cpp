@@ -19,6 +19,7 @@ object Errors {
     const val HOLEPUNCH_TIMEOUT = -6
     const val RELAY_FAILED = -7
     const val CANCELLED = -8
+    const val SERVER_ERROR = -9
 
     fun describe(code: Int): String = when (code) {
         OK -> "success"
@@ -30,6 +31,7 @@ object Errors {
         HOLEPUNCH_TIMEOUT -> "holepunch timeout"
         RELAY_FAILED -> "relay connection failed"
         CANCELLED -> "cancelled"
+        SERVER_ERROR -> "server returned a handshake error or an incompatible reply"
         else -> "unknown error ($code)"
     }
 }

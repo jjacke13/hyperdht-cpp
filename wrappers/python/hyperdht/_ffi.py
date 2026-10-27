@@ -69,6 +69,7 @@ ERR_HOLEPUNCH_FAILED = -5
 ERR_HOLEPUNCH_TIMEOUT = -6
 ERR_RELAY_FAILED = -7
 ERR_CANCELLED = -8
+ERR_SERVER_ERROR = -9
 
 
 # ---------------------------------------------------------------------------

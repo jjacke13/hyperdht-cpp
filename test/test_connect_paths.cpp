@@ -32,6 +32,7 @@
 #include "hyperdht/noise_wrap.hpp"
 #include "hyperdht/peer_connect.hpp"
 #include "hyperdht/rpc.hpp"
+#include "../src/ffi_internal.hpp"
 
 using namespace hyperdht;
 using Ipv4Address = compact::Ipv4Address;
@@ -296,7 +297,9 @@ class CachedRouteReply : public ::testing::TestWithParam<int> {};
 TEST_P(CachedRouteReply, TerminalRepliesDoNotStartFindPeer) {
     // Authenticated version/error/UDX failures are terminal; malformed outer
     // replies and corrupt Noise messages must retain ordinary lookup fallback.
-    const int mode = GetParam();
+    const int mode = GetParam() % 6;
+    const bool ffi = GetParam() >= 6;
+    const int api = GetParam() / 6;  // C++, cached C, normal C, relay C, stream C
     const bool terminal = mode < 3;
     uv_loop_t loop;
     ASSERT_EQ(uv_loop_init(&loop), 0);
@@ -314,6 +317,12 @@ TEST_P(CachedRouteReply, TerminalRepliesDoNotStartFindPeer) {
         resp.id = rpc::compute_peer_id(address);
         if (!req.internal && req.command == messages::CMD_FIND_PEER) {
             ++lookups;
+            if (api >= 2) {
+                dht_messages::PeerRecord peer;
+                peer.public_key = keypair.public_key;
+                peer.relay_addresses.push_back(address);
+                resp.value = dht_messages::encode_peer_record(peer);
+            }
         } else if (!req.internal && req.command == messages::CMD_PEER_HANDSHAKE) {
             ++handshakes;
             ASSERT_TRUE(req.value.has_value());
@@ -324,7 +333,7 @@ TEST_P(CachedRouteReply, TerminalRepliesDoNotStartFindPeer) {
             ASSERT_TRUE(payload.has_value());
             const auto client = peer_connect::decode_noise_payload(payload->data(), payload->size());
             ASSERT_TRUE(client.udx.has_value());
-            EXPECT_TRUE(client.udx->reusable_socket);
+            EXPECT_EQ(client.udx->reusable_socket, api < 2);
             peer_connect::NoisePayload reply;
             reply.version = mode == 0 ? 2 : 1;
             reply.error = mode == 1 ? peer_connect::ERROR_TRY_LATER : peer_connect::ERROR_NONE;
@@ -340,7 +349,8 @@ TEST_P(CachedRouteReply, TerminalRepliesDoNotStartFindPeer) {
         }
         relay.reply(resp, req.from_server);
     });
-    HyperDHT dht(&loop);
+    hyperdht_s handle{std::make_unique<HyperDHT>(&loop)};
+    auto& dht = *handle.dht;
     ASSERT_EQ(dht.bind(), 0);
     routing::Node node;
     node.id = rpc::compute_peer_id(address);
@@ -350,25 +360,62 @@ TEST_P(CachedRouteReply, TerminalRepliesDoNotStartFindPeer) {
     dht.socket_pool()->add_route(keypair.public_key, dht.socket().socket_handle(), address);
     ConnectOptions opts;
     opts.reusable_socket = true;
-    int callbacks = 0, error = 0;
-    dht.connect(keypair.public_key, opts, [&](int err, const ConnectResult& result) {
-        ++callbacks;
-        error = err;
-        EXPECT_FALSE(result.success);
-    });
-    run_until(&loop, [&]() { return callbacks != 0; }, 5000);
-    EXPECT_EQ(callbacks, 1);
-    EXPECT_EQ(error, terminal ? ConnectError::SERVER_ERROR : ConnectError::PEER_CONNECTION_FAILED);
+    struct Completion { int calls = 0, error = 0; } done;
+    if (ffi) {
+        hyperdht_connect_opts_t c_opts;
+        hyperdht_connect_opts_default(&c_opts);
+        c_opts.reusable_socket = 1;
+        auto cb = [](int error, const hyperdht_connection_t* conn, void* userdata) {
+                auto& done = *static_cast<Completion*>(userdata);
+                ++done.calls;
+                done.error = error;
+                EXPECT_EQ(conn, nullptr);
+            };
+        int rc;
+        if (api == 1) {
+            rc = hyperdht_connect_ex(&handle, keypair.public_key.data(), &c_opts, cb, &done);
+        } else if (api == 2) {
+            rc = hyperdht_connect(&handle, keypair.public_key.data(), cb, &done);
+        } else if (api == 3) {
+            rc = hyperdht_connect_relay(&handle, keypair.public_key.data(), nullptr, 5000, cb, &done);
+        } else {
+            rc = hyperdht_connect_and_open_stream(&handle, keypair.public_key.data(),
+                [](int error, hyperdht_stream_t* stream, void* userdata) {
+                    auto& done = *static_cast<Completion*>(userdata);
+                    ++done.calls;
+                    done.error = error;
+                    EXPECT_EQ(stream, nullptr);
+                }, nullptr, nullptr, nullptr, &done);
+        }
+        ASSERT_EQ(rc, 0);
+    } else {
+        dht.connect(keypair.public_key, opts, [&](int error, const ConnectResult& result) {
+            ++done.calls;
+            done.error = error;
+            EXPECT_FALSE(result.success);
+        });
+    }
+    run_until(&loop, [&]() { return done.calls != 0; }, 5000);
+    EXPECT_EQ(done.calls, 1);
+    EXPECT_EQ(done.error, terminal ? (ffi ? HYPERDHT_ERR_SERVER_ERROR : ConnectError::SERVER_ERROR)
+                                  : ConnectError::PEER_CONNECTION_FAILED);
+    if (ffi && terminal) {
+        EXPECT_NE(done.error, HYPERDHT_ERR_CANCELLED);
+        EXPECT_STRNE(hyperdht_connect_strerror(done.error), "cancelled");
+        EXPECT_STRNE(hyperdht_connect_strerror(done.error), "unknown error");
+    }
     EXPECT_EQ(handshakes, 1);
-    EXPECT_EQ(lookups, terminal ? 0 : 1);
+    EXPECT_EQ(lookups, api >= 2 || !terminal ? 1 : 0);
     dht.destroy();
     relay.close();
     uv_run(&loop, UV_RUN_DEFAULT);
-    EXPECT_EQ(callbacks, 1);
+    EXPECT_EQ(done.calls, 1);
     EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
-INSTANTIATE_TEST_SUITE_P(Validation, CachedRouteReply, ::testing::Values(0, 1, 2, 3, 4, 5));
+INSTANTIATE_TEST_SUITE_P(Validation, CachedRouteReply,
+    ::testing::Values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+                      12, 13, 14, 18, 19, 20, 24, 25, 26));
 
 // JS connect.js:234-251 — when the LAN trigger fires and the LAN ping
 // succeeds, the connection completes over the LAN address and the

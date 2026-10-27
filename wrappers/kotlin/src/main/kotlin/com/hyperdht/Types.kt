@@ -19,6 +19,7 @@ object Errors {
     const val HOLEPUNCH_TIMEOUT = -6
     const val RELAY_FAILED = -7
     const val CANCELLED = -8
+    const val SERVER_ERROR = -9
 
     fun describe(code: Int): String = Native.connectStrerror(code)
 }

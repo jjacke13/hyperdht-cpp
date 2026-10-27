@@ -15,6 +15,28 @@
 // Keypair tests
 // ============================================================================
 
+TEST(CAPI, ConnectErrorDescriptions) {
+    struct Error { int code; const char* description; };
+    const Error errors[] = {
+        {HYPERDHT_OK, "success"},
+        {HYPERDHT_ERR_DESTROYED, "DHT destroyed during connect"},
+        {HYPERDHT_ERR_PEER_NOT_FOUND, "peer not found"},
+        {HYPERDHT_ERR_CONNECTION_FAILED, "peer connection failed (all relay handshakes failed)"},
+        {HYPERDHT_ERR_NO_ADDRESSES, "no connectable addresses from server"},
+        {HYPERDHT_ERR_HOLEPUNCH_FAILED, "holepunch failed"},
+        {HYPERDHT_ERR_HOLEPUNCH_TIMEOUT, "holepunch timeout"},
+        {HYPERDHT_ERR_RELAY_FAILED, "blind relay pairing failed"},
+        {HYPERDHT_ERR_CANCELLED, "cancelled"},
+        {HYPERDHT_ERR_SERVER_ERROR, "server returned a handshake error or an incompatible reply"},
+    };
+    EXPECT_EQ(HYPERDHT_ERR_CANCELLED, -8);
+    EXPECT_EQ(HYPERDHT_ERR_SERVER_ERROR, -9);
+    for (const auto& error : errors) {
+        EXPECT_STREQ(hyperdht_connect_strerror(error.code), error.description);
+    }
+    EXPECT_STREQ(hyperdht_connect_strerror(12345), "unknown error");
+}
+
 TEST(CAPI, KeypairGenerate) {
     hyperdht_keypair_t kp;
     hyperdht_keypair_generate(&kp);

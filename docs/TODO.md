@@ -5,12 +5,18 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-27 (direct connection sockets; older snapshots below are historical).
+Last updated: 2026-10-27 (C/Kotlin connection error mapping; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-27 C/Kotlin connection errors:** C++ terminal server-handshake
+  failures map to the additive C/Kotlin `SERVER_ERROR` code (-9), with a native
+  description. Existing C++ codes and C query cancellation (-8) are preserved;
+  server errors were previously mislabeled as cancellation by C consumers.
+  All C connect entry points use the mapping; JNI forwards the C result.
+  Other query/storage errors and synchronous JNI status handling remain open.
 - **2026-10-27 direct socket results:** OPEN, no-holepunch and LAN results
   report the main UDX socket already selected by consumers' fallback. This
   enables the existing route cache when both sides opt in. No socket ownership

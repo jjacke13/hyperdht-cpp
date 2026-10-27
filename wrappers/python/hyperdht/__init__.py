@@ -47,6 +47,7 @@ from hyperdht._ffi import (
     ERR_OK,
     ERR_PEER_NOT_FOUND,
     ERR_RELAY_FAILED,
+    ERR_SERVER_ERROR,
     FIREWALL_CONSISTENT,
     FIREWALL_OPEN,
     FIREWALL_RANDOM,
@@ -83,6 +84,7 @@ __all__ = [
     "ERR_HOLEPUNCH_TIMEOUT",
     "ERR_RELAY_FAILED",
     "ERR_CANCELLED",
+    "ERR_SERVER_ERROR",
 ]
 
 __version__ = "0.1.0"

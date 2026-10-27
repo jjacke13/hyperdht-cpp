@@ -209,12 +209,18 @@ parse_host_port(const char* s) {
 // Shared connect result → C callback bridge (used by both connect and
 // connect_relay). Converts ConnectResult into hyperdht_connection_t,
 // manages the pool-socket keepalive lifetime, and dispatches the user's cb.
+inline int connect_error_to_ffi(int error) {
+    // C++ SERVER_ERROR predates the C mapping and shares -8 with C cancellation.
+    return error == hyperdht::ConnectError::SERVER_ERROR
+        ? HYPERDHT_ERR_SERVER_ERROR : error;
+}
+
 inline void dispatch_connect_result(hyperdht_connect_cb cb, void* userdata,
                                     int error,
                                     const hyperdht::ConnectResult& result,
                                     bool is_initiator) {
     if (error != 0) {
-        cb(error, nullptr, userdata);
+        cb(connect_error_to_ffi(error), nullptr, userdata);
         return;
     }
     hyperdht_connection_t conn{};

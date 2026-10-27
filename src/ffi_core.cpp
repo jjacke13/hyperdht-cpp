@@ -12,6 +12,8 @@ const char* hyperdht_connect_strerror(int error) {
         case -6: return "holepunch timeout";
         case -7: return "blind relay pairing failed";
         case -8: return "cancelled";
+        case HYPERDHT_ERR_SERVER_ERROR:
+            return "server returned a handshake error or an incompatible reply";
         default: return "unknown error";
     }
 }
@@ -318,7 +320,7 @@ int hyperdht_connect_and_open_stream(
             int error, const hyperdht::ConnectResult& result) {
 
             if (error != 0) {
-                on_connect(error, nullptr, userdata);
+                on_connect(connect_error_to_ffi(error), nullptr, userdata);
                 return;
             }
 

@@ -745,8 +745,11 @@ HYPERDHT_API int hyperdht_connect_and_open_stream(
 #define HYPERDHT_ERR_HOLEPUNCH_TIMEOUT  (-6)
 #define HYPERDHT_ERR_RELAY_FAILED       (-7)
 #define HYPERDHT_ERR_CANCELLED          (-8)
+#define HYPERDHT_ERR_SERVER_ERROR       (-9)
 
-/** Return a human-readable name for a connect error code. */
+/** Return a static human-readable description for a C connect error code.
+ *  Terminal server-handshake errors use HYPERDHT_ERR_SERVER_ERROR; -8 remains
+ *  reserved for query cancellation. Unknown codes return "unknown error". */
 HYPERDHT_API const char* hyperdht_connect_strerror(int error);
 
 /* --- C2: DHT state --- */

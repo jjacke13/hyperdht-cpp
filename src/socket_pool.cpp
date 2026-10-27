@@ -3,6 +3,7 @@
 // timeout cleanup and refcount tracking.
 
 #include "hyperdht/socket_pool.hpp"
+#include "hyperdht/debug.hpp"
 
 #include <cstring>
 
@@ -263,10 +264,25 @@ void SocketPool::gc_routes_for_socket(udx_socket_t* socket) {
 }
 
 void SocketPool::on_stream_error(udx_socket_t* socket) {
-    // JS socket-pool.js:96-100 — a rawStream 'error' marks its socket
-    // non-reusable and gc's the route so it's never handed out again.
+    // Preserve the existing socket-wide API; real streams use the overload below.
     set_reusable(socket, false);
     gc_routes_for_socket(socket);
+}
+
+void SocketPool::on_stream_error(udx_stream_t* stream,
+                                const std::array<uint8_t, 32>& public_key) {
+    if (!stream) return;
+    auto key = key_hex(public_key);
+    auto it = routes_.find(key);
+    if (it != routes_.end() && (it->second.stream
+            ? it->second.stream == stream : it->second.socket == stream->socket)) {
+        // Keep the cached socket identity even after a relay-to-direct migration.
+        set_reusable(it->second.socket, false);
+        DHT_LOG("  [socket-pool] route-error key=%.8s stream=%u removed=1\n", key.c_str(), stream->local_id);
+        routes_.erase(it);
+    } else {
+        set_reusable(stream->socket, false);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -276,8 +292,15 @@ void SocketPool::on_stream_error(udx_socket_t* socket) {
 void SocketPool::add_route(const std::array<uint8_t, 32>& public_key,
                            udx_socket_t* socket,
                            const compact::Ipv4Address& address) {
+    add_route(public_key, socket, address, nullptr);
+}
+
+void SocketPool::add_route(const std::array<uint8_t, 32>& public_key,
+                           udx_socket_t* socket, const compact::Ipv4Address& address,
+                           udx_stream_t* stream) {
     auto hex = key_hex(public_key);
-    routes_[hex] = SocketRoute{socket, address};
+    routes_[hex] = SocketRoute{socket, address, stream};
+    DHT_LOG("  [socket-pool] route-add key=%.8s stream=%u socket=%p\n", hex.c_str(), stream ? stream->local_id : 0, static_cast<void*>(socket));
     set_reusable(socket, true);
 }
 

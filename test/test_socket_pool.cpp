@@ -6,9 +6,125 @@
 #include <uv.h>
 
 #include "hyperdht/socket_pool.hpp"
+#include "hyperdht/dht.hpp"
+#include "../src/ffi_internal.hpp"
 
 using namespace hyperdht;
 using namespace hyperdht::socket_pool;
+
+class StreamRouteError : public ::testing::TestWithParam<int> {};
+
+TEST_P(StreamRouteError, InvalidatesOnlyTheFailedPeerBeforeCloseCallback) {
+    // Local error, remote UDX reset, normal close, replaced socket, options
+    // created before bind, a self-deleting close callback, a newer route on
+    // the same socket, a migrated stream, and a C API remote reset.
+    const int mode = GetParam();
+    const bool failed = mode != 2;
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    hyperdht_s owner;
+    owner.dht = std::make_unique<HyperDHT>(&loop);
+    auto& dht = *owner.dht;
+    auto options = dht.make_duplex_options();
+    ASSERT_EQ(dht.bind(), 0);
+    if (mode != 4) options = dht.make_duplex_options();
+    options.keep_alive_ms = 0;
+    auto* pool = dht.socket_pool();
+    auto* first = pool->acquire();
+    auto* other = pool->acquire();
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(other, nullptr);
+    std::array<uint8_t, 32> peer{}, shared_peer{}, other_peer{};
+    peer.fill(0xA1); shared_peer.fill(0xB2); other_peer.fill(0xC3);
+    udx_stream_t raw{}, remote{}, newer{};
+    pool->add_route(peer, first->socket(), other->address(), &raw);
+    pool->add_route(shared_peer, first->socket(), other->address());
+    pool->add_route(other_peer, other->socket(), first->address());
+    ASSERT_EQ(udx_stream_init(dht.socket().udx_handle(), &raw, 101, nullptr, nullptr), 0);
+    ASSERT_EQ(udx_stream_init(dht.socket().udx_handle(), &remote, 102, nullptr, nullptr), 0);
+    struct sockaddr_in a{}, b{};
+    uv_ip4_addr("127.0.0.1", first->address().port, &a);
+    uv_ip4_addr("127.0.0.1", other->address().port, &b);
+    ASSERT_EQ(udx_stream_connect(&raw, first->socket(), 102, reinterpret_cast<const sockaddr*>(&b)), 0);
+    ASSERT_EQ(udx_stream_connect(&remote, other->socket(), 101, reinterpret_cast<const sockaddr*>(&a)), 0);
+    secret_stream::DuplexHandshake handshake;
+    handshake.remote_public_key = peer;
+    std::unique_ptr<secret_stream::SecretStreamDuplex> duplex;
+    if (mode == 3) pool->add_route(peer, other->socket(), first->address(), &newer);
+    if (mode == 6) pool->add_route(peer, first->socket(), other->address(), &newer);
+    int callbacks = 0;
+    auto closed = [&](int err) {
+        ++callbacks;
+        EXPECT_EQ(err != 0, failed);
+        EXPECT_EQ(first->reusable, !failed);
+        EXPECT_TRUE(other->reusable);
+        if (failed && mode != 3 && mode != 6) EXPECT_EQ(pool->get_route(peer), nullptr);
+        else ASSERT_NE(pool->get_route(peer), nullptr);
+        if (mode == 3) EXPECT_EQ(pool->get_route(peer)->socket, other->socket());
+        EXPECT_NE(pool->get_route(shared_peer), nullptr);
+        EXPECT_NE(pool->get_route(other_peer), nullptr);
+        if (mode == 5) duplex.reset();
+    };
+    std::function<void()> ffi_closed = [&]() { closed(UV_ECONNRESET); };
+    if (mode == 8) {
+        hyperdht_connection_t conn{};
+        std::memcpy(conn.remote_public_key, peer.data(), peer.size());
+        std::strcpy(conn.peer_host, "127.0.0.1");
+        conn.peer_port = other->address().port;
+        conn.raw_stream = &raw;
+        conn.udx_socket = first->socket();
+        conn.local_udx_id = raw.local_id;
+        conn.remote_udx_id = remote.local_id;
+        ASSERT_NE(hyperdht_stream_open(&owner, &conn, nullptr, nullptr,
+            [](void* p) { (*static_cast<std::function<void()>*>(p))(); }, &ffi_closed), nullptr);
+    } else {
+        duplex = std::make_unique<secret_stream::SecretStreamDuplex>(&raw, handshake, &loop, options);
+        duplex->on_close(closed);
+        duplex->start();
+    }
+    if (mode == 7) {
+        ASSERT_EQ(udx_stream_change_remote(&raw, other->socket(), 102,
+            reinterpret_cast<const sockaddr*>(&b), nullptr), 0);
+        ASSERT_EQ(raw.socket, other->socket());
+    }
+    if (mode == 1 || mode == 8) udx_stream_destroy(&remote);
+    else duplex->destroy(failed ? UV_ECONNRESET : 0);
+    const auto until = uv_hrtime() + 1000000000ULL;
+    while (callbacks == 0 && uv_hrtime() < until) {
+        uv_run(&loop, UV_RUN_NOWAIT);
+        uv_sleep(1);
+    }
+    EXPECT_EQ(callbacks, 1);
+    duplex.reset();
+    udx::destroy_stream_once(&remote);
+    // Let stream callbacks drain before releasing their pool sockets.
+    for (int i = 0; i < 10; ++i) uv_run(&loop, UV_RUN_NOWAIT);
+    first->release();
+    other->release();
+    for (int i = 0; i < 10; ++i) uv_run(&loop, UV_RUN_NOWAIT);
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(callbacks, 1);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(Lifecycle, StreamRouteError, ::testing::Values(0, 1, 2, 3, 4, 5, 6, 7, 8));
+
+TEST(StreamRouteError, OptionsOutliveDestroyedOwner) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    auto dht = std::make_unique<HyperDHT>(&loop);
+    auto options = dht->make_duplex_options();
+    ASSERT_TRUE(options.on_stream_error);
+    ASSERT_EQ(dht->bind(), 0);
+    dht->destroy();
+    udx_stream_t unrelated{};
+    options.on_stream_error(&unrelated, {});  // Alive sentinel is false.
+    uv_run(&loop, UV_RUN_DEFAULT);
+    dht.reset();
+    options.on_stream_error(&unrelated, {});  // Sentinel has expired.
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
 
 // ---------------------------------------------------------------------------
 // Test fixture — sets up libuv loop and libudx

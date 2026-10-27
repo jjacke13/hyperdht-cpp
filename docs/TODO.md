@@ -5,12 +5,19 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-27 (cached-route terminal replies; older snapshots below are historical).
+Last updated: 2026-10-27 (stream-error route invalidation; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-27 stream-error routes:** DHT duplex options observe failed streams
+  before consumer close callbacks and invalidate only the matching peer/stream
+  route. Normal close, healthy peers sharing a socket, newer route replacements,
+  and callbacks after DHT destruction are protected. C++ consumers should use
+  make_duplex_options(); the C wrapper already does. C ABI signatures stay the
+  same; C++ consumers must rebuild for the appended option/cache metadata.
+  This does not change cache replacement policy or pooled-socket selection.
 - **2026-10-27 cached-route replies:** authenticated terminal handshake errors
   stop the connection with SERVER_ERROR before findPeer, matching JS's cached
   route path and the existing normal C++ handshake path. Malformed outer replies

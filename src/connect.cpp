@@ -180,7 +180,7 @@ struct ConnState {
             dht && dht->socket_pool() &&
             result.udx_socket != nullptr) {
             dht->socket_pool()->add_route(
-                remote_pk, result.udx_socket, result.peer_address);
+                remote_pk, result.udx_socket, result.peer_address, result.raw_stream);
         }
 
         auto cb = std::move(on_done);

@@ -209,6 +209,8 @@ struct DuplexOptions {
     uint64_t keep_alive_ms = 0;   // 0 = disabled
     uint64_t timeout_ms    = 0;   // 0 = disabled
     bool enable_send       = true; // enable secretbox send/trySend + on_udp_message
+    // Internal DHT observer, called before on_close while the raw stream is live.
+    std::function<void(udx_stream_t*, const std::array<uint8_t, 32>&)> on_stream_error;
 };
 
 class SecretStreamDuplex {
@@ -431,7 +433,7 @@ private:
     bool try_extract_frame();    // returns true if a full frame was consumed
     void handle_frame(std::vector<uint8_t> msg);
     void maybe_fire_connect();
-    void fire_close(int err);
+    void fire_close(int err, udx_stream_t* raw = nullptr);
     std::vector<uint8_t> box_message(const uint8_t* data, size_t len);
     bool unbox_message(const uint8_t* data, size_t len,
                        std::vector<uint8_t>& out);

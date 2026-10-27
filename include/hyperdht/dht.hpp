@@ -1013,10 +1013,16 @@ public:
     // `DuplexOptions{}` themselves — doing so automatically applies the
     // DHT's `connection_keep_alive` setting, matching JS's
     // `NoiseSecretStream({..., keepAlive: dht.connectionKeepAlive})` in
-    // `hyperdht/lib/connect.js:41-46`.
+    // `hyperdht/lib/connect.js:41-46`. Also observes stream errors so failed
+    // cached routes are invalidated before the consumer's close callback.
     secret_stream::DuplexOptions make_duplex_options() const {
         secret_stream::DuplexOptions opts;
         opts.keep_alive_ms = opts_.connection_keep_alive;
+        opts.on_stream_error = [this, weak = std::weak_ptr<bool>(alive_)](
+                udx_stream_t* stream, const noise::PubKey& peer) {
+            auto alive = weak.lock();
+            if (alive && *alive && socket_pool_) socket_pool_->on_stream_error(stream, peer);
+        };
         return opts;
     }
 

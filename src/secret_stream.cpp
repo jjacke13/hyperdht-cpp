@@ -711,7 +711,7 @@ void SecretStreamDuplex::destroy(int error) {
     }
 }
 
-void SecretStreamDuplex::fire_close(int err) {
+void SecretStreamDuplex::fire_close(int err, udx_stream_t* raw) {
     if (on_close_fired_) return;
     on_close_fired_ = true;
     // Release the relay→direct upgrade owner FIRST — it must null its emitted-
@@ -723,16 +723,12 @@ void SecretStreamDuplex::fire_close(int err) {
         on_upgrade_close_ = nullptr;
         tap();
     }
-    // Move it out before invoking: consumers free the Duplex from here
-    // (ffi_internal.hpp stream_fire_close), which would otherwise destroy
-    // this std::function while it is still on the stack. Same reason the
-    // upgrade tap above is moved. Everything after this line is a
-    // use-after-free — fire_close must do nothing else.
-    if (on_close_) {
-        auto cb = std::move(on_close_);
-        on_close_ = nullptr;
-        cb(err);
-    }
+    // Either callback may release the Duplex; move everything out first.
+    auto observer = std::move(opts_.on_stream_error);
+    auto cb = std::move(on_close_);
+    auto peer = hs_.remote_public_key;
+    if (err && raw && observer) observer(raw, peer);
+    if (cb) cb(err);
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,7 +1076,7 @@ void SecretStreamDuplex::on_udx_close(udx_stream_t* s, int err) {
     // libudx always passes 0 here even when we aborted for a protocol
     // error like a malformed frame.
     int report_err = self->close_error_ != 0 ? self->close_error_ : err;
-    self->fire_close(report_err);
+    self->fire_close(report_err, s);
 }
 
 void SecretStreamDuplex::on_udx_recv_message(udx_stream_t* s, ssize_t nread,

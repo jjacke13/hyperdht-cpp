@@ -99,6 +99,7 @@ private:
 struct SocketRoute {
     udx_socket_t* socket = nullptr;
     compact::Ipv4Address address;
+    udx_stream_t* stream = nullptr;  // Identity only; never dereferenced or owned.
 };
 
 // ---------------------------------------------------------------------------
@@ -130,6 +131,9 @@ public:
     void add_route(const std::array<uint8_t, 32>& public_key,
                    udx_socket_t* socket,
                    const compact::Ipv4Address& address);
+    void add_route(const std::array<uint8_t, 32>& public_key,
+                   udx_socket_t* socket, const compact::Ipv4Address& address,
+                   udx_stream_t* stream);
 
     // Get a cached route for a remote peer (nullptr if none)
     const SocketRoute* get_route(const std::array<uint8_t, 32>& public_key) const;
@@ -137,10 +141,13 @@ public:
     // Remove a route
     void remove_route(const std::array<uint8_t, 32>& public_key);
 
-    // JS socket-pool.js:96-100 — a rawStream error marks its socket
-    // non-reusable and gc's any route backed by it. Call from a stream's
-    // error surface. (Socket close is handled automatically in remove().)
+    // Socket-wide invalidation for low-level callers; closing sockets also
+    // remove all their routes automatically in remove().
     void on_stream_error(udx_socket_t* socket);
+    // JS socket-pool.js:96-100: invalidate only this peer's matching route.
+    // An old stream must not remove a newer route, or other peers on its socket.
+    void on_stream_error(udx_stream_t* stream,
+                         const std::array<uint8_t, 32>& public_key);
 
     // Number of active sockets
     size_t size() const { return sockets_.size(); }

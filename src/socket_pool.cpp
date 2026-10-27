@@ -282,6 +282,7 @@ void SocketPool::on_stream_error(udx_stream_t* stream,
         routes_.erase(it);
     } else {
         set_reusable(stream->socket, false);
+        DHT_LOG("  [socket-pool] route-error key=%.8s stream=%u removed=0\n", key.c_str(), stream->local_id);
     }
 }
 
@@ -299,8 +300,9 @@ void SocketPool::add_route(const std::array<uint8_t, 32>& public_key,
                            udx_socket_t* socket, const compact::Ipv4Address& address,
                            udx_stream_t* stream) {
     auto hex = key_hex(public_key);
-    routes_[hex] = SocketRoute{socket, address, stream};
-    DHT_LOG("  [socket-pool] route-add key=%.8s stream=%u socket=%p\n", hex.c_str(), stream ? stream->local_id : 0, static_cast<void*>(socket));
+    // JS keeps the first route until its socket closes or it is invalidated.
+    bool inserted = routes_.try_emplace(hex, SocketRoute{socket, address, stream}).second;
+    DHT_LOG("  [socket-pool] route-add key=%.8s stream=%u socket=%p inserted=%d\n", hex.c_str(), stream ? stream->local_id : 0, static_cast<void*>(socket), inserted);
     set_reusable(socket, true);
 }
 

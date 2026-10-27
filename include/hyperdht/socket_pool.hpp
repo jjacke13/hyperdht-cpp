@@ -128,6 +128,7 @@ public:
     // -----------------------------------------------------------------------
 
     // Add a route for a remote peer
+    // Keep the first live route; each successful socket is still marked reusable.
     void add_route(const std::array<uint8_t, 32>& public_key,
                    udx_socket_t* socket,
                    const compact::Ipv4Address& address);

@@ -50,8 +50,10 @@ TEST_P(StreamRouteError, InvalidatesOnlyTheFailedPeerBeforeCloseCallback) {
     secret_stream::DuplexHandshake handshake;
     handshake.remote_public_key = peer;
     std::unique_ptr<secret_stream::SecretStreamDuplex> duplex;
-    if (mode == 3) pool->add_route(peer, other->socket(), first->address(), &newer);
-    if (mode == 6) pool->add_route(peer, first->socket(), other->address(), &newer);
+    if (mode == 3 || mode == 6) {
+        pool->remove_route(peer);
+        pool->add_route(peer, mode == 3 ? other->socket() : first->socket(), first->address(), &newer);
+    }
     int callbacks = 0;
     auto closed = [&](int err) {
         ++callbacks;
@@ -264,6 +266,52 @@ TEST_F(SocketPoolTest, AddGetRoute) {
     EXPECT_EQ(route->address.port, 5000);
 
     ref->release();
+    pool.destroy();
+    run_loop();
+}
+
+TEST_F(SocketPoolTest, KeepsFirstLiveRouteUntilRemoval) {
+    SocketPool pool(&loop_, &udx_);
+    auto* first = pool.acquire();
+    auto* second = pool.acquire();
+    std::array<uint8_t, 32> peer{}, other_peer{};
+    peer.fill(0x41); other_peer.fill(0x42);
+    udx_stream_t original{}, later{};
+    original.socket = first->socket(); later.socket = second->socket();
+    auto a = compact::Ipv4Address::from_string("127.0.0.1", 12345);
+    auto b = compact::Ipv4Address::from_string("127.0.0.1", 23456);
+    pool.add_route(peer, first->socket(), a, &original);
+    pool.add_route(peer, first->socket(), b);
+    EXPECT_EQ(pool.get_route(peer)->address, a);
+    EXPECT_EQ(pool.get_route(peer)->stream, &original);
+    pool.add_route(peer, second->socket(), b, &later);
+    ASSERT_NE(pool.get_route(peer), nullptr);
+    EXPECT_EQ(pool.get_route(peer)->socket, first->socket());
+    EXPECT_EQ(pool.get_route(peer)->address, a);
+    EXPECT_EQ(pool.get_route(peer)->stream, &original);
+    EXPECT_TRUE(first->reusable);
+    EXPECT_TRUE(second->reusable);
+    pool.add_route(other_peer, second->socket(), b);
+    pool.on_stream_error(&later, peer);
+    ASSERT_NE(pool.get_route(peer), nullptr);
+    EXPECT_EQ(pool.get_route(peer)->socket, first->socket());
+    EXPECT_TRUE(first->reusable);
+    EXPECT_FALSE(second->reusable);
+    EXPECT_NE(pool.get_route(other_peer), nullptr);
+    pool.remove_route(peer);
+    pool.add_route(peer, second->socket(), b, &later);
+    ASSERT_NE(pool.get_route(peer), nullptr);
+    EXPECT_EQ(pool.get_route(peer)->socket, second->socket());
+    EXPECT_EQ(pool.get_route(peer)->address, b);
+    EXPECT_EQ(pool.get_route(peer)->stream, &later);
+    EXPECT_TRUE(second->reusable);
+    first->release();
+    for (int i = 0; i < 10; ++i) uv_run(&loop_, UV_RUN_NOWAIT);
+    ASSERT_NE(pool.get_route(peer), nullptr);
+    EXPECT_EQ(pool.get_route(peer)->socket, second->socket());
+    second->release();
+    run_loop();
+    EXPECT_EQ(pool.get_route(peer), nullptr);
     pool.destroy();
     run_loop();
 }

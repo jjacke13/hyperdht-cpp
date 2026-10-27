@@ -5,12 +5,16 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-27 (stream-error route invalidation; older snapshots below are historical).
+Last updated: 2026-10-27 (first live cached route; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-27 cache insertion:** retain the first live route for each peer,
+  matching JS socket-pool.js. Later successful sockets are marked reusable
+  without replacing that route; removal or socket closure permits a fresh one.
+  Existing stream-error ownership guards and cached transport selection remain.
 - **2026-10-27 stream-error routes:** DHT duplex options observe failed streams
   before consumer close callbacks and invalidate only the matching peer/stream
   route. Normal close, healthy peers sharing a socket, newer route replacements,

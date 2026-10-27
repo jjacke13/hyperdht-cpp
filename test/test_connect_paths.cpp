@@ -195,6 +195,85 @@ LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive) {
 
 }  // namespace
 
+class CachedRouteReply : public ::testing::TestWithParam<int> {};
+
+TEST_P(CachedRouteReply, TerminalRepliesDoNotStartFindPeer) {
+    // Authenticated version/error/UDX failures are terminal; malformed outer
+    // replies and corrupt Noise messages must retain ordinary lookup fallback.
+    const int mode = GetParam();
+    const bool terminal = mode < 3;
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    noise::Seed seed{};
+    seed.fill(0x43);
+    const auto keypair = noise::generate_keypair(seed);
+    rpc::RpcSocket relay(&loop, {});
+    ASSERT_EQ(relay.bind(0, "127.0.0.1"), 0);
+    const auto address = Ipv4Address::from_string("127.0.0.1", relay.port());
+    int handshakes = 0, lookups = 0;
+    relay.on_request([&](const messages::Request& req) {
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = req.from.addr;
+        resp.id = rpc::compute_peer_id(address);
+        if (!req.internal && req.command == messages::CMD_FIND_PEER) {
+            ++lookups;
+        } else if (!req.internal && req.command == messages::CMD_PEER_HANDSHAKE) {
+            ++handshakes;
+            ASSERT_TRUE(req.value.has_value());
+            const auto hs = peer_connect::decode_handshake_msg(req.value->data(), req.value->size());
+            const auto& prologue = dht_messages::ns_peer_handshake();
+            noise::NoiseIK responder(false, keypair, prologue.data(), prologue.size());
+            const auto payload = responder.recv(hs.noise.data(), hs.noise.size());
+            ASSERT_TRUE(payload.has_value());
+            const auto client = peer_connect::decode_noise_payload(payload->data(), payload->size());
+            ASSERT_TRUE(client.udx.has_value());
+            EXPECT_TRUE(client.udx->reusable_socket);
+            peer_connect::NoisePayload reply;
+            reply.version = mode == 0 ? 2 : 1;
+            reply.error = mode == 1 ? peer_connect::ERROR_TRY_LATER : peer_connect::ERROR_NONE;
+            reply.firewall = peer_connect::FIREWALL_OPEN;
+            if (mode != 2) reply.udx = peer_connect::UdxInfo{1, true, 777, 0};
+            const auto bytes = peer_connect::encode_noise_payload(reply);
+            peer_connect::HandshakeMessage message;
+            message.mode = mode == 3 ? peer_connect::MODE_FROM_SERVER : peer_connect::MODE_REPLY;
+            message.noise = responder.send(bytes.data(), bytes.size());
+            if (mode == 4) message.noise.clear();
+            if (mode == 5) message.noise.back() ^= 1;
+            resp.value = peer_connect::encode_handshake_msg(message);
+        }
+        relay.reply(resp, req.from_server);
+    });
+    HyperDHT dht(&loop);
+    ASSERT_EQ(dht.bind(), 0);
+    routing::Node node;
+    node.id = rpc::compute_peer_id(address);
+    node.host = address.host_string();
+    node.port = address.port;
+    ASSERT_TRUE(dht.socket().table().add(node));
+    dht.socket_pool()->add_route(keypair.public_key, dht.socket().socket_handle(), address);
+    ConnectOptions opts;
+    opts.reusable_socket = true;
+    int callbacks = 0, error = 0;
+    dht.connect(keypair.public_key, opts, [&](int err, const ConnectResult& result) {
+        ++callbacks;
+        error = err;
+        EXPECT_FALSE(result.success);
+    });
+    run_until(&loop, [&]() { return callbacks != 0; }, 5000);
+    EXPECT_EQ(callbacks, 1);
+    EXPECT_EQ(error, terminal ? ConnectError::SERVER_ERROR : ConnectError::PEER_CONNECTION_FAILED);
+    EXPECT_EQ(handshakes, 1);
+    EXPECT_EQ(lookups, terminal ? 0 : 1);
+    dht.destroy();
+    relay.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(callbacks, 1);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(Validation, CachedRouteReply, ::testing::Values(0, 1, 2, 3, 4, 5));
+
 // JS connect.js:234-251 — when the LAN trigger fires and the LAN ping
 // succeeds, the connection completes over the LAN address and the
 // holepunch engine is NEVER started.

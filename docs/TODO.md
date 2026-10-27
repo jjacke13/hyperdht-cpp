@@ -5,12 +5,17 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-26 (forced-persistent startup; older snapshots below are historical).
+Last updated: 2026-10-27 (cached-route terminal replies; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-27 cached-route replies:** authenticated terminal handshake errors
+  stop the connection with SERVER_ERROR before findPeer, matching JS's cached
+  route path and the existing normal C++ handshake path. Malformed outer replies
+  and corrupt Noise replies retain lookup fallback. Other socket-reuse and
+  recovery items remain open.
 - **2026-10-26 forced-persistent startup:** generic `ephemeral=false` starts
   ephemeral and awaits the existing address/firewall check during bootstrap,
   matching JS `_forcePersistent`. Success adopts the verified endpoint's routing
@@ -184,10 +189,10 @@ FALSE_DONE. Behavioral parity estimate ~93%. Net-new, none previously ledgered:
   relay setup, preventing a relay continuation from reusing the emitted stream.
   The regression requires one direct emission and no relay pairing; all three
   suites and isolated public/NAT connectivity checks pass.
-- [ ] **connect/divergence-1 (LOW)** — reusableSocket route-shortcut callback
-  (connect.cpp:580-591) ignores `hs.terminal`, running a full findPeer walk
-  where JS terminates SERVER_ERROR (can return PEER_NOT_FOUND instead). Fix:
-  apply the `fire_handshake` terminal check (connect.cpp:315-318). One line.
+- [x] **connect/divergence-1 (LOW)** — fixed 2026-10-27. The cached-route
+  callback applies the normal handshake's `hs.terminal` check and reports
+  SERVER_ERROR without a findPeer walk. Previously the regression returned
+  PEER_CONNECTION_FAILED after a lookup; retryable replies still fall back.
 - [ ] **connect/divergence-2 (LOW)** — step-4 no-holepunch direct-connect
   (connect.cpp:732-753) missing JS's `(relayed && !remoteHolepunchable)` gate
   (connect.js:212) and ordered ahead of passive-wait/LAN; a NON-relayed

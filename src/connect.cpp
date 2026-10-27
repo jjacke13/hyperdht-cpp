@@ -598,7 +598,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
         if (route) {
             DHT_LOG("  [connect] route shortcut: trying cached route\n");
             state->found = true;
-            // Try handshake through cached route. On failure, fall through
+            // Try handshake through cached route. Retryable failures fall through
             // to findPeer. We don't increment handshakes_in_flight because
             // this path returns early (line below) — no pipelining runs
             // concurrently. INVARIANT: the `return` below is load-bearing.
@@ -611,6 +611,10 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                 prepare_handshake(state),
                 [state, route_addr](const peer_connect::HandshakeResult& hs) {
                     if (state->completed || state->alive.expired()) return;
+                    if (hs.terminal) {
+                        state->complete_error(ConnectError::SERVER_ERROR);
+                        return;
+                    }
                     if (hs.success) {
                         state->relay_addr = route_addr;
                         state->hs_result = hs;

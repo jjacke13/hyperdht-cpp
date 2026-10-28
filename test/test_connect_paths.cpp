@@ -72,6 +72,9 @@ struct LanScenarioResult {
     bool payload_received = false;
     int lan_pings = 0;
     int cached_handshakes = 0;
+    std::vector<Ipv4Address> cached_relays;
+    std::vector<Ipv4Address> advertised_relays;
+    std::vector<Ipv4Address> discovery_relays;
 };
 
 // direct_path: 0 = LAN, 1 = OPEN, 2 = no holepunch.
@@ -82,7 +85,8 @@ struct LanScenarioResult {
 // shares the client's host (127.0.0.1) so the JS LAN trigger
 // `clientAddress.host === serverAddress.host` fires.
 LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive,
-                                  int direct_path = 0, int reusable_flags = -1) {
+                                  int direct_path = 0, int reusable_flags = -1,
+                                  int hint_mode = -1, bool discover = false) {
     uv_loop_t loop;
     uv_loop_init(&loop);
 
@@ -109,6 +113,11 @@ LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive,
         lan_port = lan_peer.port();
     }
     const uint16_t lan_port_used = lan_port;
+    out.discovery_relays = {relay_addr};
+    if (hint_mode > 0) {
+        out.advertised_relays = {Ipv4Address::from_string("127.0.0.1", lan_port_used),
+                                 relay_addr};
+    }
 
     auto respond = [&](rpc::RpcSocket& via, const messages::Request& req) {
         if (req.internal && req.command == messages::CMD_PING) {
@@ -119,6 +128,17 @@ LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive,
         if (req.command == messages::CMD_PEER_HOLEPUNCH) {
             out.holepunch_reqs++;
             return;  // never answered — the test only counts
+        }
+        if (discover && req.command == messages::CMD_FIND_PEER) {
+            messages::Response resp;
+            resp.tid = req.tid;
+            resp.from.addr = req.from.addr;
+            resp.id = rpc::compute_peer_id(relay_addr);
+            dht_messages::PeerRecord record;
+            record.public_key = server_kp.public_key;
+            resp.value = dht_messages::encode_peer_record(record);
+            via.reply(resp, req.from_server);
+            return;
         }
         if (req.command != messages::CMD_PEER_HANDSHAKE || !req.value) return;
         if (&via == &lan_peer) ++out.cached_handshakes;
@@ -138,6 +158,8 @@ LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive,
         peer_connect::NoisePayload rp;
         rp.version = 1;
         rp.error = peer_connect::ERROR_NONE;
+        if (hint_mode == 2) rp.error = peer_connect::ERROR_ABORTED;
+        rp.relay_addresses = out.advertised_relays;
         rp.firewall = direct_path == 1 ? peer_connect::FIREWALL_OPEN
                                      : peer_connect::FIREWALL_CONSISTENT;
         rp.addresses4.push_back(
@@ -177,7 +199,8 @@ LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive,
 
     HyperDHT dht(&loop);  // empty bootstrap — offline
     dht.bind();
-    dht.cache_relay_addresses(server_kp.public_key, {relay_addr});
+    if (discover) dht.add_node(relay_addr);
+    else dht.cache_relay_addresses(server_kp.public_key, {relay_addr});
 
     ConnectOptions opts;
     opts.reusable_socket = reusable_flags >= 0 && (reusable_flags & 1);
@@ -234,7 +257,7 @@ LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive,
     // Grace period: old (buggy) behavior launched the holepunch engine in
     // parallel with the LAN ping — give any stray Round 1 time to land.
     if (reusable_flags < 0) run_until(&loop, [] { return false; }, 700);
-    else run_until(&loop, [&] { return out.payload_received; }, 2000);
+    else if (!out.connect_err) run_until(&loop, [&] { return out.payload_received; }, 2000);
 
     if (reusable_flags >= 0 && (reusable_flags & 4)) {
         udx_stream_destroy(out.connect_result.raw_stream);
@@ -248,6 +271,7 @@ LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive,
         run_until(&loop, [&] { return out.payload_received; }, 2000);
     }
 
+    out.cached_relays = dht.get_cached_relay_addresses(server_kp.public_key);
     if (out.connect_result.raw_stream) {
         udx_stream_destroy(out.connect_result.raw_stream);
     }
@@ -264,6 +288,48 @@ LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive,
 }  // namespace
 
 class DirectRouteSocket : public ::testing::TestWithParam<int> {};
+
+class AdvertisedRelayCache : public ::testing::TestWithParam<int> {};
+
+TEST_P(AdvertisedRelayCache, PrefersServerHintsAndRetainsDiscoveryFallback) {
+    const int p = GetParam();
+    // LAN/OPEN/no-holepunch; cached start or actual findPeer; absent/present hints.
+    auto out = run_lan_scenario(0, true, p / 4, 0, p % 2, (p % 4) >= 2);
+    ASSERT_TRUE(out.connect_done);
+    ASSERT_EQ(out.connect_err, 0);
+    EXPECT_TRUE(out.payload_received);
+    EXPECT_EQ(out.cached_relays, p % 2 ? out.advertised_relays : out.discovery_relays);
+}
+
+INSTANTIATE_TEST_SUITE_P(Paths, AdvertisedRelayCache, ::testing::Range(0, 12));
+
+class AdvertisedRelayRouteCache : public ::testing::TestWithParam<int> {};
+
+TEST_P(AdvertisedRelayRouteCache, CachedMainRouteStillPrefersAdvertisedHints) {
+    auto out = run_lan_scenario(0, true, GetParam(), 1 | 2 | 4, 1);
+    EXPECT_TRUE(out.payload_received);
+    EXPECT_EQ(out.connect_err, 0);
+    EXPECT_EQ(out.cached_handshakes, 1);
+    EXPECT_EQ(out.cached_relays, out.advertised_relays);
+}
+
+INSTANTIATE_TEST_SUITE_P(Paths, AdvertisedRelayRouteCache, ::testing::Range(0, 3));
+
+TEST(AdvertisedRelayCacheFailure, RejectedHandshakeKeepsPreviousHints) {
+    auto out = run_lan_scenario(0, true, 1, 0, 2);
+    EXPECT_TRUE(out.connect_done);
+    EXPECT_EQ(out.connect_err, ConnectError::SERVER_ERROR);
+    EXPECT_FALSE(out.payload_received);
+    EXPECT_EQ(out.cached_relays, out.discovery_relays);
+}
+
+TEST(AdvertisedRelayCacheFailure, FailedTransportKeepsPreviousHints) {
+    auto out = run_lan_scenario(1, false, 0, 0, 1);
+    EXPECT_TRUE(out.connect_done);
+    EXPECT_EQ(out.connect_err, ConnectError::HOLEPUNCH_TIMEOUT);
+    EXPECT_FALSE(out.payload_received);
+    EXPECT_EQ(out.cached_relays, out.discovery_relays);
+}
 
 TEST_P(DirectRouteSocket, ReportsTheConsumerSocketAndCachesOnlyWithBothOptIns) {
     // LAN, OPEN, no-holepunch; each with neither/client/server/both reusable flags.

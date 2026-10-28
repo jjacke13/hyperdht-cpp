@@ -164,10 +164,10 @@ struct ConnState {
         if (completed) return;  // Prevent double invocation (firewall + holepunch race)
         completed = true;
 
-        // §AUDIT-3: cache relay addresses after successful connect.
-        // JS: connect.js:464-466
-        if (err == 0 && dht && !relays.empty()) {
-            dht->cache_relay_addresses(remote_pk, relays);
+        // JS connect.js:464-468 — prefer the server's hints, then discovery replies.
+        if (err == 0 && dht) {
+            const auto& advertised = hs_result.remote_payload.relay_addresses;
+            dht->cache_relay_addresses(remote_pk, advertised.empty() ? relays : advertised);
         }
 
         // §AUDIT-6: store route after successful connect.

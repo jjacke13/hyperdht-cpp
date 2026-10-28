@@ -200,7 +200,7 @@ class HyperDHT(
         onLoop {
             val rc = Native.connectAndOpenStream(
                 handle, remotePublicKey, onOpen, onData, onClose, cb)
-            if (rc != 0) throw DhtException(rc)
+            Errors.checkCall(rc, "connect")
         }
 
         return deferred.await()
@@ -215,12 +215,13 @@ class HyperDHT(
     suspend fun immutablePut(value: ByteArray) {
         val deferred = CompletableDeferred<Unit>()
         val cb = DoneCallback { error ->
-            if (error != 0) deferred.completeExceptionally(DhtException(error))
+            if (error != 0) deferred.completeExceptionally(
+                DhtException(error, "immutablePut: ${Errors.describeQuery(error)} ($error)"))
             else deferred.complete(Unit)
         }
         onLoop {
             val rc = Native.immutablePut(handle, value, cb)
-            if (rc != 0) throw DhtException(rc)
+            Errors.checkCall(rc, "immutablePut")
         }
         deferred.await()
     }
@@ -231,12 +232,13 @@ class HyperDHT(
         var result: ByteArray? = null
         val valCb = ValueCallback { value -> result = value }
         val doneCb = DoneCallback { error ->
-            if (error != 0) deferred.completeExceptionally(DhtException(error))
+            if (error != 0) deferred.completeExceptionally(
+                DhtException(error, "immutableGet: ${Errors.describeQuery(error)} ($error)"))
             else deferred.complete(result)
         }
         onLoop {
             val rc = Native.immutableGet(handle, target, valCb, doneCb)
-            if (rc != 0) throw DhtException(rc)
+            Errors.checkCall(rc, "immutableGet")
         }
         return deferred.await()
     }
@@ -244,13 +246,14 @@ class HyperDHT(
     suspend fun mutablePut(keyPair: KeyPair, value: ByteArray, seq: Long) {
         val deferred = CompletableDeferred<Unit>()
         val cb = DoneCallback { error ->
-            if (error != 0) deferred.completeExceptionally(DhtException(error))
+            if (error != 0) deferred.completeExceptionally(
+                DhtException(error, "mutablePut: ${Errors.describeQuery(error)} ($error)"))
             else deferred.complete(Unit)
         }
         onLoop {
             val rc = Native.mutablePut(handle, keyPair.publicKey, keyPair.secretKey,
                 value, seq, cb)
-            if (rc != 0) throw DhtException(rc)
+            Errors.checkCall(rc, "mutablePut")
         }
         deferred.await()
     }
@@ -265,7 +268,7 @@ class HyperDHT(
 
     suspend fun addNode(host: String, port: Int) = onLoop {
         val rc = Native.addNode(handle, host, port)
-        if (rc != 0) throw DhtException(rc, "addNode failed: $rc")
+        Errors.checkCall(rc, "addNode")
     }
 
     suspend fun ping(host: String, port: Int): Boolean {
@@ -273,7 +276,7 @@ class HyperDHT(
         val cb = PingCallback { success -> deferred.complete(success) }
         onLoop {
             val rc = Native.ping(handle, host, port, cb)
-            if (rc != 0) throw DhtException(rc)
+            Errors.checkCall(rc, "ping")
         }
         return deferred.await()
     }

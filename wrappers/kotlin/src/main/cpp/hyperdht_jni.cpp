@@ -606,6 +606,21 @@ Java_com_hyperdht_Native_connectStrerror(
     return env->NewStringUTF(msg);
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_hyperdht_Native_queryStrerror(JNIEnv* env, jobject, jint error) {
+    return env->NewStringUTF(hyperdht_query_strerror(error));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_hyperdht_Native_callStrerror(JNIEnv* env, jobject, jint error) {
+    return env->NewStringUTF(hyperdht_call_strerror(error));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_hyperdht_Native_systemStrerror(JNIEnv* env, jobject, jint error) {
+    return env->NewStringUTF(hyperdht_system_strerror(error));
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_hash(
     JNIEnv* env, jobject, jbyteArray jdata, jbyteArray jout)

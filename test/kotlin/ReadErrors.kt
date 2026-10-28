@@ -17,7 +17,12 @@ object ReadErrorsTest {
                     else check(result?.contentEquals("read".toByteArray()) == true)
                 } catch (error: DhtException) {
                     check(expectedError != 0 && error.code == expectedError)
-                    check(error.message == Errors.describe(expectedError))
+                    val description = when (expectedError) {
+                        1 -> "too few nodes responded"
+                        Errors.CANCELLED -> "cancelled"
+                        else -> "unknown query error"
+                    }
+                    check(error.message == "immutableGet: $description ($expectedError)")
                 }
             }
         }

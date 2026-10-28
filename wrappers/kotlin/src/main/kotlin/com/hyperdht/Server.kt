@@ -31,7 +31,7 @@ class Server internal constructor(
                 val stream = Stream.open(dhtHandle, connPtr, postToLoop)
                 trySend(stream)
             })
-        if (rc != 0) throw DhtException(rc, "server_listen failed: $rc")
+        Errors.checkCall(rc, "serverListen")
 
         awaitClose { close() }
     }

@@ -753,6 +753,19 @@ HYPERDHT_API int hyperdht_connect_and_open_stream(
  *  reserved for query cancellation. Unknown codes return "unknown error". */
 HYPERDHT_API const char* hyperdht_connect_strerror(int error);
 
+/** Storage/query completion status (hyperdht_done_cb), not a connect result.
+ *  1 means too few nodes responded; -8 means explicit _ex cancellation. */
+HYPERDHT_API const char* hyperdht_query_strerror(int error);
+
+/** Immediate submission status for connect, storage, server_listen, ping and
+ *  add_node: -1 is invalid arguments/handle; ping/add_node use -2 for invalid
+ *  IPv4 input. No completion callback follows a rejected submission.
+ *  Do not use for raw libuv statuses (e.g. bind) or async completion codes. */
+HYPERDHT_API const char* hyperdht_call_strerror(int error);
+
+/** Raw libuv status (e.g. bind); codes are platform-dependent. */
+HYPERDHT_API const char* hyperdht_system_strerror(int error);
+
 /* --- C2: DHT state --- */
 
 HYPERDHT_API int hyperdht_is_online(const hyperdht_t* dht);

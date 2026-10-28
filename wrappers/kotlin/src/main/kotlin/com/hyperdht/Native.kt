@@ -141,6 +141,9 @@ internal object Native {
     ): Int
 
     // --- Misc ---
+    external fun queryStrerror(error: Int): String
+    external fun callStrerror(error: Int): String
+    external fun systemStrerror(error: Int): String
     external fun connectStrerror(error: Int): String
     external fun hash(data: ByteArray, out: ByteArray)
     external fun addNode(handle: Long, host: String, port: Int): Int

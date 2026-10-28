@@ -18,6 +18,28 @@ const char* hyperdht_connect_strerror(int error) {
     }
 }
 
+const char* hyperdht_query_strerror(int error) {
+    switch (error) {
+        case 0: return "success";
+        case hyperdht::query::QUERY_ERR_TOO_FEW_NODES: return "too few nodes responded";
+        case HYPERDHT_ERR_CANCELLED: return "cancelled";
+        default: return "unknown query error";
+    }
+}
+
+const char* hyperdht_call_strerror(int error) {
+    switch (error) {
+        case 0: return "success";
+        case -1: return "invalid argument or handle";
+        case -2: return "invalid IPv4 address";
+        default: return "unknown submission error";
+    }
+}
+
+const char* hyperdht_system_strerror(int error) {
+    return error == 0 ? "success" : uv_strerror(error);
+}
+
 // ---------------------------------------------------------------------------
 // Query cancellation (shared by all *_ex variants)
 // ---------------------------------------------------------------------------

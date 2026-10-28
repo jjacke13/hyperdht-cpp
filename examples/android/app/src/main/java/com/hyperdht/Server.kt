@@ -35,7 +35,7 @@ class Server internal constructor(
                 activeStreams.add(stream)
                 trySend(stream)
             })
-        if (rc != 0) throw DhtException(rc, "server_listen failed: $rc")
+        Errors.checkCall(rc, "serverListen")
 
         awaitClose { close() }
     }

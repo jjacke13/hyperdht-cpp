@@ -37,6 +37,43 @@ TEST(CAPI, ConnectErrorDescriptions) {
     EXPECT_STREQ(hyperdht_connect_strerror(12345), "unknown error");
 }
 
+TEST(CAPI, ContextErrorDescriptions) {
+    EXPECT_STREQ(hyperdht_query_strerror(0), "success");
+    EXPECT_STREQ(hyperdht_query_strerror(1), "too few nodes responded");
+    EXPECT_STREQ(hyperdht_query_strerror(HYPERDHT_ERR_CANCELLED), "cancelled");
+    EXPECT_STREQ(hyperdht_query_strerror(73), "unknown query error");
+    EXPECT_STREQ(hyperdht_query_strerror(-2), "unknown query error");
+    EXPECT_STREQ(hyperdht_call_strerror(0), "success");
+    EXPECT_STREQ(hyperdht_call_strerror(-1), "invalid argument or handle");
+    EXPECT_STREQ(hyperdht_call_strerror(-2), "invalid IPv4 address");
+    EXPECT_STREQ(hyperdht_call_strerror(-73), "unknown submission error");
+    EXPECT_STREQ(hyperdht_system_strerror(0), "success");
+    for (int code : {UV_EINVAL, UV_EADDRINUSE, UV_EPERM, UV_ENOENT}) {
+        EXPECT_STREQ(hyperdht_system_strerror(code), uv_strerror(code));
+        EXPECT_NE(std::strcmp(hyperdht_system_strerror(code), "unknown error"), 0);
+    }
+    // The same integer has different meanings depending on where it came from.
+    EXPECT_STRNE(hyperdht_connect_strerror(-1), hyperdht_call_strerror(-1));
+    EXPECT_STRNE(hyperdht_connect_strerror(-2), hyperdht_call_strerror(-2));
+}
+
+TEST(CAPI, BindSystemErrorDescription) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    hyperdht_opts_t opts;
+    hyperdht_opts_default(&opts);
+    opts.host = "invalid-ip";
+    auto* dht = hyperdht_create(&loop, &opts);
+    ASSERT_NE(dht, nullptr);
+    const int code = hyperdht_bind(dht, 0);
+    EXPECT_EQ(code, UV_EINVAL);
+    EXPECT_STREQ(hyperdht_system_strerror(code), uv_strerror(UV_EINVAL));
+    hyperdht_destroy_force(dht, nullptr, nullptr);
+    while (uv_run(&loop, UV_RUN_DEFAULT)) {}
+    hyperdht_free(dht);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
 TEST(CAPI, KeypairGenerate) {
     hyperdht_keypair_t kp;
     hyperdht_keypair_generate(&kp);

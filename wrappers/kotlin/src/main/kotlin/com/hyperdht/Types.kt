@@ -22,6 +22,15 @@ object Errors {
     const val SERVER_ERROR = -9
 
     fun describe(code: Int): String = Native.connectStrerror(code)
+
+    /** Query completion, immediate submission and raw libuv codes are separate domains. */
+    fun describeQuery(code: Int): String = Native.queryStrerror(code)
+    fun describeCall(code: Int): String = Native.callStrerror(code)
+    fun describeSystem(code: Int): String = Native.systemStrerror(code)
+
+    internal fun checkCall(code: Int, operation: String) {
+        if (code != 0) throw DhtException(code, "$operation: ${describeCall(code)} ($code)")
+    }
 }
 
 /** HyperDHT error with numeric code and human-readable message. */

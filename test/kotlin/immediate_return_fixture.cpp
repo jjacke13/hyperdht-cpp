@@ -27,13 +27,13 @@ extern "C" int __wrap_hyperdht_immutable_get(hyperdht_t* dht, const uint8_t* key
 extern "C" int __wrap_hyperdht_immutable_put(hyperdht_t* dht, const uint8_t* value,
     size_t len, hyperdht_done_cb done, void* ud) {
     if (len == 0) return __real_hyperdht_immutable_put(dht, value, len, done, ud);
-    done(0, ud);
+    done(value[0] == 2 ? 1 : 0, ud);
     return 0;
 }
 
 extern "C" int __wrap_hyperdht_mutable_put(hyperdht_t* dht, const hyperdht_keypair_t* kp,
     const uint8_t* value, size_t len, uint64_t seq, hyperdht_done_cb done, void* ud) {
     if (len == 0) return __real_hyperdht_mutable_put(dht, kp, value, len, seq, done, ud);
-    done(0, ud);
+    done(value[0] == 2 ? 1 : 0, ud);
     return 0;
 }

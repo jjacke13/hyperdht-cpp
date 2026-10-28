@@ -5,17 +5,23 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-28 (immediate Kotlin/JNI rejections; older snapshots below are historical).
+Last updated: 2026-10-28 (Kotlin submission errors and contextual descriptions; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-28 contextual error descriptions:** additive C/JNI helpers describe
+  query completions, immediate submission statuses and raw libuv errors separately.
+  Kotlin storage failures use query messages; rejected calls, addNode and
+  serverListen include the operation, description and unchanged numeric code.
+  Existing connection messages/codes, callback signatures and wire behavior
+  stay unchanged. Updated Kotlin sources require the matching JNI/core build.
 - **2026-10-28 immediate Kotlin/JNI errors:** connect, immutable put/get,
   mutable put and ping check native submission status before awaiting callbacks.
   Rejected calls throw instead of hanging; accepted callbacks are unchanged.
   Both owned Kotlin copies match. Native code and the C ABI are unchanged;
-  context-correct error descriptions remain the next separate item.
+  context-correct descriptions are covered by the separate item above.
 - **2026-10-27 read completion errors:** immutable/mutable get results retain
   the existing query completion status, and C get/get_ex callbacks forward it.
   Explicit C cancellation keeps priority; ordinary misses remain successful.

@@ -40,3 +40,18 @@ and linker flags `-Wl,--wrap=hyperdht_connect`,
 exercise real C validation; the fixture injects get/connect rejections and
 accepted synchronous callbacks. The timeout guards catch ignored returns.
 Run against both the primary wrapper and the Android example's Kotlin sources.
+
+With the same immediate-return fixture, compile `ContextErrors.kt` and run
+`com.hyperdht.ContextErrorsTest` to check descriptions and numeric codes for
+validation and query failures. It also checks JNI system descriptions using
+a real invalid-address bind failure. `ReadErrors.kt` checks query success,
+miss, failure, cancellation and unknown status messages with its read fixture.
+
+Error domains deliberately overlap numerically. C callers use
+`hyperdht_connect_strerror` for connection callbacks, `hyperdht_query_strerror`
+for storage/query completions, `hyperdht_call_strerror` for the documented
+immediate submission statuses, and `hyperdht_system_strerror` for raw libuv
+statuses (such as bind). Kotlin exposes the same distinction via `Errors`.
+Existing `Errors.describe` and default `DhtException(code)` retain connection
+semantics. Rebuild JNI/core together with the updated Kotlin sources; an old
+native library does not provide the new description entry points.

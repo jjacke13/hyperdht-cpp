@@ -30,9 +30,14 @@ jobs:
       - name: Install libsodium via vcpkg
         shell: pwsh
         run: |
-          vcpkg install --triplet=x64-windows-static-md `
+          $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+          $manifest = Get-Content "$env:GITHUB_WORKSPACE/.github/vcpkg/vcpkg.json" -Raw | ConvertFrom-Json
+          git -C "$env:VCPKG_ROOT" fetch --no-tags origin $manifest.'builtin-baseline'
+          if ($LASTEXITCODE -ne 0) { throw 'could not fetch pinned vcpkg baseline' }
+          & "$env:VCPKG_ROOT/vcpkg.exe" install --triplet=x64-windows-static-md `
             --x-manifest-root="$env:GITHUB_WORKSPACE/.github/vcpkg" `
             --x-install-root="$env:RUNNER_TEMP/vcpkg_installed"
+          if ($LASTEXITCODE -ne 0) { throw 'libsodium installation failed' }
           echo "SODIUM_PREFIX=$env:RUNNER_TEMP/vcpkg_installed/x64-windows-static-md" >> $env:GITHUB_ENV
           $header = Get-Content "$env:RUNNER_TEMP/vcpkg_installed/x64-windows-static-md/include/sodium/version.h" -Raw
           if ($header -notmatch 'SODIUM_VERSION_STRING\s+"1\.0\.22"') { throw 'unexpected libsodium version' }

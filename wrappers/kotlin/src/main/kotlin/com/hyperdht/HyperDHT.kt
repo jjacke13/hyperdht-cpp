@@ -198,8 +198,9 @@ class HyperDHT(
         }
 
         onLoop {
-            Native.connectAndOpenStream(
+            val rc = Native.connectAndOpenStream(
                 handle, remotePublicKey, onOpen, onData, onClose, cb)
+            if (rc != 0) throw DhtException(rc)
         }
 
         return deferred.await()
@@ -217,7 +218,10 @@ class HyperDHT(
             if (error != 0) deferred.completeExceptionally(DhtException(error))
             else deferred.complete(Unit)
         }
-        onLoop { Native.immutablePut(handle, value, cb) }
+        onLoop {
+            val rc = Native.immutablePut(handle, value, cb)
+            if (rc != 0) throw DhtException(rc)
+        }
         deferred.await()
     }
 
@@ -230,7 +234,10 @@ class HyperDHT(
             if (error != 0) deferred.completeExceptionally(DhtException(error))
             else deferred.complete(result)
         }
-        onLoop { Native.immutableGet(handle, target, valCb, doneCb) }
+        onLoop {
+            val rc = Native.immutableGet(handle, target, valCb, doneCb)
+            if (rc != 0) throw DhtException(rc)
+        }
         return deferred.await()
     }
 
@@ -241,8 +248,9 @@ class HyperDHT(
             else deferred.complete(Unit)
         }
         onLoop {
-            Native.mutablePut(handle, keyPair.publicKey, keyPair.secretKey,
+            val rc = Native.mutablePut(handle, keyPair.publicKey, keyPair.secretKey,
                 value, seq, cb)
+            if (rc != 0) throw DhtException(rc)
         }
         deferred.await()
     }
@@ -263,7 +271,10 @@ class HyperDHT(
     suspend fun ping(host: String, port: Int): Boolean {
         val deferred = CompletableDeferred<Boolean>()
         val cb = PingCallback { success -> deferred.complete(success) }
-        onLoop { Native.ping(handle, host, port, cb) }
+        onLoop {
+            val rc = Native.ping(handle, host, port, cb)
+            if (rc != 0) throw DhtException(rc)
+        }
         return deferred.await()
     }
 

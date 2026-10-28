@@ -31,3 +31,12 @@ For the read-completion test, add `test/kotlin/read_callback_fixture.cpp` and
 callbacks to test the real JNI/Kotlin handler; it is not a transport test.
 Real UDP/query-completion tests are `ReadStatus/StorageReadErrors.*` in
 `test_hyperdht`, including explicit cancellation and normal read misses.
+
+For immediate-return tests, use `test/kotlin/immediate_return_fixture.cpp`
+and linker flags `-Wl,--wrap=hyperdht_connect`,
+`-Wl,--wrap=hyperdht_immutable_get`, `-Wl,--wrap=hyperdht_immutable_put`, and
+`-Wl,--wrap=hyperdht_mutable_put`. Compile `ImmediateErrors.kt` and run
+`com.hyperdht.ImmediateErrorsTest`. Empty puts and invalid ping addresses
+exercise real C validation; the fixture injects get/connect rejections and
+accepted synchronous callbacks. The timeout guards catch ignored returns.
+Run against both the primary wrapper and the Android example's Kotlin sources.

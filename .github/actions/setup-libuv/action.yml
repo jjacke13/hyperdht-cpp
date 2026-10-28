@@ -1,0 +1,26 @@
+name: Build pinned libuv
+description: Build the checked-out libuv submodule for native release packaging
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        prefix="$RUNNER_TEMP/hyperdht-libuv"
+        cmake -S deps/libuv -B "$RUNNER_TEMP/libuv-build" -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+          -DLIBUV_BUILD_TESTS=OFF -DLIBUV_BUILD_BENCH=OFF \
+          -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_INSTALL_NAME_DIR=@rpath \
+          -DCMAKE_INSTALL_PREFIX="$prefix"
+        cmake --build "$RUNNER_TEMP/libuv-build" --target install --parallel 2
+        grep -Eq '^#define UV_VERSION_MAJOR +1$' "$prefix/include/uv/version.h"
+        grep -Eq '^#define UV_VERSION_MINOR +51$' "$prefix/include/uv/version.h"
+        grep -Eq '^#define UV_VERSION_PATCH +0$' "$prefix/include/uv/version.h"
+        echo "LIBUV_PREFIX=$prefix" >> "$GITHUB_ENV"
+        if [[ "$RUNNER_OS" != Windows ]]; then
+          export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          test "$(pkg-config --modversion libuv)" = 1.51.0
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$prefix/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "DYLD_LIBRARY_PATH=$prefix/lib:${DYLD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+        fi

@@ -24,9 +24,8 @@ jobs:
 
       - name: Cross-compile libsodium for Android
         run: |
-          git clone --depth 1 --branch stable https://github.com/jedisct1/libsodium.git /tmp/libsodium
+          cp -R deps/libsodium /tmp/libsodium
           cd /tmp/libsodium
-          ./autogen.sh
           export ANDROID_NDK_HOME=$ANDROID_NDK
           export NDK_PLATFORM=android-26
           export LIBSODIUM_FULL_BUILD=1
@@ -35,8 +34,7 @@ jobs:
 
       - name: Cross-compile libuv for Android
         run: |
-          git clone --depth 1 --branch v1.51.0 https://github.com/libuv/libuv.git /tmp/libuv
-          cmake -B /tmp/libuv-build -S /tmp/libuv -G Ninja \
+          cmake -B /tmp/libuv-build -S deps/libuv -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release -DLIBUV_BUILD_TESTS=OFF \

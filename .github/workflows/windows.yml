@@ -27,11 +27,18 @@ jobs:
       - name: Install Ninja
         run: choco install -y ninja
 
-      - name: Install libsodium + libuv via vcpkg
+      - name: Install libsodium via vcpkg
         shell: pwsh
         run: |
-          vcpkg install libsodium:x64-windows-static-md libuv:x64-windows-static-md
+          vcpkg install --triplet=x64-windows-static-md `
+            --x-manifest-root="$env:GITHUB_WORKSPACE/.github/vcpkg" `
+            --x-install-root="$env:RUNNER_TEMP/vcpkg_installed"
+          echo "SODIUM_PREFIX=$env:RUNNER_TEMP/vcpkg_installed/x64-windows-static-md" >> $env:GITHUB_ENV
+          $header = Get-Content "$env:RUNNER_TEMP/vcpkg_installed/x64-windows-static-md/include/sodium/version.h" -Raw
+          if ($header -notmatch 'SODIUM_VERSION_STRING\s+"1\.0\.22"') { throw 'unexpected libsodium version' }
           echo "VCPKG_TOOLCHAIN=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
+
+      - uses: ./.github/actions/setup-libuv
 
       - name: Patch libudx for MSVC compatibility
         shell: bash
@@ -52,7 +59,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DHYPERDHT_BUILD_TESTS=OFF `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_TOOLCHAIN" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            -DVCPKG_INSTALLED_DIR="$env:RUNNER_TEMP/vcpkg_installed" `
+            -Dlibuv_DIR="$env:LIBUV_PREFIX/lib/cmake/libuv"
           cmake --build build --config Release
 
       - name: Build shared (DLL)
@@ -63,7 +72,9 @@ jobs:
             -DBUILD_SHARED_LIBS=ON `
             -DHYPERDHT_BUILD_TESTS=OFF `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_TOOLCHAIN" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            -DVCPKG_INSTALLED_DIR="$env:RUNNER_TEMP/vcpkg_installed" `
+            -Dlibuv_DIR="$env:LIBUV_PREFIX/lib/cmake/libuv"
           cmake --build build-shared --config Release
 
       - name: Package library
@@ -75,6 +86,14 @@ jobs:
           # DLL + its import lib (linker stub)
           Copy-Item build-shared/hyperdht.dll dist/lib/
           Copy-Item build-shared/hyperdht.lib dist/lib/
+          New-Item -ItemType Directory -Force -Path dist/licenses/libuv | Out-Null
+          Copy-Item deps/libuv/LICENSE, deps/libuv/LICENSE-extra dist/licenses/libuv/
+          Copy-Item -Recurse "$env:LIBUV_PREFIX/include/*" dist/include/
+          Copy-Item "$env:LIBUV_PREFIX/lib/libuv.lib" dist/lib/
+          New-Item -ItemType Directory -Force -Path dist/licenses/libsodium | Out-Null
+          Copy-Item deps/libsodium/LICENSE, .github/licenses/libsodium-source-notices.txt dist/licenses/libsodium/
+          Copy-Item -Recurse "$env:SODIUM_PREFIX/include/*" dist/include/
+          Copy-Item "$env:SODIUM_PREFIX/lib/libsodium.lib" dist/lib/
           # Headers
           Copy-Item -Recurse include/hyperdht dist/include/
           # Zip up

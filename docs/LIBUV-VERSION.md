@@ -1,5 +1,31 @@
 # libuv version requirement
 
+## Reproducible CI builds
+
+Native CI builds `deps/libuv`, pinned to **v1.51.0**, commit
+`5152db2cbfeb5582e9c27c5ea1dba2cd9e10759b`. Linux/macOS release archives
+include that libuv runtime beside libhyperdht, its static library, headers and
+notices. Windows links the pinned static libuv through its CMake package.
+Android builds the same submodule with the NDK. ESP32 keeps its libuv shim.
+
+The flake fetches libuv independently as a non-flake input at the same commit,
+using Nixpkgs' build recipe with the source overridden. Existing Nixpkgs,
+libudx and ESP toolchain pins are unchanged. `nix develop .#ci` provides the
+locked dependencies for Linux/macOS build and test checks; those outputs are
+not used as native release artifacts.
+
+Libsodium is separately pinned to **1.0.22**, commit
+`77e1ce5d6dee871c49ef211222ba18ef0c486bda`, in both the submodule and flake
+input. Native POSIX and Android CI build that source; Windows' locked vcpkg
+manifest selects the same 1.0.22 release. The native archives carry the matching
+library, headers and license notices. Nixpkgs itself is not upgraded here.
+
+Ordinary CMake builds still use the dependencies supplied by the caller.
+Adding the submodule alone does not change their dependency selection.
+
+The analysis and upstream-release status below are historical (July 2026);
+they are not a claim about today's latest libuv release.
+
 **hyperdht-cpp requires libuv 1.51.x. Do NOT build against libuv 1.52.0 or
 1.52.1** (and no other 1.52.x exists yet — see below). This is not a style
 preference; libuv 1.52.0 has a UDP regression that silently breaks established

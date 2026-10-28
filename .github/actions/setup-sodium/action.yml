@@ -1,0 +1,26 @@
+name: Build pinned libsodium
+description: Build the checked-out libsodium source for native POSIX release packages
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        grep -F "$(git -C deps/libsodium rev-parse HEAD)" .github/licenses/libsodium-source-notices.txt
+        prefix="$RUNNER_TEMP/hyperdht-sodium"
+        mkdir -p "$RUNNER_TEMP/sodium-build"
+        cd "$RUNNER_TEMP/sodium-build"
+        "$GITHUB_WORKSPACE/deps/libsodium/configure" --prefix="$prefix"
+        make
+        make check
+        make install
+        if [[ "$RUNNER_OS" == macOS ]]; then
+          name=$(basename "$(otool -D "$prefix/lib/libsodium.dylib" | tail -n1)")
+          install_name_tool -id "@rpath/$name" "$prefix/lib/libsodium.dylib"
+        fi
+        export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+        test "$(pkg-config --modversion libsodium)" = 1.0.22
+        echo "SODIUM_PREFIX=$prefix" >> "$GITHUB_ENV"
+        echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=$prefix/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+        echo "DYLD_LIBRARY_PATH=$prefix/lib:${DYLD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"

@@ -1,3 +1,9 @@
 [submodule "deps/libudx"]
 	path = deps/libudx
 	url = https://github.com/holepunchto/libudx.git
+[submodule "deps/libuv"]
+	path = deps/libuv
+	url = https://github.com/libuv/libuv.git
+[submodule "deps/libsodium"]
+	path = deps/libsodium
+	url = https://github.com/jedisct1/libsodium.git

@@ -1,0 +1,35 @@
+name: Nix checks
+
+on:
+  push:
+    branches: [main, testing]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: cachix/install-nix-action@d9186cbdca7adedf113a159fa91f725a27866771 # v31
+      - name: Build and test with locked dependencies
+        run: |
+          for dep in libuv libsodium; do
+            expected=$(nix eval --impure --raw --expr "(builtins.fromJSON (builtins.readFile ./flake.lock)).nodes.$dep.locked.rev")
+            test "$(git -C "deps/$dep" rev-parse HEAD)" = "$expected"
+          done
+          nix develop --no-write-lock-file .#ci --command bash -euo pipefail -c '
+            test "$(pkg-config --modversion libuv)" = 1.51.0
+            test "$(pkg-config --modversion libsodium)" = 1.0.22
+            cmake -B build-nix -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+              -DHYPERDHT_BUILD_TESTS=ON -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+            cmake --build build-nix --parallel 2
+            ctest --test-dir build-nix -L unit --output-on-failure --parallel 2 \
+              --timeout 30 -E "LiveBootstrap|LiveConnect|FindPeerRandomKey|Cross|CrossTest|TableRetryAfterExternalSeedFlood"
+          '

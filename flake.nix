@@ -7,16 +7,44 @@
       url = "github:holepunchto/libudx/0420f6267110e919d3fcefb8d5de4385912eb353";
       flake = false;
     };
+    libuv = {
+      url = "github:libuv/libuv/5152db2cbfeb5582e9c27c5ea1dba2cd9e10759b";
+      flake = false;
+    };
+    libsodium = {
+      url = "github:jedisct1/libsodium/77e1ce5d6dee871c49ef211222ba18ef0c486bda";
+      flake = false;
+    };
     nixpkgs-esp-dev = {
       url = "github:mirrexagon/nixpkgs-esp-dev";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = { self, nixpkgs, libudx, nixpkgs-esp-dev }:
+  outputs = { self, nixpkgs, libudx, libuv, libsodium, nixpkgs-esp-dev }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
-      pkgsFor = system: nixpkgs.legacyPackages.${system};
+      pinnedDepsFor = pkgs: {
+        libsodium = pkgs.libsodium.overrideAttrs {
+          version = "1.0.22";
+          src = libsodium;
+        };
+        libuv = pkgs.libuv.overrideAttrs {
+          version = "1.51.0";
+          src = libuv;
+        };
+      };
+      pkgsFor = system:
+        let pkgs = nixpkgs.legacyPackages.${system};
+        in pkgs // pinnedDepsFor pkgs;
+      ciShellFor = system:
+        let pkgs = pkgsFor system;
+        in assert pkgs.libuv.version == "1.51.0";
+        assert pkgs.libsodium.version == "1.0.22";
+        pkgs.mkShell {
+          nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.pkg-config ];
+          buildInputs = [ pkgs.libsodium pkgs.libuv pkgs.gtest ];
+        };
     in
     {
       # ── Packages ─────────────────────────────────────────────────────
@@ -60,6 +88,7 @@
         in
         {
           # C++ development
+          ci = ciShellFor system;
           default = pkgs.mkShell {
             nativeBuildInputs = [
               pkgs.cmake pkgs.ninja pkgs.pkg-config
@@ -90,11 +119,11 @@
             androidSdk = androidComposition.androidsdk;
             fhs = pkgs.buildFHSEnv {
               name = "android-fhs";
-              targetPkgs = p: [
+              targetPkgs = p: let deps = pinnedDepsFor p; in [
                 p.cmake p.ninja p.pkg-config p.gcc14
                 p.jdk21 p.kotlin p.gradle
                 androidSdk
-                p.libsodium p.libuv
+                deps.libsodium deps.libuv
                 # Runtime deps for Gradle-downloaded binaries (aapt2, etc.)
                 p.glibc p.zlib p.stdenv.cc.cc.lib
               ];
@@ -180,7 +209,10 @@
             '';
           };
         }
-      );
+      ) // {
+        # macOS needs only CI, not Linux-only Android/ESP dev tools.
+        aarch64-darwin.ci = ciShellFor "aarch64-darwin";
+      };
 
       # ── NixOS module ─────────────────────────────────────────────────
 

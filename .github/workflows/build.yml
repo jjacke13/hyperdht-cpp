@@ -14,13 +14,16 @@ jobs:
           submodules: recursive
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build pkg-config libsodium-dev libuv1-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build pkg-config make
+
+      - uses: ./.github/actions/setup-sodium
+      - uses: ./.github/actions/setup-libuv
 
       - name: Build static
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHYPERDHT_BUILD_TESTS=OFF && ninja -C build
 
       - name: Build shared
-        run: cmake -B build-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DHYPERDHT_BUILD_TESTS=OFF && ninja -C build-shared
+        run: cmake -B build-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DHYPERDHT_BUILD_TESTS=OFF -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN' && ninja -C build-shared
 
       - name: Build tests & run
         run: |
@@ -36,6 +39,7 @@ jobs:
           strip --strip-unneeded -o dist/lib/libhyperdht-stripped.a build/libhyperdht.a
           strip --strip-unneeded -o dist/lib/libhyperdht-stripped.so build-shared/libhyperdht.so
           cp -r include/hyperdht dist/include/
+          bash .github/scripts/package-dependencies.sh
           tar czf hyperdht-x86_64-linux.tar.gz -C dist .
 
       - uses: actions/upload-artifact@v4
@@ -51,13 +55,16 @@ jobs:
           submodules: recursive
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build pkg-config libsodium-dev libuv1-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build pkg-config make
+
+      - uses: ./.github/actions/setup-sodium
+      - uses: ./.github/actions/setup-libuv
 
       - name: Build static
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHYPERDHT_BUILD_TESTS=OFF && ninja -C build
 
       - name: Build shared
-        run: cmake -B build-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DHYPERDHT_BUILD_TESTS=OFF && ninja -C build-shared
+        run: cmake -B build-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DHYPERDHT_BUILD_TESTS=OFF -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN' && ninja -C build-shared
 
       - name: Build tests & run
         run: |
@@ -73,6 +80,7 @@ jobs:
           strip --strip-unneeded -o dist/lib/libhyperdht-stripped.a build/libhyperdht.a
           strip --strip-unneeded -o dist/lib/libhyperdht-stripped.so build-shared/libhyperdht.so
           cp -r include/hyperdht dist/include/
+          bash .github/scripts/package-dependencies.sh
           tar czf hyperdht-aarch64-linux.tar.gz -C dist .
 
       - uses: actions/upload-artifact@v4
@@ -88,13 +96,16 @@ jobs:
           submodules: recursive
 
       - name: Install deps
-        run: brew install cmake ninja libsodium libuv pkg-config
+        run: brew install cmake ninja pkg-config
+
+      - uses: ./.github/actions/setup-sodium
+      - uses: ./.github/actions/setup-libuv
 
       - name: Build static
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHYPERDHT_BUILD_TESTS=OFF && ninja -C build
 
       - name: Build shared
-        run: cmake -B build-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DHYPERDHT_BUILD_TESTS=OFF && ninja -C build-shared
+        run: cmake -B build-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DHYPERDHT_BUILD_TESTS=OFF -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH=@loader_path && ninja -C build-shared
 
       - name: Build tests & run
         run: |
@@ -110,6 +121,7 @@ jobs:
           strip -x -o dist/lib/libhyperdht-stripped.a build/libhyperdht.a
           strip -x -o dist/lib/libhyperdht-stripped.dylib build-shared/libhyperdht.dylib
           cp -r include/hyperdht dist/include/
+          bash .github/scripts/package-dependencies.sh
           tar czf hyperdht-arm64-macos.tar.gz -C dist .
 
       - uses: actions/upload-artifact@v4
@@ -129,9 +141,8 @@ jobs:
 
       - name: Cross-compile libsodium for Android
         run: |
-          git clone --depth 1 --branch stable https://github.com/jedisct1/libsodium.git /tmp/libsodium
+          cp -R deps/libsodium /tmp/libsodium
           cd /tmp/libsodium
-          ./autogen.sh
           export ANDROID_NDK_HOME=$ANDROID_NDK
           export NDK_PLATFORM=android-26
           export LIBSODIUM_FULL_BUILD=1
@@ -141,8 +152,7 @@ jobs:
 
       - name: Cross-compile libuv for Android
         run: |
-          git clone --depth 1 --branch v1.51.0 https://github.com/libuv/libuv.git /tmp/libuv
-          cmake -B /tmp/libuv-build -S /tmp/libuv -G Ninja \
+          cmake -B /tmp/libuv-build -S deps/libuv -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release -DLIBUV_BUILD_TESTS=OFF \

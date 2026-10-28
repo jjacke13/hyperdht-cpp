@@ -18,6 +18,23 @@
         "type": "github"
       }
     },
+    "libsodium": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775768406,
+        "narHash": "sha256-k8u7iNqvjLA0PptbneDyE8zCtutJlV2LirrRb41tmBY=",
+        "owner": "jedisct1",
+        "repo": "libsodium",
+        "rev": "77e1ce5d6dee871c49ef211222ba18ef0c486bda",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jedisct1",
+        "repo": "libsodium",
+        "rev": "77e1ce5d6dee871c49ef211222ba18ef0c486bda",
+        "type": "github"
+      }
+    },
     "libudx": {
       "flake": false,
       "locked": {
@@ -32,6 +49,23 @@
         "owner": "holepunchto",
         "repo": "libudx",
         "rev": "0420f6267110e919d3fcefb8d5de4385912eb353",
+        "type": "github"
+      }
+    },
+    "libuv": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1745574627,
+        "narHash": "sha256-ayTk3qkeeAjrGj5ab7wF7vpWI8XWS1EeKKUqzaD/LY0=",
+        "owner": "libuv",
+        "repo": "libuv",
+        "rev": "5152db2cbfeb5582e9c27c5ea1dba2cd9e10759b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "libuv",
+        "repo": "libuv",
+        "rev": "5152db2cbfeb5582e9c27c5ea1dba2cd9e10759b",
         "type": "github"
       }
     },
@@ -74,7 +108,9 @@
     },
     "root": {
       "inputs": {
+        "libsodium": "libsodium",
         "libudx": "libudx",
+        "libuv": "libuv",
         "nixpkgs": "nixpkgs",
         "nixpkgs-esp-dev": "nixpkgs-esp-dev"
       }

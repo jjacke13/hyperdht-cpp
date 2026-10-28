@@ -1,0 +1,9 @@
+{
+  "name": "hyperdht-ci",
+  "version-string": "0.0.0",
+  "builtin-baseline": "15b12b99a227d51e21c86dffd40385439eac87a0",
+  "dependencies": ["libsodium"],
+  "overrides": [
+    {"name": "libsodium", "version": "1.0.22", "port-version": 1}
+  ]
+}

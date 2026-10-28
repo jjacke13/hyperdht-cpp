@@ -5,12 +5,18 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-28 (Kotlin submission errors and contextual descriptions; older snapshots below are historical).
+Last updated: 2026-10-28 (public-server relay address hints; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-10-28 public-server relay hints:** successful public handshakes prepend
+  the validated public endpoint to relayAddresses, matching JS announcer.js.
+  NAT replies retain their relay-only hints; holepunch relay pairs and announced
+  records are unchanged. This helps clients that prefer advertised hints.
+  C++ reconnect still caches discovery responders rather than preferring the
+  advertised list (JS connect.js:464-468); that is a separate remaining fix.
 - **2026-10-28 contextual error descriptions:** additive C/JNI helpers describe
   query completions, immediate submission statuses and raw libuv errors separately.
   Kotlin storage failures use query messages; rejected calls, addNode and

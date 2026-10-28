@@ -1430,6 +1430,7 @@ TEST(Server, Addresses4IsRemoteAddressPlusLanWithoutDuplicates) {
                                      peer_connect::FIREWALL_CONSISTENT, 0x42);
 
     std::vector<compact::Ipv4Address> addrs;
+    std::vector<compact::Ipv4Address> relay_hints;
     bool got_reply = false;
     ASSERT_TRUE(dht.router().handle_peer_handshake(
         hs.req,
@@ -1440,9 +1441,10 @@ TEST(Server, Addresses4IsRemoteAddressPlusLanWithoutDuplicates) {
             auto decrypted =
                 hs.noise->recv(resp_hs.noise.data(), resp_hs.noise.size());
             ASSERT_TRUE(decrypted.has_value());
-            addrs = peer_connect::decode_noise_payload(decrypted->data(),
-                                                       decrypted->size())
-                        .addresses4;
+            const auto payload = peer_connect::decode_noise_payload(
+                decrypted->data(), decrypted->size());
+            addrs = payload.addresses4;
+            relay_hints = payload.relay_addresses;
             got_reply = true;
         },
         [](const messages::Request&, udx_socket_t*) {}));
@@ -1459,6 +1461,8 @@ TEST(Server, Addresses4IsRemoteAddressPlusLanWithoutDuplicates) {
     }
     EXPECT_EQ(public_count, 1) << "addresses4 must carry ONE public entry";
     EXPECT_EQ(addrs[0], our_pub) << "addresses4[0] must be remoteAddress()";
+    ASSERT_FALSE(relay_hints.empty());
+    EXPECT_EQ(relay_hints.front(), our_pub);
 
     srv->close();
     dht.destroy();

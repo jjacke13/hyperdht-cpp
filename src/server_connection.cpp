@@ -250,6 +250,10 @@ std::optional<ServerConnection> finalize_handshake(
         }
 
         // relayAddresses — JS: relayAddresses.length ? relayAddresses : null
+        // JS announcer.js:176-179 — the public endpoint precedes the relays.
+        if (has_remote_address && !our_addresses.empty()) {
+            response.relay_addresses.push_back(our_addresses.front());
+        }
         for (const auto& ri : relay_infos) {
             response.relay_addresses.push_back(ri.relay_address);
         }

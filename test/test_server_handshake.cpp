@@ -6,6 +6,7 @@
 
 #include <sodium.h>
 #include <uv.h>
+#include <tuple>
 
 #include "hyperdht/dht_messages.hpp"
 #include "hyperdht/noise_wrap.hpp"
@@ -67,6 +68,54 @@ static ClientHandshake make_client_msg1(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+class ServerRelayHints : public ::testing::TestWithParam<std::tuple<bool, bool, int>> {};
+
+// JS announcer.js:176-179 prepends remoteAddress() to the plain address list;
+// server.js:368 sends that list separately from the holepunch relay pairs.
+TEST_P(ServerRelayHints, PublicAddressComesBeforeRelays) {
+    const auto [is_public, has_address, relay_count] = GetParam();
+    auto server_kp = noise::generate_keypair();
+    auto client = make_client_msg1(noise::generate_keypair(), server_kp.public_key, 1);
+    const auto public_address = compact::Ipv4Address::from_string("203.0.113.1", 49737);
+    std::vector<compact::Ipv4Address> addresses;
+    if (has_address) {
+        addresses.push_back(public_address);
+        addresses.push_back(compact::Ipv4Address::from_string("192.168.1.2", 49737));
+    }
+    std::vector<peer_connect::RelayInfo> relays;
+    for (int i = 0; i < relay_count; ++i) {
+        relays.push_back({compact::Ipv4Address::from_string("198.51.100.1", 10000 + i),
+                          compact::Ipv4Address::from_string("203.0.113.2", 20000 + i)});
+    }
+    auto result = handle_handshake(server_kp, client.noise_msg1,
+        compact::Ipv4Address::from_string("192.0.2.1", 12345), 7,
+        addresses, relays, nullptr, is_public);
+    ASSERT_TRUE(result.has_value());
+    auto bytes = client.noise_ik->recv(result->reply_noise.data(), result->reply_noise.size());
+    ASSERT_TRUE(bytes.has_value());
+    const auto response = peer_connect::decode_noise_payload(bytes->data(), bytes->size());
+    std::vector<compact::Ipv4Address> expected;
+    if (is_public && has_address) expected.push_back(public_address);
+    for (const auto& relay : relays) expected.push_back(relay.relay_address);
+    EXPECT_EQ(response.relay_addresses, expected);
+    EXPECT_EQ(response.addresses4, addresses);
+    if (is_public) {
+        EXPECT_FALSE(response.holepunch.has_value());
+    } else {
+        ASSERT_TRUE(response.holepunch.has_value());
+        ASSERT_EQ(response.holepunch->relays.size(), relays.size());
+        for (size_t i = 0; i < relays.size(); ++i) {
+            EXPECT_EQ(response.holepunch->relays[i].relay_address, relays[i].relay_address);
+            EXPECT_EQ(response.holepunch->relays[i].peer_address, relays[i].peer_address);
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(RelayAddressHint, ServerRelayHints,
+    ::testing::Values(std::make_tuple(true, true, 0), std::make_tuple(true, true, 3),
+                      std::make_tuple(false, true, 0), std::make_tuple(false, true, 3),
+                      std::make_tuple(true, false, 0), std::make_tuple(true, false, 3)));
 
 TEST(ServerHandshake, BasicHandshake) {
     // Generate keypairs

@@ -142,6 +142,7 @@ using FirewallFn = std::function<bool(
 // Returns: populated ServerConnection, or nullopt on failure.
 // On success, reply_noise contains the Noise msg2 to send back.
 // has_remote_address: true if server knows its public address (dht.remoteAddress() != null).
+//   our_addresses[0] is that public endpoint; also prepend it to relay hints.
 //   When true: holepunch field is omitted from response (client connects directly).
 //   JS: server.js:358 — `holepunch: ourRemoteAddr ? null : { id, relays }`
 // relay_through: optional relayThrough info to include in the response payload.

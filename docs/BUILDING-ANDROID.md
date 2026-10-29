@@ -45,12 +45,18 @@ Requires the Android NDK (r25+). On NixOS, `nix develop .#android`
 provides everything. Otherwise install Android Studio's NDK and set
 `$ANDROID_NDK`.
 
+Use a fresh `/tmp/libsodium` working directory for these commands. The sources
+are pinned to libsodium **1.0.22** and libuv **1.51.0**, as recorded by Git.
+
 ### 1. Cross-compile libsodium
 
 ```bash
-git clone --depth 1 --branch stable https://github.com/jedisct1/libsodium.git /tmp/libsodium
+# From the hyperdht-cpp repository root:
+git submodule update --init --recursive
+export HYPERDHT_SOURCE="$PWD"
+# The Android build script writes into its source tree; use a working copy.
+cp -R "$HYPERDHT_SOURCE/deps/libsodium" /tmp/libsodium
 cd /tmp/libsodium
-./autogen.sh
 export ANDROID_NDK_HOME=$ANDROID_NDK
 export NDK_PLATFORM=android-26
 export LIBSODIUM_FULL_BUILD=1
@@ -61,11 +67,11 @@ export SODIUM_PREFIX=/tmp/libsodium/libsodium-android-armv8-a+crypto
 ### 2. Cross-compile libuv
 
 ```bash
-git clone --depth 1 --branch v1.51.0 https://github.com/libuv/libuv.git /tmp/libuv
-cmake -B /tmp/libuv-build -S /tmp/libuv -G Ninja \
+cmake -B /tmp/libuv-build -S "$HYPERDHT_SOURCE/deps/libuv" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
-  -DCMAKE_BUILD_TYPE=Release -DLIBUV_BUILD_TESTS=OFF \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+  -DLIBUV_BUILD_TESTS=OFF -DLIBUV_BUILD_BENCH=OFF -DCMAKE_INSTALL_LIBDIR=lib \
   -DCMAKE_INSTALL_PREFIX=/tmp/libuv-android
 ninja -C /tmp/libuv-build install
 export UV_LIB=$(find /tmp/libuv-android/lib -name "*.a" | head -1)
@@ -74,7 +80,7 @@ export UV_LIB=$(find /tmp/libuv-android/lib -name "*.a" | head -1)
 ### 3. Build hyperdht static libs
 
 ```bash
-cd /path/to/hyperdht-cpp
+cd "$HYPERDHT_SOURCE"
 cmake -B build-android -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
   -DANDROID_ABI=arm64-v8a \

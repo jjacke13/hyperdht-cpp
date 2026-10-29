@@ -17,9 +17,7 @@ for cmd in cmake ninja pkg-config; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "ERROR: $cmd not found. Install it first:"
         echo ""
-        echo "  Debian/Ubuntu: sudo apt install cmake ninja-build pkg-config libsodium-dev libuv1-dev"
-        echo "  Fedora:        sudo dnf install cmake ninja-build pkgconf libsodium-devel libuv-devel"
-        echo "  Arch:          sudo pacman -S cmake ninja pkgconf libsodium libuv"
+        echo "  See $REPO_ROOT/docs/BUILDING.md for tools and pinned dependency builds."
         echo ""
         exit 1
     fi
@@ -32,9 +30,7 @@ pkg-config --exists libuv 2>/dev/null || missing="$missing libuv"
 if [ -n "$missing" ]; then
     echo "ERROR: Missing libraries:$missing"
     echo ""
-    echo "  Debian/Ubuntu: sudo apt install libsodium-dev libuv1-dev"
-    echo "  Fedora:        sudo dnf install libsodium-devel libuv-devel"
-    echo "  Arch:          sudo pacman -S libsodium libuv"
+    echo "  Build the pinned dependencies and set PKG_CONFIG_PATH; see $REPO_ROOT/docs/BUILDING.md."
     echo ""
     exit 1
 fi

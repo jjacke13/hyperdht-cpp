@@ -4,32 +4,25 @@ ctypes-based bindings for `libhyperdht.so`. Pure Python — no extension
 module to compile, but the C library (`libhyperdht.so` + `libuv.so.1`)
 must be reachable at runtime.
 
-## 1. System dependencies
+## 1. Dependencies
 
-```bash
-# Debian / Ubuntu
-sudo apt install cmake ninja-build pkg-config libsodium-dev libuv1-dev python3
-
-# Fedora
-sudo dnf install cmake ninja-build pkgconf libsodium-devel libuv-devel python3
-
-# Arch
-sudo pacman -S cmake ninja pkgconf libsodium libuv python
-```
-
-`libuv` is also a runtime dep — usually preinstalled. Install via your
-package manager if missing (`libuv1` on Debian/Ubuntu).
+Install Python 3 and follow the
+[non-Nix dependency build instructions](BUILDING.md#linux-and-macos-without-nix)
+to build libuv **1.51.0** and libsodium **1.0.22** from the pinned submodules.
+Keep `PKG_CONFIG_PATH` and the runtime library variables from that guide in
+the same shell. Distro development packages may provide different versions.
 
 ## 2. Build `libhyperdht.so`
 
-Shortcut:
+Linux shortcut:
 
 ```bash
 cd examples/python
 ./build.sh
 ```
 
-This produces `build-shared/libhyperdht.so` at the repo root.
+This produces `build-shared/libhyperdht.so` at the repo root. On macOS,
+use the manual CMake command below; the output is `libhyperdht.dylib`.
 
 Equivalent manual invocation:
 

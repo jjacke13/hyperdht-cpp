@@ -34,15 +34,16 @@ Wire-compatible with JS `hyperdht@6.29.1`. Live-tested in both directions on the
 nix develop && mkdir -p build && cd build && cmake .. -G Ninja && ninja && ctest -L unit
 ```
 
-Without Nix: install `cmake`, `ninja`, `libsodium`, `libuv`, then the same cmake flow. Docker also works (`docker build -t hyperdht .`). On Windows, use vcpkg for the dependencies and MSVC — CI builds the static and shared variants on every push (`.github/workflows/windows.yml`). See [BUILDING.md](docs/BUILDING.md) for full instructions (Linux, macOS, Windows, Docker, linking, troubleshooting).
+Without Nix, build the pinned libuv **1.51.0** and libsodium **1.0.22**
+submodules first, then configure CMake with their `pkg-config` path. Cloning the
+submodules alone does not select them automatically. See
+[BUILDING.md](docs/BUILDING.md) for Linux/macOS commands, Windows' locked vcpkg
+recipe, Docker, linking, and troubleshooting. Docker builds the pinned sources too.
 
-> **⚠️ libuv 1.51.x required — do not build against libuv 1.52.0/1.52.1.**
-> libuv 1.52.0 has a UDP `POLLERR` regression that silently wedges established
-> connections on real NAT paths (via libudx's PMTU-probe socket). The flake
-> pins `nixos-25.11` (libuv 1.51) deliberately. Building on `nixos-26.05` /
-> libuv 1.52 requires the override in
-> [`nix/libuv-1.52-udp-pollerr.patch`](nix/libuv-1.52-udp-pollerr.patch).
-> Full write-up + upstream status + re-check checklist: [docs/LIBUV-VERSION.md](docs/LIBUV-VERSION.md).
+> **libuv 1.51.x required:** libuv 1.52.0/1.52.1 has a UDP regression that can
+> stall established libudx connections. The flake and native CI pin 1.51.0
+> independently of the system's libuv. Background and re-check checklist:
+> [docs/LIBUV-VERSION.md](docs/LIBUV-VERSION.md).
 
 ## Documentation
 

@@ -18,16 +18,12 @@ Build-time:
 - `libclang` (for `bindgen`)
 - `pkg-config`
 
-Runtime libraries (also build-time for headers):
-- `libsodium-dev`
-- `libuv1-dev`
-
-### Debian / Ubuntu
-
-```bash
-sudo apt install cmake ninja-build pkg-config g++ git \
-                 libsodium-dev libuv1-dev libclang-dev
-```
+For native builds without Nix, install `libclang` (`libclang-dev` on
+Debian/Ubuntu) and follow the [pinned dependency source build](BUILDING.md#linux-and-macos-without-nix)
+for libuv **1.51.0** and libsodium **1.0.22**. Keep its `PKG_CONFIG_PATH`,
+`LIBRARY_PATH` and runtime library variables in the same shell when running
+Cargo. These cover CMake discovery, Rust's final linker and runtime loading.
+Do not substitute unversioned distro libuv/libsodium packages.
 
 ### Nix
 

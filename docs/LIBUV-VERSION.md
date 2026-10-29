@@ -22,6 +22,8 @@ library, headers and license notices. Nixpkgs itself is not upgraded here.
 
 Ordinary CMake builds still use the dependencies supplied by the caller.
 Adding the submodule alone does not change their dependency selection.
+[BUILDING.md](BUILDING.md) shows how to build and select the pinned sources
+without Nix; the Dockerfile builds those same sources.
 
 The analysis and upstream-release status below are historical (July 2026);
 they are not a claim about today's latest libuv release.

@@ -10,7 +10,7 @@
 
 pkgs.stdenv.mkDerivation {
   pname = "hyperdht-echo-server";
-  version = "0.5.0";
+  version = "0.6.0";
   src = ../examples/cpp;
 
   buildInputs = [ staticLib pkgs.libsodium pkgs.libuv ];

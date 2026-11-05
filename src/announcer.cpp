@@ -8,7 +8,7 @@
 //   - JS runs an async `_background()` loop that pings relays every 3s
 //     and re-announces every ~5min, awaiting on a `Sleeper`/`Signal`.
 //     C++ uses two libuv timers: bg_timer_ (REANNOUNCE_MS = 5 min) and
-//     ping_timer_ (RELAY_PING_MS = 3 s; fixed cadence, without awaiting pongs).
+//     ping_timer_ (3 s after the last round settles; ticks also run the watchdog).
 //   - JS keeps three rotating Maps in `_serverRelays[3]`. C++ keeps a
 //     single `active_relays_` vector plus a time-limited lenient gate.
 //   - JS picks the 3 best replies via `pickBest` (slice(0,3)) and commits
@@ -69,7 +69,7 @@ struct Announcer::Withdrawals {
 constexpr uint64_t REANNOUNCE_MS = 5 * 60 * 1000;
 
 // Relay ping interval: keep NAT mappings alive.
-// Match JS's 3s idle delay; this periodic timer does not include the ping RTT.
+// Match JS's 3s idle delay after the ping round settles.
 constexpr uint64_t RELAY_PING_MS = 3 * 1000;
 
 // Minimum spacing between drift-triggered refreshes (BEYOND-JS, see
@@ -109,6 +109,7 @@ void Announcer::start() {
     if (withdrawals_) withdrawals_->cancel();
     if (weak.expired()) return;
     running_ = true;
+    pinging_ = false;
 
     // Re-arm the C7 sentinel. stop_impl() sets *alive_ = false to make every
     // in-flight callback a no-op, and nothing else ever sets it back — so
@@ -158,6 +159,7 @@ void Announcer::stop_without_unannounce() {
 void Announcer::stop_impl(bool send_unannounce) {
     if (!running_) return;
     running_ = false;
+    pinging_ = false;
     *alive_ = false;                        // C7: invalidate sentinel
     if (current_query_) {                    // M9: cancel live query
         current_query_.reset();
@@ -302,7 +304,8 @@ void Announcer::on_ping_timer(uv_timer_t* timer) {
 // Ping relay nodes — keep NAT mappings alive + detect lost relays
 //
 // JS: .analysis/js/hyperdht/lib/announcer.js:105-141 (_background ping loop)
-//     JS awaits the ping round, then sleeps 3s. Our uv_timer repeats every 3s.
+//     JS awaits the ping round, then sleeps 3s. Rearm after all slots settle.
+//     The timer still ticks while waiting so the cycle watchdog stays live.
 //     If fewer than MIN_ACTIVE responses come back we trigger refresh()
 //     (matches JS:119-121).
 //
@@ -318,7 +321,8 @@ void Announcer::on_ping_timer(uv_timer_t* timer) {
 // ---------------------------------------------------------------------------
 
 void Announcer::ping_relays() {
-    if (active_relays_.empty()) return;
+    if (active_relays_.empty() || pinging_) return;
+    pinging_ = true;
 
     // Iterate a snapshot, not the live vector. The health branch below calls
     // refresh() → update() → dht_ops::find_peer, which starts the query
@@ -330,9 +334,20 @@ void Announcer::ping_relays() {
     // Track how many relays respond. Shared counter freed when all callbacks complete.
     auto active_count = std::make_shared<int>(0);
     auto total = static_cast<int>(targets.size());
-    auto pending = std::make_shared<int>(total);
+    auto pending = std::make_shared<int>(total + 1);  // Hold settlement until all requests are queued.
 
     auto weak = std::weak_ptr<bool>(alive_);  // C7: sentinel
+    auto settled = [weak, this, active_count, pending, total] {
+        if (auto a = weak.lock(); !a || !*a) return;
+        if (--*pending != 0) return;
+        pinging_ = false;
+        if (ping_timer_) uv_timer_again(ping_timer_);
+        if (*active_count < std::min(total, MIN_ACTIVE)) {
+            DHT_LOG("  [announcer] relay health: %d/%d active (min=%d), refreshing\n",
+                    *active_count, total, MIN_ACTIVE);
+            refresh();
+        }
+    };
     for (const auto& relay : targets) {
         messages::Request req;
         req.to.addr = relay.addr;
@@ -343,11 +358,10 @@ void Announcer::ping_relays() {
         const auto announced_peer_addr = relay.peer_addr;
 
         uint16_t tid = socket_.request(req,
-            [weak, this, active_count, pending, total, relay_addr,
+            [weak, this, active_count, settled, relay_addr,
              announced_peer_addr](const messages::Response& resp) {
                 if (auto a = weak.lock(); !a || !*a) return;
                 (*active_count)++;
-                (*pending)--;
 
                 // Drift check (see header comment above).
                 const auto& observed = resp.from.addr;
@@ -378,33 +392,17 @@ void Announcer::ping_relays() {
                     }
                 }
 
-                if (*pending == 0 && *active_count < std::min(total, MIN_ACTIVE)) {
-                    DHT_LOG("  [announcer] relay health: %d/%d active (min=%d), refreshing\n",
-                            *active_count, total, MIN_ACTIVE);
-                    refresh();
-                }
+                settled();
             },
-            [weak, this, active_count, pending, total](uint16_t) {
-                if (auto a = weak.lock(); !a || !*a) return;
-                (*pending)--;
-                if (*pending == 0 && *active_count < std::min(total, MIN_ACTIVE)) {
-                    DHT_LOG("  [announcer] relay health: %d/%d active (min=%d), refreshing\n",
-                            *active_count, total, MIN_ACTIVE);
-                    refresh();
-                }
-            });
+            [settled](uint16_t) { settled(); });
         // Dropped by the congestion queue (tid == 0): neither callback fires
         // — settle this relay's slot now so the tick's health check can
         // still evaluate (mirror of the ANNOUNCE commit congestion path).
         if (tid == 0) {
-            (*pending)--;
-            if (*pending == 0 && *active_count < std::min(total, MIN_ACTIVE)) {
-                DHT_LOG("  [announcer] relay health: %d/%d active (min=%d), refreshing\n",
-                        *active_count, total, MIN_ACTIVE);
-                refresh();
-            }
+            settled();
         }
     }
+    settled();
 }
 
 // ---------------------------------------------------------------------------

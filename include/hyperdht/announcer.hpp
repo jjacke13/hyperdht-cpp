@@ -6,7 +6,7 @@
 //   1. find_peer(target) to discover k closest nodes
 //   2. For each: ANNOUNCE with signed record
 //   3. Track relay addresses (which DHT nodes store our announcement)
-//   4. Ping relays every 3s to keep NAT mappings alive
+//   4. Ping relays, then wait 3s after the round settles
 //   5. Re-announce every ~5 minutes
 //   6. On stop: UNANNOUNCE from all relay nodes
 //
@@ -206,6 +206,7 @@ private:
     uv_timer_t* ping_timer_ = nullptr;  // Relay keepalive (~3s)
     bool running_ = false;
     bool updating_ = false;
+    bool pinging_ = false;
 
     // ---- Publish-after-settle cycle state ----
     // One "cycle" = one find_peer walk + its ANNOUNCE commits. relays_ is

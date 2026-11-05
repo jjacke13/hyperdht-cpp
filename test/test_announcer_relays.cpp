@@ -23,6 +23,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <vector>
 
 #include "hyperdht/announcer.hpp"
@@ -63,6 +64,9 @@ struct FakeNode {
     int find_peer_count = 0;
     int announce_count = 0;
     int ping_count = 0;
+    std::set<uint16_t> ping_tids;
+    bool hold_ping = false;
+    std::vector<std::pair<messages::Response, compact::Ipv4Address>> held_pings;
 
     bool reply_error = false;   // fail FIND_PEER → node leaves the closest set
     bool silent_ping = false;   // never pong → looks dead to the health check
@@ -90,6 +94,11 @@ struct FakeNode {
 
         if (req.internal && req.command == messages::CMD_PING) {
             ping_count++;
+            ping_tids.insert(req.tid);
+            if (hold_ping) {
+                held_pings.emplace_back(resp, req.from.addr);
+                return;
+            }
             if (silent_ping) return;
         } else if (!req.internal && req.command == messages::CMD_FIND_PEER) {
             find_peer_count++;
@@ -104,6 +113,13 @@ struct FakeNode {
         }
 
         sock.udp_send(messages::encode_response(resp), req.from.addr);
+    }
+
+    void release_pings() {
+        hold_ping = false;
+        for (const auto& [resp, to] : held_pings)
+            sock.udp_send(messages::encode_response(resp), to);
+        held_pings.clear();
     }
 };
 
@@ -343,6 +359,67 @@ TEST(AnnouncerRelays, PeriodicKeepaliveReachesEveryRelayWithinFourSeconds) {
         }
         return true;
     }, 4000));
+}
+
+TEST(AnnouncerRelays, KeepaliveRoundsDoNotOverlap) {
+    Fixture f(3);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    f.nodes[0]->hold_ping = true;
+    f.ann->ping_relays_for_test();
+    ASSERT_TRUE(run_until(&f.loop, [&] { return !f.nodes[0]->held_pings.empty(); }, 500));
+
+    f.ann->ping_relays_for_test();
+    run_until(&f.loop, [] { return false; }, 100);
+    EXPECT_EQ(f.nodes[0]->ping_tids.size(), 1u);
+}
+
+TEST(AnnouncerRelays, KeepalivePauseStartsAfterLastPong) {
+    Fixture f(3);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    f.nodes[0]->hold_ping = true;
+    f.ann->ping_relays_for_test();
+    ASSERT_TRUE(run_until(&f.loop, [&] { return !f.nodes[0]->held_pings.empty(); }, 500));
+    run_until(&f.loop, [] { return false; }, 1000);
+    f.nodes[0]->release_pings();
+    ASSERT_TRUE(run_until(&f.loop, [&] { return f.client->inflight_count() == 0; }, 500));
+
+    // Fast relays must also wait for the slow relay's pong, then the full pause.
+    const auto before = f.nodes[1]->ping_tids.size();
+    EXPECT_FALSE(run_until(&f.loop, [&] { return f.nodes[1]->ping_tids.size() > before; }, 2500));
+    EXPECT_TRUE(run_until(&f.loop, [&] { return f.nodes[1]->ping_tids.size() > before; }, 1500));
+}
+
+TEST(AnnouncerRelays, KeepaliveTimeoutSettlesAndAllowsAnotherRound) {
+    Fixture f(1);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    f.nodes[0]->silent_ping = true;
+    f.ann->ping_relays_for_test();
+    ASSERT_TRUE(f.settled_at(2, 10000));  // Lost relay triggers the existing health refresh.
+
+    f.nodes[0]->silent_ping = false;
+    const auto before = f.nodes[0]->ping_tids.size();
+    f.ann->ping_relays_for_test();
+    EXPECT_TRUE(run_until(&f.loop, [&] { return f.nodes[0]->ping_tids.size() > before; }, 500));
+}
+
+TEST(AnnouncerRelays, StopDuringKeepaliveDoesNotBlockRestart) {
+    Fixture f(1);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    f.nodes[0]->hold_ping = true;
+    f.ann->ping_relays_for_test();
+    ASSERT_TRUE(run_until(&f.loop, [&] { return !f.nodes[0]->held_pings.empty(); }, 500));
+    f.ann->stop_without_unannounce();
+    f.nodes[0]->release_pings();
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(2));
+
+    const auto before = f.nodes[0]->ping_tids.size();
+    f.ann->ping_relays_for_test();
+    EXPECT_TRUE(run_until(&f.loop, [&] { return f.nodes[0]->ping_tids.size() > before; }, 500));
 }
 
 // A relay that leaves the walk must leave the published set — which is what

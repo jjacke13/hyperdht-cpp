@@ -519,8 +519,12 @@ void Announcer::maybe_publish() {
                 for (const auto& next : cycle_relays_) kept |= old.addr == next.addr;
                 if (!kept) retired.push_back(old);
             }
+            const bool first_publish = active_relays_.empty();
             active_relays_ = std::move(cycle_relays_);
             build_relays();
+            // JS starts its background ping loop as soon as the initial update settles.
+            if (first_publish && ping_timer_)
+                uv_timer_start(ping_timer_, on_ping_timer, 0, RELAY_PING_MS);
         } else {
             // Deliberate divergence: JS assigns `this.relays = relays` even
             // when the walk committed to nothing (announcer.js:188). We keep

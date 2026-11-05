@@ -344,11 +344,54 @@ TEST(AnnouncerRelays, AllFailCycleKeepsPublishedList) {
 }
 
 // ============================================================================
+TEST(AnnouncerRelays, FirstKeepaliveStartsAfterInitialPublication) {
+    Fixture f(3);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    ASSERT_EQ(f.ann->relays().size(), 3u);
+
+    EXPECT_TRUE(run_until(&f.loop, [&] {
+        for (const auto& node : f.nodes) {
+            if (node->ping_count == 0) return false;
+        }
+        return true;
+    }, 500));
+}
+
+TEST(AnnouncerRelays, FirstKeepaliveStartsAfterResumePublication) {
+    Fixture f(3);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    f.ann->stop_without_unannounce();
+    ASSERT_TRUE(run_until(&f.loop, [&] { return f.client->inflight_count() == 0; }, 500));
+
+    std::vector<int> before;
+    for (const auto& node : f.nodes) before.push_back(node->ping_count);
+    const auto next_gen = f.ann->cycle_gen_for_test() + 1;
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(next_gen));
+    ASSERT_EQ(f.ann->relays().size(), 3u);
+
+    EXPECT_TRUE(run_until(&f.loop, [&] {
+        for (size_t i = 0; i < f.nodes.size(); ++i) {
+            if (f.nodes[i]->ping_count <= before[i]) return false;
+        }
+        return true;
+    }, 500));
+}
+
 TEST(AnnouncerRelays, PeriodicKeepaliveReachesEveryRelayWithinFourSeconds) {
     Fixture f(3);
     f.ann->start();
     ASSERT_TRUE(f.settled_at(1));
     ASSERT_EQ(f.ann->relays().size(), 3u);
+
+    ASSERT_TRUE(run_until(&f.loop, [&] {
+        for (const auto& node : f.nodes) {
+            if (node->ping_count == 0) return false;
+        }
+        return f.client->inflight_count() == 0;
+    }, 4000));
 
     std::vector<int> before;
     for (const auto& node : f.nodes) before.push_back(node->ping_count);

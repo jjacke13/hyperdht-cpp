@@ -5,12 +5,18 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-05 (persistent forwarding hint priority; older snapshots below are historical).
+Last updated: 2026-11-05 (announcer first keepalive; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-05 announcer first keepalive:** startup and resume schedule the
+  first relay ping round immediately after the first nonempty announcement
+  publishes, matching JS start() awaiting the initial update before starting
+  its background loop. Later rounds retain the three-second pause after all
+  replies/timeouts settle. Reannounce and later refresh-cycle timing are
+  unchanged; no public API, wrapper or wire-format changes are needed.
 - **2026-11-05 persistent forwarding hints:** a persistent node's live router
   forwarding address replaces cached relay hints for the first FIND_PEER pass,
   matching JS connect.js:327-333. Ephemeral nodes, local handlers without a
@@ -51,7 +57,8 @@ Last updated: 2026-11-05 (persistent forwarding hint priority; older snapshots b
   timeout or queue rejection settles, matching JS's await-then-pause ordering.
   Timer ticks still run the cycle watchdog while a round is pending. The
   reannounce timer, watchdog threshold, drift handling and wire/API formats
-  are unchanged; this does not change the first-ping or refresh-cycle timing.
+  are unchanged; first-ping timing is covered above and later refresh-cycle
+  timing remains separate work.
 - **2026-10-28 client reconnect hints:** successful connections cache the
   server's advertised relayAddresses in preference to discovery responders,
   matching JS connect.js:464-468. Empty advertised lists retain the discovery

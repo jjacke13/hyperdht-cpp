@@ -5,12 +5,18 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-05 (announcer keepalive round scheduling; older snapshots below are historical).
+Last updated: 2026-11-05 (pooled RPC retry count; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-05 pooled RPC retries:** default PoolSocket requests now allow
+  one initial send plus three retries (four total), matching JS dht-rpc's
+  `retries = 3`. Previously the total was three. Retransmissions retain the
+  same TID and encoded request; adaptive timeouts and overall connection
+  deadlines are unchanged. Sampling PINGs still lack JS's `retry: false`
+  override; that remains separate work.
 - **2026-11-05 announcer keepalives:** the periodic relay ping interval is now
   three seconds instead of five, matching JS's three-second idle delay.
   Ping rounds do not overlap; the three-second pause starts after every reply,
@@ -1386,7 +1392,7 @@ has still never carried a packet against a real peer.**
 - [ ] `PoolSocket::reply()` (`src/holepunch.cpp`) has no production caller — only
       `test/test_pool_socket_requests.cpp`. The round reply goes out through
       `socket_.udp_send(..., via)` instead. Either wire it or delete it.
-- [ ] The sampling PINGs use `MAX_REQUEST_ATTEMPTS` (3) where JS `nat.js:59` uses
+- [ ] The sampling PINGs use `MAX_REQUEST_ATTEMPTS` (4 total) where JS `nat.js:59` uses
       `{ retry: false }` and re-runs `autoSample` once instead. Now that discovery
       settles on classification the retries no longer block anything, but it is still
       a divergence; revisit if sampling shows up in field latency.

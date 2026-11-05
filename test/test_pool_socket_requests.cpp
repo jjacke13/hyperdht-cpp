@@ -96,6 +96,8 @@ class PoolSocketRequests : public ::testing::Test {
     }
 
     std::optional<messages::Request> plain_got_request_;
+    std::vector<uint16_t> plain_request_tids_;
+    std::function<void(const messages::Request&)> plain_request_handler_;
 
     static void on_plain_recv(udx_socket_t* s, ssize_t nread,
                               const uv_buf_t* buf, const struct sockaddr* addr) {
@@ -108,6 +110,8 @@ class PoolSocketRequests : public ::testing::Test {
             static_cast<size_t>(nread), req, resp);
         if (type == messages::REQUEST_ID) {
             self->plain_got_request_ = req;
+            self->plain_request_tids_.push_back(req.tid);
+            if (self->plain_request_handler_) self->plain_request_handler_(req);
             return;
         }
         if (type != messages::RESPONSE_ID) return;
@@ -163,6 +167,41 @@ class PoolSocketRequests : public ::testing::Test {
         return pred();
     }
 };
+
+TEST_F(PoolSocketRequests, FourthSendCanRecoverAfterThreeDroppedRequests) {
+    plain_request_handler_ = [this](const messages::Request& req) {
+        if (plain_request_tids_.size() != 4) return;
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = pool_addr();
+        send_from_plain_socket(messages::encode_response(resp), pool_addr());
+    };
+    messages::Request req;
+    req.command = messages::CMD_PEER_HOLEPUNCH;
+    req.to.addr = bound_addr(plain_->handle());
+    int replies = 0, timeouts = 0;
+    pool_->request(req, [&](const auto&) { ++replies; }, [&](uint16_t) { ++timeouts; });
+
+    ASSERT_TRUE(run_loop_until([&] { return replies || timeouts; }, 5500));
+    EXPECT_EQ(replies, 1);
+    EXPECT_EQ(timeouts, 0);
+    ASSERT_EQ(plain_request_tids_.size(), 4u);
+    EXPECT_EQ(plain_request_tids_, std::vector<uint16_t>(4, plain_request_tids_.front()));
+}
+
+TEST_F(PoolSocketRequests, SilentPeerTimesOutOnceAfterFourSends) {
+    messages::Request req;
+    req.command = messages::CMD_PEER_HOLEPUNCH;
+    req.to.addr = bound_addr(plain_->handle());
+    int replies = 0, timeouts = 0;
+    pool_->request(req, [&](const auto&) { ++replies; }, [&](uint16_t) { ++timeouts; });
+
+    ASSERT_TRUE(run_loop_until([&] { return timeouts != 0; }, 5500));
+    EXPECT_EQ(replies, 0);
+    EXPECT_EQ(timeouts, 1);
+    ASSERT_EQ(plain_request_tids_.size(), 4u);
+    EXPECT_EQ(plain_request_tids_, std::vector<uint16_t>(4, plain_request_tids_.front()));
+}
 
 TEST_F(PoolSocketRequests, InboundRequestDispatchesAndReplyRoundTrips) {
     messages::Request req;

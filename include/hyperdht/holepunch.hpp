@@ -163,9 +163,10 @@ public:
     int bind();
     bool is_bound() const { return bound_; }
 
-    // Send an RPC request from this socket. Retries up to MAX_REQUEST_ATTEMPTS
-    // times keeping the same TID — matches JS dht-rpc/lib/io.js:366
-    // (`this.retries = 3`) and io.js:458 (adaptive `_adt.get`). Each retry
+    // Send an RPC request from this socket: one initial send plus three retries
+    // (MAX_REQUEST_ATTEMPTS total), keeping the same TID. Matches JS
+    // dht-rpc/lib/io.js:366,598 (`retries = 3`, timeout when sent > retries).
+    // Each retry
     // consults `rpc_socket_->timeout_for(peer)` (or DEFAULT_TIMEOUT_MS when
     // no shared RTT map), so a successful early response trains the per-peer
     // EMA and shortens the next attempt's wait.
@@ -173,7 +174,7 @@ public:
                  rpc::OnResponseCallback on_response,
                  rpc::OnTimeoutCallback on_timeout = nullptr);
 
-    static constexpr int MAX_REQUEST_ATTEMPTS = 3;
+    static constexpr int MAX_REQUEST_ATTEMPTS = 4;
 
     // Probes
     void send_probe(const compact::Ipv4Address& to);

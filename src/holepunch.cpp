@@ -1362,7 +1362,7 @@ void discover_pool_addresses(
     // decide. Resolve anyway so the caller never hangs — `ok` is false and the
     // puncher's analyze() sees UNKNOWN and either retries or aborts.
     // Waiting for THIS was the bug: the slowest of MAX_TARGETS targets, each
-    // retried MAX_REQUEST_ATTEMPTS times, gated every parked holepunch round
+    // sent MAX_REQUEST_ATTEMPTS times, gated every parked holepunch round
     // behind one dead node while the client's own round timeout ran out.
     auto exhausted = [ctx, settle]() {
         if (ctx->done) return;
@@ -1380,7 +1380,7 @@ void discover_pool_addresses(
     // We do NOT ping the server's announce address. Earlier we did, intending
     // to seed the server's NAT mapping for our IP, but the server has typically
     // remapped since announce time (CGNAT recycles ports), so the PING reliably
-    // times out and (after the new 3× retry path) burns ~3 s waiting. JS's
+    // times out and burns the full retry budget waiting. JS's
     // nat.autoSample only PINGs routing-table nodes (`nat.js:25-79`); match it.
     constexpr size_t MAX_TARGETS = 7;
     std::vector<compact::Ipv4Address> targets;

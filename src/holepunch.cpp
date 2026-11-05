@@ -1313,7 +1313,7 @@ void PoolSocket::close() {
 // ---------------------------------------------------------------------------
 // discover_pool_addresses — PING DHT nodes from pool socket for NAT discovery.
 //
-// JS: .analysis/js/nat-sampler/index.js (Nat.autoSample, invoked from
+// JS: .analysis/js/hyperdht/lib/nat.js (Nat.autoSample, invoked from
 //     Holepuncher constructor at holepuncher.js:20 — fires background PINGs
 //     to populate the NatSampler before the first punch round). C++ makes
 //     this explicit as a synchronous PING campaign before Round 1.
@@ -1392,7 +1392,13 @@ void discover_pool_addresses(
     // nat.autoSample only PINGs routing-table nodes (`nat.js:25-79`); match it.
     constexpr size_t MAX_TARGETS = 7;
     std::vector<compact::Ipv4Address> targets;
-    targets.push_back(relay_addr);
+    // JS nat.js tracks visited host:port pairs before sending a sampling PING.
+    auto add_target = [&targets](const Ipv4Address& addr) {
+        if (std::find(targets.begin(), targets.end(), addr) == targets.end()) {
+            targets.push_back(addr);
+        }
+    };
+    add_target(relay_addr);
 
     // JS `nat.js:33`: `skip = nodes.length >= 8 ? 5 : 0` — skip the first
     // 5 closest nodes when the table is well-populated, to spread sampling
@@ -1401,7 +1407,7 @@ void discover_pool_addresses(
     int skip = closest.size() >= 8 ? 5 : 0;
     for (size_t i = skip;
          i < closest.size() && targets.size() < MAX_TARGETS; i++) {
-        targets.push_back(Ipv4Address::from_string(closest[i]->host, closest[i]->port));
+        add_target(Ipv4Address::from_string(closest[i]->host, closest[i]->port));
     }
 
     // Fallback: use bootstrap nodes when routing table is sparse. Try to
@@ -1413,7 +1419,7 @@ void discover_pool_addresses(
         };
         for (const auto& host : bootstrap) {
             if (targets.size() >= MAX_TARGETS) break;
-            targets.push_back(Ipv4Address::from_string(host, 49737));
+            add_target(Ipv4Address::from_string(host, 49737));
         }
     }
 

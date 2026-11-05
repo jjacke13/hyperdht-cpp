@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <optional>
@@ -100,6 +101,7 @@ class PoolSocketRequests : public ::testing::Test {
 
     std::optional<messages::Request> plain_got_request_;
     std::vector<uint16_t> plain_request_tids_;
+    std::vector<uint16_t> plain_request_ports_;
     std::function<void(const messages::Request&)> plain_request_handler_;
 
     static void on_plain_recv(udx_socket_t* s, ssize_t nread,
@@ -114,6 +116,7 @@ class PoolSocketRequests : public ::testing::Test {
         if (type == messages::REQUEST_ID) {
             self->plain_got_request_ = req;
             self->plain_request_tids_.push_back(req.tid);
+            self->plain_request_ports_.push_back(port_of(s));
             if (self->plain_request_handler_) self->plain_request_handler_(req);
             return;
         }
@@ -439,6 +442,39 @@ TEST_F(PoolSocketRequests, SilentDiscoveryPingsEachTargetOnlyOnce) {
     EXPECT_FALSE(ok);
     EXPECT_EQ(completions, 1);
     EXPECT_EQ(plain_request_tids_.size(), 7u);
+}
+
+TEST_F(PoolSocketRequests, DiscoveryDoesNotPingTheRelayTwiceWhenItIsInTheTable) {
+    hyperdht::routing::RoutingTable table(hyperdht::routing::NodeId{});
+    std::vector<uint16_t> expected_ports;
+    for (int i = 0; i < 7; ++i) {
+        extra_peers_.push_back(std::make_unique<UdxSocket>(*udx_));
+        auto& peer = extra_peers_.back();
+        struct sockaddr_in addr{};
+        uv_ip4_addr("127.0.0.1", 0, &addr);
+        ASSERT_EQ(peer->bind(reinterpret_cast<const struct sockaddr*>(&addr)), 0);
+        peer->handle()->data = this;
+        ASSERT_EQ(peer->recv_start(on_plain_recv), 0);
+        const auto endpoint = bound_addr(peer->handle());
+        hyperdht::routing::Node node;
+        node.id = hyperdht::rpc::compute_peer_id(endpoint);
+        node.host = endpoint.host_string();
+        node.port = endpoint.port;
+        table.add(node);
+        expected_ports.push_back(endpoint.port);
+    }
+    ASSERT_EQ(table.size(), 7u);  // Enough local targets to avoid public bootstrap fallback.
+    const auto closest = table.closest(hyperdht::routing::NodeId{}, 20);
+    const auto relay = Ipv4Address::from_string(closest.front()->host, closest.front()->port);
+    int completions = 0;
+    hyperdht::holepunch::discover_pool_addresses(*pool_, table, relay,
+        [&](bool ok) { EXPECT_FALSE(ok); ++completions; });
+
+    ASSERT_TRUE(run_loop_until([&] { return completions > 0; }, 2000));
+    EXPECT_EQ(completions, 1);
+    std::sort(expected_ports.begin(), expected_ports.end());
+    std::sort(plain_request_ports_.begin(), plain_request_ports_.end());
+    EXPECT_EQ(plain_request_ports_, expected_ports);
 }
 
 TEST_F(PoolSocketRequests, DiscoverSettlesOnClassificationNotOnStragglers) {

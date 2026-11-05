@@ -5,12 +5,17 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-05 (one-shot NAT sampling pings; older snapshots below are historical).
+Last updated: 2026-11-05 (unique NAT sampling targets; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-05 sampling target deduplication:** each address-discovery campaign
+  selects distinct host:port endpoints, matching JS nat.js's visited-node gate.
+  A relay also present in the routing table no longer receives two PINGs or
+  crowds out another target. Bootstrap fallback uses the same gate. The
+  seven-target margin, selection order and cross-campaign policy are unchanged.
 - **2026-11-05 sampling ping retries:** address-discovery PINGs now send once,
   matching JS nat.js `retry: false`. An additive PoolSocket request overload
   selects this behavior; the original overload and ordinary holepunch RPCs
@@ -1398,9 +1403,12 @@ has still never carried a packet against a real peer.**
       `socket_.udp_send(..., via)` instead. Either wire it or delete it.
 - [x] Sampling PINGs use `{ retry: false }` (one send), matching JS nat.js:59
       (2026-11-05); ordinary pooled RPCs retain their default retry budget.
+- [x] Sampling campaigns deduplicate relay/routing/bootstrap endpoints before
+      sending, matching JS nat.js's host:port visited gate (2026-11-05).
 - [ ] Review the remaining sampling campaign selection/retry policy against
       JS's visited-node second pass. The deliberate seven-target margin and
-      current selection policy were retained by the per-request retry fix.
+      current selection policy were retained by the per-request retry and
+      same-campaign deduplication fixes; cross-campaign visited state is deferred.
 - [ ] `QueryWalk.DownHintEmittedToReferrerOnTimeout` is load-flaky: it needs ~2.02 s
       of wall clock and failed once in a parallel `ctest` run, then passed standalone
       3/3 and in a full rerun. Untouched by this branch (`src/query.cpp` and

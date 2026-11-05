@@ -16,6 +16,7 @@
 #include "hyperdht/blind_relay.hpp"
 #include "hyperdht/dht.hpp"
 #include "hyperdht/dht_messages.hpp"
+#include "hyperdht/dht_ops.hpp"
 #include "hyperdht/holepunch.hpp"
 #include "hyperdht/messages.hpp"
 #include "hyperdht/noise_wrap.hpp"
@@ -744,6 +745,20 @@ struct SilentNodes {
     std::vector<uint16_t> ports_;
 };
 
+static bool answer_find_peer(hyperdht::rpc::RpcSocket& socket, const msgs::Request& req,
+                             const hyperdht::noise::PubKey& key) {
+    if (req.command != msgs::CMD_FIND_PEER) return false;
+    if (req.target != hyperdht::dht_ops::hash_public_key(key.data(), key.size())) return true;
+    hyperdht::dht_messages::PeerRecord record;
+    record.public_key = key;
+    msgs::Response resp;
+    resp.tid = req.tid;
+    resp.from.addr = req.from.addr;
+    resp.value = hyperdht::dht_messages::encode_peer_record(record);
+    socket.reply(resp, req.from_server);
+    return true;
+}
+
 // The relay peer, whole: a DHT node that completes the PEER_HANDSHAKE for the
 // relay keypair, plus the UDX endpoint behind it speaking SecretStream →
 // Protomux → blind-relay.
@@ -799,6 +814,7 @@ struct FakeRelayPeer {
     }
 
     void on_request(const msgs::Request& req) {
+        if (answer_find_peer(node_, req, kp_.public_key)) return;
         if (req.internal && req.command == msgs::CMD_PING) {
             msgs::Response resp;
             resp.tid = req.tid;
@@ -1136,6 +1152,7 @@ static void run_client_relay_emit(bool open_relay, bool fail_write = false) {
     target.bind(0);
     auto target_addr = Ipv4Address::from_string("127.0.0.1", target.port());
     target.on_request([&](const msgs::Request& req) {
+        if (answer_find_peer(target, req, target_kp.public_key)) return;
         msgs::Response resp;
         resp.tid = req.tid;
         resp.from.addr = req.from.addr;
@@ -1239,19 +1256,20 @@ TEST(ConnectRelayRequests, ReusesNoiseRequestAcrossRelays) {
     hyperdht::rpc::RpcSocket first(&loop, first_id), second(&loop, second_id);
     ASSERT_EQ(first.bind(0), 0);
     ASSERT_EQ(second.bind(0), 0);
+    auto remote = hyperdht::noise::generate_keypair().public_key;
     std::vector<std::vector<uint8_t>> requests;
-    auto capture = [&](const msgs::Request& req) {
+    auto capture = [&](hyperdht::rpc::RpcSocket& socket, const msgs::Request& req) {
+        if (answer_find_peer(socket, req, remote)) return;
         if (req.command != msgs::CMD_PEER_HANDSHAKE || !req.value) return;
         requests.push_back(pc::decode_handshake_msg(req.value->data(),
                                                     req.value->size()).noise);
     };
-    first.on_request(capture);
-    second.on_request(capture);
+    first.on_request([&](const auto& req) { capture(first, req); });
+    second.on_request([&](const auto& req) { capture(second, req); });
     hyperdht::HyperDHT dht(&loop);
     ASSERT_EQ(dht.bind(), 0);
     auto silent = std::make_unique<SilentNodes>(&loop);
     silent->seed(dht);
-    auto remote = hyperdht::noise::generate_keypair().public_key;
     dht.cache_relay_addresses(remote, {
         Ipv4Address::from_string("127.0.0.1", first.port()),
         Ipv4Address::from_string("127.0.0.1", second.port())});

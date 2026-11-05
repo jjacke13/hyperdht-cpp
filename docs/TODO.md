@@ -5,17 +5,25 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-05 (connection discovery retry budget; older snapshots below are historical).
+Last updated: 2026-11-05 (cached connection discovery first pass; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-05 cached connection discovery:** cached relay addresses seed a
+  FIND_PEER-only first pass with one retry and no table/closer-node expansion,
+  matching JS connect.js:320-368. Handshakes start from valid peer replies.
+  When that pass and its handshakes finish without a connection, normal
+  discovery starts with three retries. Stale, empty and filtered hints retain
+  fallback; shutdown cannot start another pass. Existing helper symbols and
+  general query behavior are preserved. Explicit relay-address options and
+  persistent-router hint priority remain separate work.
 - **2026-11-05 connection discovery retries:** the normal connection FIND_PEER
   walk uses three retries (four sends), matching JS connect.js:347, instead of
   inheriting the general query default of five retries. The original find_peer
   overloads retain their defaults; an additive overload sets the budget before
-  the first send. Cached-query seeding and its shorter first pass remain open.
+  the first send. Cached-relay seeding is covered above.
 - **2026-11-05 sampling target deduplication:** each address-discovery campaign
   selects distinct host:port endpoints, matching JS nat.js's visited-node gate.
   A relay also present in the routing table no longer receives two PINGs or
@@ -315,8 +323,11 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   is local-only (no ABORTED round to the relay — see Section G).
 - [x] connect-9 normal walk retry budget — three retries, matching JS
   connect.js:347 (2026-11-05). General findPeer queries retain five retries.
-- [ ] connect-9 remaining — findPeer query not seeded with closestNodes /
-  onlyClosestNodes; cached first-pass retries and fallback remain to be wired.
+- [x] connect-9 cached relay first pass — cached-only FIND_PEER with one retry,
+  followed by a normal walk after the query and pending handshakes settle
+  (2026-11-05). Query filtering, cancellation and normal-walk controls covered.
+- [ ] connect-9 remaining — explicit relay-address seeds and persistent-router
+  forward hints are not selected as JS findAndConnect inputs yet.
 
 ### server (4 open; done: server-1/2/3/5/8)
 - [x] server-1 — DONE 2026-07-22. Firewall-rejected handshake now sends NOTHING
@@ -748,8 +759,8 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
   remap is out of scope (JS doesn't handle it either — onsocket is one-shot).
 - [x] **`_relayAddressesCache` — IMPLEMENTED** (`c196205`; source rechecked
   2026-10-13). `HyperDHT::cache_relay_addresses()` stores successful-connect
-  relays by server pubkey; reconnect starts handshakes from cached relays while
-  still running pipelined findPeer. The cache is capped at 512 entries with
+  relays by server pubkey; reconnect queries only cached relays first, then
+  falls back to ordinary discovery if needed (2026-11-05). The cache is capped at 512 entries with
   unordered-map eviction, rather than JS xache LRU. See `src/dht.cpp` and
   `src/connect.cpp`.
 - [x] **Read-side backpressure** — DONE 2026-07-28 (`a08cade`).

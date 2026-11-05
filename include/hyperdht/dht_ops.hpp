@@ -28,7 +28,7 @@ std::array<uint8_t, 32> hash_public_key(const uint8_t* pubkey, size_t len);
 // findPeer — find nodes that have announced at a public key
 // ---------------------------------------------------------------------------
 
-// Pre-seed node for the find_peer walk (JS `opts.nodes` — the Announcer
+// Pre-seed node for the find_peer walk (JS `opts.nodes` / `opts.closestNodes` — the Announcer
 // passes its previous cycle's closest nodes, announcer.js:156; dht-rpc
 // query.js:47-67 pushes them onto the pending frontier closest-first).
 struct SeedNode {
@@ -56,6 +56,14 @@ std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
                                          query::OnDoneCallback on_done,
                                          const std::vector<SeedNode>* seed_nodes,
                                          int retries);
+
+// JS opts.onlyClosestNodes: visit only the supplied seeds, without expansion.
+std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
+                                         const uint8_t* public_key, size_t pk_len,
+                                         query::OnReplyCallback on_reply,
+                                         query::OnDoneCallback on_done,
+                                         const std::vector<SeedNode>* seed_nodes,
+                                         int retries, bool only_closest_nodes);
 
 std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
                                          const std::array<uint8_t, 32>& public_key,

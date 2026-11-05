@@ -58,12 +58,23 @@ std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
                                          query::OnDoneCallback on_done,
                                          const std::vector<SeedNode>* seed_nodes,
                                          int retries) {
+    return find_peer(socket, public_key, pk_len, std::move(on_reply),
+                     std::move(on_done), seed_nodes, retries, false);
+}
+
+std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
+                                         const uint8_t* public_key, size_t pk_len,
+                                         query::OnReplyCallback on_reply,
+                                         query::OnDoneCallback on_done,
+                                         const std::vector<SeedNode>* seed_nodes,
+                                         int retries, bool only_closest_nodes) {
     auto target = hash_public_key(public_key, pk_len);
     routing::NodeId target_id{};
     std::copy(target.begin(), target.end(), target_id.begin());
 
     auto q = query::Query::create(socket, target_id, messages::CMD_FIND_PEER);
     q->set_retries(retries);
+    q->set_only_closest_nodes(only_closest_nodes);
     q->on_reply([on_reply = std::move(on_reply)](const query::QueryReply& reply) {
         if (!on_reply || !reply.value) return;
         dht_messages::PeerRecord peer;
@@ -80,7 +91,7 @@ std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
     if (seed_nodes) {
         for (const auto& s : *seed_nodes) q->add_seed_node(s.id, s.addr);
     }
-    add_default_bootstrap(*q, socket);
+    if (!only_closest_nodes) add_default_bootstrap(*q, socket);
     q->start();
     return q;
 }

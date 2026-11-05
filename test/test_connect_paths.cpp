@@ -109,6 +109,104 @@ TEST_P(FindPeerRetryBudget, SilentDiscoveryNode) {
 
 INSTANTIATE_TEST_SUITE_P(ConnectionAndGeneralQuery, FindPeerRetryBudget, ::testing::Bool());
 
+class CachedFindPeer : public ::testing::TestWithParam<int> {};
+
+TEST_P(CachedFindPeer, CachedPassPrecedesNormalDiscovery) {
+    // 0=record, 1=empty, 2=silent, 3=retryable handshake, 4=closer node,
+    // 5=filtered seed (synchronous completion), 6=destroy during the first pass.
+    const int mode = GetParam();
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    DhtOptions options;
+    options.ephemeral = true;
+    options.adaptive = false;
+    HyperDHT client(&loop, options);
+    ASSERT_EQ(client.bind(), 0);
+    rpc::RpcSocket hint(&loop, {}), normal(&loop, {});
+    ASSERT_EQ(hint.bind(0, "127.0.0.1"), 0);
+    ASSERT_EQ(normal.bind(0, "127.0.0.1"), 0);
+    const auto hint_addr = Ipv4Address::from_string("127.0.0.1", hint.port());
+    const auto normal_addr = Ipv4Address::from_string("127.0.0.1", normal.port());
+    routing::Node node;
+    node.id = rpc::compute_peer_id(normal_addr);
+    node.host = normal_addr.host_string();
+    node.port = normal_addr.port;
+    ASSERT_TRUE(client.socket().table().add(node));
+    noise::Seed seed{};
+    seed.fill(0x54);
+    const auto keypair = noise::generate_keypair(seed);
+    client.cache_relay_addresses(keypair.public_key, {hint_addr});
+    if (mode == 5) client.socket().set_filter_node(
+        [&](const auto&, const auto& addr) { return addr != hint_addr; });
+    std::vector<std::string> events;
+    std::vector<uint16_t> tids;
+    auto respond = [&](rpc::RpcSocket& via, const messages::Request& req, bool cached) {
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = req.from.addr;
+        // No id: these test responders must not enter the normal routing table.
+        if (!req.internal && req.command == messages::CMD_FIND_PEER) {
+            events.push_back(cached ? "hint-find" : "normal-find");
+            if (cached) tids.push_back(req.tid);
+            if (cached && (mode == 2 || mode == 6)) return;
+            if (!cached || mode != 1) {
+                dht_messages::PeerRecord record;
+                record.public_key = keypair.public_key;
+                resp.value = dht_messages::encode_peer_record(record);
+            }
+            if (cached && mode == 4) resp.closer_nodes.push_back(normal_addr);
+        } else if (req.command == messages::CMD_PEER_HANDSHAKE && req.value) {
+            events.push_back(cached ? "hint-handshake" : "normal-handshake");
+            if (cached && mode == 3) {
+                resp.value = std::vector<uint8_t>{0};  // Retryable outer-message failure.
+            } else {
+                const auto hs = peer_connect::decode_handshake_msg(req.value->data(), req.value->size());
+                const auto& prologue = dht_messages::ns_peer_handshake();
+                noise::NoiseIK responder(false, keypair, prologue.data(), prologue.size());
+                ASSERT_TRUE(responder.recv(hs.noise.data(), hs.noise.size()).has_value());
+                peer_connect::NoisePayload payload;
+                payload.version = 1;
+                payload.error = peer_connect::ERROR_ABORTED;
+                const auto bytes = peer_connect::encode_noise_payload(payload);
+                peer_connect::HandshakeMessage reply;
+                reply.mode = peer_connect::MODE_REPLY;
+                reply.noise = responder.send(bytes.data(), bytes.size());
+                resp.value = peer_connect::encode_handshake_msg(reply);
+            }
+        } else return;
+        via.reply(resp, req.from_server);
+    };
+    hint.on_request([&](const auto& req) { respond(hint, req, true); });
+    normal.on_request([&](const auto& req) { respond(normal, req, false); });
+    int completions = 0;
+    client.connect(keypair.public_key, [&](int error, const auto&) {
+        if (mode != 6) EXPECT_EQ(error, ConnectError::SERVER_ERROR);
+        ++completions;
+    });
+    run_until(&loop, [&] { return mode == 6 ? !events.empty() : completions > 0; }, 6000);
+    if (mode == 6) client.destroy();
+    else EXPECT_EQ(completions, 1);
+    const std::vector<std::vector<std::string>> expected = {
+        {"hint-find", "hint-handshake"},
+        {"hint-find", "normal-find", "normal-handshake"},
+        {"hint-find", "hint-find", "normal-find", "normal-handshake"},
+        {"hint-find", "hint-handshake", "normal-find", "normal-handshake"},
+        {"hint-find", "hint-handshake"},
+        {"normal-find", "normal-handshake"},
+        {"hint-find"}
+    };
+    client.destroy();
+    hint.close();
+    normal.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(events, expected[mode]);
+    EXPECT_LE(completions, 1);
+    if (mode == 2 && tids.size() == 2) EXPECT_EQ(tids.front(), tids.back());
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(Discovery, CachedFindPeer, ::testing::Range(0, 7));
+
 // ===========================================================================
 // connect-6 — LAN same-NAT shortcut (EXCLUSIVE of holepunch)
 // ===========================================================================
@@ -178,7 +276,7 @@ LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive,
             out.holepunch_reqs++;
             return;  // never answered — the test only counts
         }
-        if (discover && req.command == messages::CMD_FIND_PEER) {
+        if (req.command == messages::CMD_FIND_PEER) {
             messages::Response resp;
             resp.tid = req.tid;
             resp.from.addr = req.from.addr;

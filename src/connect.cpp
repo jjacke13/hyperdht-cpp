@@ -80,6 +80,7 @@ struct ConnState {
     int handshakes_started = 0;
     std::deque<compact::Ipv4Address> pending_relays;
     bool query_done = false;  // True after on_done fires
+    bool query_seeded = false;
 
     // Cached early firewall event — JS: c.serverSocket / c.serverAddress.
     // If the server's first UDX packet arrives BEFORE the handshake reply,
@@ -232,7 +233,7 @@ static void fire_handshake(std::shared_ptr<ConnState> state,
                             const compact::Ipv4Address& relay_addr);
 static void try_next_relay(std::shared_ptr<ConnState> state);
 static void check_exhaustion(std::shared_ptr<ConnState> state);
-static void start_find_peer(std::shared_ptr<ConnState> state);
+static void start_find_peer(std::shared_ptr<ConnState> state, bool use_cached = true);
 
 // ---------------------------------------------------------------------------
 // connect-4 — local half of the noisePayload, shared by EVERY handshake
@@ -302,7 +303,7 @@ static auto prepare_handshake(std::shared_ptr<ConnState> state) {
 
 // ---------------------------------------------------------------------------
 // §AUDIT-2: fire_handshake — start a single PEER_HANDSHAKE through a relay.
-// Called as findPeer results stream in (pipelining) or from cached relays.
+// Called as findPeer results stream in, including the cached-only pass.
 // JS: connect.js:355-368 (connectThroughNode inside for-await).
 // ---------------------------------------------------------------------------
 static void fire_handshake(std::shared_ptr<ConnState> state,
@@ -373,6 +374,11 @@ static void check_exhaustion(std::shared_ptr<ConnState> state) {
     if (!state->pending_relays.empty()) return;    // More to try
     if (!state->query_done) return;                // Query still running
     if (state->hs_result.success) return;          // Already succeeded
+    if (state->query_seeded) {
+        DHT_LOG("  [connect] cached findPeer exhausted, starting normal discovery\n");
+        start_find_peer(state, false);
+        return;
+    }
     state->complete(ConnectError::PEER_CONNECTION_FAILED);
 }
 
@@ -403,10 +409,21 @@ static void try_next_relay(std::shared_ptr<ConnState> state) {
 // §AUDIT-2: start_find_peer — initiate the Kademlia findPeer query.
 // Extracted so the route-shortcut failure path can fall through to it.
 // ---------------------------------------------------------------------------
-static void start_find_peer(std::shared_ptr<ConnState> state) {
-    if (state->completed || state->alive.expired()) return;
+static void start_find_peer(std::shared_ptr<ConnState> state, bool use_cached) {
+    auto alive = state->alive.lock();
+    if (state->completed || !alive || !*alive) return;
+    std::vector<dht_ops::SeedNode> seeds;
+    if (use_cached) {
+        for (const auto& addr : state->dht->get_cached_relay_addresses(state->remote_pk))
+            seeds.push_back({rpc::compute_peer_id(addr), addr});
+    }
+    const bool seeded = !seeds.empty();
+    state->query_seeded = seeded;
+    state->query_done = false;
+    if (seeded) DHT_LOG("  [connect] findPeer cached pass: %zu hints (retries=1, onlyClosestNodes=1)\n", seeds.size());
+    else DHT_LOG("  [connect] findPeer normal pass (retries=3)\n");
 
-    state->query = dht_ops::find_peer(*state->socket,
+    auto q = dht_ops::find_peer(*state->socket,
         state->remote_pk.data(), state->remote_pk.size(),
         // on_reply: fire handshake as results stream in (pipelining)
         [state](const query::QueryReply& reply) {
@@ -439,18 +456,21 @@ static void start_find_peer(std::shared_ptr<ConnState> state) {
             state->query.reset();
             state->query_done = true;
             if (state->completed) return;
-            if (!state->found && state->handshakes_started == 0) {
+            if (!state->query_seeded && !state->found && state->handshakes_started == 0) {
                 state->complete(ConnectError::PEER_NOT_FOUND);
                 return;
             }
             check_exhaustion(state);
-        }, /*seed_nodes=*/nullptr, /*retries=*/3);  // JS connect.js:347, normal discovery walk.
+        }, &seeds, /*retries=*/seeded ? 1 : 3, /*only_closest_nodes=*/seeded);
+    // A filtered seed can finish synchronously and start the fallback inside start().
+    if (!state->completed && !state->query_done && state->query_seeded == seeded)
+        state->query = std::move(q);
 }
 
 // ---------------------------------------------------------------------------
 // do_connect — entry point for HyperDHT::connect().
 //
-// Orchestrates: route shortcut -> cached relays -> findPeer (pipelined) ->
+// Orchestrates: route shortcut -> cached-only findPeer -> normal fallback ->
 // peer_handshake (Semaphore(2)) -> on_handshake_success.
 // ---------------------------------------------------------------------------
 void HyperDHT::do_connect(const noise::PubKey& remote_pk,
@@ -630,22 +650,6 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                     start_find_peer(state);
                 });
             return;  // Route attempt in progress — findPeer deferred
-        }
-    }
-
-    // §AUDIT-3: Pre-populate from relay address cache on reconnect.
-    // JS: connect.js:323-324 — use cached relays as initial set.
-    auto cached = get_cached_relay_addresses(remote_pk);
-    if (!cached.empty()) {
-        DHT_LOG("  [connect] relay cache hit: %zu cached relays\n",
-                cached.size());
-        state->found = true;
-        for (const auto& addr : cached) {
-            if (state->handshakes_in_flight < 2) {
-                fire_handshake(state, addr);
-            } else {
-                state->pending_relays.push_back(addr);
-            }
         }
     }
 

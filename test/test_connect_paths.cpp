@@ -27,6 +27,7 @@
 #include "hyperdht/compact.hpp"
 #include "hyperdht/dht.hpp"
 #include "hyperdht/dht_messages.hpp"
+#include "hyperdht/dht_ops.hpp"
 #include "hyperdht/holepunch.hpp"
 #include "hyperdht/messages.hpp"
 #include "hyperdht/noise_wrap.hpp"
@@ -206,6 +207,98 @@ TEST_P(CachedFindPeer, CachedPassPrecedesNormalDiscovery) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Discovery, CachedFindPeer, ::testing::Range(0, 7));
+
+class ForwardFindPeer : public ::testing::TestWithParam<int> {};
+
+TEST_P(ForwardFindPeer, PersistentForwardHintPrecedesRelayCache) {
+    // 0=live, 1=ephemeral, 2=local handler, 3=other target, 4=expired,
+    // 5=empty reply/fallback, 6=no cached hints, 7=no forward entry.
+    const int mode = GetParam();
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    DhtOptions options;
+    options.ephemeral = true;
+    options.adaptive = false;
+    HyperDHT client(&loop, options);
+    ASSERT_EQ(client.bind(), 0);
+    // Isolate the role predicate without running public reachability probes.
+    client.socket().set_ephemeral(mode == 1);
+    ASSERT_EQ(client.is_persistent(), mode != 1);
+    rpc::RpcSocket forward(&loop, {}), cached(&loop, {});
+    ASSERT_EQ(forward.bind(0, "127.0.0.1"), 0);
+    ASSERT_EQ(cached.bind(0, "127.0.0.1"), 0);
+    const auto forward_addr = Ipv4Address::from_string("127.0.0.1", forward.port());
+    const auto cached_addr = Ipv4Address::from_string("127.0.0.1", cached.port());
+    routing::Node node;
+    node.id = rpc::compute_peer_id(cached_addr);
+    node.host = cached_addr.host_string();
+    node.port = cached_addr.port;
+    ASSERT_TRUE(client.socket().table().add(node));  // Normal fallback stays local.
+    noise::Seed seed{};
+    seed.fill(0x55);
+    const auto keypair = noise::generate_keypair(seed);
+    if (mode != 6) client.cache_relay_addresses(keypair.public_key, {cached_addr});
+    auto target = dht_ops::hash_public_key(keypair.public_key.data(), keypair.public_key.size());
+    if (mode == 3) target[0] ^= 1;
+    if (mode != 7) {
+        router::ForwardEntry entry;
+        if (mode == 2) entry.on_peer_handshake = [](const auto&, const auto&, const auto&, bool, auto) {};
+        else entry.relay = forward_addr;
+        client.router().set(target, std::move(entry));
+    }
+    if (mode == 4) client.router().gc(uv_hrtime() / 1000000 + announce::DEFAULT_TTL_MS + 1);
+    std::vector<std::string> events;
+    auto respond = [&](rpc::RpcSocket& via, const messages::Request& req, bool own_forward) {
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = req.from.addr;
+        if (!req.internal && req.command == messages::CMD_FIND_PEER) {
+            events.push_back(own_forward ? "forward-find" : "cached-find");
+            if (!own_forward || mode != 5) {
+                dht_messages::PeerRecord record;
+                record.public_key = keypair.public_key;
+                resp.value = dht_messages::encode_peer_record(record);
+            }
+        } else if (req.command == messages::CMD_PEER_HANDSHAKE && req.value) {
+            events.push_back(own_forward ? "forward-handshake" : "cached-handshake");
+            const auto hs = peer_connect::decode_handshake_msg(req.value->data(), req.value->size());
+            const auto& prologue = dht_messages::ns_peer_handshake();
+            noise::NoiseIK responder(false, keypair, prologue.data(), prologue.size());
+            ASSERT_TRUE(responder.recv(hs.noise.data(), hs.noise.size()).has_value());
+            peer_connect::NoisePayload payload;
+            payload.version = 1;
+            payload.error = peer_connect::ERROR_ABORTED;
+            const auto bytes = peer_connect::encode_noise_payload(payload);
+            peer_connect::HandshakeMessage reply;
+            reply.mode = peer_connect::MODE_REPLY;
+            reply.noise = responder.send(bytes.data(), bytes.size());
+            resp.value = peer_connect::encode_handshake_msg(reply);
+        } else return;
+        via.reply(resp, req.from_server);
+    };
+    forward.on_request([&](const auto& req) { respond(forward, req, true); });
+    cached.on_request([&](const auto& req) { respond(cached, req, false); });
+    int completions = 0;
+    client.connect(keypair.public_key, [&](int error, const auto&) {
+        EXPECT_EQ(error, ConnectError::SERVER_ERROR);
+        ++completions;
+    });
+    run_until(&loop, [&] { return completions > 0; }, 3000);
+    EXPECT_EQ(completions, 1);
+    const std::vector<std::string> expected = mode == 5
+        ? std::vector<std::string>{"forward-find", "cached-find", "cached-handshake"}
+        : (mode == 0 || mode == 6)
+            ? std::vector<std::string>{"forward-find", "forward-handshake"}
+            : std::vector<std::string>{"cached-find", "cached-handshake"};
+    EXPECT_EQ(events, expected);
+    client.destroy();
+    forward.close();
+    cached.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(RouterPriority, ForwardFindPeer, ::testing::Range(0, 8));
 
 // ===========================================================================
 // connect-6 — LAN same-NAT shortcut (EXCLUSIVE of holepunch)

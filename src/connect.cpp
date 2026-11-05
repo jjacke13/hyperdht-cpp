@@ -416,6 +416,16 @@ static void start_find_peer(std::shared_ptr<ConnState> state, bool use_cached) {
     if (use_cached) {
         for (const auto& addr : state->dht->get_cached_relay_addresses(state->remote_pk))
             seeds.push_back({rpc::compute_peer_id(addr), addr});
+        // JS connect.js:327-333: a persistent node prefers its own live forward.
+        if (state->dht->is_persistent()) {
+            const auto target = dht_ops::hash_public_key(state->remote_pk.data(), state->remote_pk.size());
+            auto* forward = state->dht->router().get(target);
+            if (forward && forward->relay) {
+                seeds.clear();
+                const auto addr = *forward->relay;
+                seeds.push_back({rpc::compute_peer_id(addr), addr});
+            }
+        }
     }
     const bool seeded = !seeds.empty();
     state->query_seeded = seeded;

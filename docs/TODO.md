@@ -5,20 +5,26 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-05 (cached connection discovery first pass; older snapshots below are historical).
+Last updated: 2026-11-05 (persistent forwarding hint priority; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-05 persistent forwarding hints:** a persistent node's live router
+  forwarding address replaces cached relay hints for the first FIND_PEER pass,
+  matching JS connect.js:327-333. Ephemeral nodes, local handlers without a
+  forwarding address and missing/expired/other-target entries retain the cache
+  fallback. Normal discovery still follows an unsuccessful first pass. Cache,
+  router expiry, query budgets and public APIs are unchanged.
 - **2026-11-05 cached connection discovery:** cached relay addresses seed a
   FIND_PEER-only first pass with one retry and no table/closer-node expansion,
   matching JS connect.js:320-368. Handshakes start from valid peer replies.
   When that pass and its handshakes finish without a connection, normal
   discovery starts with three retries. Stale, empty and filtered hints retain
   fallback; shutdown cannot start another pass. Existing helper symbols and
-  general query behavior are preserved. Explicit relay-address options and
-  persistent-router hint priority remain separate work.
+  general query behavior are preserved. Persistent-router hint priority is
+  covered above; explicit relay-address options remain separate work.
 - **2026-11-05 connection discovery retries:** the normal connection FIND_PEER
   walk uses three retries (four sends), matching JS connect.js:347, instead of
   inheriting the general query default of five retries. The original find_peer
@@ -326,8 +332,10 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
 - [x] connect-9 cached relay first pass — cached-only FIND_PEER with one retry,
   followed by a normal walk after the query and pending handshakes settle
   (2026-11-05). Query filtering, cancellation and normal-walk controls covered.
-- [ ] connect-9 remaining — explicit relay-address seeds and persistent-router
-  forward hints are not selected as JS findAndConnect inputs yet.
+- [x] connect-9 persistent-router hint priority — live forwarding addresses
+  override cached hints on persistent nodes (2026-11-05).
+- [ ] connect-9 remaining — explicit relay-address seeds are not accepted as
+  JS findAndConnect inputs yet.
 
 ### server (4 open; done: server-1/2/3/5/8)
 - [x] server-1 — DONE 2026-07-22. Firewall-rejected handshake now sends NOTHING

@@ -5,18 +5,22 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-05 (pooled RPC retry count; older snapshots below are historical).
+Last updated: 2026-11-05 (one-shot NAT sampling pings; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-05 sampling ping retries:** address-discovery PINGs now send once,
+  matching JS nat.js `retry: false`. An additive PoolSocket request overload
+  selects this behavior; the original overload and ordinary holepunch RPCs
+  retain their four-send budget. Response timeouts, target selection,
+  classification/early completion and campaign retry policy are unchanged.
 - **2026-11-05 pooled RPC retries:** default PoolSocket requests now allow
   one initial send plus three retries (four total), matching JS dht-rpc's
   `retries = 3`. Previously the total was three. Retransmissions retain the
   same TID and encoded request; adaptive timeouts and overall connection
-  deadlines are unchanged. Sampling PINGs still lack JS's `retry: false`
-  override; that remains separate work.
+  deadlines are unchanged. The sampling override is covered above.
 - **2026-11-05 announcer keepalives:** the periodic relay ping interval is now
   three seconds instead of five, matching JS's three-second idle delay.
   Ping rounds do not overlap; the three-second pause starts after every reply,
@@ -1392,10 +1396,11 @@ has still never carried a packet against a real peer.**
 - [ ] `PoolSocket::reply()` (`src/holepunch.cpp`) has no production caller — only
       `test/test_pool_socket_requests.cpp`. The round reply goes out through
       `socket_.udp_send(..., via)` instead. Either wire it or delete it.
-- [ ] The sampling PINGs use `MAX_REQUEST_ATTEMPTS` (4 total) where JS `nat.js:59` uses
-      `{ retry: false }` and re-runs `autoSample` once instead. Now that discovery
-      settles on classification the retries no longer block anything, but it is still
-      a divergence; revisit if sampling shows up in field latency.
+- [x] Sampling PINGs use `{ retry: false }` (one send), matching JS nat.js:59
+      (2026-11-05); ordinary pooled RPCs retain their default retry budget.
+- [ ] Review the remaining sampling campaign selection/retry policy against
+      JS's visited-node second pass. The deliberate seven-target margin and
+      current selection policy were retained by the per-request retry fix.
 - [ ] `QueryWalk.DownHintEmittedToReferrerOnTimeout` is load-flaky: it needs ~2.02 s
       of wall clock and failed once in a parallel `ctest` run, then passed standalone
       3/3 and in a full rerun. Untouched by this branch (`src/query.cpp` and

@@ -174,6 +174,13 @@ public:
                  rpc::OnResponseCallback on_response,
                  rpc::OnTimeoutCallback on_timeout = nullptr);
 
+    // JS opts.retry: false sends once, then waits one normal response timeout.
+    // Keep the original overload/default retry budget for existing callers.
+    void request(const messages::Request& req,
+                 rpc::OnResponseCallback on_response,
+                 rpc::OnTimeoutCallback on_timeout,
+                 bool retry);
+
     static constexpr int MAX_REQUEST_ATTEMPTS = 4;
 
     // Probes
@@ -218,6 +225,7 @@ private:
         std::vector<uint8_t> buffer;          // pre-encoded request body
         compact::Ipv4Address dest;            // re-send target
         int attempts_left = 0;                // total remaining attempts (incl. current)
+        bool retry = true;
         uint64_t sent_at = 0;                 // monotonic ms, for RTT
     };
 

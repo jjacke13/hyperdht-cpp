@@ -1100,9 +1100,10 @@ void PoolSocket::send_inflight(Inflight* inf) {
     struct sockaddr_in dest{};
     uv_ip4_addr(inf->dest.host_string().c_str(), inf->dest.port, &dest);
 
-    int attempt_no = MAX_REQUEST_ATTEMPTS - inf->attempts_left + 1;
+    const int total_attempts = inf->retry ? MAX_REQUEST_ATTEMPTS : 1;
+    int attempt_no = total_attempts - inf->attempts_left + 1;
     DHT_LOG("  [pool] Sending request (tid=%u, %zu bytes, attempt %d/%d) to %s:%u\n",
-            inf->tid, ctx->buf.size(), attempt_no, MAX_REQUEST_ATTEMPTS,
+            inf->tid, ctx->buf.size(), attempt_no, total_attempts,
             inf->dest.host_string().c_str(), inf->dest.port);
 
     int rc = udx_socket_send(&ctx->req, socket_, &uv_buf, 1,
@@ -1167,16 +1168,23 @@ void PoolSocket::send_inflight(Inflight* inf) {
 void PoolSocket::request(const messages::Request& req,
                           rpc::OnResponseCallback on_response,
                           rpc::OnTimeoutCallback on_timeout) {
+    request(req, std::move(on_response), std::move(on_timeout), true);
+}
+
+void PoolSocket::request(const messages::Request& req,
+                          rpc::OnResponseCallback on_response,
+                          rpc::OnTimeoutCallback on_timeout, bool retry) {
     auto* inf = new Inflight;
     inf->tid = next_tid_++;
     inf->on_response = std::move(on_response);
     inf->on_timeout = std::move(on_timeout);
     inf->pool = this;
     inf->dest = req.to.addr;
-    inf->attempts_left = MAX_REQUEST_ATTEMPTS;
+    inf->retry = retry;
+    inf->attempts_left = retry ? MAX_REQUEST_ATTEMPTS : 1;
 
     // Encode once with our TID — re-sends reuse the buffer (same TID, so
-    // a late response from attempt 1 still matches the inflight on attempt 2/3).
+    // a late response still matches the inflight on any retry).
     messages::Request msg = req;
     msg.tid = inf->tid;
     inf->buffer = messages::encode_request(msg);
@@ -1424,7 +1432,7 @@ void discover_pool_addresses(
                 settle_if_decided();
                 exhausted();
             },
-            [ctx, exhausted](uint16_t) { exhausted(); });
+            [ctx, exhausted](uint16_t) { exhausted(); }, false);  // JS nat.js:59 retry: false.
     }
 
     exhausted();  // Decrement initial +1

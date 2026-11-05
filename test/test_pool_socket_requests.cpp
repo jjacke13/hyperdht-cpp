@@ -64,6 +64,7 @@ class PoolSocketRequests : public ::testing::Test {
     std::unique_ptr<Udx> udx_;
     std::unique_ptr<PoolSocket> pool_;
     std::unique_ptr<UdxSocket> plain_;  // stands in for the remote peer
+    std::vector<std::unique_ptr<UdxSocket>> extra_peers_;
     std::optional<messages::Response> received_;
     uint16_t received_src_port_ = 0;  // UDP source of the reply
 
@@ -88,9 +89,11 @@ class PoolSocketRequests : public ::testing::Test {
     void TearDown() override {
         if (pool_) pool_->close();
         if (plain_) plain_->close();
+        for (auto& peer : extra_peers_) peer->close();
         uv_run(&loop_, UV_RUN_DEFAULT);
         pool_.reset();
         plain_.reset();
+        extra_peers_.clear();
         udx_.reset();
         uv_loop_close(&loop_);
     }
@@ -187,6 +190,38 @@ TEST_F(PoolSocketRequests, FourthSendCanRecoverAfterThreeDroppedRequests) {
     EXPECT_EQ(timeouts, 0);
     ASSERT_EQ(plain_request_tids_.size(), 4u);
     EXPECT_EQ(plain_request_tids_, std::vector<uint16_t>(4, plain_request_tids_.front()));
+}
+
+TEST_F(PoolSocketRequests, NoRetryAcceptsTheFirstResponse) {
+    plain_request_handler_ = [this](const messages::Request& req) {
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = pool_addr();
+        send_from_plain_socket(messages::encode_response(resp), pool_addr());
+    };
+    messages::Request req;
+    req.command = messages::CMD_PING;
+    req.internal = true;
+    req.to.addr = bound_addr(plain_->handle());
+    int replies = 0, timeouts = 0;
+    pool_->request(req, [&](const auto&) { ++replies; }, [&](uint16_t) { ++timeouts; }, false);
+    ASSERT_TRUE(run_loop_until([&] { return replies || timeouts; }, 2000));
+    EXPECT_EQ(replies, 1);
+    EXPECT_EQ(timeouts, 0);
+    EXPECT_EQ(plain_request_tids_.size(), 1u);
+}
+
+TEST_F(PoolSocketRequests, NoRetryTimesOutAfterOneSend) {
+    messages::Request req;
+    req.command = messages::CMD_PING;
+    req.internal = true;
+    req.to.addr = bound_addr(plain_->handle());
+    int replies = 0, timeouts = 0;
+    pool_->request(req, [&](const auto&) { ++replies; }, [&](uint16_t) { ++timeouts; }, false);
+    ASSERT_TRUE(run_loop_until([&] { return timeouts; }, 2000));
+    EXPECT_EQ(replies, 0);
+    EXPECT_EQ(timeouts, 1);
+    EXPECT_EQ(plain_request_tids_.size(), 1u);
 }
 
 TEST_F(PoolSocketRequests, SilentPeerTimesOutOnceAfterFourSends) {
@@ -376,6 +411,35 @@ TEST_F(PoolSocketRequests, RequestWithoutConsumerIsDropped) {
 // round budget — it aborts with -5 and the server answers a tid nobody is
 // waiting for.
 // ---------------------------------------------------------------------------
+
+TEST_F(PoolSocketRequests, SilentDiscoveryPingsEachTargetOnlyOnce) {
+    hyperdht::routing::RoutingTable table(hyperdht::routing::NodeId{});
+    for (int i = 0; i < 6; ++i) {
+        extra_peers_.push_back(std::make_unique<UdxSocket>(*udx_));
+        auto& peer = extra_peers_.back();
+        struct sockaddr_in addr{};
+        uv_ip4_addr("127.0.0.1", 0, &addr);
+        ASSERT_EQ(peer->bind(reinterpret_cast<const struct sockaddr*>(&addr)), 0);
+        peer->handle()->data = this;
+        ASSERT_EQ(peer->recv_start(on_plain_recv), 0);
+        const auto endpoint = bound_addr(peer->handle());
+        hyperdht::routing::Node node;
+        node.id = hyperdht::rpc::compute_peer_id(endpoint);
+        node.host = endpoint.host_string();
+        node.port = endpoint.port;
+        table.add(node);
+    }
+    ASSERT_EQ(table.size(), 6u);  // Relay + six local peers avoids public bootstrap fallback.
+    bool done = false, ok = true;
+    int completions = 0;
+    hyperdht::holepunch::discover_pool_addresses(*pool_, table,
+        bound_addr(plain_->handle()), [&](bool success) { ++completions; ok = success; done = true; });
+
+    EXPECT_TRUE(run_loop_until([&] { return done; }, 2000));
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(completions, 1);
+    EXPECT_EQ(plain_request_tids_.size(), 7u);
+}
 
 TEST_F(PoolSocketRequests, DiscoverSettlesOnClassificationNotOnStragglers) {
     // Four nodes that answer instantly and agree on our address (three

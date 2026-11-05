@@ -6,7 +6,7 @@
 //   1. find_peer(target) to discover k closest nodes
 //   2. For each: ANNOUNCE with signed record
 //   3. Track relay addresses (which DHT nodes store our announcement)
-//   4. Ping relays every 5s to keep NAT mappings alive
+//   4. Ping relays every 3s to keep NAT mappings alive
 //   5. Re-announce every ~5 minutes
 //   6. On stop: UNANNOUNCE from all relay nodes
 //
@@ -100,7 +100,7 @@ public:
     bool is_running() const { return running_; }
 
     // Test-only: drive one relay keepalive round without waiting for the
-    // 5s ping timer (same pattern as RpcSocket::force_check_persistent).
+    // 3s ping timer (same pattern as RpcSocket::force_check_persistent).
     // This also runs the stuck-cycle watchdog (via on_ping_timer in the
     // real path; here we invoke ping_relays directly, so tests exercising
     // the watchdog call on_ping_timer through the timer or use the helpers
@@ -203,7 +203,7 @@ private:
 
     // Timers
     uv_timer_t* bg_timer_ = nullptr;    // Re-announce (~5 min)
-    uv_timer_t* ping_timer_ = nullptr;  // Relay keepalive (~5s)
+    uv_timer_t* ping_timer_ = nullptr;  // Relay keepalive (~3s)
     bool running_ = false;
     bool updating_ = false;
 

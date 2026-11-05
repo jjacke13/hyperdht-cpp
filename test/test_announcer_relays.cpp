@@ -328,12 +328,29 @@ TEST(AnnouncerRelays, AllFailCycleKeepsPublishedList) {
 }
 
 // ============================================================================
+TEST(AnnouncerRelays, PeriodicKeepaliveReachesEveryRelayWithinFourSeconds) {
+    Fixture f(3);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    ASSERT_EQ(f.ann->relays().size(), 3u);
+
+    std::vector<int> before;
+    for (const auto& node : f.nodes) before.push_back(node->ping_count);
+    // Exercise the real timer and wire requests, not the manual ping test hook.
+    EXPECT_TRUE(run_until(&f.loop, [&] {
+        for (size_t i = 0; i < f.nodes.size(); ++i) {
+            if (f.nodes[i]->ping_count <= before[i]) return false;
+        }
+        return true;
+    }, 4000));
+}
+
 // A relay that leaves the walk must leave the published set — which is what
 // stops the relay-health check from re-walking forever.
 //
 // ping_relays() refreshes when fewer than min(total, MIN_ACTIVE) relays pong.
 // With the set frozen at three, a single dead relay pinned `total` at 3 and
-// made that condition true on every 5s tick for the rest of the process: a
+// made that condition true on every keepalive tick for the rest of the process: a
 // permanent re-walk. Once the set rebuilds, the corpse drops out, `total`
 // becomes 2, and 2 of 2 responding satisfies min(2, 3). Same arithmetic as JS
 // (announcer.js:119-121); no separate eviction rule needed.

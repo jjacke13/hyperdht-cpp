@@ -5,12 +5,17 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-10-28 (client reconnect hint preference; older snapshots below are historical).
+Last updated: 2026-11-05 (announcer keepalive interval; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-05 announcer keepalives:** the periodic relay ping interval is now
+  three seconds instead of five, matching JS's three-second idle delay.
+  C++ still uses a fixed timer; awaiting each ping round before the delay,
+  as JS does, remains separate work. The reannounce timer, watchdog threshold,
+  drift handling and wire/API formats are unchanged.
 - **2026-10-28 client reconnect hints:** successful connections cache the
   server's advertised relayAddresses in preference to discovery responders,
   matching JS connect.js:464-468. Empty advertised lists retain the discovery

@@ -8,7 +8,7 @@
 //   - JS runs an async `_background()` loop that pings relays every 3s
 //     and re-announces every ~5min, awaiting on a `Sleeper`/`Signal`.
 //     C++ uses two libuv timers: bg_timer_ (REANNOUNCE_MS = 5 min) and
-//     ping_timer_ (RELAY_PING_MS = 5 s).
+//     ping_timer_ (RELAY_PING_MS = 3 s; fixed cadence, without awaiting pongs).
 //   - JS keeps three rotating Maps in `_serverRelays[3]`. C++ keeps a
 //     single `active_relays_` vector plus a time-limited lenient gate.
 //   - JS picks the 3 best replies via `pickBest` (slice(0,3)) and commits
@@ -69,8 +69,8 @@ struct Announcer::Withdrawals {
 constexpr uint64_t REANNOUNCE_MS = 5 * 60 * 1000;
 
 // Relay ping interval: keep NAT mappings alive.
-// JS pings every 3s. We use 5s — still well within CGNAT UDP timeouts (30-60s).
-constexpr uint64_t RELAY_PING_MS = 5 * 1000;
+// Match JS's 3s idle delay; this periodic timer does not include the ping RTT.
+constexpr uint64_t RELAY_PING_MS = 3 * 1000;
 
 // Minimum spacing between drift-triggered refreshes (BEYOND-JS, see
 // ping_relays). An oscillating NAT observation must not refresh-storm.
@@ -128,7 +128,7 @@ void Announcer::start() {
     bg_timer_->data = this;
     uv_timer_start(bg_timer_, on_bg_timer, REANNOUNCE_MS, REANNOUNCE_MS);
 
-    // Relay ping timer (5s) — keeps NAT mappings alive
+    // Relay ping timer (3s) — keeps NAT mappings alive
     ping_timer_ = new uv_timer_t;
     uv_timer_init(socket_.loop(), ping_timer_);
     ping_timer_->data = this;
@@ -268,7 +268,7 @@ void Announcer::on_ping_timer(uv_timer_t* timer) {
     // query-drop settle in query.cpp closes the known leak; this backstop
     // guarantees no unknown one can wedge the announcer for more than
     // CYCLE_STUCK_MS: force-reset exactly like notify_online() and start
-    // a fresh cycle. Runs from the 5s ping timer so it cannot be starved
+    // a fresh cycle. Runs from the 3s ping timer so it cannot be starved
     // by an empty relay list (ping_relays returns early on empty).
     if (self->updating_) {
         const uint64_t now = uv_now(self->socket_.loop());
@@ -302,7 +302,7 @@ void Announcer::on_ping_timer(uv_timer_t* timer) {
 // Ping relay nodes — keep NAT mappings alive + detect lost relays
 //
 // JS: .analysis/js/hyperdht/lib/announcer.js:105-141 (_background ping loop)
-//     JS pings every 3s, then sleeps. We use a periodic uv_timer at 5s.
+//     JS awaits the ping round, then sleeps 3s. Our uv_timer repeats every 3s.
 //     If fewer than MIN_ACTIVE responses come back we trigger refresh()
 //     (matches JS:119-121).
 //

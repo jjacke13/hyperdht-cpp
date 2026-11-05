@@ -48,11 +48,22 @@ std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
                                          query::OnReplyCallback on_reply,
                                          query::OnDoneCallback on_done,
                                          const std::vector<SeedNode>* seed_nodes) {
+    return find_peer(socket, public_key, pk_len, std::move(on_reply),
+                     std::move(on_done), seed_nodes, query::QUERY_RETRIES);
+}
+
+std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
+                                         const uint8_t* public_key, size_t pk_len,
+                                         query::OnReplyCallback on_reply,
+                                         query::OnDoneCallback on_done,
+                                         const std::vector<SeedNode>* seed_nodes,
+                                         int retries) {
     auto target = hash_public_key(public_key, pk_len);
     routing::NodeId target_id{};
     std::copy(target.begin(), target.end(), target_id.begin());
 
     auto q = query::Query::create(socket, target_id, messages::CMD_FIND_PEER);
+    q->set_retries(retries);
     q->on_reply([on_reply = std::move(on_reply)](const query::QueryReply& reply) {
         if (!on_reply || !reply.value) return;
         dht_messages::PeerRecord peer;

@@ -48,6 +48,15 @@ std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
                                          query::OnDoneCallback on_done,
                                          const std::vector<SeedNode>* seed_nodes = nullptr);
 
+// Configure retries before the first send; the original overload keeps the
+// generic query default. Connection discovery uses the JS-specific budget.
+std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
+                                         const uint8_t* public_key, size_t pk_len,
+                                         query::OnReplyCallback on_reply,
+                                         query::OnDoneCallback on_done,
+                                         const std::vector<SeedNode>* seed_nodes,
+                                         int retries);
+
 std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
                                          const std::array<uint8_t, 32>& public_key,
                                          query::OnReplyCallback on_reply,

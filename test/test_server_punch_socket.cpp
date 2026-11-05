@@ -137,7 +137,7 @@ struct FakeNode {
 
 class ServerPunchSocket : public ::testing::Test {
   protected:
-    static constexpr size_t NODE_COUNT = 6;  // >= discover's MIN_SAMPLES (4)
+    static constexpr size_t NODE_COUNT = 7;  // Fill distinct discovery targets; no public bootstrap fallback.
 
     uv_loop_t loop_{};
     std::unique_ptr<rpc::RpcSocket> socket_;

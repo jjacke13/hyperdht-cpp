@@ -60,6 +60,55 @@ void answer_ping(rpc::RpcSocket& sock, const messages::Request& req) {
     sock.reply(resp, req.from_server);
 }
 
+class FindPeerRetryBudget : public ::testing::TestWithParam<bool> {};
+
+TEST_P(FindPeerRetryBudget, SilentDiscoveryNode) {
+    const bool connecting = GetParam();
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    DhtOptions options;
+    options.ephemeral = true;
+    options.adaptive = false;
+    HyperDHT client(&loop, options);
+    ASSERT_EQ(client.bind(), 0);
+    rpc::RpcSocket peer(&loop, {});
+    ASSERT_EQ(peer.bind(0, "127.0.0.1"), 0);
+    const auto address = Ipv4Address::from_string("127.0.0.1", peer.port());
+    routing::Node node;
+    node.id = rpc::compute_peer_id(address);
+    node.host = address.host_string();
+    node.port = address.port;
+    ASSERT_TRUE(client.socket().table().add(node));  // No public bootstrap fallback.
+    std::vector<uint16_t> tids;
+    peer.on_request([&](const messages::Request& req) {
+        if (!req.internal && req.command == messages::CMD_FIND_PEER) tids.push_back(req.tid);
+    });
+    noise::Seed seed{};
+    seed.fill(0x53);
+    const auto key = noise::generate_keypair(seed).public_key;
+    int completions = 0;
+    std::shared_ptr<query::Query> walk;
+    if (connecting) {
+        client.connect(key, [&](int error, const ConnectResult&) {
+            EXPECT_EQ(error, ConnectError::PEER_NOT_FOUND);
+            ++completions;
+        });
+    } else {
+        walk = client.find_peer(key, nullptr, [&](int, const auto&) { ++completions; });
+    }
+    run_until(&loop, [&] { return completions > 0; }, 9000);
+    EXPECT_EQ(completions, 1);
+    EXPECT_EQ(tids.size(), connecting ? 4u : 6u);
+    if (!tids.empty()) EXPECT_EQ(tids, std::vector<uint16_t>(tids.size(), tids.front()));
+    walk.reset();
+    client.destroy();
+    peer.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(ConnectionAndGeneralQuery, FindPeerRetryBudget, ::testing::Bool());
+
 // ===========================================================================
 // connect-6 — LAN same-NAT shortcut (EXCLUSIVE of holepunch)
 // ===========================================================================

@@ -406,7 +406,8 @@ static void try_next_relay(std::shared_ptr<ConnState> state) {
 static void start_find_peer(std::shared_ptr<ConnState> state) {
     if (state->completed || state->alive.expired()) return;
 
-    state->query = dht_ops::find_peer(*state->socket, state->remote_pk,
+    state->query = dht_ops::find_peer(*state->socket,
+        state->remote_pk.data(), state->remote_pk.size(),
         // on_reply: fire handshake as results stream in (pipelining)
         [state](const query::QueryReply& reply) {
             if (state->completed) return;
@@ -443,7 +444,7 @@ static void start_find_peer(std::shared_ptr<ConnState> state) {
                 return;
             }
             check_exhaustion(state);
-        });
+        }, /*seed_nodes=*/nullptr, /*retries=*/3);  // JS connect.js:347, normal discovery walk.
 }
 
 // ---------------------------------------------------------------------------

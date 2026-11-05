@@ -5,12 +5,17 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-05 (unique NAT sampling targets; older snapshots below are historical).
+Last updated: 2026-11-05 (connection discovery retry budget; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-05 connection discovery retries:** the normal connection FIND_PEER
+  walk uses three retries (four sends), matching JS connect.js:347, instead of
+  inheriting the general query default of five retries. The original find_peer
+  overloads retain their defaults; an additive overload sets the budget before
+  the first send. Cached-query seeding and its shorter first pass remain open.
 - **2026-11-05 sampling target deduplication:** each address-discovery campaign
   selects distinct host:port endpoints, matching JS nat.js's visited-node gate.
   A relay also present in the routing table no longer receives two PINGs or
@@ -308,7 +313,10 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
 - [x] connect-7 — DONE 2026-07-22. `opts.holepunch` veto invoked after probe
   round, before punching; abort maps to HOLEPUNCH_TIMEOUT. Deviation: abort
   is local-only (no ABORTED round to the relay — see Section G).
-- [ ] connect-9 — findPeer query not seeded with closestNodes/onlyClosestNodes/retries.
+- [x] connect-9 normal walk retry budget — three retries, matching JS
+  connect.js:347 (2026-11-05). General findPeer queries retain five retries.
+- [ ] connect-9 remaining — findPeer query not seeded with closestNodes /
+  onlyClosestNodes; cached first-pass retries and fallback remain to be wired.
 
 ### server (4 open; done: server-1/2/3/5/8)
 - [x] server-1 — DONE 2026-07-22. Firewall-rejected handshake now sends NOTHING

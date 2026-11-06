@@ -833,7 +833,7 @@ void Server::on_handshake_result(
         DHT_LOG("  [server] Client is OPEN, connecting directly\n");
         remember_completed_handshake(noise_key, *conn_ptr);
         // Use the route's observed endpoint, not the client's advertised list.
-        on_socket(*conn_ptr, peer_address);
+        on_socket(*conn_ptr, peer_address, relayed ? socket_.active_socket() : nullptr);
         return;
     }
 

@@ -1589,6 +1589,7 @@ TEST_P(OpenClientShortcut, UsesObservedEndpoint) {
         ASSERT_EQ(socket.bind(0, "127.0.0.1"), 0);
         ASSERT_EQ(client.bind(0, "127.0.0.1"), 0);
         ASSERT_EQ(relay.bind(0, "127.0.0.1"), 0);
+        socket.set_firewalled(!(mode & 8));
         const auto client_addr = compact::Ipv4Address::from_string("127.0.0.1", client.port());
         router::Router router;
         Server srv(socket, router);
@@ -1597,26 +1598,42 @@ TEST_P(OpenClientShortcut, UsesObservedEndpoint) {
         const auto kp = noise::generate_keypair(seed);
         udx_stream_t receiver{};
         ASSERT_EQ(udx_stream_init(client.udx_handle(), &receiver, 12345, nullptr, nullptr), 0);
-        bool received = false;
+        struct Receipt {
+            bool payload = false;
+            uint16_t source_port = 0;
+            uint32_t server_id = 0;
+        } received;
         receiver.data = &received;
         ASSERT_EQ(udx_stream_read_start(&receiver, [](udx_stream_t* s, ssize_t n, const uv_buf_t* b) {
-            if (n > 0) *static_cast<bool*>(s->data) =
+            if (n > 0) static_cast<Receipt*>(s->data)->payload =
                 std::string(b->base, n) == "OPEN server payload";
         }), 0);
+        ASSERT_EQ(udx_stream_firewall(&receiver, [](udx_stream_t* s, udx_socket_t* sock,
+                                                  const sockaddr* from) {
+            auto* receipt = static_cast<Receipt*>(s->data);
+            receipt->source_port = ntohs(reinterpret_cast<const sockaddr_in*>(from)->sin_port);
+            const int rc = udx_stream_connect(s, sock, receipt->server_id, from);
+            EXPECT_EQ(rc, 0);
+            return rc < 0 ? 1 : 0;
+        }), 0);
+        sockaddr_in local{};
+        int len = sizeof(local);
+        auto* expected = relayed ? socket.active_socket() : socket.socket_handle();
+        ASSERT_EQ(udx_socket_getsockname(expected, reinterpret_cast<sockaddr*>(&local), &len), 0);
+        const auto expected_port = ntohs(local.sin_port);
         udx_stream_t* adopted = nullptr;
         int connections = 0, replies = 0;
         srv.listen(kp, [&](const ConnectionInfo& info) {
             ++connections;
             adopted = info.raw_stream;
             EXPECT_EQ(info.peer_address, client_addr);
-            EXPECT_EQ(info.udx_socket, nullptr);  // Existing consumer socket fallback is unchanged.
+            EXPECT_EQ(info.udx_socket, relayed ? socket.active_socket() : nullptr);
             EXPECT_FALSE(info.socket_keepalive);
+            received.server_id = info.local_udx_id;
             sockaddr_in addr{};
             uv_ip4_addr(info.peer_address.host_string().c_str(), info.peer_address.port, &addr);
-            ASSERT_EQ(udx_stream_connect(adopted, socket.socket_handle(), info.remote_udx_id,
-                reinterpret_cast<const sockaddr*>(&addr)), 0);
-            uv_ip4_addr("127.0.0.1", socket.port(), &addr);
-            ASSERT_EQ(udx_stream_connect(&receiver, client.socket_handle(), info.local_udx_id,
+            auto* egress = info.udx_socket ? info.udx_socket : socket.socket_handle();
+            ASSERT_EQ(udx_stream_connect(adopted, egress, info.remote_udx_id,
                 reinterpret_cast<const sockaddr*>(&addr)), 0);
             static char payload[] = "OPEN server payload";
             uv_buf_t buf = uv_buf_init(payload, sizeof(payload) - 1);
@@ -1678,7 +1695,8 @@ TEST_P(OpenClientShortcut, UsesObservedEndpoint) {
         EXPECT_EQ(connections, 1);
         if (adopted) {
             run_loop_for(&loop, 100);
-            EXPECT_TRUE(received);
+            EXPECT_TRUE(received.payload);
+            EXPECT_EQ(received.source_port, expected_port);
             udx::destroy_stream_once(adopted);
         }
         udx::destroy_stream_once(&receiver);
@@ -1691,7 +1709,7 @@ TEST_P(OpenClientShortcut, UsesObservedEndpoint) {
     EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
-INSTANTIATE_TEST_SUITE_P(Paths, OpenClientShortcut, ::testing::Range(0, 8));
+INSTANTIATE_TEST_SUITE_P(Paths, OpenClientShortcut, ::testing::Range(0, 16));
 
 TEST(Server, OpenClientSkipsBlindRelayBootstrap) {
     uv_loop_t loop;

@@ -5,12 +5,18 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-06 (announcer successful-cycle wake; older snapshots below are historical).
+Last updated: 2026-11-06 (announcer periodic deadline; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-06 announcer periodic deadline:** the existing five-minute
+  reannounce timer restarts when a complete update settles, including retired
+  withdrawals, instead of keeping its startup deadline after a manual refresh.
+  Empty completed cycles restart that window too, matching JS's update-to-loop
+  ordering. Ping cadence, watchdog and the five-minute interval are unchanged.
+  This does not implement JS's exact 100-round plus RTT background-loop period.
 - **2026-11-06 announcer successful-cycle wake:** a nonempty announcement
   cycle schedules the next relay-ping round immediately after all commits and
   retired-relay withdrawals settle, matching JS's update-to-ping ordering.

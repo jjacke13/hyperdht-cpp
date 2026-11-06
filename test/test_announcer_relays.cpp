@@ -518,6 +518,7 @@ TEST(AnnouncerRelays, RefreshWakeWaitsForRetiredRelayWithdrawal) {
     retiring->stored_peer = f.kp.public_key;
     retiring->reply_error_once = true;  // Leave this walk, then answer fresh-token lookup.
     retiring->hold_command = messages::CMD_UNANNOUNCE;
+    const auto old_deadline = f.ann->reannounce_deadline_for_test();
     f.ann->refresh();
     ASSERT_TRUE(run_until(&f.loop, [&] { return !retiring->held_responses.empty(); }, 500));
     ASSERT_TRUE(f.ann->is_updating_for_test());
@@ -526,8 +527,10 @@ TEST(AnnouncerRelays, RefreshWakeWaitsForRetiredRelayWithdrawal) {
             if (f.nodes[i]->ping_count > before[i]) return true;
         return false;
     }, 150));
+    EXPECT_EQ(f.ann->reannounce_deadline_for_test(), old_deadline);
     retiring->release_responses();
     ASSERT_TRUE(f.settled_at(2));
+    EXPECT_GT(f.ann->reannounce_deadline_for_test(), old_deadline);
     EXPECT_FALSE(contains_addr(f.ann->relays(), old));
     EXPECT_TRUE(run_until(&f.loop, [&] {
         for (size_t i = 0; i < f.nodes.size(); ++i)
@@ -548,6 +551,44 @@ TEST(AnnouncerRelays, PingTimerWatchdogStillRecoversPendingCycle) {
     f.ann->tick_ping_timer_for_test();
     ASSERT_TRUE(f.settled_at(wedged_gen + 1));
     for (const auto& node : f.nodes) EXPECT_GE(node->find_peer_count, 2);
+}
+
+class AnnouncerPeriodicDeadline : public ::testing::TestWithParam<int> {};
+
+TEST_P(AnnouncerPeriodicDeadline, CompletedCycleRestartsPeriodicWindow) {
+    Fixture f(3);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    const auto old_deadline = f.ann->reannounce_deadline_for_test();
+    ASSERT_NE(old_deadline, 0u);
+    run_until(&f.loop, [] { return false; }, 20);
+    if (GetParam() == 2) for (auto& node : f.nodes) node->reply_error = true;
+    const auto next_gen = f.ann->cycle_gen_for_test() + 1;
+    if (GetParam() == 1) f.ann->notify_online();
+    else f.ann->refresh();
+    ASSERT_TRUE(f.ann->is_updating_for_test());
+    EXPECT_EQ(f.ann->reannounce_deadline_for_test(), old_deadline);
+    ASSERT_TRUE(f.settled_at(next_gen));
+    EXPECT_GT(f.ann->reannounce_deadline_for_test(), old_deadline);
+}
+
+INSTANTIATE_TEST_SUITE_P(RefreshOnlineEmpty, AnnouncerPeriodicDeadline, ::testing::Range(0, 3));
+
+TEST(AnnouncerRelays, LateCycleRepliesCannotRearmStoppedPeriodicTimer) {
+    Fixture f(3);
+    EXPECT_EQ(f.ann->reannounce_deadline_for_test(), 0u);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    for (auto& node : f.nodes) node->hold_command = messages::CMD_ANNOUNCE;
+    f.ann->refresh();
+    ASSERT_TRUE(run_until(&f.loop, [&] {
+        for (const auto& node : f.nodes) if (node->held_responses.empty()) return false;
+        return true;
+    }, 500));
+    f.ann->stop_without_unannounce();
+    for (auto& node : f.nodes) node->release_responses();
+    run_until(&f.loop, [] { return false; }, 50);
+    EXPECT_EQ(f.ann->reannounce_deadline_for_test(), 0u);
 }
 
 TEST(AnnouncerRelays, KeepaliveRoundsDoNotOverlap) {

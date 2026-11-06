@@ -139,6 +139,11 @@ public:
     uint64_t cycle_gen_for_test() const { return cycle_gen_; }
     bool is_updating_for_test() const { return updating_; }
 
+    // Test-only: absolute periodic deadline, without waiting five minutes.
+    uint64_t reannounce_deadline_for_test() const {
+        return bg_timer_ ? uv_now(socket_.loop()) + uv_timer_get_due_in(bg_timer_) : 0;
+    }
+
     // Current relay info (for NoisePayload holepunch field)
     const std::vector<peer_connect::RelayInfo>& relays() const { return relays_; }
 

@@ -511,6 +511,8 @@ void Announcer::maybe_publish() {
     const bool published = running_ && !cycle_relays_.empty();
     auto finish = [this, published] {
         updating_ = false;
+        // JS begins its next background cycle after the whole update settles.
+        if (bg_timer_) uv_timer_again(bg_timer_);
         // JS resumes pings after the full successful update, including withdrawals.
         if (published && !pinging_ && ping_timer_)
             uv_timer_start(ping_timer_, on_ping_timer, 0, RELAY_PING_MS);

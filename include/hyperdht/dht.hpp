@@ -273,7 +273,7 @@ struct ConnectOptions {
         const std::vector<compact::Ipv4Address>&)>;
     HolepunchVetoFn holepunch_veto;
 
-    // Cached relay addresses for faster reconnect (JS: opts.relayAddresses)
+    // Explicit discovery hints, preferred over cached relays (JS: opts.relayAddresses).
     std::vector<compact::Ipv4Address> relay_addresses;
 
     // JS: opts.keyPair — override the default DHT keypair for this single
@@ -341,8 +341,8 @@ struct ConnectOptions {
     //  - `createHandshake`: factory hook for a custom Noise handshake.
     //    LOW priority — `peer_connect::peer_handshake` is called directly.
     //
-    // (Note: `relay_addresses` ABOVE is the cached "which relays found this
-    //  peer last time" hint, distinct from `relay_through` blind-relay.)
+    // (`relay_addresses` ABOVE supplies discovery hints, distinct from
+    //  `relay_through` blind-relay.)
 };
 
 // ---------------------------------------------------------------------------

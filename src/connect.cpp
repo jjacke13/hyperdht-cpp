@@ -101,6 +101,7 @@ struct ConnState {
     // outlive the original scope once we enter async territory).
     bool fast_open = true;
     bool local_connection = true;
+    std::vector<compact::Ipv4Address> relay_addresses;
     // connect-3 — JS: c.reusableSocket = !!opts.reusableSocket (connect.js:67).
     bool reusable_socket = false;
     // connect-7 — JS: opts.holepunch client veto (connect.js:296-307).
@@ -414,7 +415,9 @@ static void start_find_peer(std::shared_ptr<ConnState> state, bool use_cached) {
     if (state->completed || !alive || !*alive) return;
     std::vector<dht_ops::SeedNode> seeds;
     if (use_cached) {
-        for (const auto& addr : state->dht->get_cached_relay_addresses(state->remote_pk))
+        auto hints = state->relay_addresses;
+        if (hints.empty()) hints = state->dht->get_cached_relay_addresses(state->remote_pk);
+        for (const auto& addr : hints)
             seeds.push_back({rpc::compute_peer_id(addr), addr});
         // JS connect.js:327-333: a persistent node prefers its own live forward.
         if (state->dht->is_persistent()) {
@@ -498,6 +501,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
     state->dht = this;
     state->fast_open = opts.fast_open;
     state->local_connection = opts.local_connection;
+    state->relay_addresses = opts.relay_addresses;
     state->relay_keep_alive = opts.relay_keep_alive;
     // connect-3 — JS connect.js:67: c.reusableSocket = !!opts.reusableSocket.
     state->reusable_socket = opts.reusable_socket;

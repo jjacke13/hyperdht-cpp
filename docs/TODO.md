@@ -5,12 +5,19 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-05 (announcer first keepalive; older snapshots below are historical).
+Last updated: 2026-11-06 (explicit connection discovery hints; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-06 explicit connection discovery hints:** nonempty
+  ConnectOptions::relay_addresses seed the first FIND_PEER pass ahead of
+  cached hints, matching JS connect.js:320-333. A persistent node's live
+  forwarding address still overrides both. Empty options retain cache behavior;
+  unsuccessful seeded passes retain normal discovery fallback. The existing
+  option is copied for asynchronous route fallback; APIs, wrappers, retry
+  budgets and cache updates are unchanged.
 - **2026-11-05 announcer first keepalive:** startup and resume schedule the
   first relay ping round immediately after the first nonempty announcement
   publishes, matching JS start() awaiting the initial update before starting
@@ -30,7 +37,7 @@ Last updated: 2026-11-05 (announcer first keepalive; older snapshots below are h
   discovery starts with three retries. Stale, empty and filtered hints retain
   fallback; shutdown cannot start another pass. Existing helper symbols and
   general query behavior are preserved. Persistent-router hint priority is
-  covered above; explicit relay-address options remain separate work.
+  covered above, along with explicit relay-address options.
 - **2026-11-05 connection discovery retries:** the normal connection FIND_PEER
   walk uses three retries (four sends), matching JS connect.js:347, instead of
   inheriting the general query default of five retries. The original find_peer
@@ -341,8 +348,8 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   (2026-11-05). Query filtering, cancellation and normal-walk controls covered.
 - [x] connect-9 persistent-router hint priority — live forwarding addresses
   override cached hints on persistent nodes (2026-11-05).
-- [ ] connect-9 remaining — explicit relay-address seeds are not accepted as
-  JS findAndConnect inputs yet.
+- [x] connect-9 explicit relay-address seeds — honor the existing connection
+  option ahead of cache, retaining persistent-forward priority (2026-11-06).
 
 ### server (4 open; done: server-1/2/3/5/8)
 - [x] server-1 — DONE 2026-07-22. Firewall-rejected handshake now sends NOTHING

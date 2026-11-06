@@ -112,10 +112,9 @@ INSTANTIATE_TEST_SUITE_P(ConnectionAndGeneralQuery, FindPeerRetryBudget, ::testi
 
 class CachedFindPeer : public ::testing::TestWithParam<int> {};
 
-TEST_P(CachedFindPeer, CachedPassPrecedesNormalDiscovery) {
+void check_discovery_hints(int mode, bool explicit_hints) {
     // 0=record, 1=empty, 2=silent, 3=retryable handshake, 4=closer node,
     // 5=filtered seed (synchronous completion), 6=destroy during the first pass.
-    const int mode = GetParam();
     uv_loop_t loop;
     ASSERT_EQ(uv_loop_init(&loop), 0);
     DhtOptions options;
@@ -136,7 +135,10 @@ TEST_P(CachedFindPeer, CachedPassPrecedesNormalDiscovery) {
     noise::Seed seed{};
     seed.fill(0x54);
     const auto keypair = noise::generate_keypair(seed);
-    client.cache_relay_addresses(keypair.public_key, {hint_addr});
+    if (!explicit_hints || mode != 7)
+        client.cache_relay_addresses(keypair.public_key, {explicit_hints ? normal_addr : hint_addr});
+    ConnectOptions connect_options;
+    if (explicit_hints) connect_options.relay_addresses = {hint_addr};
     if (mode == 5) client.socket().set_filter_node(
         [&](const auto&, const auto& addr) { return addr != hint_addr; });
     std::vector<std::string> events;
@@ -180,7 +182,7 @@ TEST_P(CachedFindPeer, CachedPassPrecedesNormalDiscovery) {
     hint.on_request([&](const auto& req) { respond(hint, req, true); });
     normal.on_request([&](const auto& req) { respond(normal, req, false); });
     int completions = 0;
-    client.connect(keypair.public_key, [&](int error, const auto&) {
+    client.connect(keypair.public_key, connect_options, [&](int error, const auto&) {
         if (mode != 6) EXPECT_EQ(error, ConnectError::SERVER_ERROR);
         ++completions;
     });
@@ -194,7 +196,8 @@ TEST_P(CachedFindPeer, CachedPassPrecedesNormalDiscovery) {
         {"hint-find", "hint-handshake", "normal-find", "normal-handshake"},
         {"hint-find", "hint-handshake"},
         {"normal-find", "normal-handshake"},
-        {"hint-find"}
+        {"hint-find"},
+        {"hint-find", "hint-handshake"}  // Explicit hints without any cache.
     };
     client.destroy();
     hint.close();
@@ -206,14 +209,27 @@ TEST_P(CachedFindPeer, CachedPassPrecedesNormalDiscovery) {
     EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
+TEST_P(CachedFindPeer, CachedPassPrecedesNormalDiscovery) {
+    check_discovery_hints(GetParam(), false);
+}
+
 INSTANTIATE_TEST_SUITE_P(Discovery, CachedFindPeer, ::testing::Range(0, 7));
+
+class ExplicitFindPeer : public ::testing::TestWithParam<int> {};
+
+TEST_P(ExplicitFindPeer, ExplicitHintsPrecedeCacheAndFallBack) {
+    check_discovery_hints(GetParam(), true);
+}
+
+INSTANTIATE_TEST_SUITE_P(Discovery, ExplicitFindPeer, ::testing::Range(0, 8));
 
 class ForwardFindPeer : public ::testing::TestWithParam<int> {};
 
 TEST_P(ForwardFindPeer, PersistentForwardHintPrecedesRelayCache) {
     // 0=live, 1=ephemeral, 2=local handler, 3=other target, 4=expired,
     // 5=empty reply/fallback, 6=no cached hints, 7=no forward entry.
-    const int mode = GetParam();
+    const int mode = GetParam() % 8;
+    const bool explicit_hints = GetParam() >= 8;
     uv_loop_t loop;
     ASSERT_EQ(uv_loop_init(&loop), 0);
     DhtOptions options;
@@ -279,7 +295,9 @@ TEST_P(ForwardFindPeer, PersistentForwardHintPrecedesRelayCache) {
     forward.on_request([&](const auto& req) { respond(forward, req, true); });
     cached.on_request([&](const auto& req) { respond(cached, req, false); });
     int completions = 0;
-    client.connect(keypair.public_key, [&](int error, const auto&) {
+    ConnectOptions connect_options;
+    if (explicit_hints) connect_options.relay_addresses = {cached_addr};
+    client.connect(keypair.public_key, connect_options, [&](int error, const auto&) {
         EXPECT_EQ(error, ConnectError::SERVER_ERROR);
         ++completions;
     });
@@ -298,7 +316,7 @@ TEST_P(ForwardFindPeer, PersistentForwardHintPrecedesRelayCache) {
     EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
-INSTANTIATE_TEST_SUITE_P(RouterPriority, ForwardFindPeer, ::testing::Range(0, 8));
+INSTANTIATE_TEST_SUITE_P(RouterPriority, ForwardFindPeer, ::testing::Range(0, 16));
 
 // ===========================================================================
 // connect-6 — LAN same-NAT shortcut (EXCLUSIVE of holepunch)

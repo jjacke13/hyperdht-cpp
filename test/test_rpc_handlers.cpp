@@ -2581,6 +2581,124 @@ TEST(NatSamplerFeed, RequestPathAdvancesRingSampler) {
 }
 
 // ============================================================================
+// JS _addNode samples a newly admitted node even on the inactive socket.
+class ExternalRequestSamples : public ::testing::TestWithParam<bool> {
+protected:
+    uv_loop_t loop{};
+    std::unique_ptr<RpcSocket> receiver, peer;
+    NodeId peer_id{};
+    Ipv4Address destination;
+    Ipv4Address observation = Ipv4Address::from_string("198.51.100.12", 41001);
+    int received = 0;
+
+    void SetUp() override {
+        ASSERT_EQ(uv_loop_init(&loop), 0);
+        peer = std::make_unique<RpcSocket>(&loop, NodeId{});
+        ASSERT_EQ(peer->bind(0), 0);
+        peer_id = compute_peer_id(Ipv4Address::from_string("127.0.0.1", peer->port()));
+        auto local_id = peer_id;
+        local_id[0] ^= 0x80;  // Keep all admission-control peers in one bucket.
+        receiver = std::make_unique<RpcSocket>(&loop, local_id);
+        ASSERT_EQ(receiver->bind(0), 0);
+        receiver->set_firewalled(GetParam());
+        receiver->on_request([this](const Request&) { ++received; });
+        auto* inactive = GetParam() ? receiver->socket_handle()
+                                    : receiver->client_socket_handle();
+        sockaddr_in addr{};
+        int len = sizeof(addr);
+        ASSERT_EQ(udx_socket_getsockname(inactive, reinterpret_cast<sockaddr*>(&addr), &len), 0);
+        destination = Ipv4Address::from_string("127.0.0.1", ntohs(addr.sin_port));
+    }
+
+    void TearDown() override {
+        if (receiver) receiver->close();
+        if (peer) peer->close();
+        uv_run(&loop, UV_RUN_DEFAULT);
+        EXPECT_EQ(uv_loop_close(&loop), 0);
+    }
+
+    bool send(std::optional<NodeId> id) {
+        Request req;
+        req.id = id;
+        req.tid = received + 1;
+        req.to.addr = observation;
+        req.command = CMD_PING;
+        req.internal = true;
+        const int wanted = received + 1;
+        peer->udp_send(encode_request(req), destination, peer->socket_handle());
+        for (int i = 0; i < 500 && received < wanted; ++i) {
+            uv_run(&loop, UV_RUN_NOWAIT);
+            uv_sleep(1);
+        }
+        return received == wanted;
+    }
+
+    void expect_samples(int count) {
+        EXPECT_EQ(receiver->ring_sampler().size(), count);
+        EXPECT_EQ(receiver->nat_sampler().sampled(), count);
+    }
+};
+
+TEST_P(ExternalRequestSamples, NewPeerSamplesOnce) {
+    for (int i = 1; i <= 2; ++i) {
+        receiver->ring_sampler().add(observation.host_string(), observation.port);
+        receiver->nat_sampler().add(observation,
+            Ipv4Address::from_string("192.0.2." + std::to_string(i), 41002));
+    }
+    ASSERT_TRUE(send(peer_id));
+    EXPECT_TRUE(receiver->table().has(peer_id));
+    expect_samples(3);
+    EXPECT_EQ(receiver->ring_sampler().host(), observation.host_string());
+    EXPECT_EQ(receiver->nat_sampler().host(), observation.host_string());
+    ASSERT_TRUE(send(peer_id));
+    expect_samples(3);
+}
+
+TEST_P(ExternalRequestSamples, KnownPeerIsNotResampled) {
+    receiver->add_node_from_network(peer_id, Ipv4Address::from_string("127.0.0.1", peer->port()));
+    ASSERT_TRUE(send(peer_id));
+    EXPECT_TRUE(receiver->table().has(peer_id));
+    expect_samples(0);
+}
+
+TEST_P(ExternalRequestSamples, FilteredPeerIsNotSampled) {
+    receiver->set_filter_node([](const NodeId&, const Ipv4Address&) { return false; });
+    ASSERT_TRUE(send(peer_id));
+    EXPECT_FALSE(receiver->table().has(peer_id));
+    expect_samples(0);
+}
+
+TEST_P(ExternalRequestSamples, InvalidOrMissingIdIsNotSampled) {
+    auto invalid = peer_id;
+    invalid[0] ^= 1;
+    ASSERT_TRUE(send(invalid));
+    ASSERT_TRUE(send(std::nullopt));
+    EXPECT_EQ(receiver->table().size(), 0u);
+    expect_samples(0);
+}
+
+TEST_P(ExternalRequestSamples, FullBucketDoesNotSampleRejectedPeer) {
+    for (size_t i = 1; i <= K; ++i) {
+        Node n;
+        n.id = peer_id;
+        n.id[31] ^= i;
+        ASSERT_TRUE(receiver->table().add(n));
+    }
+    ASSERT_TRUE(send(peer_id));
+    EXPECT_FALSE(receiver->table().has(peer_id));
+    EXPECT_EQ(receiver->table().size(), K);
+    expect_samples(0);
+}
+
+TEST_P(ExternalRequestSamples, OwnIdIsNotSampled) {
+    receiver->table().rebuild_with_id(peer_id);
+    ASSERT_TRUE(send(peer_id));
+    EXPECT_EQ(receiver->table().size(), 0u);
+    expect_samples(0);
+}
+
+INSTANTIATE_TEST_SUITE_P(FirewallStates, ExternalRequestSamples, ::testing::Bool());
+
 // dhtrpc-io-7 — alloc_tid must never return 0 (the request() failure
 // sentinel). The random seed or the uint16 wrap can land on 0; the allocator
 // skips it. JS uses the full 0..65535 range; this is a C++-sentinel guard.

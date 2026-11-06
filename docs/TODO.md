@@ -5,12 +5,19 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-06 (announcer periodic update ordering; older snapshots below are historical).
+Last updated: 2026-11-06 (first inbound node observation; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-06 first inbound node observation:** a valid node newly admitted
+  to the routing table contributes its request's address observation even on
+  the inactive socket, matching JS dht-rpc's _addNode. Repeated requests on
+  that socket do not resample it. Invalid/missing IDs, filtered peers, self
+  and full-bucket rejections retain the sampling exclusion. Existing expected-
+  socket and response sampling policies are unchanged; age-based resampling
+  remains separate work.
 - **2026-11-06 announcer pending periodic update:** a periodic reannouncement
   waits for the current relay-ping round to settle, matching JS's awaited
   pings before its background update. Repeated deadlines coalesce; an explicit
@@ -335,11 +342,11 @@ FALSE_DONE. Behavioral parity estimate ~93%. Net-new, none previously ledgered:
 - [ ] **compact/buffer64k (LOW — doc-only)** — `Buffer::decode` 64KB cap
   (compact.cpp:239-249) vs JS uncapped; fails SAFE (rejects a superset), H12
   anti-DoS. Add a ledger line like compact-2's array cap. No code change.
-- [ ] **dhtrpc-io-6 (correction: DONE → PARTIAL)** — a node first seen via an
-  external inbound request is never NAT-sampled; JS `_addNode` samples every
-  new node once regardless of the `sample` gate (index.js:533-536). Low impact
-  (new nodes usually arrive on the active socket). Fix: carry a `sampled` flag
-  + sample new nodes once; or accept + downgrade the ledger entry.
+- [x] **dhtrpc-io-6 first external request** — fixed 2026-11-06: after a valid
+  new node is admitted, its first request feeds the address samplers even on
+  the inactive socket, matching JS `_addNode` (index.js:533-536). Known peers
+  on that socket remain excluded, as do rejected nodes. Existing expected-
+  socket sampling and separate age-based resampling work are unchanged.
 
 **Docs caught up (code was AHEAD):** 6 appendix entries were labeled OPEN but
 are FIXED + skeptic-confirmed — now tagged `[DONE — verified 2026-07-26]` in

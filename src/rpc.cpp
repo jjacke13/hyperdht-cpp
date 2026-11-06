@@ -880,6 +880,7 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
         if (req.id.has_value()) {
             auto expected = compute_peer_id(req.from.addr);
             if (*req.id == expected) {
+                const bool new_node = table_.get(expected) == nullptr;
                 add_node_from_network(expected, req.from.addr);
 
                 // JS dht-rpc/index.js:632-635 — _onrequest also feeds the NAT
@@ -895,7 +896,8 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
                 // feed both the ring sampler (external host/port + persistence
                 // gate) and the Nat classifier, using req.from.addr as the
                 // dedup source (matches nat_sampler_.add(to, from)).
-                if (from_server != firewalled_) {
+                // JS _addNode samples a newly admitted node even if external.
+                if (from_server != firewalled_ || (new_node && table_.get(expected))) {
                     nat_sampler_.add(req.to.addr, req.from.addr);
                     ring_sampler_.add(req.to.addr.host_string(), req.to.addr.port);
                 }

@@ -28,6 +28,7 @@
 
 #include "hyperdht/announcer.hpp"
 #include "hyperdht/compact.hpp"
+#include "hyperdht/dht_messages.hpp"
 #include "hyperdht/messages.hpp"
 #include "hyperdht/noise_wrap.hpp"
 #include "hyperdht/routing_table.hpp"
@@ -69,6 +70,8 @@ struct FakeNode {
     std::vector<std::pair<messages::Response, compact::Ipv4Address>> held_pings;
 
     bool reply_error = false;   // fail FIND_PEER → node leaves the closest set
+    bool reply_error_once = false;
+    std::optional<noise::PubKey> stored_peer;
     bool silent_ping = false;   // never pong → looks dead to the health check
     std::optional<uint64_t> hold_command;
     std::vector<std::pair<messages::Response, compact::Ipv4Address>> held_responses;
@@ -104,11 +107,17 @@ struct FakeNode {
             if (silent_ping) return;
         } else if (!req.internal && req.command == messages::CMD_FIND_PEER) {
             find_peer_count++;
-            if (reply_error) {
+            if (reply_error || reply_error_once) {
                 resp.error = 1;
+                reply_error_once = false;
             } else {
                 resp.token =
                     sock.token_store().create(req.from.addr.host_string());
+                if (stored_peer) {
+                    dht_messages::PeerRecord peer;
+                    peer.public_key = *stored_peer;
+                    resp.value = dht_messages::encode_peer_record(peer);
+                }
             }
         } else if (!req.internal && req.command == messages::CMD_ANNOUNCE) {
             announce_count++;
@@ -459,6 +468,76 @@ TEST_P(AnnouncerCyclePause, KeepaliveWaitsForCycleThenResumes) {
 
 INSTANTIATE_TEST_SUITE_P(WalkAndCommits, AnnouncerCyclePause, ::testing::Bool());
 
+class AnnouncerRefreshWake : public ::testing::TestWithParam<bool> {};
+
+TEST_P(AnnouncerRefreshWake, OnlySuccessfulRefreshWakesKeepaliveImmediately) {
+    Fixture f(3);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    ASSERT_TRUE(run_until(&f.loop, [&] {
+        for (const auto& node : f.nodes) if (node->ping_count == 0) return false;
+        return f.client->inflight_count() == 0;
+    }, 500));
+    std::vector<int> before;
+    for (auto& node : f.nodes) {
+        before.push_back(node->ping_count);
+        node->reply_error = !GetParam();
+    }
+    f.ann->refresh();
+    ASSERT_TRUE(f.settled_at(2));
+    const auto all_pinged = [&] {
+        for (size_t i = 0; i < f.nodes.size(); ++i)
+            if (f.nodes[i]->ping_count <= before[i]) return false;
+        return true;
+    };
+    EXPECT_EQ(run_until(&f.loop, all_pinged, 500), GetParam());
+    if (!GetParam()) EXPECT_TRUE(run_until(&f.loop, all_pinged, 4000));
+}
+
+INSTANTIATE_TEST_SUITE_P(NonemptyAndEmpty, AnnouncerRefreshWake, ::testing::Bool());
+
+TEST(AnnouncerRelays, RefreshWakeWaitsForRetiredRelayWithdrawal) {
+    Fixture f(4);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    ASSERT_EQ(f.ann->relays().size(), 3u);
+    ASSERT_TRUE(run_until(&f.loop, [&] {
+        int pinged = 0;
+        for (const auto& node : f.nodes) pinged += node->ping_count > 0;
+        return pinged == 3 && f.client->inflight_count() == 0;
+    }, 500));
+    std::vector<int> before;
+    FakeNode* retiring = nullptr;
+    const auto old = f.published().front();
+    for (auto& node : f.nodes) {
+        before.push_back(node->ping_count);
+        if (node->addr == old) retiring = node.get();
+    }
+    ASSERT_NE(retiring, nullptr);
+    const auto retiring_ping_count = retiring->ping_count;
+    retiring->stored_peer = f.kp.public_key;
+    retiring->reply_error_once = true;  // Leave this walk, then answer fresh-token lookup.
+    retiring->hold_command = messages::CMD_UNANNOUNCE;
+    f.ann->refresh();
+    ASSERT_TRUE(run_until(&f.loop, [&] { return !retiring->held_responses.empty(); }, 500));
+    ASSERT_TRUE(f.ann->is_updating_for_test());
+    EXPECT_FALSE(run_until(&f.loop, [&] {
+        for (size_t i = 0; i < f.nodes.size(); ++i)
+            if (f.nodes[i]->ping_count > before[i]) return true;
+        return false;
+    }, 150));
+    retiring->release_responses();
+    ASSERT_TRUE(f.settled_at(2));
+    EXPECT_FALSE(contains_addr(f.ann->relays(), old));
+    EXPECT_TRUE(run_until(&f.loop, [&] {
+        for (size_t i = 0; i < f.nodes.size(); ++i)
+            if (contains_addr(f.ann->relays(), f.nodes[i]->addr) &&
+                f.nodes[i]->ping_count <= before[i]) return false;
+        return true;
+    }, 500));
+    EXPECT_EQ(retiring->ping_count, retiring_ping_count);
+}
+
 TEST(AnnouncerRelays, PingTimerWatchdogStillRecoversPendingCycle) {
     Fixture f(3);
     f.ann->start();
@@ -491,6 +570,8 @@ TEST(AnnouncerRelays, KeepalivePauseStartsAfterLastPong) {
     f.nodes[0]->hold_ping = true;
     f.ann->ping_relays_for_test();
     ASSERT_TRUE(run_until(&f.loop, [&] { return !f.nodes[0]->held_pings.empty(); }, 500));
+    f.ann->refresh();
+    ASSERT_TRUE(f.settled_at(2));
     run_until(&f.loop, [] { return false; }, 1000);
     f.nodes[0]->release_pings();
     ASSERT_TRUE(run_until(&f.loop, [&] { return f.client->inflight_count() == 0; }, 500));

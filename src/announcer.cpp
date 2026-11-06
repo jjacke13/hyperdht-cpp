@@ -508,6 +508,13 @@ void Announcer::commit_settled() {
 void Announcer::maybe_publish() {
     if (!query_done_ || pending_commits_ != 0) return;
 
+    const bool published = running_ && !cycle_relays_.empty();
+    auto finish = [this, published] {
+        updating_ = false;
+        // JS resumes pings after the full successful update, including withdrawals.
+        if (published && !pinging_ && ping_timer_)
+            uv_timer_start(ping_timer_, on_ping_timer, 0, RELAY_PING_MS);
+    };
     std::vector<RelayNode> retired;
     if (running_) {
         if (!cycle_relays_.empty()) {
@@ -520,12 +527,8 @@ void Announcer::maybe_publish() {
                 for (const auto& next : cycle_relays_) kept |= old.addr == next.addr;
                 if (!kept) retired.push_back(old);
             }
-            const bool first_publish = active_relays_.empty();
             active_relays_ = std::move(cycle_relays_);
             build_relays();
-            // JS starts its background ping loop as soon as the initial update settles.
-            if (first_publish && ping_timer_)
-                uv_timer_start(ping_timer_, on_ping_timer, 0, RELAY_PING_MS);
         } else {
             // Deliberate divergence: JS assigns `this.relays = relays` even
             // when the walk committed to nothing (announcer.js:188). We keep
@@ -543,14 +546,14 @@ void Announcer::maybe_publish() {
 
     cycle_relays_.clear();  // moved-from vectors are valid but unspecified
     if (retired.empty()) {
-        updating_ = false;
+        finish();
         return;
     }
     // Serialize retirement with the next cycle, as JS awaits _unannounceAll.
     auto pending = std::make_shared<size_t>(retired.size());
-    auto done = [weak = std::weak_ptr<bool>(alive_), this, gen = cycle_gen_, pending] {
+    auto done = [weak = std::weak_ptr<bool>(alive_), this, gen = cycle_gen_, pending, finish] {
         if (--*pending != 0) return;
-        if (auto a = weak.lock(); a && *a && gen == cycle_gen_) updating_ = false;
+        if (auto a = weak.lock(); a && *a && gen == cycle_gen_) finish();
     };
     for (const auto& relay : retired) unannounce_node(relay, done);
 }

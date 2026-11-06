@@ -5,19 +5,26 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-06 (announcer cycle ordering; older snapshots below are historical).
+Last updated: 2026-11-06 (announcer successful-cycle wake; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-06 announcer successful-cycle wake:** a nonempty announcement
+  cycle schedules the next relay-ping round immediately after all commits and
+  retired-relay withdrawals settle, matching JS's update-to-ping ordering.
+  Empty/failed cycles retain their existing timer schedule. If a ping round
+  is already in flight, it retains the full pause after settlement instead
+  of starting an extra round. Startup/resume and watchdog behavior remain;
+  full background-loop timing parity is still separate work.
 - **2026-11-06 announcer cycle ordering:** new relay keepalive rounds wait
   while the announcement cycle is updating, matching JS's awaited _runUpdate.
   The gate covers the walk, commits and retired-relay withdrawals; existing
   in-flight pings settle normally. Timer ticks still run the stuck-cycle
-  watchdog. Startup/resume first pings, round spacing and the existing
-  post-refresh timer schedule are unchanged; full background-loop timing
-  parity remains separate work.
+  watchdog. Startup/resume first pings and round spacing are unchanged;
+  successful-cycle wake timing is covered above. Full background-loop
+  timing parity remains separate work.
 - **2026-11-06 explicit connection discovery hints:** nonempty
   ConnectOptions::relay_addresses seed the first FIND_PEER pass ahead of
   cached hints, matching JS connect.js:320-333. A persistent node's live
@@ -614,7 +621,7 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   clean shutdown checks.
 - [x] **Keepalive/update ordering** — new ping rounds wait for cycle
   settlement, matching JS's awaited update; watchdog ticks remain active
-  (2026-11-06). Exact post-refresh wake timing remains separate work.
+  (2026-11-06). Successful-cycle wake timing is covered above.
 - [ ] **`refresh()` has no `_refreshing` latch** (announcer.cpp vs
   announcer.js:76-79) — a health/drift refresh landing mid-cycle is dropped,
   costing <=5s until the next ping tick. Low.

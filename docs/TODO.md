@@ -5,12 +5,19 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-06 (ordinary direct handshake; older snapshots below are historical).
+Last updated: 2026-11-06 (public-client passive wait; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-06 public-client passive wait:** a client that advertised OPEN
+  waits for the relayed server to reach it, matching JS's handshake snapshot.
+  The NAT classifier remains the input for active punching; it cannot report
+  OPEN and no longer decides passive waiting. Later firewall-state changes
+  do not change the sent snapshot. Completion or raw-stream destruction
+  stops the wait timer; the ten-second timeout and existing direct, NAT,
+  relay and cached-route policies are preserved.
 - **2026-11-06 ordinary direct handshake (lab compatibility checked):** a handshake reply
   without peerAddress completes on the main socket at the contacted endpoint,
   matching JS connectThroughNode before holepunch selection. This also covers

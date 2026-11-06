@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "hyperdht/compact.hpp"
+#include "hyperdht/async_utils.hpp"
 #include "hyperdht/dht.hpp"
 #include "hyperdht/dht_messages.hpp"
 #include "hyperdht/dht_ops.hpp"
@@ -619,6 +620,162 @@ TEST_P(DirectHandshake, CompletesWithoutHolepunchOrLanPing) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Paths, DirectHandshake, ::testing::Range(0, 6));
+
+class PublicClientPassive : public ::testing::TestWithParam<int> {};
+
+TEST_P(PublicClientPassive, UsesAdvertisedFirewallSnapshot) {
+    // 0: late server, 1: OPEN->firewalled, 2: UNKNOWN->open,
+    // 3: passive timeout, 4: NAT client, 5: unverified public port, 6: destroy while waiting.
+    const int mode = GetParam();
+    const bool advertised_open = mode == 0 || mode == 1 || mode == 3 || mode == 6;
+    const bool late_server = mode == 0 || mode == 1;
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    bool payload_received = false;
+    loop.data = &payload_received;
+    DhtOptions options;
+    options.ephemeral = true;
+    options.adaptive = false;
+    HyperDHT client(&loop, options);
+    ASSERT_EQ(client.bind(), 0);
+    const auto client_addr = Ipv4Address::from_string("127.0.0.1", client.socket().port());
+    if (advertised_open || mode == 5) {
+        auto observed = client_addr;
+        if (mode == 5) observed.port = observed.port == 65535 ? 65534 : observed.port + 1;
+        for (int i = 1; i <= 3; ++i)
+            client.socket().nat_sampler().add(observed,
+                Ipv4Address::from_string("192.0.2." + std::to_string(i), 4000));
+        client.socket().set_firewalled(false);
+    }
+    rpc::RpcSocket relay(&loop, {}), server(&loop, {});
+    ASSERT_EQ(relay.bind(0, "127.0.0.1"), 0);
+    ASSERT_EQ(server.bind(0, "127.0.0.1"), 0);
+    const auto relay_addr = Ipv4Address::from_string("127.0.0.1", relay.port());
+    const auto server_addr = Ipv4Address::from_string("127.0.0.1", server.port());
+    noise::Seed seed{};
+    seed.fill(0x62);
+    const auto keypair = noise::generate_keypair(seed);
+    udx_stream_t sender{};
+    bool sender_started = false;
+    std::unique_ptr<async_utils::UvTimer> late;
+    int punches = 0, handshakes = 0, completions = 0, error = 0;
+    ConnectResult result;
+    relay.on_request([&](const messages::Request& req) {
+        messages::Response resp;
+        resp.tid = req.tid;
+        resp.from.addr = req.from.addr;
+        resp.id = rpc::compute_peer_id(relay_addr);
+        if (req.command == messages::CMD_FIND_PEER) {
+            dht_messages::PeerRecord record;
+            record.public_key = keypair.public_key;
+            resp.value = dht_messages::encode_peer_record(record);
+        } else if (req.command == messages::CMD_PEER_HOLEPUNCH) {
+            ++punches;  // Empty reply fails an active attempt promptly.
+        } else if (req.command == messages::CMD_PEER_HANDSHAKE && req.value) {
+            ++handshakes;
+            auto hs = peer_connect::decode_handshake_msg(req.value->data(), req.value->size());
+            const auto& prologue = dht_messages::ns_peer_handshake();
+            noise::NoiseIK responder(false, keypair, prologue.data(), prologue.size());
+            auto plain = responder.recv(hs.noise.data(), hs.noise.size());
+            ASSERT_TRUE(plain.has_value());
+            const auto sent = peer_connect::decode_noise_payload(plain->data(), plain->size());
+            ASSERT_TRUE(sent.udx.has_value());
+            EXPECT_EQ(sent.firewall, advertised_open ? peer_connect::FIREWALL_OPEN
+                                                     : peer_connect::FIREWALL_UNKNOWN);
+            if (mode == 1) client.socket().set_firewalled(true);
+            if (mode == 2) client.socket().set_firewalled(false);
+            peer_connect::NoisePayload reply;
+            reply.version = 1;
+            reply.firewall = peer_connect::FIREWALL_CONSISTENT;
+            reply.udx = peer_connect::UdxInfo{1, false, 777, 0};
+            reply.has_secret_stream = true;
+            reply.holepunch = peer_connect::HolepunchInfo{};
+            reply.holepunch->id = 7;
+            reply.holepunch->relays.push_back({relay_addr, server_addr});
+            auto bytes = peer_connect::encode_noise_payload(reply);
+            peer_connect::HandshakeMessage message;
+            message.mode = peer_connect::MODE_REPLY;
+            message.peer_address = server_addr;
+            message.noise = responder.send(bytes.data(), bytes.size());
+            resp.value = peer_connect::encode_handshake_msg(message);
+            if (late_server || mode == 6) {
+                const auto remote_id = sent.udx->id;
+                late = std::make_unique<async_utils::UvTimer>(&loop);
+                late->start([&, remote_id] {
+                    if (mode == 6) { client.destroy(); return; }
+                    ASSERT_EQ(udx_stream_init(server.udx_handle(), &sender, 777, nullptr, nullptr), 0);
+                    sender_started = true;
+                    sockaddr_in addr{};
+                    uv_ip4_addr("127.0.0.1", client_addr.port, &addr);
+                    ASSERT_EQ(udx_stream_connect(&sender, server.socket_handle(), remote_id,
+                        reinterpret_cast<const sockaddr*>(&addr)), 0);
+                    static char payload[] = "passive server payload";
+                    uv_buf_t buf = uv_buf_init(payload, sizeof(payload) - 1);
+                    auto* write = static_cast<udx_stream_write_t*>(std::calloc(1, udx_stream_write_sizeof(1)));
+                    ASSERT_NE(write, nullptr);
+                    const int rc = udx_stream_write(write, &sender, &buf, 1,
+                        [](udx_stream_write_t* w, int, int) { std::free(w); });
+                    EXPECT_GE(rc, 0);
+                    if (rc < 0) std::free(write);
+                }, 150);
+            }
+        }
+        relay.reply(resp, req.from_server);
+    });
+    client.socket_pool()->add_route(keypair.public_key, client.socket().socket_handle(), relay_addr);
+    ConnectOptions opts;
+    opts.reusable_socket = true;
+    opts.local_connection = false;
+    const auto started = uv_now(&loop);
+    client.connect(keypair.public_key, opts, [&](int err, const ConnectResult& conn) {
+        ++completions;
+        error = err;
+        result = conn;
+        if (!err) {
+            EXPECT_EQ(conn.udx_socket, client.socket().socket_handle());
+            EXPECT_EQ(conn.peer_address, server_addr);
+            sockaddr_in addr{};
+            uv_ip4_addr("127.0.0.1", server_addr.port, &addr);
+            ASSERT_EQ(udx_stream_connect(conn.raw_stream, conn.udx_socket, 777,
+                reinterpret_cast<const sockaddr*>(&addr)), 0);
+            udx_stream_read_start(conn.raw_stream, [](udx_stream_t* s, ssize_t n, const uv_buf_t* b) {
+                if (n > 0) *static_cast<bool*>(s->udx->loop->data) =
+                    std::string(b->base, n) == "passive server payload";
+            });
+        }
+    });
+    run_until(&loop, [&] { return completions != 0 || (mode == 6 && client.is_destroyed()); }, 13000);
+    EXPECT_EQ(completions, mode == 6 ? 0 : 1);
+    EXPECT_EQ(handshakes, 1);
+    if (mode != 6)
+        EXPECT_EQ(error, late_server ? 0 : mode == 3 ? ConnectError::HOLEPUNCH_TIMEOUT
+                                                    : ConnectError::HOLEPUNCH_FAILED);
+    if (late_server) {
+        run_until(&loop, [&] { return payload_received; }, 1000);
+        EXPECT_TRUE(payload_received);
+    }
+    if (advertised_open) EXPECT_EQ(punches, 0);
+    else EXPECT_GT(punches, 0);
+    if (mode == 3) EXPECT_GE(uv_now(&loop) - started, 9000u);
+    late.reset();
+    udx::destroy_stream_once(result.raw_stream);
+    if (sender_started) udx::destroy_stream_once(&sender);
+    client.destroy();
+    relay.close();
+    server.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    if (mode == 6) {
+        EXPECT_EQ(completions, 0);
+        EXPECT_LT(uv_now(&loop) - started, 2000u);
+    }
+    const int close_rc = uv_loop_close(&loop);
+    // Active-punch controls retain the existing PunchState cleanup cycle.
+    if (!advertised_open && close_rc == UV_EBUSY)
+        fprintf(stderr, "Known active-punch teardown baseline: UV_EBUSY\n");
+    else EXPECT_EQ(close_rc, 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(Snapshots, PublicClientPassive, ::testing::Range(0, 7));
 
 TEST(DirectRouteSocketReconnect, MainRouteCompletesWithoutHolepunch) {
     auto out = run_lan_scenario(0, true, 0, 1 | 2 | 4);

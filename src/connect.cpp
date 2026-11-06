@@ -66,6 +66,7 @@ struct ConnState {
     uint32_t our_udx_id = 0;
     udx_stream_t* raw_stream = nullptr;  // Client rawStream (like JS)
     bool completed = false;
+    bool local_open = false;  // Snapshot of the firewall advertised in our handshake.
 
     // connect-4 — the local LAN address list is computed ONCE per connect()
     // and reused by every relay attempt, mirroring JS's `c.requesting` latch
@@ -165,6 +166,7 @@ struct ConnState {
     void complete(int err, const ConnectResult& result = {}) {
         if (completed) return;  // Prevent double invocation (firewall + holepunch race)
         completed = true;
+        if (passive_timer) passive_timer->stop();
 
         // JS connect.js:464-468 — prefer the server's hints, then discovery replies.
         if (err == 0 && dht) {
@@ -294,6 +296,7 @@ static LocalHandshakeInfo build_local_handshake_info(
 static auto prepare_handshake(std::shared_ptr<ConnState> state) {
     if (!state->hs_request) {
         auto info = build_local_handshake_info(state);
+        state->local_open = info.firewall == peer_connect::FIREWALL_OPEN;
         // JS memoizes the complete Noise request, so every route shares a session.
         state->hs_request = peer_connect::prepare_handshake(
             state->keypair, state->remote_pk, state->our_udx_id,
@@ -613,8 +616,10 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
                             if (s->data) {
                                 auto* ctx = static_cast<ClientRawStreamCtx*>(s->data);
                                 // A pending query can keep ConnState alive past UDX finalization.
-                                if (auto st = ctx->state.lock(); st && st->raw_stream == s)
+                                if (auto st = ctx->state.lock(); st && st->raw_stream == s) {
                                     st->raw_stream = nullptr;
+                                    if (st->passive_timer) st->passive_timer->stop();
+                                }
                                 delete ctx;
                                 s->data = nullptr;
                             }
@@ -859,10 +864,11 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
     auto fw = state->socket->nat_sampler().firewall();
     auto addrs = state->socket->nat_sampler().addresses();
 
-    // JS: if our firewall is OPEN, wait passively for server to probe us
+    // JS uses the OPEN status sent in the handshake, not the NAT classifier.
+    // Wait passively for the server to probe us
     // (via rawStream firewall callback). 10s timeout.
     // JS: connect.js:228-231 — passive wait when our firewall is OPEN
-    if (fw == peer_connect::FIREWALL_OPEN) {
+    if (state->local_open) {
         DHT_LOG("  [connect] Our firewall is OPEN, waiting passively (10s)\n");
         state->passive_timer = std::make_unique<async_utils::UvTimer>(
             state->socket->loop());

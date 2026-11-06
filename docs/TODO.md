@@ -11,7 +11,7 @@ Last updated: 2026-11-06 (ordinary direct handshake; older snapshots below are h
 
 ## Status snapshot
 
-- **2026-11-06 ordinary direct handshake (lab pending):** a handshake reply
+- **2026-11-06 ordinary direct handshake (lab compatibility checked):** a handshake reply
   without peerAddress completes on the main socket at the contacted endpoint,
   matching JS connectThroughNode before holepunch selection. This also covers
   servers advertising holepunch info or a non-OPEN firewall. Both cached relay
@@ -340,7 +340,7 @@ FALSE_DONE. Behavioral parity estimate ~93%. Net-new, none previously ledgered:
   SERVER_ERROR without a findPeer walk. Previously the regression returned
   PEER_CONNECTION_FAILED after a lookup; retryable replies still fall back.
 - [x] **connect/divergence-2 normal direct handshake** — rechecked and fixed
-  2026-11-06 (lab pending). JS connect.js:499-501 completes non-relayed
+  2026-11-06 (lab compatibility checked). JS connect.js:499-501 completes non-relayed
   handshakes before its holepunch function; gating the no-holepunch branch
   alone would miss that control flow. Ordinary C++ discovery now uses the
   existing main-socket direct completion too, rather than punching an already

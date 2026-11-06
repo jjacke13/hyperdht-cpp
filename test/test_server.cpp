@@ -1577,6 +1577,122 @@ TEST(Server, RemoteAddressUsesRingSamplerNotStaleClassifier) {
     uv_loop_close(&loop);
 }
 
+class OpenClientShortcut : public ::testing::TestWithParam<int> {};
+
+TEST_P(OpenClientShortcut, UsesObservedEndpoint) {
+    const int mode = GetParam();
+    const bool relayed = mode & 1, asynchronous = mode & 2, empty_addresses = mode & 4;
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        rpc::RpcSocket socket(&loop, {}), client(&loop, {}), relay(&loop, {});
+        ASSERT_EQ(socket.bind(0, "127.0.0.1"), 0);
+        ASSERT_EQ(client.bind(0, "127.0.0.1"), 0);
+        ASSERT_EQ(relay.bind(0, "127.0.0.1"), 0);
+        const auto client_addr = compact::Ipv4Address::from_string("127.0.0.1", client.port());
+        router::Router router;
+        Server srv(socket, router);
+        noise::Seed seed{};
+        seed.fill(0x63);
+        const auto kp = noise::generate_keypair(seed);
+        udx_stream_t receiver{};
+        ASSERT_EQ(udx_stream_init(client.udx_handle(), &receiver, 12345, nullptr, nullptr), 0);
+        bool received = false;
+        receiver.data = &received;
+        ASSERT_EQ(udx_stream_read_start(&receiver, [](udx_stream_t* s, ssize_t n, const uv_buf_t* b) {
+            if (n > 0) *static_cast<bool*>(s->data) =
+                std::string(b->base, n) == "OPEN server payload";
+        }), 0);
+        udx_stream_t* adopted = nullptr;
+        int connections = 0, replies = 0;
+        srv.listen(kp, [&](const ConnectionInfo& info) {
+            ++connections;
+            adopted = info.raw_stream;
+            EXPECT_EQ(info.peer_address, client_addr);
+            EXPECT_EQ(info.udx_socket, nullptr);  // Existing consumer socket fallback is unchanged.
+            EXPECT_FALSE(info.socket_keepalive);
+            sockaddr_in addr{};
+            uv_ip4_addr(info.peer_address.host_string().c_str(), info.peer_address.port, &addr);
+            ASSERT_EQ(udx_stream_connect(adopted, socket.socket_handle(), info.remote_udx_id,
+                reinterpret_cast<const sockaddr*>(&addr)), 0);
+            uv_ip4_addr("127.0.0.1", socket.port(), &addr);
+            ASSERT_EQ(udx_stream_connect(&receiver, client.socket_handle(), info.local_udx_id,
+                reinterpret_cast<const sockaddr*>(&addr)), 0);
+            static char payload[] = "OPEN server payload";
+            uv_buf_t buf = uv_buf_init(payload, sizeof(payload) - 1);
+            auto* write = static_cast<udx_stream_write_t*>(std::calloc(1, udx_stream_write_sizeof(1)));
+            ASSERT_NE(write, nullptr);
+            const int rc = udx_stream_write(write, adopted, &buf, 1,
+                [](udx_stream_write_t* w, int, int) { std::free(w); });
+            EXPECT_GE(rc, 0);
+            if (rc < 0) std::free(write);
+        });
+        Server::FirewallDoneCb done;
+        if (asynchronous)
+            srv.set_firewall_async([&](const auto&, const auto&, const auto& observed,
+                                      Server::FirewallDoneCb cb) {
+                EXPECT_EQ(observed, client_addr);
+                done = std::move(cb);
+            });
+        seed.fill(0x64);
+        const auto client_kp = noise::generate_keypair(seed);
+        const auto& prologue = dht_messages::ns_peer_handshake();
+        noise::NoiseIK noise(true, client_kp, prologue.data(), prologue.size(), &kp.public_key);
+        peer_connect::NoisePayload payload;
+        payload.version = 1;
+        payload.firewall = peer_connect::FIREWALL_OPEN;
+        payload.udx = peer_connect::UdxInfo{1, false, 12345, 0};
+        payload.has_secret_stream = true;
+        if (!empty_addresses)
+            payload.addresses4.push_back(compact::Ipv4Address::from_string("192.0.2.9", 5000));
+        auto bytes = peer_connect::encode_noise_payload(payload);
+        peer_connect::HandshakeMessage message;
+        message.mode = relayed ? peer_connect::MODE_FROM_RELAY : peer_connect::MODE_FROM_CLIENT;
+        if (relayed) message.peer_address = client_addr;
+        message.noise = noise.send(bytes.data(), bytes.size());
+        messages::Request req;
+        std::array<uint8_t, 32> target{};
+        crypto_generichash(target.data(), target.size(), kp.public_key.data(), kp.public_key.size(), nullptr, 0);
+        req.target = target;
+        req.value = peer_connect::encode_handshake_msg(message);
+        req.from.addr = relayed ? compact::Ipv4Address::from_string("127.0.0.1", relay.port()) : client_addr;
+        req.tid = 1;
+        auto absorb = [&](const std::vector<uint8_t>& value) {
+            ++replies;
+            const auto reply = peer_connect::decode_handshake_msg(value.data(), value.size());
+            EXPECT_TRUE(noise.recv(reply.noise.data(), reply.noise.size()).has_value());
+        };
+        ASSERT_TRUE(router.handle_peer_handshake(req, [&](const messages::Response& resp) {
+            ASSERT_TRUE(resp.value.has_value());
+            absorb(*resp.value);
+        }, [&](const messages::Request& forwarded, udx_socket_t*) {
+            ASSERT_TRUE(forwarded.value.has_value());
+            absorb(*forwarded.value);
+        }));
+        if (asynchronous) {
+            ASSERT_TRUE(done);
+            EXPECT_EQ(connections, 0);
+            done(false);
+        }
+        EXPECT_EQ(replies, 1);
+        EXPECT_EQ(connections, 1);
+        if (adopted) {
+            run_loop_for(&loop, 100);
+            EXPECT_TRUE(received);
+            udx::destroy_stream_once(adopted);
+        }
+        udx::destroy_stream_once(&receiver);
+        srv.close();
+        socket.close();
+        client.close();
+        relay.close();
+        uv_run(&loop, UV_RUN_DEFAULT);
+    }
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(Paths, OpenClientShortcut, ::testing::Range(0, 8));
+
 TEST(Server, OpenClientSkipsBlindRelayBootstrap) {
     uv_loop_t loop;
     ASSERT_EQ(uv_loop_init(&loop), 0);

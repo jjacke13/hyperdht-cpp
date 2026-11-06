@@ -634,7 +634,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
         firewall_async_(pending_shared->remote_public_key,
                         pending_shared->remote_payload, peer_address,
                         [this, weak_alive, fired_once, weak_pending,
-                         hp_id, noise_key, has_remote_addr, relayed,
+                         hp_id, noise_key, peer_address, has_remote_addr, relayed,
                          from_address, relay_through_shared, our_addrs,
                          relay_infos, reply_fn](bool reject) mutable {
             // (2) Once-guard.
@@ -657,7 +657,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
                 reusable_socket);
             // Relay hint for the session punch socket (Task 4 consumes it).
             if (res) res->handshake_relay_addr = from_address;
-            on_handshake_result(hp_id, noise_key, has_remote_addr, relayed,
+            on_handshake_result(hp_id, noise_key, peer_address, has_remote_addr, relayed,
                                 relay_through_shared, reply_fn, std::move(res));
         });
         return;
@@ -679,7 +679,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     // Relay hint for the session punch socket (Task 4 consumes it).
     if (result) result->handshake_relay_addr = from_address;
 
-    on_handshake_result(hp_id, noise_key, has_remote_addr, relayed,
+    on_handshake_result(hp_id, noise_key, peer_address, has_remote_addr, relayed,
                         relay_through_info, reply_fn, std::move(result));
 }
 
@@ -690,6 +690,7 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
 void Server::on_handshake_result(
     uint32_t hp_id,
     std::string noise_key,
+    compact::Ipv4Address peer_address,
     bool has_remote_addr,
     bool relayed,
     std::optional<peer_connect::RelayThroughInfo> relay_through_info,
@@ -759,8 +760,7 @@ void Server::on_handshake_result(
     // punch-socket decision) is committed before the direct-connect branch
     // further down.
     const bool client_open =
-        conn.remote_payload.firewall == peer_connect::FIREWALL_OPEN &&
-        !conn.remote_payload.addresses4.empty();
+        conn.remote_payload.firewall == peer_connect::FIREWALL_OPEN;
 
 #ifndef HYPERDHT_EMBEDDED
     // Acquire the session's punch socket BEFORE the reply goes out: the
@@ -830,10 +830,10 @@ void Server::on_handshake_result(
 
     // JS: server.js:390-394 — if client is OPEN, connect directly
     if (client_open) {
-        auto peer_addr = conn_ptr->remote_payload.addresses4[0];
         DHT_LOG("  [server] Client is OPEN, connecting directly\n");
         remember_completed_handshake(noise_key, *conn_ptr);
-        on_socket(*conn_ptr, peer_addr);
+        // Use the route's observed endpoint, not the client's advertised list.
+        on_socket(*conn_ptr, peer_address);
         return;
     }
 

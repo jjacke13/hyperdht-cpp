@@ -5,12 +5,18 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-06 (public-client passive wait; older snapshots below are historical).
+Last updated: 2026-11-06 (OPEN-client server endpoint; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-06 OPEN-client server endpoint:** the server uses the client's
+  endpoint observed by the handshake route, matching JS.
+  The shortcut depends on OPEN alone, including an empty advertised address
+  list. Sync and async firewall completion preserve the observed endpoint;
+  NAT-client punching, relay bootstrap ordering, reply routing and consumer
+  socket selection are unchanged; explicit socket propagation remains separate.
 - **2026-11-06 public-client passive wait:** a client that advertised OPEN
   waits for the relayed server to reach it, matching JS's handshake snapshot.
   The NAT classifier remains the input for active punching; it cannot report
@@ -415,7 +421,11 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   `abort_relay`): tears down the relay chain only, session + puncher keep
   running (JS onabort parity); pair-error no longer clears the session.
 - [ ] server-9 — server-side same-host LAN match (server.js:414-426) not implemented.
-- [ ] server-11 — OPEN-client shortcut targets self-reported `addresses4[0]` with a null socket.
+- [x] server-11 endpoint — OPEN-client shortcut uses the observed client
+  endpoint regardless of advertised addresses (2026-11-06).
+- [ ] server-11 socket — propagate JS's active socket on a relayed OPEN
+  handshake and arrival socket on a direct handshake. The existing null socket
+  and consumer fallback are unchanged by the endpoint fix.
 
 ### router-announce (0 open; done: announce-1..7)
 - [x] announce-4 — DONE 2026-07-22. Announcer signs/stores empty relayAddresses

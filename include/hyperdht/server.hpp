@@ -460,6 +460,7 @@ private:
     void on_handshake_result(
         uint32_t hp_id,
         std::string noise_key,
+        compact::Ipv4Address peer_address,
         bool has_remote_addr,
         bool relayed,
         std::optional<peer_connect::RelayThroughInfo> relay_through_info,

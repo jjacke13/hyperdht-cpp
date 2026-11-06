@@ -604,6 +604,73 @@ TEST(AnnouncerRelays, KeepaliveRoundsDoNotOverlap) {
     EXPECT_EQ(f.nodes[0]->ping_tids.size(), 1u);
 }
 
+class AnnouncerPeriodicWait : public ::testing::TestWithParam<bool> {};
+
+TEST_P(AnnouncerPeriodicWait, PeriodicUpdateWaitsForRoundSettlement) {
+    Fixture f(3);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    ASSERT_TRUE(run_until(&f.loop, [&] {
+        for (const auto& node : f.nodes) if (node->ping_count == 0) return false;
+        return f.client->inflight_count() == 0;
+    }, 500));
+    f.nodes[0]->hold_ping = true;
+    f.ann->ping_relays_for_test();
+    ASSERT_TRUE(run_until(&f.loop, [&] { return !f.nodes[0]->held_pings.empty(); }, 500));
+    const auto gen = f.ann->cycle_gen_for_test();
+    std::vector<int> before;
+    for (const auto& node : f.nodes) before.push_back(node->find_peer_count);
+    f.ann->tick_reannounce_timer_for_test();
+    f.ann->tick_reannounce_timer_for_test();  // Coalesce repeated ticks.
+    run_until(&f.loop, [] { return false; }, 50);
+    EXPECT_FALSE(f.ann->is_updating_for_test());
+    EXPECT_EQ(f.ann->cycle_gen_for_test(), gen);
+    for (size_t i = 0; i < f.nodes.size(); ++i)
+        EXPECT_EQ(f.nodes[i]->find_peer_count, before[i]);
+    if (!GetParam()) f.nodes[0]->release_pings();
+    ASSERT_TRUE(f.settled_at(gen + 1, 6000));
+    run_until(&f.loop, [] { return false; }, 50);
+    EXPECT_EQ(f.ann->cycle_gen_for_test(), gen + 1);
+    for (size_t i = 0; i < f.nodes.size(); ++i)
+        EXPECT_EQ(f.nodes[i]->find_peer_count, before[i] + 1);
+}
+
+INSTANTIATE_TEST_SUITE_P(ReplyAndTimeout, AnnouncerPeriodicWait, ::testing::Bool());
+
+TEST(AnnouncerRelays, ExplicitRefreshSatisfiesPendingPeriodicUpdate) {
+    Fixture f(1);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    f.nodes[0]->hold_ping = true;
+    f.ann->ping_relays_for_test();
+    ASSERT_TRUE(run_until(&f.loop, [&] { return !f.nodes[0]->held_pings.empty(); }, 500));
+    const auto gen = f.ann->cycle_gen_for_test();
+    f.ann->tick_reannounce_timer_for_test();
+    f.ann->refresh();
+    ASSERT_TRUE(f.settled_at(gen + 1));
+    f.nodes[0]->release_pings();
+    ASSERT_TRUE(run_until(&f.loop, [&] { return f.client->inflight_count() == 0; }, 500));
+    run_until(&f.loop, [] { return false; }, 50);
+    EXPECT_EQ(f.ann->cycle_gen_for_test(), gen + 1);
+}
+
+TEST(AnnouncerRelays, StopCancelsPendingPeriodicUpdate) {
+    Fixture f(1);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    f.nodes[0]->hold_ping = true;
+    f.ann->ping_relays_for_test();
+    ASSERT_TRUE(run_until(&f.loop, [&] { return !f.nodes[0]->held_pings.empty(); }, 500));
+    f.ann->tick_reannounce_timer_for_test();
+    f.ann->stop_without_unannounce();
+    const auto gen = f.ann->cycle_gen_for_test();
+    f.nodes[0]->release_pings();
+    run_until(&f.loop, [] { return false; }, 50);
+    EXPECT_FALSE(f.ann->is_running());
+    EXPECT_EQ(f.ann->cycle_gen_for_test(), gen);
+    EXPECT_EQ(f.ann->reannounce_deadline_for_test(), 0u);
+}
+
 TEST(AnnouncerRelays, KeepalivePauseStartsAfterLastPong) {
     Fixture f(3);
     f.ann->start();

@@ -160,6 +160,7 @@ void Announcer::stop_impl(bool send_unannounce) {
     if (!running_) return;
     running_ = false;
     pinging_ = false;
+    periodic_update_pending_ = false;
     *alive_ = false;                        // C7: invalidate sentinel
     if (current_query_) {                    // M9: cancel live query
         current_query_.reset();
@@ -254,7 +255,12 @@ void Announcer::notify_online() {
 
 void Announcer::on_bg_timer(uv_timer_t* timer) {
     auto* self = static_cast<Announcer*>(timer->data);
-    if (!self || !self->running_) return;
+    if (!self || !self->running_ || self->updating_) return;
+    // JS awaits the current ping round before its periodic update.
+    if (self->pinging_) {
+        self->periodic_update_pending_ = true;
+        return;
+    }
     self->update();
 }
 
@@ -343,7 +349,9 @@ void Announcer::ping_relays() {
         if (--*pending != 0) return;
         pinging_ = false;
         if (ping_timer_) uv_timer_again(ping_timer_);
-        if (*active_count < std::min(total, MIN_ACTIVE)) {
+        if (periodic_update_pending_) {
+            update();
+        } else if (*active_count < std::min(total, MIN_ACTIVE)) {
             DHT_LOG("  [announcer] relay health: %d/%d active (min=%d), refreshing\n",
                     *active_count, total, MIN_ACTIVE);
             refresh();
@@ -438,6 +446,7 @@ void Announcer::ping_relays() {
 
 void Announcer::update() {
     if (updating_ || !running_) return;
+    periodic_update_pending_ = false;
     if (withdrawals_) withdrawals_->cancel();
     withdrawals_ = std::make_shared<Withdrawals>();
     updating_ = true;

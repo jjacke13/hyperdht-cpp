@@ -5,12 +5,18 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-06 (announcer periodic deadline; older snapshots below are historical).
+Last updated: 2026-11-06 (announcer periodic update ordering; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-06 announcer pending periodic update:** a periodic reannouncement
+  waits for the current relay-ping round to settle, matching JS's awaited
+  pings before its background update. Repeated deadlines coalesce; an explicit
+  refresh satisfies the pending update, and stop cancels it. Reply and timeout
+  settlement share this path. Explicit refresh/online/drift policy, intervals
+  and watchdog are unchanged. Exact 100-round plus RTT cadence remains separate.
 - **2026-11-06 announcer periodic deadline:** the existing five-minute
   reannounce timer restarts when a complete update settles, including retired
   withdrawals, instead of keeping its startup deadline after a manual refresh.
@@ -627,7 +633,9 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   clean shutdown checks.
 - [x] **Keepalive/update ordering** — new ping rounds wait for cycle
   settlement, matching JS's awaited update; watchdog ticks remain active
-  (2026-11-06). Successful-cycle wake timing is covered above.
+  (2026-11-06). Periodic updates also wait for in-flight ping settlement;
+  explicit refresh policy is unchanged. Successful-cycle wake timing and
+  remaining exact background-loop cadence are covered above.
 - [ ] **`refresh()` has no `_refreshing` latch** (announcer.cpp vs
   announcer.js:76-79) — a health/drift refresh landing mid-cycle is dropped,
   costing <=5s until the next ping tick. Low.

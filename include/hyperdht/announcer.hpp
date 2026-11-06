@@ -130,6 +130,11 @@ public:
         if (ping_timer_) on_ping_timer(ping_timer_);
     }
 
+    // Test-only: exercise a periodic deadline without waiting five minutes.
+    void tick_reannounce_timer_for_test() {
+        if (bg_timer_) on_bg_timer(bg_timer_);
+    }
+
     // Test-only: shorten the relay-gate window so a test can exercise
     // expiry without waiting 15 minutes.
     void set_gate_ttl_ms_for_test(uint64_t ms) { gate_ttl_ms_ = ms; }
@@ -212,6 +217,7 @@ private:
     bool running_ = false;
     bool updating_ = false;
     bool pinging_ = false;
+    bool periodic_update_pending_ = false;
 
     // ---- Publish-after-settle cycle state ----
     // One "cycle" = one find_peer walk + its ANNOUNCE commits. relays_ is

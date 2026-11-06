@@ -271,7 +271,7 @@ void Announcer::on_ping_timer(uv_timer_t* timer) {
     // guarantees no unknown one can wedge the announcer for more than
     // CYCLE_STUCK_MS: force-reset exactly like notify_online() and start
     // a fresh cycle. Runs from the 3s ping timer so it cannot be starved
-    // by an empty relay list (ping_relays returns early on empty).
+    // by an empty relay list or an updating cycle (ping_relays skips both).
     if (self->updating_) {
         const uint64_t now = uv_now(self->socket_.loop());
         DHT_LOG("  [announcer] cycle state: updating=1 query_done=%d "
@@ -321,7 +321,8 @@ void Announcer::on_ping_timer(uv_timer_t* timer) {
 // ---------------------------------------------------------------------------
 
 void Announcer::ping_relays() {
-    if (active_relays_.empty() || pinging_) return;
+    // JS awaits the announce cycle before starting another keepalive round.
+    if (active_relays_.empty() || pinging_ || updating_) return;
     pinging_ = true;
 
     // Iterate a snapshot, not the live vector. The health branch below calls

@@ -70,6 +70,8 @@ struct FakeNode {
 
     bool reply_error = false;   // fail FIND_PEER → node leaves the closest set
     bool silent_ping = false;   // never pong → looks dead to the health check
+    std::optional<uint64_t> hold_command;
+    std::vector<std::pair<messages::Response, compact::Ipv4Address>> held_responses;
 
     FakeNode(uv_loop_t* loop, uint8_t id_fill)
         : sock(loop, make_node_id(id_fill)) {
@@ -112,6 +114,10 @@ struct FakeNode {
             announce_count++;
         }
 
+        if (hold_command && !req.internal && req.command == *hold_command) {
+            held_responses.emplace_back(resp, req.from.addr);
+            return;
+        }
         sock.udp_send(messages::encode_response(resp), req.from.addr);
     }
 
@@ -120,6 +126,13 @@ struct FakeNode {
         for (const auto& [resp, to] : held_pings)
             sock.udp_send(messages::encode_response(resp), to);
         held_pings.clear();
+    }
+
+    void release_responses() {
+        hold_command.reset();
+        for (const auto& [resp, to] : held_responses)
+            sock.udp_send(messages::encode_response(resp), to);
+        held_responses.clear();
     }
 };
 
@@ -402,6 +415,60 @@ TEST(AnnouncerRelays, PeriodicKeepaliveReachesEveryRelayWithinFourSeconds) {
         }
         return true;
     }, 4000));
+}
+
+class AnnouncerCyclePause : public ::testing::TestWithParam<bool> {};
+
+TEST_P(AnnouncerCyclePause, KeepaliveWaitsForCycleThenResumes) {
+    Fixture f(3);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    ASSERT_TRUE(run_until(&f.loop, [&] {
+        for (const auto& node : f.nodes) if (node->ping_count == 0) return false;
+        return f.client->inflight_count() == 0;
+    }, 500));
+
+    std::vector<int> before;
+    for (auto& node : f.nodes) {
+        before.push_back(node->ping_count);
+        node->hold_command = GetParam() ? messages::CMD_ANNOUNCE : messages::CMD_FIND_PEER;
+    }
+    f.ann->refresh();
+    ASSERT_TRUE(run_until(&f.loop, [&] {
+        for (const auto& node : f.nodes) if (node->held_responses.empty()) return false;
+        return true;
+    }, 500));
+    // Exercise the real three-second timer while the walk or commits are pending.
+    EXPECT_FALSE(run_until(&f.loop, [&] {
+        for (size_t i = 0; i < f.nodes.size(); ++i)
+            if (f.nodes[i]->ping_count > before[i]) return true;
+        return false;
+    }, 3200));
+    EXPECT_TRUE(f.ann->is_updating_for_test());
+
+    for (auto& node : f.nodes) node->release_responses();
+    ASSERT_TRUE(f.settled_at(2));
+    before.clear();
+    for (const auto& node : f.nodes) before.push_back(node->ping_count);
+    EXPECT_TRUE(run_until(&f.loop, [&] {
+        for (size_t i = 0; i < f.nodes.size(); ++i)
+            if (f.nodes[i]->ping_count <= before[i]) return false;
+        return true;
+    }, 4000));
+}
+
+INSTANTIATE_TEST_SUITE_P(WalkAndCommits, AnnouncerCyclePause, ::testing::Bool());
+
+TEST(AnnouncerRelays, PingTimerWatchdogStillRecoversPendingCycle) {
+    Fixture f(3);
+    f.ann->start();
+    ASSERT_TRUE(f.settled_at(1));
+    f.ann->wedge_cycle_for_test();
+    const auto wedged_gen = f.ann->cycle_gen_for_test();
+    f.ann->set_cycle_stuck_ms_for_test(1);
+    f.ann->tick_ping_timer_for_test();
+    ASSERT_TRUE(f.settled_at(wedged_gen + 1));
+    for (const auto& node : f.nodes) EXPECT_GE(node->find_peer_count, 2);
 }
 
 TEST(AnnouncerRelays, KeepaliveRoundsDoNotOverlap) {

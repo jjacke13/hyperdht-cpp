@@ -224,7 +224,7 @@ struct ConnState {
 // See definitions below.
 static void on_handshake_success(std::shared_ptr<ConnState> state,
                                   const peer_connect::HandshakeResult& hs,
-                                  bool cached_main_route = false);
+                                  bool direct_main_route);
 static void start_relay_path(std::shared_ptr<ConnState> state,
                               bool is_initiator,
                               noise::PubKey relay_pk,
@@ -360,7 +360,7 @@ static void fire_handshake(std::shared_ptr<ConnState> state,
             // JS connect.js:354 break-out equivalent.
             if (state->query) state->query.reset();
             state->pending_relays.clear();
-            on_handshake_success(state, hs);
+            on_handshake_success(state, hs, !hs.server_address.has_value());
         });
 }
 
@@ -679,7 +679,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
 // succeeds. Dispatches to one of the following paths:
 //   1. Cached firewall replay (server sent data before handshake reply)
 //   2. Blind relay (if either side has relayThrough)
-//   3. Direct connect (OPEN firewall or no holepunch info)
+//   3. Direct connect (direct handshake, OPEN firewall or no holepunch info)
 //   4. Passive wait (our firewall is OPEN)
 //   5. LAN shortcut (same NAT)
 //   6. Holepunch
@@ -692,7 +692,7 @@ void HyperDHT::do_connect(const noise::PubKey& remote_pk,
 // ---------------------------------------------------------------------------
 static void on_handshake_success(std::shared_ptr<ConnState> state,
                                   const peer_connect::HandshakeResult& hs,
-                                  bool cached_main_route) {
+                                  bool direct_main_route) {
     // Replay cached firewall event if server's first packet arrived before
     // the handshake reply. JS: connect.js:493-496
     //   if (c.serverSocket) { c.onsocket(c.serverSocket, ...); return }
@@ -763,13 +763,13 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
     // connect-5 — pass the serverAddress fallback for getFirstRemoteAddress
     // semantics (connect.js:196-203,212-221).
     holepunch::HolepunchResult hp_result;
-    // JS connect.js:499-501: a non-relayed cached main address is already reachable.
-    const bool direct_main = cached_main_route && server_addr_js == state->relay_addr;
+    // JS connect.js:499-501: a non-relayed handshake already reached the server.
+    const bool direct_main = direct_main_route && server_addr_js == state->relay_addr;
     if (direct_main) hp_result.address = state->relay_addr;
     if (direct_main || holepunch::try_direct_connect(hs, hp_result, server_addr_js)) {
         DHT_LOG("  [connect] *** DIRECT CONNECT (%s) → %s:%u "
                 "(no holepunch, no pool socket) ***\n",
-                direct_main ? "cached main route" : "server OPEN",
+                direct_main ? "main route" : "server OPEN",
                 hp_result.address.host_string().c_str(), hp_result.address.port);
         ConnectResult result;
         result.success = true;

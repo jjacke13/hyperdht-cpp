@@ -854,12 +854,12 @@ struct FakeRelayPeer {
         pc::HandshakeMessage reply_msg;
         reply_msg.mode = pc::MODE_REPLY;
         reply_msg.noise = responder.send(rpb.data(), rpb.size());
-        if (open_relay_) reply_msg.peer_address = ep_addr();
+        reply_msg.peer_address = ep_addr();  // This fixture relays to a separate UDX endpoint.
 
         msgs::Response resp;
         resp.tid = req.tid;
         // Doubles as the wire `to` (→ hs.client_address) AND the datagram
-        // destination (rpc.cpp:558-573). The OPEN reply also names the UDX
+        // destination (rpc.cpp:558-573). The reply also names the UDX
         // endpoint, so the bogon-filtered loopback address has that fallback.
         resp.from.addr = req.from.addr;
         resp.value = pc::encode_handshake_msg(reply_msg);
@@ -1183,6 +1183,7 @@ static void run_client_relay_emit(bool open_relay, bool fail_write = false) {
         pc::HandshakeMessage reply;
         reply.mode = pc::MODE_REPLY;
         reply.noise = responder.send(plain.data(), plain.size());
+        reply.peer_address = target_addr;  // Keep this fallback test's handshake relayed.
         resp.value = pc::encode_handshake_msg(reply);
         target.reply(resp, req.from_server);
     });

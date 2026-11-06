@@ -344,7 +344,8 @@ struct LanScenarioResult {
 // `clientAddress.host === serverAddress.host` fires.
 LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive,
                                   int direct_path = 0, int reusable_flags = -1,
-                                  int hint_mode = -1, bool discover = false) {
+                                  int hint_mode = -1, bool discover = false,
+                                  bool direct_contact = false) {
     uv_loop_t loop;
     uv_loop_init(&loop);
 
@@ -441,7 +442,8 @@ LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive,
         // → hs.server_address (JS serverAddress = hs.peerAddress || to).
         // Same host as the client (127.0.0.1), different addr than the
         // relay → `relayed` is true and the LAN trigger host check fires.
-        if (&via == &relay || (reusable_flags >= 0 && (reusable_flags & 8)))
+        if (!direct_contact &&
+            (&via == &relay || (reusable_flags >= 0 && (reusable_flags & 8))))
             reply_msg.peer_address = Ipv4Address::from_string("127.0.0.1",
                 direct_path == 0 ? 9998 : lan_port_used);
 
@@ -480,7 +482,8 @@ LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive,
                 EXPECT_EQ(route->address, result.peer_address);
             }
             ASSERT_NE(result.raw_stream, nullptr);
-            ASSERT_EQ(udx_stream_init(lan_peer.udx_handle(), &transport_peer,
+            auto& transport_socket = direct_contact ? relay : lan_peer;
+            ASSERT_EQ(udx_stream_init(transport_socket.udx_handle(), &transport_peer,
                                      777, nullptr, nullptr), 0);
             transport_started = true;
             transport_peer.data = &out;
@@ -491,8 +494,9 @@ LanScenarioResult run_lan_scenario(uint16_t lan_port, bool lan_peer_alive,
                 });
             struct sockaddr_in client_addr{}, server_addr{};
             uv_ip4_addr("127.0.0.1", dht.socket().port(), &client_addr);
-            uv_ip4_addr("127.0.0.1", lan_port_used, &server_addr);
-            ASSERT_EQ(udx_stream_connect(&transport_peer, lan_peer.socket_handle(),
+            uv_ip4_addr("127.0.0.1", transport_socket.port(), &server_addr);
+            EXPECT_EQ(result.peer_address, Ipv4Address::from_string("127.0.0.1", transport_socket.port()));
+            ASSERT_EQ(udx_stream_connect(&transport_peer, transport_socket.socket_handle(),
                 result.local_udx_id, reinterpret_cast<const sockaddr*>(&client_addr)), 0);
             auto* selected = result.udx_socket ? result.udx_socket : expected_socket;
             ASSERT_EQ(udx_stream_connect(result.raw_stream, selected, result.remote_udx_id,
@@ -599,6 +603,22 @@ TEST_P(DirectRouteSocket, ReportsTheConsumerSocketAndCachesOnlyWithBothOptIns) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Paths, DirectRouteSocket, ::testing::Range(0, 12));
+
+class DirectHandshake : public ::testing::TestWithParam<int> {};
+
+TEST_P(DirectHandshake, CompletesWithoutHolepunchOrLanPing) {
+    // Full holepunch info, OPEN, or no holepunch info; cache-seeded or ordinary discovery.
+    const int p = GetParam();
+    auto out = run_lan_scenario(0, true, p / 2, 0, -1, p % 2, true);
+    EXPECT_EQ(out.connect_err, 0);
+    EXPECT_TRUE(out.connect_result.success);
+    EXPECT_TRUE(out.payload_received);
+    EXPECT_EQ(out.connect_result.peer_address, out.discovery_relays.front());
+    EXPECT_EQ(out.holepunch_reqs, 0);
+    EXPECT_EQ(out.lan_pings, 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(Paths, DirectHandshake, ::testing::Range(0, 6));
 
 TEST(DirectRouteSocketReconnect, MainRouteCompletesWithoutHolepunch) {
     auto out = run_lan_scenario(0, true, 0, 1 | 2 | 4);

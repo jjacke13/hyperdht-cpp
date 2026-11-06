@@ -5,12 +5,18 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-06 (first inbound node observation; older snapshots below are historical).
+Last updated: 2026-11-06 (ordinary direct handshake; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-06 ordinary direct handshake (lab pending):** a handshake reply
+  without peerAddress completes on the main socket at the contacted endpoint,
+  matching JS connectThroughNode before holepunch selection. This also covers
+  servers advertising holepunch info or a non-OPEN firewall. Both cached relay
+  discovery seeds and ordinary FIND_PEER use this path; cached socket-route
+  and relayed-handshake behavior remain unchanged.
 - **2026-11-06 first inbound node observation:** a valid node newly admitted
   to the routing table contributes its request's address observation even on
   the inactive socket, matching JS dht-rpc's _addNode. Repeated requests on
@@ -333,12 +339,13 @@ FALSE_DONE. Behavioral parity estimate ~93%. Net-new, none previously ledgered:
   callback applies the normal handshake's `hs.terminal` check and reports
   SERVER_ERROR without a findPeer walk. Previously the regression returned
   PEER_CONNECTION_FAILED after a lookup; retryable replies still fall back.
-- [ ] **connect/divergence-2 (LOW)** — step-4 no-holepunch direct-connect
-  (connect.cpp:732-753) missing JS's `(relayed && !remoteHolepunchable)` gate
-  (connect.js:212) and ordered ahead of passive-wait/LAN; a NON-relayed
-  !remoteHolepunchable connect dials server_addr instead of passive-wait /
-  CANNOT_HOLEPUNCH. Likely pre-existing. Gate on `relayed` + reorder, or ledger
-  as a deliberate divergence.
+- [x] **connect/divergence-2 normal direct handshake** — rechecked and fixed
+  2026-11-06 (lab pending). JS connect.js:499-501 completes non-relayed
+  handshakes before its holepunch function; gating the no-holepunch branch
+  alone would miss that control flow. Ordinary C++ discovery now uses the
+  existing main-socket direct completion too, rather than punching an already
+  reached server or preferring advertised addresses. Cached-route and relayed
+  paths are preserved.
 - [ ] **compact/buffer64k (LOW — doc-only)** — `Buffer::decode` 64KB cap
   (compact.cpp:239-249) vs JS uncapped; fails SAFE (rejects a superset), H12
   anti-DoS. Add a ledger line like compact-2's array cap. No code change.

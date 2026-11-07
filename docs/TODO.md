@@ -5,12 +5,17 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-06 (relayed OPEN-client socket; older snapshots below are historical).
+Last updated: 2026-11-07 (already-hashed findPeer target; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-07 already-hashed findPeer target:** named C++
+  HyperDHT::find_peer_target and dht_ops::find_peer_target use a supplied
+  32-byte target directly, matching JS's hash:false. Existing find_peer
+  overloads still hash public keys and share the same record validation,
+  routing replies, retries and seed handling. C API and wrappers are unchanged.
 - **2026-11-06 relayed OPEN-client socket:** the server explicitly passes
   its active socket to the consumer for a relayed OPEN-client handshake,
   matching JS's dht.socket: client socket while firewalled, server socket
@@ -844,6 +849,10 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
 
 ## D. Missing JS parity features
 
+- [x] **Already-hashed native findPeer target** — C++ find_peer_target
+  matches JS findPeer(target, { hash: false }) (2026-11-07). Existing
+  public-key methods keep their semantics. Other target/query controls and
+  wrapper exposure remain separate work.
 - [x] **`changeRemote`** — DONE this session (relay→direct upgrade port: libudx
   `udx_stream_change_remote` wrapped in `relay_upgrade::try_change_remote` +
   Duplex firewall tap + FFI). Covers the path-upgrade case; mid-connection NAT

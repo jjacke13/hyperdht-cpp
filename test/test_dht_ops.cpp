@@ -9,6 +9,7 @@
 
 #include "hyperdht/dht_ops.hpp"
 #include "hyperdht/dht_messages.hpp"
+#include "hyperdht/dht.hpp"
 
 using namespace hyperdht;
 using namespace hyperdht::dht_ops;
@@ -41,6 +42,78 @@ TEST(DhtOps, HashPublicKey) {
     crypto_generichash(expected, 32, pk.data(), 32, nullptr, 0);
     EXPECT_EQ(std::memcmp(target.data(), expected, 32), 0);
 }
+
+class FindPeerTarget : public ::testing::TestWithParam<int> {};
+
+TEST_P(FindPeerTarget, UsesExactWireTargetAndRetainsRecordValidation) {
+    const bool already_hashed = GetParam() & 1, malformed = GetParam() & 2;
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        DhtOptions options;
+        options.ephemeral = true;
+        options.adaptive = false;
+        HyperDHT client(&loop, options);
+        ASSERT_EQ(client.bind(), 0);
+        RpcSocket relay(&loop, {});
+        ASSERT_EQ(relay.bind(0, "127.0.0.1"), 0);
+        const auto addr = compact::Ipv4Address::from_string("127.0.0.1", relay.port());
+        Node node;
+        node.id = compute_peer_id(addr);
+        node.host = addr.host_string();
+        node.port = addr.port;
+        client.socket().table().add(node);
+        noise::PubKey pk{};
+        pk.fill(0x72);
+        const auto target = hash_public_key(pk.data(), pk.size());
+        dht_messages::PeerRecord peer;
+        peer.public_key = pk;
+        const auto value = malformed ? std::vector<uint8_t>{0x01}
+                                     : dht_messages::encode_peer_record(peer);
+        int requests = 0, replies = 0, completions = 0;
+        relay.on_request([&](const messages::Request& req) {
+            ++requests;
+            EXPECT_EQ(req.command, messages::CMD_FIND_PEER);
+            EXPECT_EQ(req.target, target);
+            EXPECT_FALSE(req.value.has_value());
+            messages::Response resp;
+            resp.tid = req.tid;
+            resp.from.addr = req.from.addr;
+            resp.id = node.id;
+            resp.value = value;
+            relay.reply(resp, req.from_server);
+        });
+        auto on_reply = [&](const QueryReply& r) { ++replies; EXPECT_EQ(r.value, value); };
+        auto on_done = [&](int error, const std::vector<QueryReply>& closest) {
+            ++completions;
+            EXPECT_EQ(error, QUERY_OK);
+            EXPECT_EQ(closest.size(), 1u);
+        };
+        // Keep the wire regression runnable on the parent, which hashes the target again.
+        auto find_target = [&]<typename Dht>(Dht& dht) {
+            if constexpr (requires { dht.find_peer_target(target, on_reply, on_done); })
+                return dht.find_peer_target(target, on_reply, on_done);
+            else return dht.find_peer(target, on_reply, on_done);
+        };
+        auto q = already_hashed ? find_target(client) : client.find_peer(pk, on_reply, on_done);
+        const auto deadline = uv_hrtime() + 2000000000ULL;
+        while (!completions && uv_hrtime() < deadline) {
+            uv_run(&loop, UV_RUN_NOWAIT);
+            uv_sleep(1);
+        }
+        EXPECT_EQ(completions, 1);
+        EXPECT_EQ(requests, 1);
+        EXPECT_EQ(replies, malformed ? 0 : 1);
+        q->destroy();
+        q.reset();
+        client.destroy();
+        relay.close();
+        uv_run(&loop, UV_RUN_DEFAULT);
+    }
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(TargetAndMapping, FindPeerTarget, ::testing::Range(0, 4));
 
 TEST(DhtOps, FindPeerFiltersMalformedRecordsWithoutLosingClosestNodes) {
     uv_loop_t loop;

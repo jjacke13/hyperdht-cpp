@@ -36,6 +36,15 @@ struct SeedNode {
     compact::Ipv4Address addr;
 };
 
+// JS findPeer(target, { hash: false }): use the supplied target without hashing.
+std::shared_ptr<query::Query> find_peer_target(rpc::RpcSocket& socket,
+                                         const routing::NodeId& target,
+                                         query::OnReplyCallback on_reply,
+                                         query::OnDoneCallback on_done,
+                                         const std::vector<SeedNode>* seed_nodes = nullptr,
+                                         int retries = query::QUERY_RETRIES,
+                                         bool only_closest_nodes = false);
+
 // `seed_nodes` (optional): pre-seeds the walk's frontier in closest-first
 // order via Query::add_seed_node before start(). Used by the Announcer to
 // re-hit the SAME relay nodes each reannounce cycle (JS announcer.js:156

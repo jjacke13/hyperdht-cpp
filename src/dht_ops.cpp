@@ -68,11 +68,18 @@ std::shared_ptr<query::Query> find_peer(rpc::RpcSocket& socket,
                                          query::OnDoneCallback on_done,
                                          const std::vector<SeedNode>* seed_nodes,
                                          int retries, bool only_closest_nodes) {
-    auto target = hash_public_key(public_key, pk_len);
-    routing::NodeId target_id{};
-    std::copy(target.begin(), target.end(), target_id.begin());
+    return find_peer_target(socket, hash_public_key(public_key, pk_len),
+                            std::move(on_reply), std::move(on_done), seed_nodes,
+                            retries, only_closest_nodes);
+}
 
-    auto q = query::Query::create(socket, target_id, messages::CMD_FIND_PEER);
+std::shared_ptr<query::Query> find_peer_target(rpc::RpcSocket& socket,
+                                         const routing::NodeId& target,
+                                         query::OnReplyCallback on_reply,
+                                         query::OnDoneCallback on_done,
+                                         const std::vector<SeedNode>* seed_nodes,
+                                         int retries, bool only_closest_nodes) {
+    auto q = query::Query::create(socket, target, messages::CMD_FIND_PEER);
     q->set_retries(retries);
     q->set_only_closest_nodes(only_closest_nodes);
     q->on_reply([on_reply = std::move(on_reply)](const query::QueryReply& reply) {

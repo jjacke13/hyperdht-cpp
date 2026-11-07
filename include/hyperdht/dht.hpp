@@ -661,6 +661,12 @@ public:
         query::OnReplyCallback on_reply,
         query::OnDoneCallback on_done);
 
+    // JS findPeer(target, { hash: false }); existing find_peer hashes a public key.
+    std::shared_ptr<query::Query> find_peer_target(
+        const routing::NodeId& target,
+        query::OnReplyCallback on_reply,
+        query::OnDoneCallback on_done);
+
     std::shared_ptr<query::Query> lookup(
         const routing::NodeId& target,
         query::OnReplyCallback on_reply,

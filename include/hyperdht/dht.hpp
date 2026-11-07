@@ -705,11 +705,23 @@ public:
         query::OnReplyCallback on_reply,
         query::OnDoneCallback on_done);
 
+    // JS lookupAndUnannounce(target, keyPair): target is already hashed.
+    std::shared_ptr<query::Query> lookup_and_unannounce_target(
+        const routing::NodeId& target,
+        const noise::Keypair& keypair,
+        query::OnReplyCallback on_reply,
+        query::OnDoneCallback on_done);
+
     // B1: Standalone unannounce (JS: dht.unannounce — hyperdht/index.js:240-242)
     // Convenience wrapper: runs lookup_and_unannounce, ignores per-reply.
     void unannounce(const noise::PubKey& public_key,
                     const noise::Keypair& keypair,
                     std::function<void()> on_done = nullptr);
+
+    // Target-aware counterpart; completion follows the same contract as unannounce.
+    void unannounce_target(const routing::NodeId& target,
+                           const noise::Keypair& keypair,
+                           std::function<void()> on_done = nullptr);
 
     // Ping a specific node (JS: dht.ping(addr))
     void ping(const compact::Ipv4Address& addr,

@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <algorithm>
 #include <cstring>
 #include <string>
 
@@ -159,6 +160,181 @@ static std::vector<uint8_t> signed_announce(
         target, node_id, token.data(), token.size(), ann, kp);
     return dht_messages::encode_announce_msg(ann);
 }
+
+class TargetUnannounce : public ::testing::TestWithParam<int> {};
+
+TEST_P(TargetUnannounce, UsesTargetAndPreservesUnrelatedLocalState) {
+    // 0/1: target APIs, 2: own target, 3: listener, 4/5: legacy APIs,
+    // 6: ephemeral cleanup guard, 7: legacy topic belonging to another key.
+    const int mode = GetParam();
+    const bool legacy = mode == 4 || mode == 5 || mode == 7;
+    const bool convenience = mode == 1 || mode == 5;
+    const bool own_target = mode == 2 || mode == 4 || mode == 5;
+    uv_loop_t loop{};
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        HyperDHT node(&loop);
+        ASSERT_EQ(node.bind(), 0);
+        std::unique_ptr<udx_interface_event_t> watcher(node.socket().udx_handle()->listeners);
+        ASSERT_NE(watcher, nullptr);
+        ASSERT_EQ(watcher->next, nullptr);
+        watcher->on_close = nullptr;  // Same drained watcher ownership as the local-cache fixture above.
+        node.socket().set_ephemeral(false);
+        RpcSocket relay(&loop, {});
+        ASSERT_EQ(relay.bind(0, "127.0.0.1"), 0);
+        relay.set_ephemeral(false);  // Storage commands must reach the simulated persistent peer.
+        add_server_to_table(node.socket(), relay);
+        const auto relay_addr = Ipv4Address::from_string("127.0.0.1", relay.port());
+        const auto relay_id = compute_peer_id(relay_addr);
+        const auto node_addr = Ipv4Address::from_string("127.0.0.1", node.port());
+        noise::Seed seed{};
+        seed.fill(0x61); const auto first = noise::generate_keypair(seed);
+        seed.fill(0x62); const auto second = noise::generate_keypair(seed);
+        seed.fill(0x63); const auto topic = noise::generate_keypair(seed);
+        const auto input = own_target ? first.public_key : topic.public_key;
+        NodeId target{};
+        target.fill(0x93);
+        if (own_target || mode == 3 || mode == 7)
+            crypto_generichash(target.data(), target.size(), input.data(), input.size(), nullptr, 0);
+        auto pump = [&](auto ready) {
+            const auto deadline = uv_hrtime() + 2000000000ULL;
+            while (!ready() && uv_hrtime() < deadline) { uv_run(&loop, UV_RUN_NOWAIT); uv_sleep(1); }
+            EXPECT_TRUE(ready());
+        };
+        auto call = [&](Request req) {
+            std::optional<Response> result;
+            req.to.addr = node_addr;
+            relay.request(req, [&](const Response& r) { result = r; }, [](uint16_t) {});
+            pump([&] { return result.has_value(); });
+            return result.value_or(Response{});
+        };
+        for (const auto* kp : {&first, &second}) {
+            Request req;
+            req.command = CMD_ANNOUNCE;
+            req.target = target;
+            req.token = node.socket().token_store().create("127.0.0.1");
+            req.value = signed_announce(*kp, target, node.socket().table().id(), *req.token);
+            call(req);
+        }
+        dht_messages::PeerRecord forward_peer;
+        forward_peer.public_key = own_target ? first.public_key : topic.public_key;
+        router::ForwardEntry entry;
+        entry.record = dht_messages::encode_peer_record(forward_peer);
+        entry.relay = Ipv4Address::from_string("192.0.2.1", 49737);
+        if (mode == 3)
+            entry.on_peer_handshake = [](const auto&, const auto&, const auto&, bool,
+                                         router::HandshakeReplyFn) {};
+        node.router().set(target, std::move(entry));
+        auto local_keys = [&] {
+            Request req;
+            req.command = CMD_LOOKUP;
+            req.target = target;
+            const auto response = call(req);
+            std::vector<noise::PubKey> keys;
+            if (response.value) {
+                const auto records = dht_messages::decode_lookup_reply(response.value->data(), response.value->size());
+                for (const auto& value : records.peers)
+                    keys.push_back(dht_messages::decode_peer_record(value.data(), value.size()).public_key);
+            }
+            return keys;
+        };
+        const auto before = local_keys();
+        EXPECT_EQ(std::count(before.begin(), before.end(), first.public_key), 1);
+        EXPECT_EQ(std::count(before.begin(), before.end(), second.public_key), 1);
+        std::optional<Request> lookup, withdrawal;
+        relay.on_request([&](const Request& req) {
+            EXPECT_EQ(req.target, target);
+            if (req.command == CMD_LOOKUP) lookup = req;
+            else if (req.command == CMD_UNANNOUNCE) withdrawal = req;
+            else ADD_FAILURE() << "Unexpected query command " << req.command;
+        });
+        int completions = 0, replies = 0;
+        auto on_done = [&](int error, const std::vector<query::QueryReply>& closest) {
+            ++completions;
+            EXPECT_EQ(error, query::QUERY_OK);
+            EXPECT_EQ(closest.size(), 1u);
+        };
+        auto on_reply = [&](const query::QueryReply& reply) {
+            ++replies;
+            EXPECT_EQ(reply.from_id, relay_id);
+            EXPECT_TRUE(reply.token.has_value());
+        };
+        auto done = [&] { ++completions; };
+        std::shared_ptr<query::Query> q;
+        auto start_lookup = [&]<typename Dht>(Dht& dht) {
+            if (legacy) return dht.lookup_and_unannounce(input, first, on_reply, on_done);
+            // Parent fallback demonstrates that its convenience API hashes the topic again.
+            if constexpr (requires { dht.lookup_and_unannounce_target(target, first, on_reply, on_done); })
+                return dht.lookup_and_unannounce_target(target, first, on_reply, on_done);
+            else return dht.lookup_and_unannounce(target, first, on_reply, on_done);
+        };
+        auto start_void = [&]<typename Dht>(Dht& dht) {
+            if (legacy) dht.unannounce(input, first, done);
+            else if constexpr (requires { dht.unannounce_target(target, first, done); })
+                dht.unannounce_target(target, first, done);
+            else dht.unannounce(target, first, done);
+        };
+        if (mode == 6) node.socket().set_ephemeral(true);
+        if (convenience) start_void(node);
+        else q = start_lookup(node);
+        const bool keep_forward = !own_target;
+        EXPECT_EQ(node.router().get(target) != nullptr, keep_forward);
+        if (mode == 3) ASSERT_TRUE(node.router().get(target)->on_peer_handshake);
+        node.socket().set_ephemeral(false);  // Inspect the cache even for the ephemeral guard.
+        const auto after = local_keys();
+        EXPECT_EQ(std::count(after.begin(), after.end(), first.public_key), mode == 6 ? 1 : 0);
+        EXPECT_EQ(std::count(after.begin(), after.end(), second.public_key), 1);
+        pump([&] { return lookup.has_value(); });
+        ASSERT_TRUE(lookup);
+        EXPECT_EQ(completions, 0);
+        dht_messages::PeerRecord peer;
+        peer.public_key = first.public_key;
+        dht_messages::LookupRawReply records;
+        records.peers.push_back(dht_messages::encode_peer_record(peer));
+        const auto token = relay.token_store().create(lookup->from.addr.host_string());
+        Response response;
+        response.tid = lookup->tid;
+        response.from.addr = lookup->from.addr;
+        response.id = relay_id;
+        response.token = token;
+        response.value = dht_messages::encode_lookup_reply(records);
+        relay.reply(response, lookup->from_server);
+        pump([&] { return withdrawal.has_value(); });
+        if (!withdrawal || !withdrawal->value) {
+            ADD_FAILURE() << "No withdrawal: replies=" << replies << " completions=" << completions;
+            if (q) q->destroy();
+            node.destroy(); relay.close();
+            udx_teardown(node.socket().udx_handle());
+            uv_run(&loop, UV_RUN_DEFAULT);
+            EXPECT_EQ(uv_loop_close(&loop), 0);
+            return;
+        }
+        EXPECT_EQ(withdrawal->token, token);
+        const auto ann = dht_messages::decode_announce_msg(withdrawal->value->data(), withdrawal->value->size());
+        ASSERT_TRUE(ann.peer && ann.signature);
+        EXPECT_EQ(ann.peer->public_key, first.public_key);
+        EXPECT_TRUE(announce_sig::verify_announce(dht_messages::ns_unannounce(), target,
+            relay_id, token.data(), token.size(), ann, *ann.signature, first.public_key));
+        for (int i = 0; i < 25; ++i) { uv_run(&loop, UV_RUN_NOWAIT); uv_sleep(1); }
+        EXPECT_EQ(completions, 0) << "Completion must await the withdrawal ACK";
+        response = {};
+        response.tid = withdrawal->tid;
+        response.from.addr = withdrawal->from.addr;
+        response.id = relay_id;
+        relay.reply(response, withdrawal->from_server);
+        pump([&] { return completions != 0; });
+        EXPECT_EQ(completions, 1);
+        EXPECT_EQ(replies, convenience ? 0 : 1);
+        if (q) { q->destroy(); q.reset(); }
+        node.destroy();
+        relay.close();
+        udx_teardown(node.socket().udx_handle());
+        uv_run(&loop, UV_RUN_DEFAULT);
+    }
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(TargetCleanupAndAck, TargetUnannounce, ::testing::Range(0, 8));
 
 // Shared harness: PING → get token → announce → run body → drain loop.
 struct Harness {

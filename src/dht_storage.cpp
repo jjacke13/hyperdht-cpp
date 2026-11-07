@@ -83,11 +83,20 @@ std::shared_ptr<query::Query> HyperDHT::lookup_and_unannounce(
     const noise::Keypair& keypair,
     query::OnReplyCallback on_reply,
     query::OnDoneCallback on_done) {
-    ensure_bound();
     // target = BLAKE2b(public_key) — the self-announce topic (matches the
     // existing C++ convention; JS callers pass `target` directly).
     routing::NodeId target{};
     crypto_generichash(target.data(), 32, public_key.data(), 32, nullptr, 0);
+    return lookup_and_unannounce_target(target, keypair,
+                                        std::move(on_reply), std::move(on_done));
+}
+
+std::shared_ptr<query::Query> HyperDHT::lookup_and_unannounce_target(
+    const routing::NodeId& target,
+    const noise::Keypair& keypair,
+    query::OnReplyCallback on_reply,
+    query::OnDoneCallback on_done) {
+    ensure_bound();
 
     // JS index.js:203-206 — remove the signing key's local cached record before
     // walking the network (`_persistent.unannounce(target, keyPair.publicKey)`).
@@ -96,9 +105,10 @@ std::shared_ptr<query::Query> HyperDHT::lookup_and_unannounce(
         announce::TargetKey tk{};
         std::copy(target.begin(), target.end(), tk.begin());
         if (handlers_) handlers_->store().remove(tk, keypair.public_key);
-        auto* entry = router_.get(tk);
-        if (entry && !entry->on_peer_handshake) {
-            router_.remove(tk);
+        // JS persistent.js:49 removes a forward only for the signing key's own topic.
+        if (target == dht_ops::hash_public_key(keypair.public_key.data(), keypair.public_key.size())) {
+            auto* entry = router_.get(tk);
+            if (entry && !entry->on_peer_handshake) router_.remove(tk);
         }
     }
 
@@ -121,6 +131,16 @@ void HyperDHT::unannounce(const noise::PubKey& public_key,
                            const noise::Keypair& keypair,
                            std::function<void()> on_done) {
     lookup_and_unannounce(public_key, keypair,
+        [](const query::QueryReply&) {},
+        [on_done](int /*error*/, const std::vector<query::QueryReply>&) {
+            if (on_done) on_done();
+        });
+}
+
+void HyperDHT::unannounce_target(const routing::NodeId& target,
+                                  const noise::Keypair& keypair,
+                                  std::function<void()> on_done) {
+    lookup_and_unannounce_target(target, keypair,
         [](const query::QueryReply&) {},
         [on_done](int /*error*/, const std::vector<query::QueryReply>&) {
             if (on_done) on_done();

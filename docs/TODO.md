@@ -5,12 +5,19 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-07 (already-hashed findPeer target; older snapshots below are historical).
+Last updated: 2026-11-07 (arbitrary-target unannounce; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
 
+- **2026-11-07 arbitrary-target unannounce:** native C++
+  lookup_and_unannounce_target and unannounce_target use a supplied topic
+  directly, sharing the existing signed LOOKUP/UNANNOUNCE path. Existing
+  public-key methods still hash once. Local cleanup removes only the signing
+  key's record; relay-only forwards are removed only for its own hashed topic,
+  matching JS. Other keys, unrelated forwards and local listeners survive.
+  Completion still awaits withdrawals; C API, wrappers and layouts are unchanged.
 - **2026-11-07 already-hashed findPeer target:** named C++
   HyperDHT::find_peer_target and dht_ops::find_peer_target use a supplied
   32-byte target directly, matching JS's hash:false. Existing find_peer
@@ -849,6 +856,10 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
 
 ## D. Missing JS parity features
 
+- [x] **Arbitrary-target native unannounce** — target-aware
+  lookup_and_unannounce_target and unannounce_target match JS topic semantics
+  (2026-11-07). Legacy public-key methods retain hashing; C API/wrapper
+  exposure and other query controls remain separate work.
 - [x] **Already-hashed native findPeer target** — C++ find_peer_target
   matches JS findPeer(target, { hash: false }) (2026-11-07). Existing
   public-key methods keep their semantics. Other target/query controls and

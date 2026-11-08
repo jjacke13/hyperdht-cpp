@@ -35,6 +35,28 @@ std::shared_ptr<query::Query> HyperDHT::find_peer_target(
                                      std::move(on_reply), std::move(on_done));
 }
 
+std::shared_ptr<query::Query> HyperDHT::find_peer(
+    const noise::PubKey& public_key,
+    query::OnReplyCallback on_reply,
+    query::OnDoneCallback on_done,
+    const std::vector<dht_ops::SeedNode>* seed_nodes,
+    int retries, bool only_closest_nodes) {
+    ensure_bound();
+    return dht_ops::find_peer(*socket_, public_key.data(), public_key.size(),
+        std::move(on_reply), std::move(on_done), seed_nodes, retries, only_closest_nodes);
+}
+
+std::shared_ptr<query::Query> HyperDHT::find_peer_target(
+    const routing::NodeId& target,
+    query::OnReplyCallback on_reply,
+    query::OnDoneCallback on_done,
+    const std::vector<dht_ops::SeedNode>* seed_nodes,
+    int retries, bool only_closest_nodes) {
+    ensure_bound();
+    return dht_ops::find_peer_target(*socket_, target,
+        std::move(on_reply), std::move(on_done), seed_nodes, retries, only_closest_nodes);
+}
+
 std::shared_ptr<query::Query> HyperDHT::lookup(
     const routing::NodeId& target,
     query::OnReplyCallback on_reply,

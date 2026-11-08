@@ -5,11 +5,17 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-07 (arbitrary-target unannounce; older snapshots below are historical).
+Last updated: 2026-11-08 (native findPeer query controls; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
+
+- **2026-11-08 native findPeer query controls:** additive C++ overloads for
+  find_peer and find_peer_target expose copied seed nodes, request retries and
+  onlyClosestNodes before dispatch, using the existing worker. Original calls
+  keep their defaults and hashing/validation semantics. C API, wrappers and
+  layouts are unchanged; their option exposure remains separate work.
 
 - **2026-11-07 arbitrary-target unannounce:** native C++
   lookup_and_unannounce_target and unannounce_target use a supplied topic

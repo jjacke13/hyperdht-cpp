@@ -667,6 +667,21 @@ public:
         query::OnReplyCallback on_reply,
         query::OnDoneCallback on_done);
 
+    // JS findPeer opts: copied seeds, per-request retries and a seed-only walk.
+    std::shared_ptr<query::Query> find_peer(
+        const noise::PubKey& public_key,
+        query::OnReplyCallback on_reply,
+        query::OnDoneCallback on_done,
+        const std::vector<dht_ops::SeedNode>* seed_nodes,
+        int retries, bool only_closest_nodes);
+
+    std::shared_ptr<query::Query> find_peer_target(
+        const routing::NodeId& target,
+        query::OnReplyCallback on_reply,
+        query::OnDoneCallback on_done,
+        const std::vector<dht_ops::SeedNode>* seed_nodes,
+        int retries, bool only_closest_nodes);
+
     std::shared_ptr<query::Query> lookup(
         const routing::NodeId& target,
         query::OnReplyCallback on_reply,

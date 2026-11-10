@@ -932,13 +932,27 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
             probe_replied_hosts_.insert(remote_host);
         }
         resp.remote_addr = remote_addr;
-        nat_sampler_.add(resp.from.addr, remote_addr);
-        // Feed the dht-rpc ring sampler the same observation. JS feeds
-        // `this._nat` from _addNodeFromNetwork (index.js:480,500,533); the C++
-        // architecture centralizes external-address sampling on the response
-        // path, so we mirror JS's `_natAdd(to.host, to.port)` here. resp.from
-        // is the wire `to` field = how the remote sees us.
-        ring_sampler_.add(resp.from.addr.host_string(), resp.from.addr.port);
+        // Validate and observe the responding peer.
+        // JS: io.js:619 `from.id = validateId(id, from)` — same validation
+        // as requests. Clear resp.id on mismatch so the query layer
+        // (which reads resp.id to set reply.from_id) sees clean data.
+        bool observe_peer = true;
+        if (resp.id.has_value()) {
+            auto expected = compute_peer_id(remote_addr);
+            if (*resp.id == expected) {
+                observe_peer = filter_accept(expected, remote_addr);
+                if (observe_peer) add_node_from_network_unfiltered(expected, remote_addr);
+            } else {
+                resp.id = std::nullopt;
+            }
+        }
+
+
+        // JS filters valid-ID peers before taking normal address observations.
+        if (observe_peer) {
+            nat_sampler_.add(resp.from.addr, remote_addr);
+            ring_sampler_.add(resp.from.addr.host_string(), resp.from.addr.port);
+        }
 #ifndef HYPERDHT_EMBEDDED
         // Firewall probe: replies land on the server socket. Feed a FRESH
         // sampler with the server-observed `to` so finish_firewall_probe can
@@ -948,19 +962,6 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
             probe_ring_.add(resp.from.addr.host_string(), resp.from.addr.port);
         }
 #endif
-
-        // Validate and observe the responding peer.
-        // JS: io.js:619 `from.id = validateId(id, from)` — same validation
-        // as requests. Clear resp.id on mismatch so the query layer
-        // (which reads resp.id to set reply.from_id) sees clean data.
-        if (resp.id.has_value()) {
-            auto expected = compute_peer_id(remote_addr);
-            if (*resp.id == expected) {
-                add_node_from_network(expected, remote_addr);
-            } else {
-                resp.id = std::nullopt;
-            }
-        }
 
         if (probe_reply) return;
         if (inflight && !inflight->destroyed) {
@@ -998,7 +999,7 @@ void RpcSocket::add_node_from_network(const routing::NodeId& id,
     add_node_from_network_unfiltered(id, from);
 }
 
-// Requests share one filter decision for routing updates and address samples.
+// Requests and responses share one filter decision for routing and samples.
 void RpcSocket::add_node_from_network_unfiltered(const routing::NodeId& id,
                                                  const compact::Ipv4Address& from) {
     // Already in the table — just refresh metadata.

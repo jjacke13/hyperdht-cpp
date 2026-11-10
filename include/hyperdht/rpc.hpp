@@ -448,7 +448,7 @@ public:
 
     // Install a filter callback that can reject network-observed peers
     // (matches JS `_filterNode`). Applied before adding to the routing
-    // table, taking incoming-request address samples, and adding to a Query frontier.
+    // table, sampling valid-ID requests/responses, and adding to a Query frontier.
     void set_filter_node(FilterNodeCallback cb) { filter_node_ = std::move(cb); }
     bool filter_accept(const routing::NodeId& id,
                        const compact::Ipv4Address& addr) const {

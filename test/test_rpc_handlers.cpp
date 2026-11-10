@@ -2633,6 +2633,31 @@ protected:
         return received == wanted;
     }
 
+    bool receive_reply(std::optional<NodeId> id) {
+        peer->on_request([this, id](const Request& req) {
+            Response resp;
+            resp.tid = req.tid;
+            resp.id = id;
+            resp.from.addr = observation;
+            peer->udp_send(encode_response(resp), req.from.addr, peer->socket_handle());
+        });
+        Request req;
+        req.command = CMD_PING;
+        req.internal = true;
+        req.to.addr = Ipv4Address::from_string("127.0.0.1", peer->port());
+        const int wanted = received + 1;
+        receiver->request(req, 200, 0, [this, id](const Response& resp) {
+            EXPECT_EQ(resp.id, id == peer_id ? id : std::nullopt);
+            ++received;
+        });
+        for (int i = 0; i < 500 && received < wanted; ++i) {
+            uv_run(&loop, UV_RUN_NOWAIT);
+            uv_sleep(1);
+        }
+        EXPECT_EQ(receiver->inflight_count(), 0u);
+        return received == wanted;
+    }
+
     void use_active_socket() {
         auto* active = GetParam() ? receiver->client_socket_handle()
                                   : receiver->socket_handle();
@@ -2796,6 +2821,56 @@ TEST_P(ExternalRequestSamples, InactiveRequestDoesNotRefreshSampleAge) {
     expect_samples(0);
     EXPECT_EQ(receiver->table().get(peer_id)->sampled, 1u);
     EXPECT_EQ(receiver->table().get(peer_id)->seen, receiver->tick());
+}
+
+TEST_P(ExternalRequestSamples, FilteredResponseDoesNotSample) {
+    int calls = 0;
+    receiver->set_filter_node([&](const NodeId&, const Ipv4Address&) { ++calls; return false; });
+    ASSERT_TRUE(receive_reply(peer_id));
+    EXPECT_EQ(calls, 1);
+    EXPECT_FALSE(receiver->table().has(peer_id));
+    expect_samples(0);
+}
+
+TEST_P(ExternalRequestSamples, ExistingFilteredResponseDoesNotSample) {
+    receiver->add_node_from_network(peer_id, Ipv4Address::from_string("127.0.0.1", peer->port()));
+    const auto seen = receiver->table().get(peer_id)->seen;
+    receiver->bump_tick();
+    int calls = 0;
+    receiver->set_filter_node([&](const NodeId&, const Ipv4Address&) { ++calls; return false; });
+    ASSERT_TRUE(receive_reply(peer_id));
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(receiver->table().get(peer_id)->seen, seen);
+    expect_samples(0);
+}
+
+TEST_P(ExternalRequestSamples, AllowedResponseStillSamples) {
+    int calls = 0;
+    receiver->set_filter_node([&](const NodeId&, const Ipv4Address&) { ++calls; return true; });
+    ASSERT_TRUE(receive_reply(peer_id));
+    EXPECT_EQ(calls, 1);
+    EXPECT_TRUE(receiver->table().has(peer_id));
+    expect_samples(1);
+}
+
+TEST_P(ExternalRequestSamples, NoIdResponseKeepsBootstrapSampling) {
+    int calls = 0;
+    receiver->set_filter_node([&](const NodeId&, const Ipv4Address&) { ++calls; return false; });
+    ASSERT_TRUE(receive_reply(std::nullopt));
+    EXPECT_EQ(calls, 0);
+    EXPECT_FALSE(receiver->table().has(peer_id));
+    expect_samples(1);
+}
+
+TEST_P(ExternalRequestSamples, InvalidIdResponseKeepsBootstrapSampling) {
+    auto invalid = peer_id;
+    invalid[0] ^= 1;
+    int calls = 0;
+    receiver->set_filter_node([&](const NodeId&, const Ipv4Address&) { ++calls; return false; });
+    ASSERT_TRUE(receive_reply(invalid));
+    EXPECT_EQ(calls, 0);
+    EXPECT_EQ(receiver->table().size(), 0u);
+    expect_samples(1);
 }
 
 INSTANTIATE_TEST_SUITE_P(FirewallStates, ExternalRequestSamples, ::testing::Bool());

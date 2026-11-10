@@ -687,6 +687,15 @@ public:
         query::OnReplyCallback on_reply,
         query::OnDoneCallback on_done);
 
+    // JS lookup(target, opts): copied seeds, retry budget and seed-only mode.
+    std::shared_ptr<query::Query> lookup(
+        const routing::NodeId& target,
+        query::OnReplyCallback on_reply,
+        query::OnDoneCallback on_done,
+        const std::vector<dht_ops::SeedNode>* seed_nodes,
+        int retries, bool only_closest_nodes);
+
+
     // JS `announce(target, keyPair, relayAddresses, opts)` (index.js:244): a
     // value-less LOOKUP walk whose commit signs a fresh ANNOUNCE record per
     // closest node. `keypair` signs; `relay_addresses` are embedded in the

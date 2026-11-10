@@ -192,6 +192,99 @@ TEST_P(FindPeerControls, SeedOnlyWalkHonorsRetryBudgetBeforeFirstSend) {
 
 INSTANTIATE_TEST_SUITE_P(NativeOptions, FindPeerControls, ::testing::Range(0, 4));
 
+class LookupControls : public ::testing::TestWithParam<int> {};
+
+TEST_P(LookupControls, SeedOnlyWalkHonorsRetryBudgetBeforeFirstSend) {
+    const bool low_level = GetParam() % 2;
+    const bool responds = GetParam() >= 4, malformed = GetParam() >= 6;
+    const int retries = responds ? 0 : GetParam() / 2;
+    uv_loop_t loop{};
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        DhtOptions options;
+        options.ephemeral = true;
+        options.adaptive = false;
+        HyperDHT client(&loop, options);
+        ASSERT_EQ(client.bind(), 0);
+        // Keep the UDX watcher alive until teardown has drained its callbacks.
+        std::unique_ptr<udx_interface_event_t> watcher(client.socket().udx_handle()->listeners);
+        ASSERT_NE(watcher, nullptr);
+        ASSERT_EQ(watcher->next, nullptr);
+        watcher->on_close = nullptr;
+        RpcSocket seeded(&loop, {}), table_peer(&loop, {});
+        ASSERT_EQ(seeded.bind(0, "127.0.0.1"), 0);
+        ASSERT_EQ(table_peer.bind(0, "127.0.0.1"), 0);
+        auto address = [](RpcSocket& s) {
+            return compact::Ipv4Address::from_string("127.0.0.1", s.port());
+        };
+        const auto seed_addr = address(seeded), table_addr = address(table_peer);
+        Node node;
+        node.id = compute_peer_id(table_addr);
+        node.host = table_addr.host_string();
+        node.port = table_addr.port;
+        ASSERT_TRUE(client.socket().table().add(node));
+        std::vector<SeedNode> seeds{{compute_peer_id(seed_addr), seed_addr}};
+        noise::PubKey pk{};
+        pk.fill(0x6d);
+        const auto target = hash_public_key(pk.data(), pk.size());
+        std::vector<uint16_t> tids;
+        int table_requests = 0, completions = 0, replies = 0;
+        seeded.on_request([&](const messages::Request& req) {
+            if (req.command != messages::CMD_LOOKUP || req.internal) return;
+            EXPECT_EQ(req.target, target);
+            tids.push_back(req.tid);
+            if (responds) {
+                dht_messages::LookupRawReply record;
+                dht_messages::PeerRecord peer;
+                peer.public_key = pk;
+                record.peers.push_back(dht_messages::encode_peer_record(peer));
+                messages::Response response;
+                response.tid = req.tid;
+                response.from.addr = req.from.addr;
+                response.id = compute_peer_id(seed_addr);
+                response.value = malformed ? std::vector<uint8_t>{0x01}
+                    : dht_messages::encode_lookup_reply(record);
+                seeded.reply(response, req.from_server);
+            }
+        });
+        table_peer.on_request([&](const messages::Request& req) {
+            if (req.command == messages::CMD_LOOKUP && !req.internal) ++table_requests;
+        });
+        auto done = [&](int, const std::vector<QueryReply>&) { ++completions; };
+        auto on_reply = [&](const QueryReply&) { ++replies; };
+        auto start = [&]<typename Dht, typename Socket>(Dht& dht, Socket& socket) {
+            if (low_level) {
+                if constexpr (requires { dht_ops::lookup(socket, target, on_reply, done, &seeds, retries, true); })
+                    return dht_ops::lookup(socket, target, on_reply, done, &seeds, retries, true);
+                else return dht_ops::lookup(socket, target, on_reply, done);
+            } else {
+                if constexpr (requires { dht.lookup(target, on_reply, done, &seeds, retries, true); })
+                    return dht.lookup(target, on_reply, done, &seeds, retries, true);
+                else return dht.lookup(target, on_reply, done);
+            }
+        };
+        auto q = start(client, client.socket());
+        seeds.clear(); // The worker must copy seeds before returning.
+        const auto deadline = uv_hrtime() + 9000000000ULL;
+        while (!completions && uv_hrtime() < deadline) {
+            uv_run(&loop, UV_RUN_NOWAIT);
+            uv_sleep(1);
+        }
+        EXPECT_EQ(completions, 1);
+        EXPECT_EQ(tids.size(), static_cast<size_t>(responds ? 1 : retries + 1));
+        if (!tids.empty()) EXPECT_EQ(tids, std::vector<uint16_t>(tids.size(), tids.front()));
+        EXPECT_EQ(table_requests, 0) << "onlyClosestNodes must exclude routing-table peers";
+        EXPECT_EQ(replies, responds && !malformed ? 1 : 0);
+        q->destroy(); q.reset();
+        client.destroy(); seeded.close(); table_peer.close();
+        udx_teardown(client.socket().udx_handle());
+        uv_run(&loop, UV_RUN_DEFAULT);
+    }
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(LookupOptions, LookupControls, ::testing::Range(0, 8));
+
 TEST(DhtOps, FindPeerFiltersMalformedRecordsWithoutLosingClosestNodes) {
     uv_loop_t loop;
     ASSERT_EQ(uv_loop_init(&loop), 0);

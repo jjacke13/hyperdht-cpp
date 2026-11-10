@@ -122,7 +122,19 @@ std::shared_ptr<query::Query> lookup(rpc::RpcSocket& socket,
                                       const routing::NodeId& target,
                                       query::OnReplyCallback on_reply,
                                       query::OnDoneCallback on_done) {
+    return lookup(socket, target, std::move(on_reply), std::move(on_done),
+                  nullptr, query::QUERY_RETRIES, false);
+}
+
+std::shared_ptr<query::Query> lookup(rpc::RpcSocket& socket,
+                                      const routing::NodeId& target,
+                                      query::OnReplyCallback on_reply,
+                                      query::OnDoneCallback on_done,
+                                      const std::vector<SeedNode>* seed_nodes,
+                                      int retries, bool only_closest_nodes) {
     auto q = query::Query::create(socket, target, messages::CMD_LOOKUP);
+    q->set_retries(retries);
+    q->set_only_closest_nodes(only_closest_nodes);
     q->on_reply([on_reply = std::move(on_reply)](const query::QueryReply& reply) {
         if (!on_reply || !reply.value) return;
         dht_messages::LookupRawReply parsed;
@@ -132,7 +144,10 @@ std::shared_ptr<query::Query> lookup(rpc::RpcSocket& socket,
         }
     });
     q->on_done(std::move(on_done));
-    add_default_bootstrap(*q, socket);
+    if (seed_nodes) {
+        for (const auto& seed : *seed_nodes) q->add_seed_node(seed.id, seed.addr);
+    }
+    if (!only_closest_nodes) add_default_bootstrap(*q, socket);
     q->start();
     return q;
 }

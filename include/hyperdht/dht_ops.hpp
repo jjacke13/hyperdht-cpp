@@ -91,6 +91,15 @@ std::shared_ptr<query::Query> lookup(rpc::RpcSocket& socket,
                                       query::OnReplyCallback on_reply,
                                       query::OnDoneCallback on_done);
 
+// JS lookup opts: copy seeds and configure the walk before the first send.
+std::shared_ptr<query::Query> lookup(rpc::RpcSocket& socket,
+                                      const routing::NodeId& target,
+                                      query::OnReplyCallback on_reply,
+                                      query::OnDoneCallback on_done,
+                                      const std::vector<SeedNode>* seed_nodes,
+                                      int retries, bool only_closest_nodes);
+
+
 // ---------------------------------------------------------------------------
 // announce — announce at a target, then commit to k closest
 //

@@ -5,11 +5,17 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-08 (native findPeer query controls; older snapshots below are historical).
+Last updated: 2026-11-09 (native lookup query controls; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
+
+- **2026-11-09 native lookup query controls:** additive C++ lookup overloads
+  on HyperDHT and dht_ops expose copied seeds, request retries and
+  onlyClosestNodes before dispatch, matching JS lookup options. Original calls
+  retain generic retries and ordinary discovery. Both paths share record
+  validation; C API, wrappers and layouts are unchanged.
 
 - **2026-11-08 native findPeer query controls:** additive C++ overloads for
   find_peer and find_peer_target expose copied seed nodes, request retries and

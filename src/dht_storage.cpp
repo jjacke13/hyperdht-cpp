@@ -66,6 +66,17 @@ std::shared_ptr<query::Query> HyperDHT::lookup(
                             std::move(on_reply), std::move(on_done));
 }
 
+std::shared_ptr<query::Query> HyperDHT::lookup(
+    const routing::NodeId& target,
+    query::OnReplyCallback on_reply,
+    query::OnDoneCallback on_done,
+    const std::vector<dht_ops::SeedNode>* seed_nodes,
+    int retries, bool only_closest_nodes) {
+    ensure_bound();
+    return dht_ops::lookup(*socket_, target, std::move(on_reply), std::move(on_done),
+                           seed_nodes, retries, only_closest_nodes);
+}
+
 std::shared_ptr<query::Query> HyperDHT::announce(
     const routing::NodeId& target,
     const noise::Keypair& keypair,

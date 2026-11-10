@@ -472,6 +472,10 @@ public:
     void quick_firewall_ping(const compact::Ipv4Address& to);
 
 private:
+    void observe_identified_peer(const routing::NodeId& id,
+                                 const compact::Ipv4Address& from,
+                                 const compact::Ipv4Address& observed,
+                                 bool from_server);
     void add_node_from_network_unfiltered(const routing::NodeId& id,
                                           const compact::Ipv4Address& from);
 

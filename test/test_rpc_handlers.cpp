@@ -2633,8 +2633,10 @@ protected:
         return received == wanted;
     }
 
-    bool receive_reply(std::optional<NodeId> id) {
-        peer->on_request([this, id](const Request& req) {
+    bool receive_reply(std::optional<NodeId> id, bool switch_socket = false) {
+        peer->on_request([this, id, switch_socket](const Request& req) {
+            // A reply can arrive after the receiver switches its active socket.
+            if (switch_socket) receiver->set_firewalled(!GetParam());
             Response resp;
             resp.tid = req.tid;
             resp.id = id;
@@ -2654,6 +2656,7 @@ protected:
             uv_run(&loop, UV_RUN_NOWAIT);
             uv_sleep(1);
         }
+        if (switch_socket) receiver->set_firewalled(GetParam());
         EXPECT_EQ(receiver->inflight_count(), 0u);
         return received == wanted;
     }
@@ -2871,6 +2874,58 @@ TEST_P(ExternalRequestSamples, InvalidIdResponseKeepsBootstrapSampling) {
     EXPECT_EQ(calls, 0);
     EXPECT_EQ(receiver->table().size(), 0u);
     expect_samples(1);
+}
+
+TEST_P(ExternalRequestSamples, ResponseUsesRequestSampleAge) {
+    use_active_socket();
+    receiver->set_tick_for_test(100);
+    ASSERT_TRUE(send(peer_id));
+
+    receiver->bump_tick(OLD_NODE_TICKS - 1);
+    ASSERT_TRUE(receive_reply(peer_id));
+    EXPECT_EQ(receiver->ring_sampler().size(), 1);
+    EXPECT_EQ(receiver->table().get(peer_id)->sampled, 100u);
+    EXPECT_EQ(receiver->table().get(peer_id)->seen, receiver->tick());
+
+    receiver->bump_tick();
+    ASSERT_TRUE(receive_reply(peer_id));
+    EXPECT_EQ(receiver->ring_sampler().size(), 2);
+    EXPECT_EQ(receiver->table().get(peer_id)->sampled, receiver->tick());
+    ASSERT_TRUE(send(peer_id));
+    EXPECT_EQ(receiver->ring_sampler().size(), 2);
+}
+
+TEST_P(ExternalRequestSamples, InactiveResponseSamplesOnlyNewAdmission) {
+    receiver->set_tick_for_test(100);
+    ASSERT_TRUE(receive_reply(peer_id, true));
+    ASSERT_TRUE(receiver->table().has(peer_id));
+    expect_samples(1);
+    EXPECT_EQ(receiver->table().get(peer_id)->sampled, 100u);
+
+    receiver->bump_tick(OLD_NODE_TICKS);
+    ASSERT_TRUE(receive_reply(peer_id, true));
+    EXPECT_EQ(receiver->ring_sampler().size(), 1);
+    EXPECT_EQ(receiver->table().get(peer_id)->sampled, 100u);
+    EXPECT_EQ(receiver->table().get(peer_id)->seen, receiver->tick());
+
+    ASSERT_TRUE(receive_reply(peer_id));
+    EXPECT_EQ(receiver->ring_sampler().size(), 2);
+    EXPECT_EQ(receiver->table().get(peer_id)->sampled, receiver->tick());
+}
+
+TEST_P(ExternalRequestSamples, ResponseDoesNotSampleUnadmittedPeer) {
+    for (size_t i = 1; i <= K; ++i) {
+        Node n;
+        n.id = peer_id;
+        n.id[31] ^= i;
+        ASSERT_TRUE(receiver->table().add(n));
+    }
+    ASSERT_TRUE(receive_reply(peer_id));
+    EXPECT_FALSE(receiver->table().has(peer_id));
+    expect_samples(0);
+    receiver->table().rebuild_with_id(peer_id);
+    ASSERT_TRUE(receive_reply(peer_id));
+    expect_samples(0);
 }
 
 INSTANTIATE_TEST_SUITE_P(FirewallStates, ExternalRequestSamples, ::testing::Bool());

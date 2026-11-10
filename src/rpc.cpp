@@ -879,33 +879,8 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
         // node from claiming an arbitrary position in our routing table.
         if (req.id.has_value()) {
             auto expected = compute_peer_id(req.from.addr);
-            if (*req.id == expected && filter_accept(expected, req.from.addr)) {
-                const bool new_node = table_.get(expected) == nullptr;
-                add_node_from_network_unfiltered(expected, req.from.addr);
-
-                // JS dht-rpc/index.js:632-635 — _onrequest also feeds the NAT
-                // sampler from incoming requests:
-                //   if (req.from.id !== null) _addNodeFromNetwork(!external, from, to)
-                // where `to` (req.to.addr) is our external address as the
-                // requester sees it, and `sample = !external`. `external` is
-                // "arrived on the wrong socket for our firewall state"
-                // (io.js:88-91): expected = firewalled ? clientSocket
-                // : serverSocket; external = socket !== expected. With C++
-                // from_server marking the server socket, sample reduces to
-                // (from_server != firewalled_). Mirror the RESPONSE path below:
-                // feed both the ring sampler (external host/port + persistence
-                // gate) and the Nat classifier, using req.from.addr as the
-                // dedup source (matches nat_sampler_.add(to, from)).
-                // JS _addNode samples a newly admitted node even if external.
-                if (auto* node = table_.get_mut(expected)) {
-                    // JS samples admitted peers once per OLD_NODE interval.
-                    if (new_node || (from_server != firewalled_ &&
-                        (node->sampled == 0 || tick_ - node->sampled >= OLD_NODE_TICKS))) {
-                        node->sampled = tick_;
-                        nat_sampler_.add(req.to.addr, req.from.addr);
-                        ring_sampler_.add(req.to.addr.host_string(), req.to.addr.port);
-                    }
-                }
+            if (*req.id == expected) {
+                observe_identified_peer(expected, req.from.addr, req.to.addr, from_server);
             }
             // else: ID mismatch — treat as no-ID (don't add to table)
         }
@@ -932,24 +907,13 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
             probe_replied_hosts_.insert(remote_host);
         }
         resp.remote_addr = remote_addr;
-        // Validate and observe the responding peer.
-        // JS: io.js:619 `from.id = validateId(id, from)` — same validation
-        // as requests. Clear resp.id on mismatch so the query layer
-        // (which reads resp.id to set reply.from_id) sees clean data.
-        bool observe_peer = true;
-        if (resp.id.has_value()) {
-            auto expected = compute_peer_id(remote_addr);
-            if (*resp.id == expected) {
-                observe_peer = filter_accept(expected, remote_addr);
-                if (observe_peer) add_node_from_network_unfiltered(expected, remote_addr);
-            } else {
-                resp.id = std::nullopt;
-            }
+        // A mismatched ID is treated as missing, as in JS decodeReply.
+        if (resp.id && *resp.id != compute_peer_id(remote_addr)) {
+            resp.id.reset();
         }
-
-
-        // JS filters valid-ID peers before taking normal address observations.
-        if (observe_peer) {
+        if (resp.id) {
+            observe_identified_peer(*resp.id, remote_addr, resp.from.addr, from_server);
+        } else {
             nat_sampler_.add(resp.from.addr, remote_addr);
             ring_sampler_.add(resp.from.addr.host_string(), resp.from.addr.port);
         }
@@ -999,7 +963,27 @@ void RpcSocket::add_node_from_network(const routing::NodeId& id,
     add_node_from_network_unfiltered(id, from);
 }
 
-// Requests and responses share one filter decision for routing and samples.
+void RpcSocket::observe_identified_peer(const routing::NodeId& id,
+                                        const compact::Ipv4Address& from,
+                                        const compact::Ipv4Address& observed,
+                                        bool from_server) {
+    if (!filter_accept(id, from)) return;
+    const bool new_node = table_.get(id) == nullptr;
+    add_node_from_network_unfiltered(id, from);
+
+    auto* node = table_.get_mut(id);
+    if (!node) return;
+
+    // JS shares the sample age across requests and replies. A new admission
+    // samples on either socket. A known peer must be heard on the active socket.
+    const bool sample_due = node->sampled == 0 || tick_ - node->sampled >= OLD_NODE_TICKS;
+    if (!new_node && (from_server == firewalled_ || !sample_due)) return;
+
+    node->sampled = tick_;
+    nat_sampler_.add(observed, from);
+    ring_sampler_.add(observed.host_string(), observed.port);
+}
+
 void RpcSocket::add_node_from_network_unfiltered(const routing::NodeId& id,
                                                  const compact::Ipv4Address& from) {
     // Already in the table — just refresh metadata.

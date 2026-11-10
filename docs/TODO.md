@@ -5,11 +5,17 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-10 (valid-ID response node filters; older snapshots below are historical).
+Last updated: 2026-11-11 (shared request and reply sample age).
 
 ---
 
 ## Status snapshot
+
+- **2026-11-11 identified peer sampling:** requests and replies now share
+  the same 360-tick sampling interval. A newly admitted peer contributes
+  its first sample on either socket. An existing peer contributes a sample
+  only on the active socket when its sample is due. This matches JS
+  `_addNodeFromNetwork` and `_addNode`. Bootstrap sampling remains a separate item.
 
 - **2026-11-10 valid-ID response node filters:** rejected peers no longer
   contribute normal NAT/ring observations from responses, matching JS.

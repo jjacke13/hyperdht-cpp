@@ -5,11 +5,17 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-10 (incoming request node filters; older snapshots below are historical).
+Last updated: 2026-11-10 (incoming request sampling age; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
+
+- **2026-11-10 incoming request sampling age:** admitted peers now update
+  NAT/ring observations from active-socket requests only when never sampled
+  or after 360 ticks, matching JS's OLD_NODE gate. Newly admitted peers still
+  sample on either socket; inactive requests retain the previous sample age.
+  Response/bootstrap sampling policy is separate work. No API/wire change.
 
 - **2026-11-10 incoming request node filters:** requests from a valid-ID peer
   rejected by filter_node no longer contribute NAT/ring observations on the

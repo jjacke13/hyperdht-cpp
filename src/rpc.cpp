@@ -897,9 +897,14 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
                 // gate) and the Nat classifier, using req.from.addr as the
                 // dedup source (matches nat_sampler_.add(to, from)).
                 // JS _addNode samples a newly admitted node even if external.
-                if (from_server != firewalled_ || (new_node && table_.get(expected))) {
-                    nat_sampler_.add(req.to.addr, req.from.addr);
-                    ring_sampler_.add(req.to.addr.host_string(), req.to.addr.port);
+                if (auto* node = table_.get_mut(expected)) {
+                    // JS samples admitted peers once per OLD_NODE interval.
+                    if (new_node || (from_server != firewalled_ &&
+                        (node->sampled == 0 || tick_ - node->sampled >= OLD_NODE_TICKS))) {
+                        node->sampled = tick_;
+                        nat_sampler_.add(req.to.addr, req.from.addr);
+                        ring_sampler_.add(req.to.addr.host_string(), req.to.addr.port);
+                    }
                 }
             }
             // else: ID mismatch — treat as no-ID (don't add to table)

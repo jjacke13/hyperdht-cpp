@@ -2740,6 +2740,64 @@ TEST_P(ExternalRequestSamples, AllowedActiveRequestStillSamples) {
     expect_samples(1);
 }
 
+TEST_P(ExternalRequestSamples, ActiveRequestDoesNotSampleUnadmittedPeer) {
+    use_active_socket();
+    for (size_t i = 1; i <= K; ++i) {
+        Node n;
+        n.id = peer_id;
+        n.id[31] ^= i;
+        ASSERT_TRUE(receiver->table().add(n));
+    }
+    ASSERT_TRUE(send(peer_id));
+    EXPECT_FALSE(receiver->table().has(peer_id));
+    expect_samples(0);
+    receiver->table().rebuild_with_id(peer_id);
+    ASSERT_TRUE(send(peer_id));
+    expect_samples(0);
+}
+
+TEST_P(ExternalRequestSamples, ActiveRequestResamplesOnlyWhenDue) {
+    use_active_socket();
+    receiver->set_tick_for_test(100);
+    ASSERT_TRUE(send(peer_id));
+    ASSERT_TRUE(receiver->table().has(peer_id));
+    EXPECT_EQ(receiver->table().get(peer_id)->sampled, 100u);
+    EXPECT_EQ(receiver->ring_sampler().size(), 1);
+
+    receiver->bump_tick(OLD_NODE_TICKS - 1);
+    ASSERT_TRUE(send(peer_id));
+    EXPECT_EQ(receiver->ring_sampler().size(), 1);
+    EXPECT_EQ(receiver->table().get(peer_id)->sampled, 100u);
+    EXPECT_EQ(receiver->table().get(peer_id)->seen, receiver->tick());
+
+    receiver->bump_tick();
+    ASSERT_TRUE(send(peer_id));
+    EXPECT_EQ(receiver->ring_sampler().size(), 2);
+    EXPECT_EQ(receiver->table().get(peer_id)->sampled, receiver->tick());
+}
+
+TEST_P(ExternalRequestSamples, UnsampledActivePeerSamplesImmediately) {
+    use_active_socket();
+    receiver->set_tick_for_test(100);
+    receiver->add_node_from_network(peer_id, Ipv4Address::from_string("127.0.0.1", peer->port()));
+    ASSERT_TRUE(send(peer_id));
+    EXPECT_EQ(receiver->ring_sampler().size(), 1);
+    EXPECT_EQ(receiver->table().get(peer_id)->sampled, 100u);
+    ASSERT_TRUE(send(peer_id));
+    EXPECT_EQ(receiver->ring_sampler().size(), 1);
+}
+
+TEST_P(ExternalRequestSamples, InactiveRequestDoesNotRefreshSampleAge) {
+    receiver->set_tick_for_test(100);
+    receiver->add_node_from_network(peer_id, Ipv4Address::from_string("127.0.0.1", peer->port()));
+    receiver->table().get_mut(peer_id)->sampled = 1;
+    receiver->bump_tick(OLD_NODE_TICKS);
+    ASSERT_TRUE(send(peer_id));
+    expect_samples(0);
+    EXPECT_EQ(receiver->table().get(peer_id)->sampled, 1u);
+    EXPECT_EQ(receiver->table().get(peer_id)->seen, receiver->tick());
+}
+
 INSTANTIATE_TEST_SUITE_P(FirewallStates, ExternalRequestSamples, ::testing::Bool());
 
 // dhtrpc-io-7 — alloc_tid must never return 0 (the request() failure

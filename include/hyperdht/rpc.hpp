@@ -448,7 +448,7 @@ public:
 
     // Install a filter callback that can reject network-observed peers
     // (matches JS `_filterNode`). Applied before adding to the routing
-    // table and before adding to a Query frontier.
+    // table, taking incoming-request address samples, and adding to a Query frontier.
     void set_filter_node(FilterNodeCallback cb) { filter_node_ = std::move(cb); }
     bool filter_accept(const routing::NodeId& id,
                        const compact::Ipv4Address& addr) const {
@@ -472,6 +472,9 @@ public:
     void quick_firewall_ping(const compact::Ipv4Address& to);
 
 private:
+    void add_node_from_network_unfiltered(const routing::NodeId& id,
+                                          const compact::Ipv4Address& from);
+
     uv_loop_t* loop_;
     udx_t udx_;
     udx_socket_t client_socket_;   // Ephemeral outbound (random port)

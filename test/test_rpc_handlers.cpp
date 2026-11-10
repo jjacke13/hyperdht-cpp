@@ -2633,6 +2633,15 @@ protected:
         return received == wanted;
     }
 
+    void use_active_socket() {
+        auto* active = GetParam() ? receiver->client_socket_handle()
+                                  : receiver->socket_handle();
+        sockaddr_in addr{};
+        int len = sizeof(addr);
+        ASSERT_EQ(udx_socket_getsockname(active, reinterpret_cast<sockaddr*>(&addr), &len), 0);
+        destination = Ipv4Address::from_string("127.0.0.1", ntohs(addr.sin_port));
+    }
+
     void expect_samples(int count) {
         EXPECT_EQ(receiver->ring_sampler().size(), count);
         EXPECT_EQ(receiver->nat_sampler().sampled(), count);
@@ -2695,6 +2704,40 @@ TEST_P(ExternalRequestSamples, OwnIdIsNotSampled) {
     ASSERT_TRUE(send(peer_id));
     EXPECT_EQ(receiver->table().size(), 0u);
     expect_samples(0);
+}
+
+TEST_P(ExternalRequestSamples, FilteredActiveRequestDoesNotSample) {
+    use_active_socket();
+    int calls = 0;
+    receiver->set_filter_node([&](const NodeId&, const Ipv4Address&) { ++calls; return false; });
+    ASSERT_TRUE(send(peer_id)); // Filtering routing observations must not drop the request callback.
+    EXPECT_EQ(calls, 1);
+    EXPECT_FALSE(receiver->table().has(peer_id));
+    expect_samples(0);
+}
+
+TEST_P(ExternalRequestSamples, ExistingFilteredActiveRequestDoesNotSample) {
+    use_active_socket();
+    receiver->add_node_from_network(peer_id, Ipv4Address::from_string("127.0.0.1", peer->port()));
+    const auto seen = receiver->table().get(peer_id)->seen;
+    receiver->bump_tick();
+    int calls = 0;
+    receiver->set_filter_node([&](const NodeId&, const Ipv4Address&) { ++calls; return false; });
+    ASSERT_TRUE(send(peer_id));
+    EXPECT_EQ(calls, 1);
+    ASSERT_TRUE(receiver->table().has(peer_id));
+    EXPECT_EQ(receiver->table().get(peer_id)->seen, seen);
+    expect_samples(0);
+}
+
+TEST_P(ExternalRequestSamples, AllowedActiveRequestStillSamples) {
+    use_active_socket();
+    int calls = 0;
+    receiver->set_filter_node([&](const NodeId&, const Ipv4Address&) { ++calls; return true; });
+    ASSERT_TRUE(send(peer_id));
+    EXPECT_EQ(calls, 1);
+    EXPECT_TRUE(receiver->table().has(peer_id));
+    expect_samples(1);
 }
 
 INSTANTIATE_TEST_SUITE_P(FirewallStates, ExternalRequestSamples, ::testing::Bool());

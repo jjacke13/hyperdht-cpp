@@ -5,11 +5,18 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-09 (native lookup query controls; older snapshots below are historical).
+Last updated: 2026-11-10 (incoming request node filters; older snapshots below are historical).
 
 ---
 
 ## Status snapshot
+
+- **2026-11-10 incoming request node filters:** requests from a valid-ID peer
+  rejected by filter_node no longer contribute NAT/ring observations on the
+  active socket, matching JS. The filter is evaluated once before routing
+  updates and request sampling; the request callback still runs. Accepted
+  peers, public add_node_from_network and response/bootstrap sampling retain
+  their behavior. No public API, layout, wrapper or wire changes.
 
 - **2026-11-09 native lookup query controls:** additive C++ lookup overloads
   on HyperDHT and dht_ops expose copied seeds, request retries and

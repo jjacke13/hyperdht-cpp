@@ -879,9 +879,9 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
         // node from claiming an arbitrary position in our routing table.
         if (req.id.has_value()) {
             auto expected = compute_peer_id(req.from.addr);
-            if (*req.id == expected) {
+            if (*req.id == expected && filter_accept(expected, req.from.addr)) {
                 const bool new_node = table_.get(expected) == nullptr;
-                add_node_from_network(expected, req.from.addr);
+                add_node_from_network_unfiltered(expected, req.from.addr);
 
                 // JS dht-rpc/index.js:632-635 — _onrequest also feeds the NAT
                 // sampler from incoming requests:
@@ -990,7 +990,12 @@ void RpcSocket::add_node_from_network(const routing::NodeId& id,
                                       const compact::Ipv4Address& from) {
     // Respect a user-installed filter (JS `_filterNode`).
     if (!filter_accept(id, from)) return;
+    add_node_from_network_unfiltered(id, from);
+}
 
+// Requests share one filter decision for routing updates and address samples.
+void RpcSocket::add_node_from_network_unfiltered(const routing::NodeId& id,
+                                                 const compact::Ipv4Address& from) {
     // Already in the table — just refresh metadata.
     if (auto* existing = table_.get_mut(id)) {
         existing->pinged = tick_;

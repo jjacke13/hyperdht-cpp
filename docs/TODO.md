@@ -5,11 +5,17 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-11 (shared request and reply sample age).
+Last updated: 2026-11-11 (bootstrap reply filtering).
 
 ---
 
 ## Status snapshot
+
+- **2026-11-11 bootstrap reply filtering:** replies with a missing or invalid
+  node ID now pass the node filter before contributing address observations,
+  matching JS. The filter receives the sender's address-derived ID. RPC
+  completion still occurs. Bootstrap sample deduplication and limits remain
+  a separate item.
 
 - **2026-11-11 identified peer sampling:** requests and replies now share
   the same 360-tick sampling interval. A newly admitted peer contributes

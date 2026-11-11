@@ -71,7 +71,8 @@ using OnCycleCallback = std::function<void(uint16_t tid)>;
 
 // Filter for network-observed nodes (JS `_filterNode`). Return true to
 // accept, false to silently reject the peer before it enters our routing
-// table or query frontier. Useful for rejecting private IPs, bogons, etc.
+// table, address samples or query frontier. The ID is derived from the
+// sender address, including replies without a valid wire ID.
 using FilterNodeCallback =
     std::function<bool(const routing::NodeId& id, const compact::Ipv4Address& addr)>;
 
@@ -448,7 +449,7 @@ public:
 
     // Install a filter callback that can reject network-observed peers
     // (matches JS `_filterNode`). Applied before adding to the routing
-    // table, sampling valid-ID requests/responses, and adding to a Query frontier.
+    // table, taking peer address samples, and adding to a Query frontier.
     void set_filter_node(FilterNodeCallback cb) { filter_node_ = std::move(cb); }
     bool filter_accept(const routing::NodeId& id,
                        const compact::Ipv4Address& addr) const {

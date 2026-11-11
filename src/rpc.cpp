@@ -913,7 +913,7 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
         }
         if (resp.id) {
             observe_identified_peer(*resp.id, remote_addr, resp.from.addr, from_server);
-        } else {
+        } else if (filter_accept(compute_peer_id(remote_addr), remote_addr)) {
             nat_sampler_.add(resp.from.addr, remote_addr);
             ring_sampler_.add(resp.from.addr.host_string(), resp.from.addr.port);
         }

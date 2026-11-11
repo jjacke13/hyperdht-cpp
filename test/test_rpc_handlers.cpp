@@ -2856,24 +2856,24 @@ TEST_P(ExternalRequestSamples, AllowedResponseStillSamples) {
     expect_samples(1);
 }
 
-TEST_P(ExternalRequestSamples, NoIdResponseKeepsBootstrapSampling) {
+TEST_P(ExternalRequestSamples, FilteredNoIdResponseDoesNotSample) {
     int calls = 0;
     receiver->set_filter_node([&](const NodeId&, const Ipv4Address&) { ++calls; return false; });
     ASSERT_TRUE(receive_reply(std::nullopt));
-    EXPECT_EQ(calls, 0);
+    EXPECT_EQ(calls, 1);
     EXPECT_FALSE(receiver->table().has(peer_id));
-    expect_samples(1);
+    expect_samples(0);
 }
 
-TEST_P(ExternalRequestSamples, InvalidIdResponseKeepsBootstrapSampling) {
+TEST_P(ExternalRequestSamples, FilteredInvalidIdResponseDoesNotSample) {
     auto invalid = peer_id;
     invalid[0] ^= 1;
     int calls = 0;
     receiver->set_filter_node([&](const NodeId&, const Ipv4Address&) { ++calls; return false; });
     ASSERT_TRUE(receive_reply(invalid));
-    EXPECT_EQ(calls, 0);
+    EXPECT_EQ(calls, 1);
     EXPECT_EQ(receiver->table().size(), 0u);
-    expect_samples(1);
+    expect_samples(0);
 }
 
 TEST_P(ExternalRequestSamples, ResponseUsesRequestSampleAge) {
@@ -2926,6 +2926,35 @@ TEST_P(ExternalRequestSamples, ResponseDoesNotSampleUnadmittedPeer) {
     receiver->table().rebuild_with_id(peer_id);
     ASSERT_TRUE(receive_reply(peer_id));
     expect_samples(0);
+}
+
+TEST_P(ExternalRequestSamples, AllowedNoIdResponseStillSamples) {
+    int calls = 0;
+    receiver->set_filter_node([&](const NodeId& id, const Ipv4Address& from) {
+        ++calls;
+        EXPECT_EQ(id, peer_id);
+        EXPECT_EQ(from, Ipv4Address::from_string("127.0.0.1", peer->port()));
+        return true;
+    });
+    ASSERT_TRUE(receive_reply(std::nullopt));
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(receiver->table().size(), 0u);
+    expect_samples(1);
+}
+
+TEST_P(ExternalRequestSamples, AllowedInvalidIdResponseStillSamples) {
+    auto invalid = peer_id;
+    invalid[0] ^= 1;
+    int calls = 0;
+    receiver->set_filter_node([&](const NodeId& id, const Ipv4Address&) {
+        ++calls;
+        EXPECT_EQ(id, peer_id);
+        return true;
+    });
+    ASSERT_TRUE(receive_reply(invalid));
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(receiver->table().size(), 0u);
+    expect_samples(1);
 }
 
 INSTANTIATE_TEST_SUITE_P(FirewallStates, ExternalRequestSamples, ::testing::Bool());

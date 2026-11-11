@@ -2597,3 +2597,59 @@ TEST_P(GracefulWithdrawal, DhtCompletionFollowsWithdrawalSettlement) {
     EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 INSTANTIATE_TEST_SUITE_P(Outcome, GracefulWithdrawal, ::testing::Range(0, 9));
+
+
+// Constructor configuration is exercised through real replies on its RPC socket.
+class BootstrapSampleBudget : public ::testing::TestWithParam<int> {};
+
+TEST_P(BootstrapSampleBudget, CountsDistinctEndpointsUpToConfiguredLimit) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        DhtOptions opts;
+        opts.bootstrap.resize(GetParam(), compact::Ipv4Address::from_string("127.0.0.1", 1));
+        HyperDHT dht(&loop, opts);
+        ASSERT_EQ(dht.socket().bind(0, "127.0.0.1"), 0);
+        std::vector<std::unique_ptr<rpc::RpcSocket>> peers;
+        auto observed = compact::Ipv4Address::from_string("198.51.100.14", 42001);
+        for (int i = 0; i < 3; ++i) {
+            auto peer = std::make_unique<rpc::RpcSocket>(&loop, routing::NodeId{});
+            ASSERT_EQ(peer->bind(0, "127.0.0.1"), 0);
+            auto address = compact::Ipv4Address::from_string("127.0.0.1", peer->port());
+            auto invalid = rpc::compute_peer_id(address);
+            invalid[0] ^= 1;
+            auto* raw = peer.get();
+            peer->on_request([raw, observed, invalid](const messages::Request& req) {
+                messages::Response reply;
+                reply.tid = req.tid;
+                reply.from.addr = observed;
+                if (req.command == messages::CMD_FIND_NODE) reply.id = invalid;
+                raw->udp_send(messages::encode_response(reply), req.from.addr, raw->socket_handle());
+            });
+            for (uint32_t command : {messages::CMD_PING, messages::CMD_FIND_NODE}) {
+                int replies = 0;
+                messages::Request req;
+                req.to.addr = address;
+                req.command = command;
+                req.internal = true;
+                dht.socket().request(req, 200, 0, [&](const messages::Response& reply) {
+                    EXPECT_FALSE(reply.id.has_value());
+                    ++replies;
+                });
+                for (int n = 0; n < 500 && replies == 0; ++n) {
+                    uv_run(&loop, UV_RUN_NOWAIT);
+                    uv_sleep(1);
+                }
+                EXPECT_EQ(replies, 1);
+            }
+            EXPECT_EQ(dht.socket().ring_sampler().size(), std::min(i + 1, std::max(1, GetParam())));
+            peers.push_back(std::move(peer));
+        }
+        dht.destroy();
+        for (auto& peer : peers) peer->close();
+        uv_run(&loop, UV_RUN_DEFAULT);
+    }
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(SeedCounts, BootstrapSampleBudget, ::testing::Values(0, 1, 2));

@@ -914,8 +914,14 @@ void RpcSocket::handle_message(const uint8_t* data, size_t len,
         if (resp.id) {
             observe_identified_peer(*resp.id, remote_addr, resp.from.addr, from_server);
         } else if (filter_accept(compute_peer_id(remote_addr), remote_addr)) {
-            nat_sampler_.add(resp.from.addr, remote_addr);
-            ring_sampler_.add(resp.from.addr.host_string(), resp.from.addr.port);
+            // JS _sampleBootstrapMaybe counts each endpoint once within the seed budget.
+            if (bootstrap_sample_sources_.size() < bootstrap_sample_limit_ &&
+                std::find(bootstrap_sample_sources_.begin(), bootstrap_sample_sources_.end(),
+                          remote_addr) == bootstrap_sample_sources_.end()) {
+                bootstrap_sample_sources_.push_back(remote_addr);
+                nat_sampler_.add(resp.from.addr, remote_addr);
+                ring_sampler_.add(resp.from.addr.host_string(), resp.from.addr.port);
+            }
         }
 #ifndef HYPERDHT_EMBEDDED
         // Firewall probe: replies land on the server socket. Feed a FRESH
@@ -1457,6 +1463,7 @@ void RpcSocket::finish_firewall_probe() {
     // JS: index.js:837-845 — swap the fresh sampler into `this._nat` so the
     // node ID is computed from the probe-confirmed address.
     ring_sampler_ = probe_ring_;
+    bootstrap_sample_sources_.clear();  // JS resets this when replacing its sampler.
 
     // Not firewalled — proceed with persistent transition
     do_persistent_transition();

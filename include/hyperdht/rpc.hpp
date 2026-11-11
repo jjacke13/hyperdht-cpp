@@ -432,6 +432,9 @@ public:
     // — this prevents premature eviction while the routing table is
     // still being populated. The caller (the DHT class, or tests) is
     // responsible for flipping this after the initial bootstrap walk.
+    // JS caps nonpersistent address observations at max(1, bootstrapNodes.length).
+    void set_bootstrap_node_count(size_t count) { bootstrap_sample_limit_ = count ? count : 1; }
+
     bool is_bootstrapped() const { return bootstrapped_; }
     void set_bootstrapped(bool b) { bootstrapped_ = b; }
 
@@ -494,6 +497,8 @@ private:
     // dht-rpc `this._nat` (JS index.js:69). Drives external host/port and the
     // persistent-transition gate; adapts to remaps (no source dedup).
     nat::RingSampler ring_sampler_;
+    std::vector<compact::Ipv4Address> bootstrap_sample_sources_;
+    size_t bootstrap_sample_limit_ = 1;
     // Fresh sampler used only during a firewall probe, fed from the server
     // socket's PING_NAT replies, then swapped into ring_sampler_ on success.
     // JS: index.js:818,837-845 (`const natSampler = new NatSampler()` → swap).

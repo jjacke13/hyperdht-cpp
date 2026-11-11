@@ -213,6 +213,22 @@ TEST(Security, FullFirewallProbeRequiresExpectedSourceAndServerSocket) {
         EXPECT_TRUE(client.is_ephemeral());
         peer.udp_send(bytes, advertised, peer.socket_handle()); pump(loop);
         EXPECT_FALSE(client.is_ephemeral()); EXPECT_FALSE(client.is_firewalled());
+        const int samples_after_probe = client.ring_sampler().size();
+        bool replied = false;
+        peer.on_request([&](const auto& req) {
+            messages::Response reply;
+            reply.tid = req.tid;
+            reply.from.addr = req.from.addr;
+            peer.reply(reply, req.from_server);
+        });
+        messages::Request ping;
+        ping.to.addr = local(peer.port());
+        ping.command = messages::CMD_PING;
+        ping.internal = true;
+        client.request(ping, [&](const auto&) { replied = true; });
+        pump(loop);
+        EXPECT_TRUE(replied);
+        EXPECT_EQ(client.ring_sampler().size(), samples_after_probe + 1);
         for (auto* s : {&client, &peer, &other}) s->close();
         uv_run(&loop, UV_RUN_DEFAULT);
     }

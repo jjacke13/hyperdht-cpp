@@ -2957,6 +2957,30 @@ TEST_P(ExternalRequestSamples, AllowedInvalidIdResponseStillSamples) {
     expect_samples(1);
 }
 
+TEST_P(ExternalRequestSamples, BootstrapSourceIsSampledOnce) {
+    ASSERT_TRUE(receive_reply(std::nullopt));
+    auto invalid = peer_id;
+    invalid[0] ^= 1;
+    ASSERT_TRUE(receive_reply(invalid));
+    expect_samples(1);
+}
+
+TEST_P(ExternalRequestSamples, IdentifiedPeerStillSamplesAfterBootstrapBudget) {
+    ASSERT_TRUE(receive_reply(std::nullopt));
+    ASSERT_TRUE(receive_reply(peer_id));
+    EXPECT_TRUE(receiver->table().has(peer_id));
+    EXPECT_EQ(receiver->ring_sampler().size(), 2);
+}
+
+TEST_P(ExternalRequestSamples, FilteredBootstrapReplyDoesNotConsumeBudget) {
+    receiver->set_filter_node([](const NodeId&, const Ipv4Address&) { return false; });
+    ASSERT_TRUE(receive_reply(std::nullopt));
+    expect_samples(0);
+    receiver->set_filter_node([](const NodeId&, const Ipv4Address&) { return true; });
+    ASSERT_TRUE(receive_reply(std::nullopt));
+    expect_samples(1);
+}
+
 INSTANTIATE_TEST_SUITE_P(FirewallStates, ExternalRequestSamples, ::testing::Bool());
 
 // dhtrpc-io-7 — alloc_tid must never return 0 (the request() failure

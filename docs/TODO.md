@@ -5,11 +5,17 @@ the rest of the JS-parity sweep, missing parity features, hardening tasks,
 un-audited blind spots, and space for future sweeps. Update this file as work
 lands; keep the one-line status snapshot in `CLAUDE.md` pointing here.
 
-Last updated: 2026-11-11 (bootstrap reply filtering).
+Last updated: 2026-11-11 (bootstrap sample bounds).
 
 ---
 
 ## Status snapshot
+
+- **2026-11-11 bootstrap sample bounds:** no-ID replies contribute at most one
+  observation per endpoint and at most max(1, configured bootstrap count)
+  observations in total, matching JS. A verified firewall probe resets the
+  source cache when it replaces the address sampler. Identified peers use
+  their existing sampling rules.
 
 - **2026-11-11 bootstrap reply filtering:** replies with a missing or invalid
   node ID now pass the node filter before contributing address observations,

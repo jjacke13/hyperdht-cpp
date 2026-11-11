@@ -110,6 +110,7 @@ HyperDHT::HyperDHT(uv_loop_t* loop, DhtOptions opts)
     randombytes_buf(our_id.data(), our_id.size());
 
     socket_ = std::make_unique<rpc::RpcSocket>(loop_, our_id);
+    socket_->set_bootstrap_node_count(opts_.bootstrap.size());
 
     // tick-5: apply opts.ephemeral + the adaptive gate to the socket.
     // JS index.js:53 — `adaptive = typeof opts.ephemeral !== 'boolean' &&

@@ -18,7 +18,8 @@ void HealthMonitor::reset() {
 }
 
 bool HealthMonitor::is_idle() const {
-    return (total_responses() + total_timeouts()) < IDLE_THRESHOLD;
+    const auto& newest = window_[head_];
+    return (newest.responses + newest.timeouts) < IDLE_THRESHOLD;
 }
 
 uint32_t HealthMonitor::total_responses() const {

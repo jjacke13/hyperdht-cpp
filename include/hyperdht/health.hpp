@@ -7,6 +7,7 @@
 //   - ONLINE:   receiving responses, timeout rate < 50%
 //   - DEGRADED: receiving responses, but timeout rate > 50% for all 4 ticks
 //   - OFFLINE:  no responses in the observation window
+// Ticks with fewer than 4 outcomes do not vote on health, matching JS.
 //
 // Port of dht-rpc/lib/health.js
 

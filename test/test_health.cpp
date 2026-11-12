@@ -73,7 +73,7 @@ TEST(HealthMonitor, IdlePeriodNoStateChange) {
     h.update(10, 0);
     EXPECT_EQ(h.state(), State::ONLINE);
 
-    // Now go idle (less than 4 total activity in window)
+    // Now go idle (less than 4 outcomes in each tick)
     h.update(0, 0);
     h.update(0, 0);
     h.update(0, 0);
@@ -105,3 +105,30 @@ TEST(HealthMonitor, TotalCounts) {
     EXPECT_EQ(h.total_responses(), 7u);
     EXPECT_EQ(h.total_timeouts(), 4u);
 }
+
+TEST(HealthMonitor, IdleTimeoutTickDoesNotCountAsDegraded) {
+    HealthMonitor h;
+    for (int i = 0; i < 4; i++) h.update(10, 0);
+
+    h.update(0, 3);  // Below JS's per-tick activity threshold.
+    for (int i = 0; i < 3; i++) h.update(1, 10);
+    EXPECT_EQ(h.state(), State::ONLINE);
+    EXPECT_EQ(h.update(1, 10), State::DEGRADED);
+}
+
+class HealthIdleThreshold : public ::testing::TestWithParam<uint32_t> {};
+
+TEST_P(HealthIdleThreshold, OnlyActiveTicksCountTowardsRecovery) {
+    HealthMonitor h;
+    for (int i = 0; i < 7; i++) h.update(1, 10);
+    ASSERT_EQ(h.state(), State::DEGRADED);
+
+    h.update(GetParam(), 0);
+    for (int i = 0; i < 3; i++) h.update(10, 0);
+    EXPECT_EQ(h.state(), GetParam() < IDLE_THRESHOLD
+                            ? State::DEGRADED : State::ONLINE);
+    EXPECT_EQ(h.update(10, 0), State::ONLINE);
+}
+
+INSTANTIATE_TEST_SUITE_P(Activity, HealthIdleThreshold,
+                        ::testing::Values(0u, 1u, 2u, 3u, 4u));

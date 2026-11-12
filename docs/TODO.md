@@ -1074,6 +1074,10 @@ network change) — there they accumulate. holesail-cpp scopes them in its
 The 2026-07-09 sweep did NOT run a finder on these. Seed a round-2 sweep here
 before any full "core frozen" sign-off:
 - [ ] `health.cpp` vs `dht-rpc/lib/health.js` (only checked at the tick call-site).
+  - [x] Per-tick idle gate (2026-11-12): fewer than four responses/timeouts
+    in the latest tick do not contribute a healthy/degraded vote, matching
+    JS's delta-based `idle` getter. Window totals remain available; the
+    remaining state-transition policy still needs review.
 - [ ] HyperDHT `suspend()`/`resume()` socket rebind + inbound-drop (io.js
   `suspend`/`_rebind`) — rpc-level `stop_tick`/`start_tick` alone don't match.
 - [ ] `raw-stream-set.js`, `semaphore.js`, `refresh-chain.js`, `commands.js`,

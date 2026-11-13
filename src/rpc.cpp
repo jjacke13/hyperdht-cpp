@@ -1356,6 +1356,8 @@ void RpcSocket::check_persistent(OnStateCallback on_done) {
 void RpcSocket::start_firewall_probe() {
     if (firewall_probe_running_ || closing_) return;
     firewall_probe_running_ = true;
+    probe_client_address_ = compact::Ipv4Address::from_string(
+        ring_sampler_.host(), ring_sampler_.port());
     probe_replied_hosts_.clear();
     probe_requests_.clear();
     // JS: index.js:818 — a fresh `new NatSampler()` for the probe, fed only
@@ -1456,6 +1458,15 @@ void RpcSocket::finish_firewall_probe() {
         DHT_LOG("  [rpc] firewall probe: port remapped (server local=%u external=%u) → FIREWALLED\n",
                 server_local, probe_ring_.port());
         firewalled_ = true;
+        if (done) done();
+        return;
+    }
+
+    // JS index.js:824-827 confirms reachability but postpones promotion if
+    // the client address changed while awaiting the probe.
+    firewalled_ = false;
+    if (!ephemeral_ || ring_sampler_.host() != probe_client_address_.host_string() ||
+        ring_sampler_.port() != probe_client_address_.port) {
         if (done) done();
         return;
     }

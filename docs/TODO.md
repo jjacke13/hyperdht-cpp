@@ -697,6 +697,11 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   announcements and listener retention. The full filtered unit suite passes
   in Debug and Release; consumer and isolated connectivity checks accompany
   this security change.
+- [x] **Firewall-probe address snapshot (2026-11-13).** Before promotion or
+  sampler replacement, require the client sampler's host/port to match the
+  probe-start snapshot and the node to remain ephemeral (JS index.js:827).
+  A successful probe still confirms reachability; changed-address samples
+  survive for a later evaluation. Direct C++ RpcSocket consumers must rebuild.
 - [ ] **RECHECK: the persistence gate is one-shot and cannot demote** (context
   for Finding O and for the item above; no action decided yet). Becoming a relay
   requires passing the PING_NAT firewall probe once — five routing-table nodes

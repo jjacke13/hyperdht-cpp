@@ -503,6 +503,7 @@ private:
     // socket's PING_NAT replies, then swapped into ring_sampler_ on success.
     // JS: index.js:818,837-845 (`const natSampler = new NatSampler()` → swap).
     nat::RingSampler probe_ring_;
+    compact::Ipv4Address probe_client_address_;
     CongestionWindow congestion_;
 
     uint16_t next_tid_ = 0;

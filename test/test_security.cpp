@@ -235,6 +235,80 @@ TEST(Security, FullFirewallProbeRequiresExpectedSourceAndServerSocket) {
     EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
+class FirewallProbeSnapshot : public testing::TestWithParam<const char*> {};
+
+TEST_P(FirewallProbeSnapshot, CommitsOnlyForUnchangedEphemeralAddress) {
+    const std::string change = GetParam();
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        rpc::RpcSocket client(&loop, {}), peer(&loop, {});
+        for (auto* s : {&client, &peer}) ASSERT_EQ(s->bind(0, "127.0.0.1"), 0);
+        const auto server_addr = local(client.port());
+        for (int i = 0; i < 3; ++i)
+            client.ring_sampler().add(server_addr.host_string(), server_addr.port);
+        routing::Node node;
+        node.id = rpc::compute_peer_id(local(peer.port()));
+        node.host = "127.0.0.1";
+        node.port = peer.port();
+        client.table().add(node);
+        uint16_t tid = 0;
+        peer.on_request([&](const auto& req) {
+            if (req.command == messages::CMD_PING_NAT) tid = req.tid;
+        });
+        int completed = 0, persistent = 0;
+        client.on_persistent([&] { ++persistent; });
+        client.check_persistent([&] { ++completed; });
+        pump(loop);
+        ASSERT_NE(tid, 0);
+        ASSERT_EQ(completed, 0);
+
+        auto current = server_addr;
+        if (change == "port") current.port = server_addr.port == 65535 ? 65534 : server_addr.port + 1;
+        if (change == "host") current = compact::Ipv4Address::from_string("127.0.0.2", current.port);
+        if (change == "port" || change == "host" || change == "samples") {
+            for (int i = 0; i < 32; ++i)
+                client.ring_sampler().add(current.host_string(), current.port);
+        }
+        if (change == "persistent") client.force_check_persistent();
+        ASSERT_EQ(client.ring_sampler().host(), current.host_string());
+        ASSERT_EQ(client.ring_sampler().port(), current.port);
+        const int samples_before = client.ring_sampler().size();
+
+        messages::Response resp;
+        resp.tid = tid;
+        resp.from.addr = compact::Ipv4Address::from_string(current.host_string(), server_addr.port);
+        peer.udp_send(messages::encode_response(resp), server_addr, peer.socket_handle());
+        pump(loop);
+        EXPECT_EQ(completed, 1);
+        EXPECT_FALSE(client.is_firewalled());
+
+        if (change == "port" || change == "host") {
+            EXPECT_TRUE(client.is_ephemeral());
+            EXPECT_EQ(persistent, 0);
+            EXPECT_EQ(client.ring_sampler().host(), current.host_string());
+            EXPECT_EQ(client.ring_sampler().port(), current.port);
+            EXPECT_EQ(client.ring_sampler().size(), samples_before);
+            // A later evaluation may use the newly confirmed reachability.
+            client.check_persistent([&] { ++completed; });
+            EXPECT_EQ(completed, 2);
+            EXPECT_EQ(client.table().id(), rpc::compute_peer_id(current));
+        } else {
+            // The no-ID reply also contributes a normal bootstrap observation.
+            EXPECT_EQ(client.ring_sampler().size(), change == "persistent" ? samples_before + 1 : 1);
+        }
+        EXPECT_FALSE(client.is_ephemeral());
+        EXPECT_EQ(persistent, 1);
+        client.close();
+        peer.close();
+        uv_run(&loop, UV_RUN_DEFAULT);
+    }
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(AddressChanges, FirewallProbeSnapshot,
+                        testing::Values("stable", "port", "host", "samples", "persistent"));
+
 class UdxResetIPv6 : public testing::TestWithParam<bool> {};
 TEST_P(UdxResetIPv6, SourceGuard) {
     const bool mapped = GetParam();

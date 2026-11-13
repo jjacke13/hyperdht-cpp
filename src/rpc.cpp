@@ -1319,17 +1319,17 @@ void RpcSocket::check_persistent(OnStateCallback on_done) {
     // report the JS "host consistent, port random" signal below.
     auto current_host = ring_sampler_.host();
 
+    // JS records even incomplete observations before returning below.
+    stable_ticks_ = STABLE_TICKS_MORE;
+    last_nat_host_ = current_host;
+
     if (current_host.empty() || ring_sampler_.port() == 0) {
         // JS: index.js:814 — `if (host === null || port === 0) return false`.
         DHT_LOG("  [rpc] check_persistent: no address yet (host=%s port=%u)\n",
                 current_host.c_str(), ring_sampler_.port());
-        stable_ticks_ = STABLE_TICKS_MORE;
         if (on_done) on_done();
         return;
     }
-
-    stable_ticks_ = STABLE_TICKS_MORE;
-    last_nat_host_ = current_host;
 
     if (!firewalled_) {
         // JS reuses its confirmed sampler when the socket is already reachable.

@@ -309,6 +309,68 @@ TEST_P(FirewallProbeSnapshot, CommitsOnlyForUnchangedEphemeralAddress) {
 INSTANTIATE_TEST_SUITE_P(AddressChanges, FirewallProbeSnapshot,
                         testing::Values("stable", "port", "host", "samples", "persistent"));
 
+class PersistenceHostMemo : public testing::TestWithParam<const char*> {};
+
+TEST_P(PersistenceHostMemo, CountdownUsesLastCheckedHostEvenWithoutAnAddress) {
+    const std::string change = GetParam();
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        rpc::RpcSocket client(&loop, {}), peer(&loop, {});
+        for (auto* s : {&client, &peer}) ASSERT_EQ(s->bind(0, "127.0.0.1"), 0);
+        auto seed = [&](const std::string& host, uint16_t port) {
+            client.ring_sampler().reset();
+            for (int i = 0; i < 3; ++i) client.ring_sampler().add(host, port);
+        };
+        seed("127.0.0.1", client.port());
+        int completed = 0;
+        // No routing peers: the first check fails synchronously but remembers A.
+        client.check_persistent([&] { ++completed; });
+        ASSERT_EQ(completed, 1);
+        ASSERT_TRUE(client.is_ephemeral());
+
+        if (change == "lost" || change == "unknown") {
+            client.ring_sampler().reset();
+            client.check_persistent([&] { ++completed; });
+            ASSERT_EQ(completed, 2);
+            if (change == "lost") seed("127.0.0.1", client.port());
+        } else if (change == "unresolved-port") {
+            seed("127.0.0.2", 0);
+            ASSERT_EQ(client.ring_sampler().host(), "127.0.0.2");
+            client.check_persistent([&] { ++completed; });
+            ASSERT_EQ(completed, 2);
+            seed("127.0.0.2", client.port());
+        } else if (change == "moved") {
+            seed("127.0.0.2", client.port());
+        }
+
+        client.set_bootstrapped(true);
+        // Install the peer only at the deadline, avoiding unrelated periodic pings.
+        for (int i = 0; i < rpc::STABLE_TICKS_MORE - 1; ++i) client.background_tick();
+        routing::Node node;
+        node.id = rpc::compute_peer_id(local(peer.port()));
+        node.host = "127.0.0.1";
+        node.port = peer.port();
+        client.table().add(node);
+        int probes = 0;
+        peer.on_request([&](const auto& req) {
+            if (req.command == messages::CMD_PING_NAT) ++probes;
+        });
+        client.background_tick();
+        pump(loop);
+        EXPECT_EQ(probes, change == "lost" || change == "moved" ? 1 : 0);
+        EXPECT_TRUE(client.is_ephemeral());
+        EXPECT_TRUE(client.is_firewalled());
+        client.close();
+        peer.close();
+        uv_run(&loop, UV_RUN_DEFAULT);
+    }
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(AddressHistory, PersistenceHostMemo,
+                        testing::Values("lost", "unresolved-port", "same", "moved", "unknown"));
+
 class UdxResetIPv6 : public testing::TestWithParam<bool> {};
 TEST_P(UdxResetIPv6, SourceGuard) {
     const bool mapped = GetParam();

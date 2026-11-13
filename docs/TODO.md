@@ -702,6 +702,9 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
   probe-start snapshot and the node to remain ephemeral (JS index.js:827).
   A successful probe still confirms reachability; changed-address samples
   survive for a later evaluation. Direct C++ RpcSocket consumers must rebuild.
+- [x] **Persistence host memo (2026-11-13).** Remember the checked host even
+  when its address is incomplete, matching JS index.js:805-815. The countdown
+  then uses that observation after host/port discovery is restored.
 - [ ] **RECHECK: the persistence gate is one-shot and cannot demote** (context
   for Finding O and for the item above; no action decided yet). Becoming a relay
   requires passing the PING_NAT firewall probe once — five routing-table nodes

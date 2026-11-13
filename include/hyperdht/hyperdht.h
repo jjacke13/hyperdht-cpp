@@ -844,6 +844,15 @@ HYPERDHT_API int hyperdht_find_peer(hyperdht_t* dht,
                                      hyperdht_done_cb on_done,
                                      void* userdata);
 
+/** Query an already-hashed 32-byte target, matching JS
+ *  `findPeer(target, { hash: false })`. The existing find_peer hashes a
+ *  public key first. Reply validation and callback/error semantics are identical. */
+HYPERDHT_API int hyperdht_find_peer_target(hyperdht_t* dht,
+                                            const uint8_t target[32],
+                                            hyperdht_peer_cb on_reply,
+                                            hyperdht_done_cb on_done,
+                                            void* userdata);
+
 HYPERDHT_API int hyperdht_lookup(hyperdht_t* dht,
                                   const uint8_t target[32],
                                   hyperdht_peer_cb on_reply,
@@ -872,14 +881,22 @@ HYPERDHT_API int hyperdht_announce(hyperdht_t* dht,
                                     void* userdata);
 
 /** Cancelable variants — return a query handle that can be passed to
- *  `hyperdht_query_cancel()`. The handle is invalidated when `on_done`
- *  fires; do not dereference it after that. Returns NULL on immediate
- *  error (bad inputs). */
+ *  `hyperdht_query_cancel()`. The caller owns the handle and must release
+ *  it with `hyperdht_query_free()` as documented above, including after
+ *  completion. Returns NULL on immediate error (bad inputs). */
 HYPERDHT_API hyperdht_query_t* hyperdht_find_peer_ex(hyperdht_t* dht,
                                                       const uint8_t public_key[32],
                                                       hyperdht_peer_cb on_reply,
                                                       hyperdht_done_cb on_done,
                                                       void* userdata);
+
+/** Cancelable exact-target query. Own/free the handle as documented for
+ *  hyperdht_query_free; cancellation reports HYPERDHT_ERR_CANCELLED once. */
+HYPERDHT_API hyperdht_query_t* hyperdht_find_peer_target_ex(hyperdht_t* dht,
+                                                             const uint8_t target[32],
+                                                             hyperdht_peer_cb on_reply,
+                                                             hyperdht_done_cb on_done,
+                                                             void* userdata);
 
 HYPERDHT_API hyperdht_query_t* hyperdht_lookup_ex(hyperdht_t* dht,
                                                    const uint8_t target[32],

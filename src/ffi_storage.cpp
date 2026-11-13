@@ -223,11 +223,21 @@ int hyperdht_find_peer(hyperdht_t* dht,
                         hyperdht_done_cb on_done,
                         void* userdata) {
     if (!dht || !dht->dht || !public_key) return -1;
+    const auto target = hyperdht::dht_ops::hash_public_key(public_key, 32);
+    return hyperdht_find_peer_target(dht, target.data(), on_reply, on_done, userdata);
+}
 
-    hyperdht::noise::PubKey pk{};
-    memcpy(pk.data(), public_key, 32);
+int hyperdht_find_peer_target(hyperdht_t* dht,
+                        const uint8_t target[32],
+                        hyperdht_peer_cb on_reply,
+                        hyperdht_done_cb on_done,
+                        void* userdata) {
+    if (!dht || !dht->dht || !target) return -1;
 
-    dht->dht->find_peer(pk,
+    std::array<uint8_t, 32> t{};
+    memcpy(t.data(), target, 32);
+
+    dht->dht->find_peer_target(t,
         [on_reply, userdata](const hyperdht::query::QueryReply& reply) {
             if (on_reply && reply.value.has_value() && !reply.value->empty()) {
                 auto host = reply.from_addr.host_string();
@@ -305,18 +315,28 @@ int hyperdht_announce(hyperdht_t* dht,
 
 
 hyperdht_query_t* hyperdht_find_peer_ex(hyperdht_t* dht,
-                                         const uint8_t public_key[32],
+                        const uint8_t public_key[32],
+                        hyperdht_peer_cb on_reply,
+                        hyperdht_done_cb on_done,
+                        void* userdata) {
+    if (!dht || !dht->dht || !public_key) return nullptr;
+    const auto target = hyperdht::dht_ops::hash_public_key(public_key, 32);
+    return hyperdht_find_peer_target_ex(dht, target.data(), on_reply, on_done, userdata);
+}
+
+hyperdht_query_t* hyperdht_find_peer_target_ex(hyperdht_t* dht,
+                                         const uint8_t target[32],
                                          hyperdht_peer_cb on_reply,
                                          hyperdht_done_cb on_done,
                                          void* userdata) {
-    if (!dht || !dht->dht || !public_key) return nullptr;
+    if (!dht || !dht->dht || !target) return nullptr;
 
-    hyperdht::noise::PubKey pk{};
-    memcpy(pk.data(), public_key, 32);
+    std::array<uint8_t, 32> t{};
+    memcpy(t.data(), target, 32);
 
     auto* handle = make_query_handle(on_done, userdata);
     auto state = handle->state;  // shared copy for lambdas
-    handle->state->q = dht->dht->find_peer(pk,
+    handle->state->q = dht->dht->find_peer_target(t,
         [state, on_reply](const hyperdht::query::QueryReply& reply) {
             // on_reply fires per-visit while query is alive; silent no-op
             // if the user freed (done_cb-less snapshot of userdata).

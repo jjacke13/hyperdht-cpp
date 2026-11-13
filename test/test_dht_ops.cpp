@@ -10,6 +10,7 @@
 #include "hyperdht/dht_ops.hpp"
 #include "hyperdht/dht_messages.hpp"
 #include "hyperdht/dht.hpp"
+#include "hyperdht/hyperdht.h"
 
 using namespace hyperdht;
 using namespace hyperdht::dht_ops;
@@ -520,4 +521,126 @@ TEST(DhtOps, FindPeerRandomKey) {
 
     // q is a shared_ptr, automatically cleaned up
     uv_loop_close(&loop);
+}
+
+// Public C facade over the same loopback FIND_PEER wire contract.
+class CFindPeerTarget : public ::testing::TestWithParam<int> {};
+
+TEST_P(CFindPeerTarget, ExactTargetAndLegacyHashRetainReplyValidation) {
+    const bool exact = GetParam() & 1, cancelable = GetParam() & 2;
+    const bool malformed = GetParam() & 4;
+    uv_loop_t loop{};
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        RpcSocket relay(&loop, {});
+        ASSERT_EQ(relay.bind(0, "127.0.0.1"), 0);
+        const auto addr = compact::Ipv4Address::from_string("127.0.0.1", relay.port());
+        const auto id = compute_peer_id(addr);
+        noise::PubKey pk{};
+        pk.fill(0x72);
+        const auto target = hash_public_key(pk.data(), pk.size());
+        dht_messages::PeerRecord peer;
+        peer.public_key = pk;
+        const auto value = malformed ? std::vector<uint8_t>{0x01}
+                                     : dht_messages::encode_peer_record(peer);
+        int requests = 0;
+        relay.on_request([&](const messages::Request& req) {
+            ++requests;
+            EXPECT_EQ(req.command, messages::CMD_FIND_PEER);
+            EXPECT_EQ(req.target, target);
+            EXPECT_FALSE(req.value.has_value());
+            messages::Response resp;
+            resp.tid = req.tid;
+            resp.from.addr = req.from.addr;
+            resp.id = id;
+            resp.value = value;
+            relay.reply(resp, req.from_server);
+        });
+        hyperdht_opts_t opts;
+        hyperdht_opts_default(&opts);
+        opts.host = "127.0.0.1";
+        auto* client = hyperdht_create(&loop, &opts);
+        ASSERT_NE(client, nullptr);
+        ASSERT_EQ(hyperdht_bind(client, 0), 0);
+        ASSERT_EQ(hyperdht_add_node(client, "127.0.0.1", relay.port()), 0);
+        struct Context {
+            int replies = 0, completions = 0, error = 999;
+            const std::vector<uint8_t>* value;
+            uint16_t port;
+        } ctx{0, 0, 999, &value, relay.port()};
+        auto reply = +[](const uint8_t* data, size_t len, const char* host,
+                         uint16_t port, void* ud) {
+            auto& c = *static_cast<Context*>(ud);
+            ++c.replies;
+            EXPECT_EQ(std::vector<uint8_t>(data, data + len), *c.value);
+            EXPECT_STREQ(host, "127.0.0.1");
+            EXPECT_EQ(port, c.port);
+        };
+        auto done = +[](int error, void* ud) {
+            auto& c = *static_cast<Context*>(ud);
+            ++c.completions;
+            c.error = error;
+        };
+        const auto* input = exact ? target.data() : pk.data();
+        hyperdht_query_t* q = nullptr;
+        if (cancelable) {
+            q = (exact ? hyperdht_find_peer_target_ex : hyperdht_find_peer_ex)
+                (client, input, reply, done, &ctx);
+            ASSERT_NE(q, nullptr);
+        } else {
+            EXPECT_EQ((exact ? hyperdht_find_peer_target : hyperdht_find_peer)
+                (client, input, reply, done, &ctx), 0);
+        }
+        const auto deadline = uv_hrtime() + 2000000000ULL;
+        while (!ctx.completions && uv_hrtime() < deadline) {
+            uv_run(&loop, UV_RUN_NOWAIT);
+            uv_sleep(1);
+        }
+        EXPECT_EQ(ctx.completions, 1);
+        EXPECT_EQ(ctx.error, 0);
+        EXPECT_EQ(requests, 1);
+        EXPECT_EQ(ctx.replies, malformed ? 0 : 1);
+        if (q) {
+            hyperdht_query_cancel(q);  // completion makes cancellation a no-op
+            EXPECT_EQ(ctx.completions, 1);
+            hyperdht_query_free(q);
+        }
+        hyperdht_destroy(client, nullptr, nullptr);
+        relay.close();
+        uv_run(&loop, UV_RUN_DEFAULT);
+        hyperdht_free(client);
+    }
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(CFacade, CFindPeerTarget, ::testing::Range(0, 8));
+
+TEST(CFindPeerTarget, BadInputsAndCancellation) {
+    uint8_t target[32] = {0x42};
+    EXPECT_EQ(hyperdht_find_peer_target(nullptr, target, nullptr, nullptr, nullptr), -1);
+    EXPECT_EQ(hyperdht_find_peer_target_ex(nullptr, target, nullptr, nullptr, nullptr), nullptr);
+    uv_loop_t loop{};
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    auto* client = hyperdht_create(&loop, nullptr);
+    ASSERT_NE(client, nullptr);
+    ASSERT_EQ(hyperdht_bind(client, 0), 0);
+    int done_calls = 0;
+    auto done = +[](int error, void* ud) {
+        EXPECT_EQ(error, HYPERDHT_ERR_CANCELLED);
+        ++*static_cast<int*>(ud);
+    };
+    EXPECT_EQ(hyperdht_find_peer_target(client, nullptr, nullptr, done, &done_calls), -1);
+    EXPECT_EQ(hyperdht_find_peer_target_ex(client, nullptr, nullptr, done, &done_calls), nullptr);
+    EXPECT_EQ(done_calls, 0);
+    auto* q = hyperdht_find_peer_target_ex(client, target, nullptr, done, &done_calls);
+    ASSERT_NE(q, nullptr);
+    hyperdht_query_cancel(q);
+    hyperdht_query_cancel(q);
+    EXPECT_EQ(done_calls, 1);
+    hyperdht_query_free(q);
+    hyperdht_destroy(client, nullptr, nullptr);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(done_calls, 1);
+    hyperdht_free(client);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
 }

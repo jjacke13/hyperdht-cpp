@@ -916,8 +916,10 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
 
 - [x] **Arbitrary-target native unannounce** — target-aware
   lookup_and_unannounce_target and unannounce_target match JS topic semantics
-  (2026-11-07). Legacy public-key methods retain hashing; C API/wrapper
-  exposure and other query controls remain separate work.
+  (2026-11-07). Legacy public-key methods retain hashing. C
+  unannounce_target now exposes exact-topic withdrawal (2026-11-13), using
+  the existing native completion/signing path. Streaming query controls
+  and higher-level wrapper exposure remain separate work.
 - [x] **Already-hashed native findPeer target** — C++ find_peer_target
   matches JS findPeer(target, { hash: false }) (2026-11-07). Existing
   public-key methods keep their semantics. C find_peer_target and its

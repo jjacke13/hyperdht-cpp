@@ -398,6 +398,28 @@ int hyperdht_unannounce(hyperdht_t* dht,
     return 0;
 }
 
+int hyperdht_unannounce_target(hyperdht_t* dht,
+                         const uint8_t target[32],
+                         const hyperdht_keypair_t* kp,
+                         hyperdht_done_cb on_done,
+                         void* userdata) {
+    if (!dht || !dht->dht || !target || !kp) return -1;
+
+    hyperdht::routing::NodeId t{};
+    memcpy(t.data(), target, 32);
+
+    hyperdht::noise::Keypair cpp_kp;
+    memcpy(cpp_kp.public_key.data(), kp->public_key, 32);
+    memcpy(cpp_kp.secret_key.data(), kp->secret_key, 64);
+
+    dht->dht->unannounce_target(t, cpp_kp,
+        [on_done, userdata]() {
+            if (on_done) on_done(0, userdata);
+        });
+    sodium_memzero(cpp_kp.secret_key.data(), 64);  // C10
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // DHT lifecycle: suspend, resume
 // ---------------------------------------------------------------------------

@@ -910,6 +910,17 @@ HYPERDHT_API int hyperdht_unannounce(hyperdht_t* dht,
                                       hyperdht_done_cb on_done,
                                       void* userdata);
 
+/** Withdraw this keypair from an exact 32-byte topic, matching JS
+ *  `unannounce(target, keyPair)`. Unlike hyperdht_unannounce, the target
+ *  is not hashed. Uses the same completion contract: on_done(0) runs
+ *  after the lookup and resulting withdrawals settle. Returns -1 for
+ *  invalid inputs without starting an operation. */
+HYPERDHT_API int hyperdht_unannounce_target(hyperdht_t* dht,
+                                             const uint8_t target[32],
+                                             const hyperdht_keypair_t* kp,
+                                             hyperdht_done_cb on_done,
+                                             void* userdata);
+
 /* --- C5: DHT lifecycle --- */
 
 HYPERDHT_API void hyperdht_suspend(hyperdht_t* dht);

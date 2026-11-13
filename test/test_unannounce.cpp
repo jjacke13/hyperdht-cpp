@@ -24,6 +24,7 @@
 #include "hyperdht/noise_wrap.hpp"
 #include "hyperdht/rpc.hpp"
 #include "hyperdht/rpc_handlers.hpp"
+#include "hyperdht/hyperdht.h"
 
 using namespace hyperdht;
 using namespace hyperdht::rpc;
@@ -546,4 +547,113 @@ TEST(Announce, ClearRoutesThroughUnannounceThenAnnounces) {
     EXPECT_TRUE(clear_done) << "announce(clear) should complete";
     EXPECT_TRUE(final_is_new)
         << "after clear+announce the store should hold exactly the NEW record";
+}
+
+class CUnannounceTarget : public ::testing::TestWithParam<int> {};
+
+TEST_P(CUnannounceTarget, TopicSignatureAndCompletionWaitForAck) {
+    // Exact arbitrary target, legacy own public key, legacy different topic key.
+    const int mode = GetParam();
+    uv_loop_t loop{};
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        RpcSocket relay(&loop, {});
+        ASSERT_EQ(relay.bind(0, "127.0.0.1"), 0);
+        relay.set_ephemeral(false);
+        const auto addr = Ipv4Address::from_string("127.0.0.1", relay.port());
+        const auto id = compute_peer_id(addr);
+        uint8_t seed[32] = {0x61};
+        hyperdht_keypair_t kp;
+        hyperdht_keypair_from_seed(&kp, seed);
+        std::array<uint8_t, 32> input{};
+        std::copy_n(kp.public_key, 32, input.begin());
+        if (mode == 2) input.fill(0x93);
+        NodeId target{};
+        target.fill(0x93);
+        if (mode != 0) target = dht_ops::hash_public_key(input.data(), input.size());
+        std::optional<Request> lookup, withdrawal;
+        relay.on_request([&](const Request& req) {
+            EXPECT_EQ(req.target, target);
+            if (req.command == CMD_LOOKUP) lookup = req;
+            else if (req.command == CMD_UNANNOUNCE) withdrawal = req;
+            else ADD_FAILURE() << "Unexpected query command " << req.command;
+        });
+        hyperdht_opts_t opts;
+        hyperdht_opts_default(&opts);
+        opts.host = "127.0.0.1";
+        auto* client = hyperdht_create(&loop, &opts);
+        ASSERT_NE(client, nullptr);
+        ASSERT_EQ(hyperdht_bind(client, 0), 0);
+        ASSERT_EQ(hyperdht_add_node(client, "127.0.0.1", relay.port()), 0);
+        auto pump = [&](auto ready) {
+            const auto deadline = uv_hrtime() + 2000000000ULL;
+            while (!ready() && uv_hrtime() < deadline) { uv_run(&loop, UV_RUN_NOWAIT); uv_sleep(1); }
+            EXPECT_TRUE(ready());
+        };
+        int completions = 0;
+        auto done = +[](int error, void* ud) { EXPECT_EQ(error, 0); ++*static_cast<int*>(ud); };
+        EXPECT_EQ((mode == 0 ? hyperdht_unannounce_target : hyperdht_unannounce)
+            (client, mode == 0 ? target.data() : input.data(), &kp, done, &completions), 0);
+        pump([&] { return lookup.has_value(); });
+        ASSERT_TRUE(lookup);
+        EXPECT_EQ(completions, 0);
+        dht_messages::PeerRecord peer;
+        std::copy_n(kp.public_key, 32, peer.public_key.begin());
+        dht_messages::LookupRawReply records;
+        records.peers.push_back(dht_messages::encode_peer_record(peer));
+        const auto token = relay.token_store().create(lookup->from.addr.host_string());
+        Response response;
+        response.tid = lookup->tid;
+        response.from.addr = lookup->from.addr;
+        response.id = id;
+        response.token = token;
+        response.value = dht_messages::encode_lookup_reply(records);
+        relay.reply(response, lookup->from_server);
+        pump([&] { return withdrawal.has_value(); });
+        ASSERT_TRUE(withdrawal && withdrawal->value);
+        EXPECT_EQ(withdrawal->token, token);
+        const auto ann = dht_messages::decode_announce_msg(withdrawal->value->data(), withdrawal->value->size());
+        ASSERT_TRUE(ann.peer && ann.signature);
+        EXPECT_EQ(ann.peer->public_key, peer.public_key);
+        EXPECT_TRUE(announce_sig::verify_announce(dht_messages::ns_unannounce(), target,
+            id, token.data(), token.size(), ann, *ann.signature, peer.public_key));
+        for (int i = 0; i < 25; ++i) { uv_run(&loop, UV_RUN_NOWAIT); uv_sleep(1); }
+        EXPECT_EQ(completions, 0) << "Completion must await the withdrawal ACK";
+        response = {};
+        response.tid = withdrawal->tid;
+        response.from.addr = withdrawal->from.addr;
+        response.id = id;
+        relay.reply(response, withdrawal->from_server);
+        pump([&] { return completions != 0; });
+        EXPECT_EQ(completions, 1);
+        hyperdht_destroy(client, nullptr, nullptr);
+        relay.close();
+        uv_run(&loop, UV_RUN_DEFAULT);
+        EXPECT_EQ(completions, 1);
+        hyperdht_free(client);
+        hyperdht_keypair_zero(&kp);
+    }
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(CFacade, CUnannounceTarget, ::testing::Range(0, 3));
+
+TEST(CUnannounceTarget, RejectsNullInputsWithoutCallbacks) {
+    uint8_t target[32] = {0x42};
+    hyperdht_keypair_t kp{};
+    EXPECT_EQ(hyperdht_unannounce_target(nullptr, target, &kp, nullptr, nullptr), -1);
+    uv_loop_t loop{};
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    auto* client = hyperdht_create(&loop, nullptr);
+    ASSERT_NE(client, nullptr);
+    int completions = 0;
+    auto done = +[](int, void* ud) { ++*static_cast<int*>(ud); };
+    EXPECT_EQ(hyperdht_unannounce_target(client, nullptr, &kp, done, &completions), -1);
+    EXPECT_EQ(hyperdht_unannounce_target(client, target, nullptr, done, &completions), -1);
+    EXPECT_EQ(completions, 0);
+    hyperdht_destroy(client, nullptr, nullptr);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    hyperdht_free(client);
+    EXPECT_EQ(completions, 0);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
 }

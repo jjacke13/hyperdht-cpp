@@ -132,3 +132,62 @@ TEST_P(HealthIdleThreshold, OnlyActiveTicksCountTowardsRecovery) {
 
 INSTANTIATE_TEST_SUITE_P(Activity, HealthIdleThreshold,
                         ::testing::Values(0u, 1u, 2u, 3u, 4u));
+
+TEST(HealthMonitor, ActiveTimeoutTickOverridesEarlierResponses) {
+    HealthMonitor h;
+    for (int i = 0; i < 4; i++) h.update(10, 0);
+
+    EXPECT_EQ(h.update(0, 4), State::OFFLINE);
+    EXPECT_FALSE(h.is_online());
+    EXPECT_FALSE(h.is_degraded());
+}
+
+class HealthRecovery : public ::testing::TestWithParam<uint32_t> {};
+
+TEST_P(HealthRecovery, FirstRespondingActiveTickRecovers) {
+    HealthMonitor h;
+    for (int i = 0; i < 4; i++) h.update(0, 10);
+    ASSERT_EQ(h.state(), State::OFFLINE);
+
+    EXPECT_EQ(h.update(4 - GetParam(), GetParam()), State::ONLINE);
+    EXPECT_TRUE(h.is_online());
+    EXPECT_FALSE(h.is_degraded());
+}
+
+INSTANTIATE_TEST_SUITE_P(Timeouts, HealthRecovery,
+                        ::testing::Values(0u, 3u));
+
+TEST(HealthMonitor, OfflineClearsDegradationForRecovery) {
+    HealthMonitor h;
+    for (int i = 0; i < 7; i++) h.update(1, 10);
+    ASSERT_EQ(h.state(), State::DEGRADED);
+
+    EXPECT_EQ(h.update(0, 4), State::OFFLINE);
+    EXPECT_EQ(h.update(4, 0), State::ONLINE);
+}
+
+TEST(HealthMonitor, FullDegradedWindowStillAppliesOnRecovery) {
+    HealthMonitor h;
+    for (int i = 0; i < 7; i++) h.update(0, 10);
+    ASSERT_EQ(h.state(), State::OFFLINE);
+
+    EXPECT_EQ(h.update(1, 3), State::DEGRADED);
+    EXPECT_TRUE(h.is_online());
+}
+
+TEST(HealthMonitor, IdleResponsesDoNotRecoverOffline) {
+    HealthMonitor h;
+    for (int i = 0; i < 4; i++) h.update(0, 10);
+    ASSERT_EQ(h.state(), State::OFFLINE);
+
+    EXPECT_EQ(h.update(1, 0), State::OFFLINE);
+    EXPECT_EQ(h.update(0, 0), State::OFFLINE);
+    EXPECT_EQ(h.update(4, 0), State::ONLINE);
+}
+
+TEST(HealthMonitor, IdleTimeoutsDoNotReportOffline) {
+    HealthMonitor h;
+    for (int i = 0; i < 4; i++) h.update(10, 0);
+
+    EXPECT_EQ(h.update(0, 3), State::ONLINE);
+}

@@ -3,10 +3,10 @@
 // Health Monitor — tracks network health from response/timeout statistics.
 //
 // Uses a sliding window of 4 observation periods (ticks). Each tick records
-// how many responses and timeouts occurred. Based on the aggregate:
-//   - ONLINE:   receiving responses, timeout rate < 50%
+// how many responses and timeouts occurred:
+//   - ONLINE:   responding in the latest active tick, without latched degradation
 //   - DEGRADED: receiving responses, but timeout rate > 50% for all 4 ticks
-//   - OFFLINE:  no responses in the observation window
+//   - OFFLINE:  no responses in the latest active tick
 // Ticks with fewer than 4 outcomes do not vote on health, matching JS.
 //
 // Port of dht-rpc/lib/health.js

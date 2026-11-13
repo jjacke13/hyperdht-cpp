@@ -70,17 +70,17 @@ State HealthMonitor::update(uint32_t new_responses, uint32_t new_timeouts) {
     if (tick_degraded) degraded_ticks_++;
     else healthy_ticks_++;
 
-    // State transitions
-    bool has_responses = (total_responses() > 0);
+    // JS uses this tick's responses for availability; only degradation is latched.
+    bool has_responses = (new_responses > 0);
 
     if (has_responses && all_degraded()) {
         state_ = State::DEGRADED;
     } else if (!has_responses) {
         state_ = State::OFFLINE;
-    } else if (has_responses && all_healthy()) {
+    } else if (state_ != State::DEGRADED || all_healthy()) {
         state_ = State::ONLINE;
     }
-    // Otherwise: keep current state (hysteresis)
+    // Otherwise: keep DEGRADED until four healthy ticks.
 
     return state_;
 }

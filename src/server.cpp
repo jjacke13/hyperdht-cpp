@@ -221,6 +221,13 @@ void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection)
         probe_listener_id_ = socket_.add_probe_listener(
             [this](const compact::Ipv4Address& from) {
                 if (closed_) return;
+                // Keep older enabled sessions' probe echo after an opt-out.
+                if (!holepunch_enabled_ &&
+                    std::none_of(connections_.begin(), connections_.end(),
+                        [](const auto& entry) {
+                            return entry.second && !entry.second->firewalled && entry.second->secure;
+                        }))
+                    return;
                 socket_.send_probe(from);
             });
     }
@@ -736,6 +743,9 @@ void Server::on_handshake_result(
 
     auto& conn = *result;
 
+    // JS _neverPunch leaves hs.payload null; also blocks later main-socket rounds.
+    if (!holepunch_enabled_) conn.secure.reset();
+
     // server-1 — JS: server.js:258-261 + router.js:99. A firewall-rejected
     // handshake sends NOTHING (a Noise error reply would leak that a
     // server lives at this key); queued duplicates get the same silence.
@@ -773,7 +783,7 @@ void Server::on_handshake_result(
     // an OPEN client and a server that already knows its public address all
     // return before :436. `has_error` matches server.js:384-388, which
     // destroys the stream and clears before the puncher exists.
-    if (relayed && !has_remote_addr && !client_open && !conn.has_error) {
+    if (relayed && !has_remote_addr && !client_open && !conn.has_error && conn.secure) {
         auto pool = std::make_shared<holepunch::PoolSocket>(
             socket_.loop(), socket_.udx_handle(), &socket_);
         if (pool->bind() == 0) {

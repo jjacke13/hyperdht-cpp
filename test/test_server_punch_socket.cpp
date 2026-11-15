@@ -278,6 +278,13 @@ class ServerPunchSocket : public ::testing::Test {
 
     void pump_ms(uint64_t ms) { run_loop_until([] { return false; }, ms); }
 
+    template <typename S = Server>
+    void set_punching(bool enabled) {
+        // Parent regression: a missing opt-out leaves the normal punch path on.
+        if constexpr (requires(S& s) { s.set_holepunch_enabled(enabled); })
+            static_cast<S*>(srv_.get())->set_holepunch_enabled(enabled);
+    }
+
     // The client's UDX SYN, aimed at the session's punch socket. udx looks a
     // stream up by local_id in the udx_t-GLOBAL cirbuf (udx.c:1474,1908), so
     // the packet finds the server's pre-created rawStream even though that
@@ -526,6 +533,84 @@ TEST_F(ServerPunchSocket, DirectHandshakeCreatesNoPunchSocket) {
     ASSERT_NE(c, nullptr);
     EXPECT_FALSE(c->punch_socket);
     EXPECT_TRUE(c->parked_rounds.empty());
+}
+
+TEST_F(ServerPunchSocket, NeverPunchRepliesOnMainSocketWithoutSampling) {
+    set_punching(false);
+    do_handshake(/*relayed=*/true);
+    ASSERT_NE(conn(), nullptr);
+    EXPECT_FALSE(conn()->secure);
+    EXPECT_FALSE(conn()->punch_socket);
+    EXPECT_NE(conn()->raw_stream, nullptr);
+    ASSERT_TRUE(run_loop_until([&] { return !relay().handshakes.empty(); }));
+    EXPECT_EQ(relay().handshakes[0].second, main_port());
+    client_node().send({0}, Ipv4Address::from_string("127.0.0.1", main_port()));
+    pump_ms(50);
+    EXPECT_EQ(client_node().probes, 0);
+    for (const auto& node : nodes_) EXPECT_TRUE(node->queued_pings.empty());
+}
+
+TEST_F(ServerPunchSocket, OptOutPreservesExistingEnabledSessionProbeEcho) {
+    do_handshake(/*relayed=*/false);
+    ASSERT_NE(conn(), nullptr);
+    set_punching(false);
+    client_node().send({0}, Ipv4Address::from_string("127.0.0.1", main_port()));
+    ASSERT_TRUE(run_loop_until([&] { return client_node().probes > 0; }));
+    EXPECT_EQ(client_node().first_probe_src, main_port());
+}
+
+TEST_F(ServerPunchSocket, NeverPunchRejectedHandshakeDoesNotEnableProbeEcho) {
+    set_punching(false);
+    srv_->set_firewall([](const auto&, const auto&, const auto&) { return true; });
+    do_handshake(/*relayed=*/true);
+    client_node().send({0}, Ipv4Address::from_string("127.0.0.1", main_port()));
+    pump_ms(75);
+    EXPECT_TRUE(relay().handshakes.empty());
+    EXPECT_EQ(client_node().probes, 0);
+}
+
+TEST_F(ServerPunchSocket, ExistingRejectedSessionDoesNotKeepEchoAfterOptOut) {
+    srv_->set_firewall([](const auto&, const auto&, const auto&) { return true; });
+    do_handshake(/*relayed=*/true);
+    set_punching(false);
+    client_node().send({0}, Ipv4Address::from_string("127.0.0.1", main_port()));
+    pump_ms(75);
+    EXPECT_EQ(client_node().probes, 0);
+}
+
+TEST_F(ServerPunchSocket, NeverPunchDropsRoundsAndLaterEnableOnlyAffectsNewSessions) {
+    set_punching(false);
+    do_handshake(/*relayed=*/true);
+    ASSERT_NE(conn(), nullptr);
+    const auto old_id = hp_id_;
+    const auto samples = socket_->nat_sampler().sampled();
+    set_punching(true);
+    relay().send(wrap_round(encode_round(1, true, our_public_)),
+                 Ipv4Address::from_string("127.0.0.1", main_port()));
+    pump_ms(75);
+    ASSERT_NE(conn(), nullptr);
+    EXPECT_FALSE(conn()->punch_socket);
+    EXPECT_FALSE(conn()->puncher);
+    EXPECT_TRUE(conn()->parked_rounds.empty());
+    EXPECT_TRUE(relay().rounds.empty());
+    EXPECT_EQ(client_node().probes, 0);
+    EXPECT_EQ(socket_->nat_sampler().sampled(), samples);
+    do_handshake(/*relayed=*/true);
+    ASSERT_NE(conn(), nullptr);
+    EXPECT_NE(hp_id_, old_id);
+    EXPECT_TRUE(conn()->secure);
+    EXPECT_TRUE(conn()->punch_socket);
+}
+
+TEST_F(ServerPunchSocket, NeverPunchStillAcceptsDirectUdx) {
+    set_punching(false);
+    do_handshake(/*relayed=*/false);
+    ASSERT_NE(conn(), nullptr);
+    EXPECT_FALSE(conn()->punch_socket);
+    client_udx_connect_to(main_port());
+    ASSERT_TRUE(run_loop_until([&] { return emitted_; }));
+    EXPECT_EQ(emitted_socket_, socket_->active_socket());
+    EXPECT_NE(adopted_stream_, nullptr);
 }
 
 // A well-formed round whose payload does not decrypt changes NO session state

@@ -962,7 +962,8 @@ static void reject_relay_write(hyperdht::HyperDHT& dht, uint32_t id) {
     FAIL() << "relay control stream not found";
 }
 
-static void run_server_relay_emit(bool open_relay, bool fail_write = false) {
+static void run_server_relay_emit(bool open_relay, bool fail_write = false,
+                                  bool never_punch = false) {
     using namespace ru_relay_emit;
     using hyperdht::server::ConnectionInfo;
 
@@ -990,6 +991,12 @@ static void run_server_relay_emit(bool open_relay, bool fail_write = false) {
 
     auto* srv = dht.create_server();
     ASSERT_NE(srv, nullptr);
+    if (never_punch) {
+        []<typename S>(S& s) {
+            if constexpr (requires { s.set_holepunch_enabled(false); })
+                s.set_holepunch_enabled(false);
+        }(*srv);
+    }
     srv->handshake_clear_wait = 1500;   // the session must outlive the pairing
     srv->punch_clear_wait = 1500;       // and then be reaped inside the test
 
@@ -1070,8 +1077,13 @@ static void run_server_relay_emit(bool open_relay, bool fail_write = false) {
 
     auto* session = srv->session(hp_id);
     ASSERT_NE(session, nullptr);
-    ASSERT_TRUE(session->punch_socket)
-        << "a relayed handshake must acquire a punch socket";
+    if (never_punch) {
+        EXPECT_FALSE(session->punch_socket);
+        EXPECT_FALSE(session->secure);
+    } else {
+        ASSERT_TRUE(session->punch_socket)
+            << "a relayed handshake must acquire a punch socket";
+    }
     std::weak_ptr<hyperdht::holepunch::PoolSocket> weak = session->punch_socket;
 
     if (fail_write) {
@@ -1108,8 +1120,8 @@ static void run_server_relay_emit(bool open_relay, bool fail_write = false) {
     ru_choreo::pump_until(&loop, [&] { return srv->session(hp_id) == nullptr; },
                           8000);
     ASSERT_EQ(srv->session(hp_id), nullptr) << "session outlived the backstop";
-    EXPECT_FALSE(weak.expired())
-        << "punch socket freed under the stream the upgrade may migrate";
+    EXPECT_EQ(weak.expired(), never_punch)
+        << "only punching sessions should retain a punch socket for upgrade";
 
     emitted_upgrade.reset();
     ru_choreo::pump_until(&loop, [] { return false; }, 100);
@@ -1134,6 +1146,10 @@ TEST(ServerRelayEmit, OpenRelayPairsAndKeepsSessionPunchSocket) {
 
 TEST(ServerRelayEmit, FailedControlWriteAbortsRelayWithoutClearingDirectAttempt) {
     run_server_relay_emit(true, true);
+}
+
+TEST(ServerRelayEmit, NeverPunchStillPairsAndEmits) {
+    run_server_relay_emit(true, false, true);
 }
 
 static void run_client_relay_emit(bool open_relay, bool fail_write = false) {

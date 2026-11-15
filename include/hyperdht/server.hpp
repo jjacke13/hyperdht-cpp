@@ -187,7 +187,11 @@ public:
         firewall_ = nullptr;
     }
 
-    // Holepunch veto callback (JS: opts.holepunch)
+    // JS opts.holepunch=false: opt out for subsequent handshakes only.
+    // Direct connections and blind relay remain available; enabled by default.
+    void set_holepunch_enabled(bool enabled) { holepunch_enabled_ = enabled; }
+
+    // Holepunch veto callback (JS: opts.holepunch when it is a function)
     // Called during holepunch negotiation. Return false to abort.
     // Args: remote_fw, local_fw, remote_addrs, local_addrs
     using HolepunchCb = std::function<bool(
@@ -310,6 +314,7 @@ private:
     FirewallCb firewall_;
     AsyncFirewallCb firewall_async_;
     HolepunchCb holepunch_cb_;
+    bool holepunch_enabled_ = true;
     OnListeningCb on_listening_cb_;
 
     // Deliver an established connection to the user's callback AND every

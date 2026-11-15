@@ -914,6 +914,12 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
 
 ## D. Missing JS parity features
 
+- [x] **Server holepunch opt-out** — native set_holepunch_enabled(false)
+  matches JS opts.holepunch=false (2026-11-15): new sessions allocate no
+  punch socket or sampler and ignore holepunch rounds and bare probes,
+  unless an older enabled session still needs probe echo, while direct UDX
+  and blind-relay pairing remain available. Default enabled; the existing
+  holepunch veto callback is unchanged. C/wrapper exposure is separate.
 - [x] **Arbitrary-target native unannounce** — target-aware
   lookup_and_unannounce_target and unannounce_target match JS topic semantics
   (2026-11-07). Legacy public-key methods retain hashing. C

@@ -57,7 +57,8 @@ static void add_sample(std::vector<Sample>& samples,
         // Bubble up: maintain descending sort by hits
         for (; i > 0; i--) {
             auto& prev = samples[i - 1];
-            if (prev.hits >= s.hits) break;
+            // JS nat.js:addSample follows the promoted sample; s stays in its old slot.
+            if (prev.hits >= samples[i].hits) break;
             std::swap(samples[i - 1], samples[i]);
         }
         return;

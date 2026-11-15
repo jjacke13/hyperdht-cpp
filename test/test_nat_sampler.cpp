@@ -158,6 +158,66 @@ TEST(NatSampler, MostHitAddressWins) {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-position sample promotion (JS nat.js:addSample)
+// ---------------------------------------------------------------------------
+
+class NatSamplePromotion : public ::testing::TestWithParam<std::pair<bool, bool>> {};
+
+TEST_P(NatSamplePromotion, WinnerMovesPastEveryLowerRank) {
+    const auto [same_host, frozen] = GetParam();
+    NatSampler s;
+    if (frozen) s.freeze();
+    const char* hosts[] = {"198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4"};
+    const int sequence[] = {0, 1, 2, 3, 3, 3};
+    for (int i = 0; i < 6; ++i) {
+        const int n = sequence[i];
+        ASSERT_TRUE(s.add(addr(hosts[same_host ? 0 : n], 5100 + n),
+                          addr("127.0.0.1", 4100 + i)));
+    }
+    EXPECT_EQ(s.host(), hosts[same_host ? 0 : 3]);
+    EXPECT_EQ(s.port(), 5103);
+    if (frozen) {
+        EXPECT_EQ(s.firewall(), peer_connect::FIREWALL_UNKNOWN);
+        EXPECT_TRUE(s.addresses().empty());
+        s.unfreeze();
+    }
+    EXPECT_EQ(s.firewall(), peer_connect::FIREWALL_CONSISTENT);
+    ASSERT_EQ(s.addresses().size(), 2u);
+    EXPECT_EQ(s.addresses()[0], addr(hosts[same_host ? 0 : 3], 5103));
+    EXPECT_EQ(s.addresses()[1], addr(hosts[0], 5100));
+}
+
+INSTANTIATE_TEST_SUITE_P(HostAndFreeze, NatSamplePromotion,
+    ::testing::Values(std::pair{false, false}, std::pair{false, true},
+                      std::pair{true, false}, std::pair{true, true}));
+
+TEST(NatSampler, PromotionFindsSecondDoubleHitBehindSingletons) {
+    NatSampler s;
+    const char* hosts[] = {"198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4"};
+    const int sequence[] = {0, 1, 2, 3, 0, 3};
+    for (int i = 0; i < 6; ++i) {
+        const int n = sequence[i];
+        ASSERT_TRUE(s.add(addr(hosts[n], 5100 + n), addr("127.0.0.1", 4100 + i)));
+    }
+    EXPECT_EQ(s.firewall(), peer_connect::FIREWALL_CONSISTENT);
+    ASSERT_EQ(s.addresses().size(), 2u);
+    EXPECT_EQ(s.addresses()[0], addr(hosts[0], 5100));
+    EXPECT_EQ(s.addresses()[1], addr(hosts[3], 5103));
+}
+
+TEST(NatSampler, EqualHitRanksKeepTheirOrder) {
+    NatSampler s;
+    s.add(addr("198.51.100.1", 5100), addr("127.0.0.1", 4100));
+    s.add(addr("198.51.100.1", 5100), addr("127.0.0.1", 4101));
+    s.add(addr("198.51.100.2", 5101), addr("127.0.0.1", 4102));
+    s.add(addr("198.51.100.2", 5101), addr("127.0.0.1", 4103));
+    EXPECT_EQ(s.firewall(), peer_connect::FIREWALL_CONSISTENT);
+    ASSERT_EQ(s.addresses().size(), 2u);
+    EXPECT_EQ(s.addresses()[0], addr("198.51.100.1", 5100));
+    EXPECT_EQ(s.addresses()[1], addr("198.51.100.2", 5101));
+}
+
+// ---------------------------------------------------------------------------
 // PING_NAT handler
 // ---------------------------------------------------------------------------
 

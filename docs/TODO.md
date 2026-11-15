@@ -914,6 +914,10 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
 
 ## D. Missing JS parity features
 
+- [x] **NAT sample ranking** — keep following the promoted sample across
+  multiple swaps, matching JS nat.js:addSample (2026-11-15). This fixes
+  winner ordering and classification when a late sample overtakes several
+  entries. Equal-hit ordering, freeze and source deduplication stay unchanged.
 - [x] **Server holepunch opt-out** — native set_holepunch_enabled(false)
   matches JS opts.holepunch=false (2026-11-15): new sessions allocate no
   punch socket or sampler and ignore holepunch rounds and bare probes,

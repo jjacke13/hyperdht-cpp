@@ -812,6 +812,34 @@ class HyperDHT:
         if rc != 0:
             raise RuntimeError(f"unannounce failed: {rc}")
 
+    def unannounce_target(
+        self,
+        target: bytes,
+        keypair: KeyPair,
+        on_done: Callable | None = None,
+    ) -> None:
+        """Withdraw from an exact topic (JS `unannounce(target, keyPair)`).
+
+        Unlike `unannounce(public_key, ...)`, this does not hash the target.
+        `on_done(error)` runs after lookup and signed withdrawals settle.
+        """
+        if len(target) != 32:
+            raise ValueError("target must be 32 bytes")
+        t = (ctypes.c_uint8 * 32)(*target)
+        c_kp = keypair._to_c()
+
+        @DONE_CB
+        def cb(error, ud):
+            if on_done:
+                on_done(error)
+
+        self._callbacks.append(cb)
+        rc = _lib.hyperdht_unannounce_target(
+            self._handle, t, ctypes.byref(c_kp), cb, None)
+        _lib.hyperdht_keypair_zero(ctypes.byref(c_kp))
+        if rc != 0:
+            raise RuntimeError(f"unannounce_target failed: {rc}")
+
     # -- Storage --
 
     def immutable_put(

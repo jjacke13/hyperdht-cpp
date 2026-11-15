@@ -375,6 +375,11 @@ lib.hyperdht_unannounce.argtypes = [
     ctypes.POINTER(Keypair), DONE_CB, ctypes.c_void_p]
 lib.hyperdht_unannounce.restype = ctypes.c_int
 
+lib.hyperdht_unannounce_target.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),
+    ctypes.POINTER(Keypair), DONE_CB, ctypes.c_void_p]
+lib.hyperdht_unannounce_target.restype = ctypes.c_int
+
 lib.hyperdht_find_peer_ex.argtypes = [
     ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),
     PEER_CB, DONE_CB, ctypes.c_void_p]

@@ -54,11 +54,29 @@
           pkgs = pkgsFor system;
           hyperdhtLib = import ./nix/lib.nix { inherit pkgs libudx; src = self; };
           shared = hyperdhtLib.mkHyperdht { shared = true; };
+          # Keep build tools native; only target libraries use static musl.
+          armv7Base = import nixpkgs {
+            localSystem = system;
+            crossSystem = {
+              config = "armv7l-unknown-linux-musleabihf";
+              isStatic = true;
+            };
+          };
+          armv7Pkgs = armv7Base // pinnedDepsFor armv7Base;
+          armv7Lib = (import ./nix/lib.nix {
+            pkgs = armv7Pkgs; inherit libudx; src = self;
+          }).mkHyperdht {};
         in
         {
           default = hyperdhtLib.mkHyperdht {};
           static  = hyperdhtLib.mkHyperdht {};
           inherit shared;
+
+          static-armv7l = armv7Lib;
+          echo-server-armv7l = import ./nix/echo-server.nix {
+            pkgs = armv7Pkgs;
+            staticLib = armv7Lib;
+          };
 
           echo-server = import ./nix/echo-server.nix {
             inherit pkgs;

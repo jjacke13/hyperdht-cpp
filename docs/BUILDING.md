@@ -42,6 +42,27 @@ ninja
 ctest -L unit --output-on-failure
 ```
 
+### ARMv7 Linux cross-packages
+
+From an x86_64 or aarch64 Linux build host:
+
+```bash
+nix build .#static-armv7l          # libhyperdht.a, libudx.a and headers
+nix build .#echo-server-armv7l     # fully static echo-server and echo-client
+```
+
+These target little-endian ARMv7-A with the hard-float ABI and VFPv3-D16
+(`armv7l-unknown-linux-musleabihf`), without requiring NEON. They do not
+support ARMv6 (including the original Raspberry Pi Zero) or soft-float CPUs.
+The echo executables include musl and their dependencies, so the target does
+not need Nix or matching glibc/shared libraries. No target compiler is needed.
+
+The library output uses the existing `nix/lib.nix` builder and the same locked
+libudx, libuv 1.51.0 and libsodium 1.0.22 sources as the native packages.
+Future cross-built consumers can use
+`hyperdht.packages.${buildSystem}.static-armv7l` with a matching ARMv7 musl
+package set; the archives alone are not standalone executables.
+
 ### Docker (no local deps needed)
 
 ```bash

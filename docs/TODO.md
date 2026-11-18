@@ -110,6 +110,11 @@ Last updated: 2026-11-11 (bootstrap sample bounds).
   refresh satisfies the pending update, and stop cancels it. Reply and timeout
   settlement share this path. Explicit refresh/online/drift policy, intervals
   and watchdog are unchanged. Exact 100-round plus RTT cadence remains separate.
+- **2026-11-18 announcer ordinary refresh:** refresh requests received during
+  a relay-ping round now wait for all replies/timeouts, matching JS's awaited
+  pings. Repeated and periodic requests coalesce, and stop cancels the request.
+  Refresh during an update remains absorbed by that cycle; idle refresh,
+  deliberate immediate drift recovery, online handling and watchdog are unchanged.
 - **2026-11-06 announcer periodic deadline:** the existing five-minute
   reannounce timer restarts when a complete update settles, including retired
   withdrawals, instead of keeping its startup deadline after a manual refresh.
@@ -742,11 +747,12 @@ dhttop-6, dhttop-8. Headline 86/91 unaffected (already excluded them).
 - [x] **Keepalive/update ordering** — new ping rounds wait for cycle
   settlement, matching JS's awaited update; watchdog ticks remain active
   (2026-11-06). Periodic updates also wait for in-flight ping settlement;
-  explicit refresh policy is unchanged. Successful-cycle wake timing and
+  ordinary refreshes share that wait (2026-11-18). Successful-cycle wake timing and
   remaining exact background-loop cadence are covered above.
-- [ ] **`refresh()` has no `_refreshing` latch** (announcer.cpp vs
-  announcer.js:76-79) — a health/drift refresh landing mid-cycle is dropped,
-  costing <=5s until the next ping tick. Low.
+- [x] **Refresh during keepalive** — coalesced until round settlement
+  (2026-11-18). This does not add a mid-update latch: JS clears `_refreshing`
+  after its update before starting the next background round. Deliberate
+  immediate drift recovery remains separate.
 
 ### nat-sampler / punch payload (from the 2026-07-22 field diagnosis; see
 ### docs/FIELD-DIAGNOSIS-2026-07-22.md "Finding B" + "Finding E")

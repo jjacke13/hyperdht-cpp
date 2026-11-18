@@ -67,6 +67,7 @@ struct FakeNode {
     int ping_count = 0;
     std::set<uint16_t> ping_tids;
     bool hold_ping = false;
+    std::optional<compact::Ipv4Address> ping_observed;
     std::vector<std::pair<messages::Response, compact::Ipv4Address>> held_pings;
 
     bool reply_error = false;   // fail FIND_PEER → node leaves the closest set
@@ -98,6 +99,7 @@ struct FakeNode {
         resp.id = id;
 
         if (req.internal && req.command == messages::CMD_PING) {
+            if (ping_observed) resp.from.addr = *ping_observed;
             ping_count++;
             ping_tids.insert(req.tid);
             if (hold_ping) {
@@ -215,6 +217,14 @@ struct Fixture {
                                     ann->cycle_gen_for_test() >= gen;
                          },
                          max_ms);
+    }
+
+    bool start_and_wait_for_pings() {
+        ann->start();
+        return settled_at(1) && run_until(&loop, [this] {
+            for (const auto& node : nodes) if (node->ping_count == 0) return false;
+            return client->inflight_count() == 0;
+        }, 500);
     }
 
     // Addresses currently advertised on the wire.
@@ -639,16 +649,95 @@ INSTANTIATE_TEST_SUITE_P(ReplyAndTimeout, AnnouncerPeriodicWait, ::testing::Bool
 
 TEST(AnnouncerRelays, ExplicitRefreshSatisfiesPendingPeriodicUpdate) {
     Fixture f(1);
-    f.ann->start();
-    ASSERT_TRUE(f.settled_at(1));
+    ASSERT_TRUE(f.start_and_wait_for_pings());
     f.nodes[0]->hold_ping = true;
     f.ann->ping_relays_for_test();
     ASSERT_TRUE(run_until(&f.loop, [&] { return !f.nodes[0]->held_pings.empty(); }, 500));
     const auto gen = f.ann->cycle_gen_for_test();
     f.ann->tick_reannounce_timer_for_test();
     f.ann->refresh();
-    ASSERT_TRUE(f.settled_at(gen + 1));
+    run_until(&f.loop, [] { return false; }, 50);
+    EXPECT_EQ(f.ann->cycle_gen_for_test(), gen);
     f.nodes[0]->release_pings();
+    ASSERT_TRUE(f.settled_at(gen + 1));
+    ASSERT_TRUE(run_until(&f.loop, [&] { return f.client->inflight_count() == 0; }, 500));
+    run_until(&f.loop, [] { return false; }, 50);
+    EXPECT_EQ(f.ann->cycle_gen_for_test(), gen + 1);
+}
+
+class AnnouncerRefreshWait : public ::testing::TestWithParam<bool> {};
+
+TEST_P(AnnouncerRefreshWait, RefreshWaitsForRoundSettlement) {
+    Fixture f(3);
+    ASSERT_TRUE(f.start_and_wait_for_pings());
+    f.nodes[0]->hold_ping = true;
+    f.ann->ping_relays_for_test();
+    ASSERT_TRUE(run_until(&f.loop, [&] { return !f.nodes[0]->held_pings.empty(); }, 500));
+    const auto gen = f.ann->cycle_gen_for_test();
+    std::vector<int> before;
+    for (const auto& node : f.nodes) before.push_back(node->find_peer_count);
+    f.ann->refresh();
+    f.ann->refresh();  // Coalesce repeated requests.
+    run_until(&f.loop, [] { return false; }, 50);
+    EXPECT_FALSE(f.ann->is_updating_for_test());
+    EXPECT_EQ(f.ann->cycle_gen_for_test(), gen);
+    for (size_t i = 0; i < f.nodes.size(); ++i)
+        EXPECT_EQ(f.nodes[i]->find_peer_count, before[i]);
+    if (!GetParam()) f.nodes[0]->release_pings();
+    ASSERT_TRUE(f.settled_at(gen + 1, 6000));
+    f.nodes[0]->release_pings();  // Late timeout reply must not start another cycle.
+    ASSERT_TRUE(run_until(&f.loop, [&] { return f.client->inflight_count() == 0; }, 500));
+    run_until(&f.loop, [] { return false; }, 50);
+    EXPECT_EQ(f.ann->cycle_gen_for_test(), gen + 1);
+    for (size_t i = 0; i < f.nodes.size(); ++i)
+        EXPECT_EQ(f.nodes[i]->find_peer_count, before[i] + 1);
+}
+
+INSTANTIATE_TEST_SUITE_P(ReplyAndTimeout, AnnouncerRefreshWait, ::testing::Bool());
+
+TEST(AnnouncerRelays, StopCancelsPendingExplicitRefresh) {
+    Fixture f(1);
+    ASSERT_TRUE(f.start_and_wait_for_pings());
+    f.nodes[0]->hold_ping = true;
+    f.ann->ping_relays_for_test();
+    ASSERT_TRUE(run_until(&f.loop, [&] { return !f.nodes[0]->held_pings.empty(); }, 500));
+    const auto gen = f.ann->cycle_gen_for_test();
+    f.ann->refresh();
+    EXPECT_EQ(f.ann->cycle_gen_for_test(), gen);
+    f.ann->stop_without_unannounce();
+    const auto stopped_gen = f.ann->cycle_gen_for_test();
+    f.nodes[0]->release_pings();
+    run_until(&f.loop, [] { return false; }, 50);
+    EXPECT_EQ(f.ann->cycle_gen_for_test(), stopped_gen);
+    EXPECT_EQ(f.ann->reannounce_deadline_for_test(), 0u);
+}
+
+TEST(AnnouncerRelays, RefreshDuringUpdateDoesNotQueueAnotherCycle) {
+    Fixture f(1);
+    f.nodes[0]->hold_command = messages::CMD_ANNOUNCE;
+    f.ann->start();
+    ASSERT_TRUE(run_until(&f.loop, [&] { return !f.nodes[0]->held_responses.empty(); }, 500));
+    const auto gen = f.ann->cycle_gen_for_test();
+    f.ann->refresh();
+    f.ann->refresh();
+    f.nodes[0]->release_responses();
+    ASSERT_TRUE(f.settled_at(gen));
+    run_until(&f.loop, [] { return false; }, 50);
+    EXPECT_EQ(f.ann->cycle_gen_for_test(), gen);
+}
+
+TEST(AnnouncerRelays, DriftRecoveryStillBypassesHeldRound) {
+    Fixture f(3);
+    ASSERT_TRUE(f.start_and_wait_for_pings());
+    f.nodes[0]->hold_ping = true;
+    f.nodes[1]->ping_observed = compact::Ipv4Address::from_string("198.51.100.9", 9999);
+    const auto gen = f.ann->cycle_gen_for_test();
+    f.ann->ping_relays_for_test();
+    f.ann->refresh();
+    ASSERT_TRUE(f.settled_at(gen + 1));
+    ASSERT_FALSE(f.nodes[0]->held_pings.empty());
+    f.nodes[0]->release_pings();
+    f.nodes[1]->ping_observed.reset();
     ASSERT_TRUE(run_until(&f.loop, [&] { return f.client->inflight_count() == 0; }, 500));
     run_until(&f.loop, [] { return false; }, 50);
     EXPECT_EQ(f.ann->cycle_gen_for_test(), gen + 1);

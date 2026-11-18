@@ -85,6 +85,7 @@ public:
     // left to expire on their own. Use for crash/exit paths.
     void stop_without_unannounce();
 
+    // Ordinary refreshes coalesce behind a live ping round, not an update cycle.
     void refresh();
 
     // JS: `this.online.notify()` — wakes the _background loop from an
@@ -217,7 +218,7 @@ private:
     bool running_ = false;
     bool updating_ = false;
     bool pinging_ = false;
-    bool periodic_update_pending_ = false;
+    bool periodic_update_pending_ = false;  // Also coalesces ordinary refresh requests.
 
     // ---- Publish-after-settle cycle state ----
     // One "cycle" = one find_peer walk + its ANNOUNCE commits. relays_ is

@@ -205,7 +205,12 @@ void Announcer::stop_impl(bool send_unannounce) {
 }
 
 void Announcer::refresh() {
-    if (!running_) return;
+    if (!running_ || updating_) return;
+    // JS refresh marks the next update, after the awaited keepalive round.
+    if (pinging_) {
+        periodic_update_pending_ = true;
+        return;
+    }
     update();
 }
 
@@ -320,7 +325,7 @@ void Announcer::on_ping_timer(uv_timer_t* timer) {
 // observes it RIGHT NOW) is compared against the peer_addr captured from
 // that relay's ANNOUNCE response. A mismatch proves the relay's stored
 // forward state (`relay: req.from` at announce time, persistent.js:131-138)
-// is stale — our NAT mapping drifted — so we refresh() immediately instead
+// is stale — our NAT mapping drifted — so we update() immediately instead
 // of waiting out the 5-min reannounce. JS discards the pong body and only
 // counts responders (announcer.js:114-121). Rate-limited to one refresh
 // per DRIFT_REFRESH_MIN_MS so an oscillating observation can't storm.
@@ -331,8 +336,8 @@ void Announcer::ping_relays() {
     if (active_relays_.empty() || pinging_ || updating_) return;
     pinging_ = true;
 
-    // Iterate a snapshot, not the live vector. The health branch below calls
-    // refresh() → update() → dht_ops::find_peer, which starts the query
+    // Iterate a snapshot, not the live vector. The drift branch below calls
+    // update() → dht_ops::find_peer, which starts the query
     // synchronously; a walk that completes without anything in flight fires
     // on_done in that same frame, reaching maybe_publish() — which now
     // move-assigns active_relays_ out from under this loop.
@@ -391,7 +396,7 @@ void Announcer::ping_relays() {
                                 announced_peer_addr.host_string().c_str(),
                                 announced_peer_addr.port,
                                 observed.host_string().c_str(), observed.port);
-                        refresh();
+                        update();  // Preserve deliberate immediate drift recovery.
                     } else {
                         DHT_LOG("  [announcer] relay %s:%u drift detected but "
                                 "rate-limited (last refresh %llums ago)\n",

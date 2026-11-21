@@ -73,6 +73,33 @@ protected:
 
 // --- wakeup detection ------------------------------------------------------
 
+TEST_F(TickTest, WakeupReportsHealthRecoveryBeforeWakeup) {
+    auto& health = const_cast<health::HealthMonitor&>(rpc_->health());
+    for (const auto initial : {health::State::ONLINE, health::State::OFFLINE,
+                               health::State::DEGRADED}) {
+        health.reset();
+        if (initial != health::State::ONLINE) {
+            for (int i = 0; i < 7; ++i)
+                health.update(initial == health::State::OFFLINE ? 0 : 1, 10);
+        }
+        ASSERT_EQ(health.state(), initial);
+        std::vector<int> events;
+        rpc_->on_health_change([&]() {
+            EXPECT_EQ(health.state(), health::State::ONLINE);
+            events.push_back(1);
+        });
+        rpc_->on_wakeup([&]() { events.push_back(2); });
+        uv_update_time(&loop_);
+        rpc_->set_last_tick_ms(uv_now(&loop_) - SLEEPING_INTERVAL_MS - 1000);
+        rpc_->background_tick();
+        EXPECT_EQ(events, initial == health::State::ONLINE
+            ? std::vector<int>({2}) : std::vector<int>({1, 2}));
+        EXPECT_EQ(health.state(), health::State::ONLINE);
+    }
+    rpc_->on_health_change({});
+    rpc_->on_wakeup({});
+}
+
 TEST_F(TickTest, NormalTickNoWakeup) {
     uv_update_time(&loop_);
     rpc_->set_last_tick_ms(uv_now(&loop_));  // fresh — no gap

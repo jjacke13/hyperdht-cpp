@@ -11,6 +11,10 @@ Last updated: 2026-11-11 (bootstrap sample bounds).
 
 ## Status snapshot
 
+- **2026-11-21 wakeup health recovery:** resetting offline/degraded health on
+  wakeup now emits the health-change notification before the wakeup callback,
+  matching JS health.reset(). Already-online resets remain silent.
+
 - **2026-11-11 bootstrap sample bounds:** no-ID replies contribute at most one
   observation per endpoint and at most max(1, configured bootstrap count)
   observations in total, matching JS. A verified firewall probe resets the

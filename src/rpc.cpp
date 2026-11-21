@@ -1219,7 +1219,12 @@ void RpcSocket::do_wakeup() {
     stable_ticks_ = STABLE_TICKS_MORE;
     refresh_ticks_ = 1;               // refresh next tick, network needs a beat
     last_nat_host_.clear();           // force the NAT recheck to actually run
+    const auto previous_health = health_.state();
     health_.reset();
+    // JS health.reset() reports recovery before the wakeup event.
+    if (previous_health != health::State::ONLINE && on_health_change_) {
+        on_health_change_();
+    }
 
     // JS index.js:560-570 — only an adaptive node reverts to ephemeral on
     // wakeup (so it re-derives NAT/firewall state). A forced-persistent node

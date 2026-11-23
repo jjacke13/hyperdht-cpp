@@ -50,6 +50,7 @@ SocketRef::~SocketRef() {
 
 void SocketRef::active() {
     refs_++;
+    was_busy_ = true;  // The stream's socket pin stands in for JS's busy event.
     unlinger();
 }
 
@@ -88,7 +89,7 @@ void SocketRef::close_maybe() {
 void SocketRef::do_close() {
     unlinger();
 
-    if (reusable && was_busy_) {
+    if (reusable && was_busy_ && socket_.streams == nullptr) {
         was_busy_ = false;
         pool_.lingering_.insert(this);
         linger_timer_ = new uv_timer_t;
@@ -199,8 +200,20 @@ void SocketPool::destroy() {
         refs.push_back(ref);
     }
     for (auto* ref : refs) {
+        const bool lingering = ref->linger_timer_ != nullptr;
         ref->unlinger();
         if (ref->closed_) continue;
+        if (lingering && ref->socket_.streams == nullptr) {
+            // Linger owns the only remaining lifetime. Free the ref from the
+            // close callback without calling back into the destroyed pool.
+            gc_routes_for_socket(&ref->socket_);
+            ref->socket_.on_close = [](udx_socket_t* socket) {
+                delete static_cast<SocketRef*>(socket->data);
+            };
+            udx::close_socket_unless_busy(&ref->socket_);
+            ref->closed_ = true;
+            continue;
+        }
         ref->socket_.data = nullptr;  // H9: prevent on_socket_close UAF
         // A ref that survives us must never take do_close's linger branch:
         // that touches pool_.lingering_, and we are the pool.

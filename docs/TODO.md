@@ -1607,21 +1607,12 @@ has still never carried a packet against a real peer.**
 
 ### J.3 Found while closing Task 6 (not blockers)
 
-- [ ] **`SocketRef::was_busy_` is dead — the linger path is unreachable, so
-      `reusableSocket`/retryRoute does not work.** `git grep was_busy_` gives three
-      hits: the `= false` initialiser, the read in `if (reusable && was_busy_)`
-      (`src/socket_pool.cpp:90`), and the `= false` inside that branch. Never set
-      true ⇒ `LINGER_TIME_MS`, `lingering_`, `linger_timer_`, `on_linger_timeout`,
-      `on_linger_close` and the body of `unlinger()` are all dead code. JS lingers a
-      reusable socket 3 s past its last ref precisely so the route survives a
-      follow-up connect; we close immediately and `SocketPool::remove` →
-      `gc_routes_for_socket` drops the route with it. A real JS-parity gap, separate
-      from this branch.
-- [ ] `SocketRef::close_maybe` also lacks JS `_closeMaybe`'s `socket.idle` gate
-      (`socket-pool.js:159`) — JS never ATTEMPTS a close while a stream is attached.
-      Worth doing WITH the item above, not before it: without the linger retry there
-      is no hook to close on later, so gating alone just converts a counted refusal
-      into a silent never-close.
+- [x] A reusable `SocketRef` now lingers for three seconds after its last pin
+      is released, provided no stream remains attached. An active pin cancels
+      the timer and shutdown drains the lingering sockets.
+- [ ] JS `retryRoute` sends through the cached pool socket. C++ retries the
+      cached address through the existing RPC path. Full socket reuse and
+      libudx socket-level busy/idle events remain separate.
 - [ ] `PoolSocket::reply()` (`src/holepunch.cpp`) has no production caller — only
       `test/test_pool_socket_requests.cpp`. The round reply goes out through
       `socket_.udp_send(..., via)` instead. Either wire it or delete it.

@@ -415,6 +415,46 @@ TEST_F(SocketPoolTest, AddRouteSetsReusable) {
     run_loop();
 }
 
+TEST_F(SocketPoolTest, ReusableRouteSurvivesReleaseUntilLingerExpires) {
+    SocketPool pool(&loop_, &udx_);
+    auto* ref = pool.acquire();
+    ASSERT_NE(ref, nullptr);
+    const std::array<uint8_t, 32> peer{};
+    pool.add_route(peer, ref->socket(), ref->address());
+    ref->active();
+    ref->release();
+    ref->inactive();
+
+    EXPECT_FALSE(ref->is_closed());
+    EXPECT_NE(pool.get_route(peer), nullptr);
+    // A new pin keeps the same socket available through the next release.
+    if (!ref->is_closed()) {
+        ref->active();
+        ref->inactive();
+        EXPECT_FALSE(ref->is_closed());
+    }
+    run_loop();
+    EXPECT_EQ(pool.get_route(peer), nullptr);
+    EXPECT_EQ(pool.size(), 0u);
+}
+
+TEST_F(SocketPoolTest, DestroyCancelsReusableSocketLinger) {
+    SocketPool pool(&loop_, &udx_);
+    auto* ref = pool.acquire();
+    ASSERT_NE(ref, nullptr);
+    const std::array<uint8_t, 32> peer{};
+    pool.add_route(peer, ref->socket(), ref->address());
+    ref->active();
+    ref->release();
+    ref->inactive();
+
+    EXPECT_FALSE(ref->is_closed());
+    pool.destroy();
+    EXPECT_EQ(pool.get_route(peer), nullptr);
+    run_loop();
+    EXPECT_EQ(pool.size(), 0u);
+}
+
 // ---------------------------------------------------------------------------
 // Destroy
 // ---------------------------------------------------------------------------

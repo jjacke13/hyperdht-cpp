@@ -467,7 +467,7 @@ void Announcer::update() {
     query_done_ = false;
 
     auto weak = std::weak_ptr<bool>(alive_);  // C7: sentinel
-    current_query_ = dht_ops::find_peer(socket_,
+    auto query = dht_ops::find_peer(socket_,
         keypair_.public_key,
         // JS commits AFTER the walk to pickBest(q.closestReplies), not per
         // reply during it (announcer.js:170). The walk still needs a reply
@@ -507,6 +507,11 @@ void Announcer::update() {
         // `nodes: this._closestNodes`). Seeds are consumed before
         // start(); the on_done above may safely rewrite the vector.
         &closest_nodes_);
+
+    // An empty walk can run on_done before find_peer returns.
+    if (auto a = weak.lock(); a && *a && gen == cycle_gen_ && !query->is_done()) {
+        current_query_ = std::move(query);
+    }
 }
 
 // One ANNOUNCE commit settled (response, timeout, or congestion drop).

@@ -144,6 +144,7 @@ public:
     // non-empty` stops discriminating after the first cycle publishes.
     uint64_t cycle_gen_for_test() const { return cycle_gen_; }
     bool is_updating_for_test() const { return updating_; }
+    bool has_active_query_for_test() const { return current_query_ != nullptr; }
 
     // Test-only: absolute periodic deadline, without waiting five minutes.
     uint64_t reannounce_deadline_for_test() const {

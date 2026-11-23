@@ -87,6 +87,25 @@ TEST(Announcer, StartStop) {
     uv_loop_close(&loop);
 }
 
+TEST(Announcer, InlineCompletionDoesNotRetainQuery) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    rpc::RpcSocket socket(&loop, {});
+    ASSERT_EQ(socket.bind(0), 0);
+    socket.set_filter_node([](const auto&, const auto&) { return false; });
+    Announcer ann(socket, noise::generate_keypair(noise::Seed{}), {});
+
+    ann.start();
+    EXPECT_TRUE(ann.is_running());
+    EXPECT_FALSE(ann.is_updating_for_test());
+    EXPECT_FALSE(ann.has_active_query_for_test());
+
+    ann.stop_without_unannounce();
+    socket.close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
 TEST(Announcer, DoubleStartNoop) {
     uv_loop_t loop;
     uv_loop_init(&loop);

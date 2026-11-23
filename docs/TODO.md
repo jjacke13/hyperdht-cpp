@@ -1164,14 +1164,9 @@ before any full "core frozen" sign-off:
 - [ ] holepuncher-4: fresh-socket reopen (currently same-socket resample — recovers
   lossy-UNKNOWN, not the new-NAT-mapping case). Blocked on the upgrade-port
   socket-handle invariant; revisit if a real CGNAT case needs it.
-- [ ] Announcer synchronous-cycle-completion parks a stale `current_query_`
-  (cpp-reviewer, Finding E batch): if a full-congestion walk completes
-  synchronously inside `dht_ops::find_peer()` before the
-  `current_query_ = find_peer(...)` assignment, on_done's reset() runs on the
-  old (null) value and the finished Query is parked until the next update().
-  Benign (destroy() idempotent, self-heals, no leak/UAF), pre-existing pattern
-  now reachable via a 2nd trigger. Real fix = defer Query's first dispatch via
-  uv_idle; not warranted yet.
+- [x] Announcer keeps only live queries in `current_query_`. A walk that
+  finishes inside `find_peer()` settles the cycle without retaining the
+  completed query or delaying its callbacks.
 - Documented deviations from the 2026-07-22 batch (deliberate, revisit only if
   live behavior warrants):
   - [ ] connect-7 veto abort is local-only; JS also sends an ERROR_ABORTED

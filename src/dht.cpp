@@ -361,21 +361,12 @@ void HyperDHT::cache_relay_addresses(
     const noise::PubKey& pk,
     const std::vector<compact::Ipv4Address>& relays) {
     if (relays.empty()) return;
-    auto key = pk_to_hex(pk);
-    relay_address_cache_[key] = relays;
-    // Simple eviction: if over limit, erase first entry (effectively random
-    // for unordered_map). JS uses xache LRU but 512 is large enough that
-    // eviction policy doesn't matter in practice.
-    if (relay_address_cache_.size() > kMaxRelayAddressCache) {
-        relay_address_cache_.erase(relay_address_cache_.begin());
-    }
+    relay_address_cache_.put(pk_to_hex(pk), relays, 0);
 }
 
 std::vector<compact::Ipv4Address> HyperDHT::get_cached_relay_addresses(
     const noise::PubKey& pk) const {
-    auto key = pk_to_hex(pk);
-    auto it = relay_address_cache_.find(key);
-    if (it != relay_address_cache_.end()) return it->second;
+    if (auto* relays = relay_address_cache_.get(pk_to_hex(pk))) return *relays;
     return {};
 }
 

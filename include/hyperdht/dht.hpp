@@ -37,6 +37,7 @@
 #include "hyperdht/connection_pool.hpp"
 #include "hyperdht/dht_ops.hpp"
 #include "hyperdht/holepunch.hpp"
+#include "hyperdht/lru_cache.hpp"
 #include "hyperdht/noise_wrap.hpp"
 #include "hyperdht/query.hpp"
 #include "hyperdht/router.hpp"
@@ -1122,10 +1123,11 @@ private:
 
     // §AUDIT-3: relay address cache (JS: _relayAddressesCache).
     // Maps remote public key (hex) → vector of relay addresses from last
-    // successful findPeer. Session-lifetime, no TTL (JS: maxAge=0).
+    // successful connect. Session-lifetime, no TTL (JS: maxAge=0).
+    // shortcut: bounded LRU approximates xache's generations; revisit if rotation timing matters.
     static constexpr size_t kMaxRelayAddressCache = 512;
-    std::unordered_map<std::string, std::vector<compact::Ipv4Address>>
-        relay_address_cache_;
+    mutable LruCache<std::string, std::vector<compact::Ipv4Address>>
+        relay_address_cache_{kMaxRelayAddressCache};
 
     void ensure_bound();
     void do_connect(const noise::PubKey& remote_pk,

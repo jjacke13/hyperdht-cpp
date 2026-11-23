@@ -955,8 +955,11 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
 - [x] **`_relayAddressesCache` — IMPLEMENTED** (`c196205`; source rechecked
   2026-10-13). `HyperDHT::cache_relay_addresses()` stores successful-connect
   relays by server pubkey; reconnect queries only cached relays first, then
-  falls back to ordinary discovery if needed (2026-11-05). The cache is capped at 512 entries with
-  unordered-map eviction, rather than JS xache LRU. See `src/dht.cpp` and
+  falls back to ordinary discovery if needed (2026-11-05). Read and refresh
+  now promote hints for bounded LRU eviction (2026-11-23), preserving the
+  native 512-entry cap and empty-list no-op. JS xache uses two generations
+  with approximate size eviction; exact rotation timing remains a divergence.
+  See `src/dht.cpp` and
   `src/connect.cpp`.
 - [x] **Read-side backpressure** — DONE 2026-07-28 (`a08cade`).
   `SecretStreamDuplex::pause_read/resume_read` wrap

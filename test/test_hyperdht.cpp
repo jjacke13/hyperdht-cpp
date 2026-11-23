@@ -2653,3 +2653,82 @@ TEST_P(BootstrapSampleBudget, CountsDistinctEndpointsUpToConfiguredLimit) {
 }
 
 INSTANTIATE_TEST_SUITE_P(SeedCounts, BootstrapSampleBudget, ::testing::Values(0, 1, 2));
+
+class RelayAddressCache : public ::testing::Test {
+protected:
+    uv_loop_t loop_{};
+    std::unique_ptr<HyperDHT> dht_;
+
+    void SetUp() override {
+        ASSERT_EQ(uv_loop_init(&loop_), 0);
+        dht_ = std::make_unique<HyperDHT>(&loop_);
+    }
+
+    void TearDown() override {
+        dht_->destroy();
+        uv_run(&loop_, UV_RUN_DEFAULT);
+        dht_.reset();
+        EXPECT_EQ(uv_loop_close(&loop_), 0);
+    }
+
+    static noise::PubKey key(unsigned n) {
+        noise::PubKey pk{};
+        pk[0] = n & 0xff;
+        pk[1] = (n >> 8) & 0xff;
+        return pk;
+    }
+
+    static std::vector<compact::Ipv4Address> hints(unsigned n) {
+        return {compact::Ipv4Address::from_string("192.0.2.1", 40000 + n)};
+    }
+
+    void fill(unsigned first, unsigned count) {
+        for (unsigned n = first; n < first + count; ++n)
+            dht_->cache_relay_addresses(key(n), hints(n));
+    }
+};
+
+TEST_F(RelayAddressCache, NewHintsSurviveFullCache) {
+    fill(0, 513);
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(512)), hints(512));
+    // Keep the native 512-entry bound; JS xache has two generations instead.
+    EXPECT_TRUE(dht_->get_cached_relay_addresses(key(0)).empty());
+}
+
+TEST_F(RelayAddressCache, ReadProtectsHintsFromEviction) {
+    fill(0, 512);
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(0)), hints(0));
+    fill(512, 511);
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(0)), hints(0));
+    EXPECT_TRUE(dht_->get_cached_relay_addresses(key(1)).empty());
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(1022)), hints(1022));
+}
+
+TEST_F(RelayAddressCache, RefreshReplacesAndProtectsOldHints) {
+    fill(0, 512);
+    dht_->cache_relay_addresses(key(0), hints(2000));
+    fill(512, 511);
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(0)), hints(2000));
+    EXPECT_TRUE(dht_->get_cached_relay_addresses(key(1)).empty());
+}
+
+TEST_F(RelayAddressCache, EmptyHintsAndMissingReadsDoNotEvict) {
+    fill(0, 511);
+    dht_->cache_relay_addresses(key(0), {});
+    EXPECT_TRUE(dht_->get_cached_relay_addresses(key(2000)).empty());
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(0)), hints(0));
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(1)), hints(1));
+    fill(511, 2);
+    EXPECT_TRUE(dht_->get_cached_relay_addresses(key(2)).empty());
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(0)), hints(0));
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(1)), hints(1));
+}
+
+TEST_F(RelayAddressCache, ReturnedHintsAreIndependentCopies) {
+    fill(0, 1);
+    auto result = dht_->get_cached_relay_addresses(key(0));
+    result.clear();
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(0)), hints(0));
+    dht_->cache_relay_addresses(key(0), hints(2000));
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(0)), hints(2000));
+}

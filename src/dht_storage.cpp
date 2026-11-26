@@ -233,8 +233,8 @@ void HyperDHT::ping(const compact::Ipv4Address& addr,
 std::shared_ptr<query::Query> HyperDHT::immutable_put(
     const std::vector<uint8_t>& value,
     ImmutablePutCallback on_done) {
-    // JS: empty values are rejected server-side. Reject at the class layer
-    // so callers get an immediate nullptr instead of a silent failed query.
+    // The native client API still rejects empty values until its read path
+    // and bindings can distinguish an empty result from a missing result.
     if (value.empty()) {
         DHT_LOG("  [dht] immutable_put: rejected (empty value)\n");
         return nullptr;

@@ -1058,8 +1058,7 @@ TEST(HyperDHT, ImmutablePutReturnsValidQuery) {
 }
 
 TEST(HyperDHT, ImmutablePutRejectsEmptyValue) {
-    // §5 fix M3: empty values return nullptr immediately, matching the
-    // server-side rejection in JS persistent.onimmutableput.
+    // The native client still rejects empty values before starting the query.
     uv_loop_t loop;
     uv_loop_init(&loop);
 

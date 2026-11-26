@@ -1318,6 +1318,55 @@ TEST(RpcHandlers, ImmutablePutGetRoundTrip) {
     EXPECT_EQ(*env2.ctx.response_value, stored_value);
 }
 
+TEST(RpcHandlers, EmptyImmutableValueRoundTripsOverUdp) {
+    ASSERT_GE(sodium_init(), 0);
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        RpcSocket server(&loop, {}), client(&loop, {});
+        server.bind(0);
+        client.bind(0);
+        make_persistent(server);
+        RpcHandlers handlers(server);
+        handlers.install();
+        LoopbackCtx ctx{&server, &client};
+        uv_timer_t timer;
+        uv_timer_init(&loop, &timer);
+        ctx.timer = &timer;
+        timer.data = &ctx;
+        uv_timer_start(&timer, [](uv_timer_t* t) {
+            loopback_cleanup(static_cast<LoopbackCtx*>(t->data));
+        }, 2500, 0);
+
+        std::array<uint8_t, 32> target{};
+        crypto_generichash(target.data(), target.size(), nullptr, 0, nullptr, 0);
+        Request req;
+        req.to.addr = Ipv4Address::from_string("127.0.0.1", server.port());
+        req.target = target;
+        req.command = CMD_IMMUTABLE_PUT;
+        req.token = server.token_store().create("127.0.0.1");
+        req.value = std::vector<uint8_t>{};
+        bool stored = false, recovered = false;
+        auto timeout = [&](uint16_t) { loopback_cleanup(&ctx); };
+        client.request(req, 1000, 0, [&](const Response& response) {
+            stored = !response.error.has_value();
+            Request get;
+            get.to.addr = req.to.addr;
+            get.target = target;
+            get.command = CMD_IMMUTABLE_GET;
+            client.request(get, 1000, 0, [&](const Response& reply) {
+                recovered = reply.value.has_value() && reply.value->empty();
+                loopback_cleanup(&ctx);
+            }, timeout);
+        }, timeout);
+        uv_run(&loop, UV_RUN_DEFAULT);
+        EXPECT_TRUE(stored);
+        EXPECT_TRUE(recovered);
+    }
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
 TEST(RpcHandlers, ImmutablePutWrongHashRejected) {
     TestEnv env;
     std::vector<uint8_t> value = {'t', 'e', 's', 't'};

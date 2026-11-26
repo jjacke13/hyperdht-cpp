@@ -1019,7 +1019,7 @@ void RpcHandlers::handle_mutable_get(const messages::Request& req) {
 void RpcHandlers::handle_immutable_put(const messages::Request& req) {
     if (!req.target.has_value()) return;
     if (!req.token.has_value()) return;
-    if (!req.value.has_value() || req.value->empty()) return;
+    if (!req.value.has_value()) return;
     constexpr size_t MAX_IMMUTABLE_VALUE = 32768;  // C15: cap value size
     if (req.value->size() > MAX_IMMUTABLE_VALUE) return;
 

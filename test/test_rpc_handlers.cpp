@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 
@@ -126,6 +127,78 @@ TEST(RpcHandlers, PingReply) {
     EXPECT_FALSE(ctx.has_token) << "PING reply must NOT include a token (JS parity)";
 
     uv_loop_close(&loop);
+}
+
+TEST(RpcHandlers, LookupShufflesOrdinaryRecordsAndAppendsForward) {
+    ASSERT_GE(sodium_init(), 0);
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        namespace announce = hyperdht::announce;
+        namespace wire = hyperdht::dht_messages;
+        RpcSocket server(&loop, {}), client(&loop, {});
+        server.bind(0);
+        client.bind(0);
+        make_persistent(server);
+        hyperdht::router::Router router;
+        RpcHandlers handlers(server, &router);
+        handlers.install();
+
+        announce::TargetKey target{};
+        target.fill(0x51);
+        std::vector<std::vector<uint8_t>> expected;
+        for (uint8_t i = 1; i <= 10; ++i) {
+            wire::PeerRecord peer;
+            peer.public_key.fill(i);
+            auto value = wire::encode_peer_record(peer);
+            expected.push_back(value);
+            announce::PeerAnnouncement record;
+            record.public_key = peer.public_key;
+            record.value = std::move(value);
+            handlers.store().put(target, record);
+        }
+        wire::PeerRecord forward;
+        forward.public_key.fill(11);
+        const auto forward_record = wire::encode_peer_record(forward);
+        hyperdht::router::ForwardEntry entry;
+        entry.record = forward_record;
+        router.set(target, std::move(entry));
+
+        uv_timer_t timer;
+        uv_timer_init(&loop, &timer);
+        LoopbackCtx ctx{&server, &client};
+        ctx.timer = &timer;
+        timer.data = &ctx;
+        uv_timer_start(&timer, [](uv_timer_t* t) {
+            loopback_cleanup(static_cast<LoopbackCtx*>(t->data));
+        }, 2000, 0);
+        Request req;
+        req.command = CMD_LOOKUP;
+        req.target = target;
+        req.to.addr = Ipv4Address::from_string("127.0.0.1", server.port());
+        unsigned replies = 0;
+        bool shuffled = false;
+        for (unsigned i = 0; i < 4; ++i) {
+            client.request(req, [&](const Response& response) {
+                wire::LookupRawReply reply;
+                if (response.value && wire::decode_lookup_reply(response.value->data(), response.value->size(), reply) &&
+                    reply.peers.size() == expected.size() + 1) {
+                    EXPECT_EQ(reply.peers.back(), forward_record);
+                    reply.peers.pop_back();
+                    EXPECT_TRUE(std::is_permutation(reply.peers.begin(), reply.peers.end(), expected.begin()));
+                    shuffled |= reply.peers != expected;
+                } else {
+                    ADD_FAILURE() << "Expected all ordinary peers and the forward record";
+                }
+                if (++replies == 4) loopback_cleanup(&ctx);
+            }, [&](uint16_t) { loopback_cleanup(&ctx); });
+        }
+        uv_run(&loop, UV_RUN_DEFAULT);
+        EXPECT_EQ(replies, 4u);
+        EXPECT_TRUE(shuffled);
+    }
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
 TEST(RpcHandlers, FindNodeReply) {

@@ -72,6 +72,9 @@ Last updated: 2026-11-11 (bootstrap sample bounds).
   key's record; relay-only forwards are removed only for its own hashed topic,
   matching JS. Other keys, unrelated forwards and local listeners survive.
   Completion still awaits withdrawals; C API, wrappers and layouts are unchanged.
+- **Ordinary LOOKUP sampling:** replies shuffle the ordinary records without
+  replacement and keep the forwarding record last, matching JS. Store capacity
+  and aging remain separate.
 - **2026-11-07 already-hashed findPeer target:** named C++
   HyperDHT::find_peer_target and dht_ops::find_peer_target use a supplied
   32-byte target directly, matching JS's hash:false. Existing find_peer

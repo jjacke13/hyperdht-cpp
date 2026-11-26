@@ -561,6 +561,10 @@ void RpcHandlers::handle_lookup(const messages::Request& req) {
     for (const auto& p : peers) {
         reply.peers.push_back(p.value);  // bare m.peer record
     }
+    // record-cache samples ordinary records without replacement.
+    for (size_t n = reply.peers.size(); n > 1; --n) {
+        std::swap(reply.peers[n - 1], reply.peers[randombytes_uniform(static_cast<uint32_t>(n))]);
+    }
 
     // JS persistent.js:34 — push the router's forward record (a self-announced
     // server for this target) when we have room under the 20 cap.

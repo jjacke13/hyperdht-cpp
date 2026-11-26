@@ -959,8 +959,9 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
   2026-10-13). `HyperDHT::cache_relay_addresses()` stores successful-connect
   relays by server pubkey; reconnect queries only cached relays first, then
   falls back to ordinary discovery if needed (2026-11-05). Read and refresh
-  now promote hints for bounded LRU eviction (2026-11-23), preserving the
-  native 512-entry cap and empty-list no-op. JS xache uses two generations
+  now promote hints for bounded LRU eviction (2026-11-23). The native cap
+  also respects positive `max_size` values below 512, matching the JS
+  option. Empty hints are still ignored. JS xache uses two generations
   with approximate size eviction; exact rotation timing remains a divergence.
   See `src/dht.cpp` and
   `src/connect.cpp`.

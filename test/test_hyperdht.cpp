@@ -2657,10 +2657,11 @@ class RelayAddressCache : public ::testing::Test {
 protected:
     uv_loop_t loop_{};
     std::unique_ptr<HyperDHT> dht_;
+    DhtOptions opts_{};
 
     void SetUp() override {
         ASSERT_EQ(uv_loop_init(&loop_), 0);
-        dht_ = std::make_unique<HyperDHT>(&loop_);
+        dht_ = std::make_unique<HyperDHT>(&loop_, opts_);
     }
 
     void TearDown() override {
@@ -2686,6 +2687,20 @@ protected:
             dht_->cache_relay_addresses(key(n), hints(n));
     }
 };
+
+class SmallRelayAddressCache : public RelayAddressCache {
+protected:
+    SmallRelayAddressCache() { opts_.max_size = 2; }
+};
+
+TEST_F(SmallRelayAddressCache, HonorsSmallerConfiguredLimit) {
+    fill(0, 2);
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(0)), hints(0));
+    fill(2, 1);
+    EXPECT_TRUE(dht_->get_cached_relay_addresses(key(1)).empty());
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(0)), hints(0));
+    EXPECT_EQ(dht_->get_cached_relay_addresses(key(2)), hints(2));
+}
 
 TEST_F(RelayAddressCache, NewHintsSurviveFullCache) {
     fill(0, 513);

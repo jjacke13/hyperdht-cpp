@@ -1127,7 +1127,7 @@ private:
     // shortcut: bounded LRU approximates xache's generations; revisit if rotation timing matters.
     static constexpr size_t kMaxRelayAddressCache = 512;
     mutable LruCache<std::string, std::vector<compact::Ipv4Address>>
-        relay_address_cache_{kMaxRelayAddressCache};
+        relay_address_cache_;
 
     void ensure_bound();
     void do_connect(const noise::PubKey& remote_pk,

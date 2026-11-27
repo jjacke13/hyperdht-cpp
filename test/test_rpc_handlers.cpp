@@ -497,6 +497,63 @@ static std::vector<uint8_t> build_signed_announce(
     return hyperdht::dht_messages::encode_announce_msg(ann);
 }
 
+TEST(RpcHandlers, LookupBumpsRespectConfiguredCacheLimit) {
+    namespace wire = hyperdht::dht_messages;
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    {
+        RpcSocket server(&loop, {}), client(&loop, {});
+        ASSERT_EQ(server.bind(0), 0);
+        ASSERT_EQ(client.bind(0), 0);
+        make_persistent(server);
+        StorageCacheConfig config;
+        config.max_size = 1;
+        RpcHandlers handlers(server, nullptr, config);
+        handlers.install();
+
+        const auto kp = hyperdht::noise::generate_keypair(hyperdht::noise::Seed{});
+        const auto address = Ipv4Address::from_string("127.0.0.1", server.port());
+        for (uint8_t i : {1, 2}) {
+            Request req;
+            req.command = CMD_ANNOUNCE;
+            req.target.emplace().fill(i);
+            req.from.addr = Ipv4Address::from_string("127.0.0.1", client.port());
+            req.token = server.token_store().create("127.0.0.1");
+            wire::AnnounceMessage ann;
+            ann.peer.emplace().public_key = kp.public_key;
+            ann.bump = i;
+            ann.signature = hyperdht::announce_sig::sign_announce(
+                *req.target, server.table().id(), req.token->data(), req.token->size(), ann, kp);
+            req.value = wire::encode_announce_msg(ann);
+            handlers.handle(req);
+        }
+
+        LoopbackCtx ctx{&server, &client};
+        unsigned replies = 0;
+        for (uint8_t i : {1, 2}) {
+            Request req;
+            req.command = CMD_LOOKUP;
+            req.target.emplace().fill(i);
+            req.to.addr = address;
+            client.request(req, 1000, 0, [&, i](const Response& response) {
+                wire::LookupRawReply reply;
+                if (response.value && wire::decode_lookup_reply(
+                        response.value->data(), response.value->size(), reply)) {
+                    EXPECT_EQ(reply.peers.size(), 1u);
+                    EXPECT_EQ(reply.bump, i == 1 ? 0u : 2u);
+                } else {
+                    ADD_FAILURE() << "Expected the announcement record for topic " << +i;
+                }
+                if (++replies == 2) loopback_cleanup(&ctx);
+            }, [&](uint16_t) { loopback_cleanup(&ctx); });
+        }
+        uv_run(&loop, UV_RUN_DEFAULT);
+        EXPECT_EQ(replies, 2u);
+    }
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
 class AnnouncementIdentity : public ::testing::Test {
 protected:
     uv_loop_t loop{};

@@ -11,6 +11,9 @@ Last updated: 2026-11-11 (bootstrap sample bounds).
 
 ## Status snapshot
 
+- **Announcement bump cache:** per-topic bumps use the configured cache
+  size and the existing announcement lifetime. Eviction uses native LRU.
+
 - **Zero cache age:** `DhtOptions::max_age_ms = 0` selects the 20-minute
   default for forwards and announcements, matching JS `defaultCacheOpts`.
   Native mutable and immutable storage uses its own `storage_ttl_ms` option.

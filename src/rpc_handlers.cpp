@@ -68,8 +68,9 @@ RpcHandlers::RpcHandlers(RpcSocket& socket, router::Router* router,
       // Guard against max_size=0 by using at least 1 entry per cache.
       mutables_(std::max<size_t>(1, cache_config.max_size / 2)),
       immutables_(std::max<size_t>(1, cache_config.max_size / 2)),
-      // JS index.js:608 — refreshes gets the FULL maxSize (not halved).
-      refreshes_(std::max<size_t>(1, cache_config.max_size)) {
+      // JS index.js:608,617 — refreshes and bumps each use the full maxSize.
+      refreshes_(std::max<size_t>(1, cache_config.max_size)),
+      bumps_(std::max<size_t>(1, cache_config.max_size)) {
     start_gc_timer();
 }
 
@@ -118,15 +119,7 @@ void RpcHandlers::on_gc_tick(uv_timer_t* timer) {
     // JS index.js:608 — refreshes maxAge = opts.maxAge, same as records.
     self->refreshes_.gc(now, self->ann_ttl_ms_);
 
-    // Expire stale bump entries, same TTL as the announce store (JS bumps
-    // Cache uses maxAge = opts.maxAge, same as the records cache).
-    for (auto it = self->bumps_.begin(); it != self->bumps_.end();) {
-        if (now - it->second.created_at > self->ann_ttl_ms_) {
-            it = self->bumps_.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    self->bumps_.gc(now, self->ann_ttl_ms_);
 }
 
 void RpcHandlers::install() {
@@ -705,7 +698,7 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
         const uint64_t now_wall = wall_clock_ms();
         if (ann.bump > current_bump &&
             ann.bump <= now_wall + MAX_BUMP_DRIFT_MS) {
-            bumps_[target] = {ann.bump, uv_now(socket_.loop())};
+            bumps_.put(target, ann.bump, uv_now(socket_.loop()));
         }
 
         // Store the bare record. `ann_ttl_ms_` is plumbed from

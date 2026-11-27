@@ -135,20 +135,14 @@ private:
 
     uv_timer_t* gc_timer_ = nullptr;
 
-    // Per-target relay-port "bump" values (JS persistent.js `this.bumps`,
-    // a maxAge Cache). Fed by handle_announce's gate, returned by
-    // handle_lookup. `created_at` is uv_now (monotonic) for GC only — the
-    // drift gate uses wall-clock, matching JS `Date.now()`.
-    struct BumpEntry {
-        uint64_t value = 0;
-        uint64_t created_at = 0;  // uv_now ms, for GC
-    };
-    std::unordered_map<announce::TargetKey, BumpEntry, announce::KeyHash> bumps_;
+    // Per-target relay-port bump values use the full cache budget and
+    // announcement TTL, like JS persistent.bumps.
+    LruCache<announce::TargetKey, uint64_t, announce::KeyHash> bumps_;
     static constexpr uint64_t MAX_BUMP_DRIFT_MS = 60000;  // JS persistent.js:14
 
-    uint64_t bump_for(const announce::TargetKey& target) const {
-        auto it = bumps_.find(target);
-        return it == bumps_.end() ? 0 : it->second.value;
+    uint64_t bump_for(const announce::TargetKey& target) {
+        const auto* bump = bumps_.get(target);
+        return bump ? *bump : 0;
     }
 
     // DELAYED_PING pending replies: one heap-allocated struct per scheduled reply.

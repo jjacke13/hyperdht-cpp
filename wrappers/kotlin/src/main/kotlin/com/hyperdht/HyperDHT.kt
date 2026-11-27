@@ -210,6 +210,37 @@ class HyperDHT(
 
     fun createServer(): Server = Server(Native.serverCreate(handle), handle, ::postToLoop)
 
+    // --- DHT queries ---
+
+    /** Find a peer by public key. Replies arrive on the DHT loop thread. */
+    suspend fun findPeer(publicKey: ByteArray, onReply: PeerCallback? = null) {
+        require(publicKey.size == 32) { "Public key must be 32 bytes" }
+        findPeerQuery(publicKey, onReply, exactTarget = false)
+    }
+
+    /** Find a peer by an already-computed target, equivalent to JS hash: false. */
+    suspend fun findPeerTarget(target: ByteArray, onReply: PeerCallback? = null) {
+        require(target.size == 32) { "Target must be 32 bytes" }
+        findPeerQuery(target, onReply, exactTarget = true)
+    }
+
+    private suspend fun findPeerQuery(key: ByteArray, onReply: PeerCallback?, exactTarget: Boolean) {
+        val operation = if (exactTarget) "findPeerTarget" else "findPeer"
+        val deferred = CompletableDeferred<Unit>()
+        val done = DoneCallback { error ->
+            if (error != 0) deferred.completeExceptionally(
+                DhtException(error, "$operation: ${Errors.describeQuery(error)} ($error)"))
+            else deferred.complete(Unit)
+        }
+        onLoop {
+            check(!destroyed) { "HyperDHT is closed" }
+            val rc = if (exactTarget) Native.findPeerTarget(handle, key, onReply, done)
+                else Native.findPeer(handle, key, onReply, done)
+            Errors.checkCall(rc, operation)
+        }
+        deferred.await()
+    }
+
     // --- Storage ---
 
     suspend fun immutablePut(value: ByteArray) {

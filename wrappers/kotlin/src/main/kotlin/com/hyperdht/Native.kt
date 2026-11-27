@@ -124,6 +124,10 @@ internal object Native {
         handle: Long, publicKey: ByteArray,
         onReply: PeerCallback?, onDone: DoneCallback?,
     ): Int
+    external fun findPeerTarget(
+        handle: Long, target: ByteArray,
+        onReply: PeerCallback?, onDone: DoneCallback?,
+    ): Int
     external fun lookup(
         handle: Long, target: ByteArray,
         onReply: PeerCallback?, onDone: DoneCallback?,

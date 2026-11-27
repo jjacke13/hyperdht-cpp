@@ -898,8 +898,10 @@ static void jni_done_cb(int error, void* ud) {
     auto* ctx = static_cast<DoneCtx*>(ud);
     JNIEnv* env = get_env();
     jclass cls = env->GetObjectClass(ctx->callback);
-    jmethodID mid = env->GetMethodID(cls, "onDone", "(I)V");
-    env->CallVoidMethod(ctx->callback, mid, (jint)error);
+    jmethodID mid = cls ? env->GetMethodID(cls, "onDone", "(I)V") : nullptr;
+    if (mid) env->CallVoidMethod(ctx->callback, mid, (jint)error);
+    check_exception(env);
+    env->DeleteLocalRef(cls);
     env->DeleteGlobalRef(ctx->callback);
     delete ctx;
 }
@@ -1040,29 +1042,77 @@ struct QueryCtx {
     jobject doneCb;
 };
 
+static bool has_byte_count(JNIEnv* env, jbyteArray array, jsize expected) {
+    return array && env->GetArrayLength(array) == expected;
+}
+
+static void release_query_ctx(JNIEnv* env, QueryCtx* ctx) {
+    env->DeleteGlobalRef(ctx->replyCb);
+    env->DeleteGlobalRef(ctx->doneCb);
+    delete ctx;
+}
+
 static void jni_peer_cb(const uint8_t* value, size_t len,
                          const char* host, uint16_t port, void* ud) {
     auto* ctx = static_cast<QueryCtx*>(ud);
     JNIEnv* env = get_env();
-    jbyteArray jval = env->NewByteArray((jsize)len);
-    env->SetByteArrayRegion(jval, 0, (jsize)len, (const jbyte*)value);
-    jstring jhost = env->NewStringUTF(host);
+    if (env->PushLocalFrame(3) != JNI_OK) {
+        check_exception(env);
+        return;
+    }
     jclass cls = env->GetObjectClass(ctx->replyCb);
-    jmethodID mid = env->GetMethodID(cls, "onPeer", "([BLjava/lang/String;I)V");
-    env->CallVoidMethod(ctx->replyCb, mid, jval, jhost, (jint)port);
-    env->DeleteLocalRef(jval);
-    env->DeleteLocalRef(jhost);
+    jmethodID mid = cls ? env->GetMethodID(cls, "onPeer", "([BLjava/lang/String;I)V") : nullptr;
+    if (mid) {
+        jbyteArray jval = env->NewByteArray((jsize)len);
+        if (jval) {
+            env->SetByteArrayRegion(jval, 0, (jsize)len, (const jbyte*)value);
+            jstring jhost = env->ExceptionCheck() ? nullptr : env->NewStringUTF(host);
+            if (jhost) env->CallVoidMethod(ctx->replyCb, mid, jval, jhost, (jint)port);
+        }
+    }
+    check_exception(env);
+    env->PopLocalFrame(nullptr);
 }
 
 static void jni_query_done_cb(int error, void* ud) {
     auto* ctx = static_cast<QueryCtx*>(ud);
     JNIEnv* env = get_env();
-    jclass cls = env->GetObjectClass(ctx->doneCb);
-    jmethodID mid = env->GetMethodID(cls, "onDone", "(I)V");
-    env->CallVoidMethod(ctx->doneCb, mid, (jint)error);
-    env->DeleteGlobalRef(ctx->replyCb);
-    env->DeleteGlobalRef(ctx->doneCb);
-    delete ctx;
+    if (ctx->doneCb) {
+        jclass cls = env->GetObjectClass(ctx->doneCb);
+        jmethodID mid = cls ? env->GetMethodID(cls, "onDone", "(I)V") : nullptr;
+        if (mid) env->CallVoidMethod(ctx->doneCb, mid, (jint)error);
+        check_exception(env);
+        env->DeleteLocalRef(cls);
+    }
+    release_query_ctx(env, ctx);
+}
+
+static jint submit_peer_query(JNIEnv* env, jlong h, jbyteArray jkey,
+                              jobject jReplyCb, jobject jDoneCb,
+                              decltype(&hyperdht_find_peer) submit) {
+    uint8_t key[32]{};
+    if (!has_byte_count(env, jkey, sizeof(key))) return -1;
+    env->GetByteArrayRegion(jkey, 0, sizeof(key), (jbyte*)key);
+    if (env->ExceptionCheck()) return -1;
+    auto* dht = (hyperdht_t*)h;
+    if (!jReplyCb && !jDoneCb) return submit(dht, key, nullptr, nullptr, nullptr);
+
+    auto* ctx = new QueryCtx{};
+    if (jReplyCb) ctx->replyCb = env->NewGlobalRef(jReplyCb);
+    if (jReplyCb && !ctx->replyCb) {
+        delete ctx;
+        return UV_ENOMEM;
+    }
+    if (jDoneCb) ctx->doneCb = env->NewGlobalRef(jDoneCb);
+    if (jDoneCb && !ctx->doneCb) {
+        release_query_ctx(env, ctx);
+        return UV_ENOMEM;
+    }
+
+    // Completion owns the refs even when Java only requested peer replies.
+    int rc = submit(dht, key, jReplyCb ? jni_peer_cb : nullptr, jni_query_done_cb, ctx);
+    if (rc != 0) release_query_ctx(env, ctx);
+    return rc;
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -1070,17 +1120,15 @@ Java_com_hyperdht_Native_findPeer(
     JNIEnv* env, jobject, jlong h, jbyteArray jpk,
     jobject jReplyCb, jobject jDoneCb)
 {
-    uint8_t pk[32];
-    env->GetByteArrayRegion(jpk, 0, 32, (jbyte*)pk);
-    auto* ctx = new QueryCtx{env->NewGlobalRef(jReplyCb), env->NewGlobalRef(jDoneCb)};
-    int rc = hyperdht_find_peer((hyperdht_t*)h, pk,
-        jni_peer_cb, jni_query_done_cb, ctx);
-    if (rc != 0) {
-        env->DeleteGlobalRef(ctx->replyCb);
-        env->DeleteGlobalRef(ctx->doneCb);
-        delete ctx;
-    }
-    return rc;
+    return submit_peer_query(env, h, jpk, jReplyCb, jDoneCb, hyperdht_find_peer);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_hyperdht_Native_findPeerTarget(
+    JNIEnv* env, jobject, jlong h, jbyteArray jtarget,
+    jobject jReplyCb, jobject jDoneCb)
+{
+    return submit_peer_query(env, h, jtarget, jReplyCb, jDoneCb, hyperdht_find_peer_target);
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -1088,17 +1136,7 @@ Java_com_hyperdht_Native_lookup(
     JNIEnv* env, jobject, jlong h, jbyteArray jtarget,
     jobject jReplyCb, jobject jDoneCb)
 {
-    uint8_t target[32];
-    env->GetByteArrayRegion(jtarget, 0, 32, (jbyte*)target);
-    auto* ctx = new QueryCtx{env->NewGlobalRef(jReplyCb), env->NewGlobalRef(jDoneCb)};
-    int rc = hyperdht_lookup((hyperdht_t*)h, target,
-        jni_peer_cb, jni_query_done_cb, ctx);
-    if (rc != 0) {
-        env->DeleteGlobalRef(ctx->replyCb);
-        env->DeleteGlobalRef(ctx->doneCb);
-        delete ctx;
-    }
-    return rc;
+    return submit_peer_query(env, h, jtarget, jReplyCb, jDoneCb, hyperdht_lookup);
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -1109,16 +1147,27 @@ Java_com_hyperdht_Native_announce(
     // Per-node-signed announce: the commit signs a fresh record per node, so it
     // takes the KEYPAIR (not a pre-signed value). No relay addresses / bump for
     // a bare DHT announce.
-    uint8_t target[32];
+    if (!has_byte_count(env, jtarget, 32) || !has_byte_count(env, jpk, 32) ||
+        !has_byte_count(env, jsk, 64)) return -1;
+
+    jobject callback = jDoneCb ? env->NewGlobalRef(jDoneCb) : nullptr;
+    if (jDoneCb && !callback) return UV_ENOMEM;
+    uint8_t target[32]{};
+    hyperdht_keypair_t kp{};
     env->GetByteArrayRegion(jtarget, 0, 32, (jbyte*)target);
-    hyperdht_keypair_t kp;
     env->GetByteArrayRegion(jpk, 0, 32, (jbyte*)kp.public_key);
     env->GetByteArrayRegion(jsk, 0, 64, (jbyte*)kp.secret_key);
-    auto* ctx = new DoneCtx{env->NewGlobalRef(jDoneCb)};
+    auto* ctx = callback ? new DoneCtx{callback} : nullptr;
+    if (env->ExceptionCheck()) {
+        hyperdht_keypair_zero(&kp);
+        env->DeleteGlobalRef(callback);
+        delete ctx;
+        return -1;
+    }
     int rc = hyperdht_announce((hyperdht_t*)h, target, &kp,
-        nullptr, 0, 0, jni_done_cb, ctx);
+        nullptr, 0, 0, ctx ? jni_done_cb : nullptr, ctx);
     hyperdht_keypair_zero(&kp);  // C10
-    if (rc != 0) { env->DeleteGlobalRef(ctx->callback); delete ctx; }
+    if (rc != 0 && ctx) { env->DeleteGlobalRef(callback); delete ctx; }
     return rc;
 }
 
@@ -1127,15 +1176,26 @@ Java_com_hyperdht_Native_unannounce(
     JNIEnv* env, jobject, jlong h, jbyteArray jpubkey,
     jbyteArray jpk, jbyteArray jsk, jobject jDoneCb)
 {
-    uint8_t pubkey[32];
+    if (!has_byte_count(env, jpubkey, 32) || !has_byte_count(env, jpk, 32) ||
+        !has_byte_count(env, jsk, 64)) return -1;
+
+    jobject callback = jDoneCb ? env->NewGlobalRef(jDoneCb) : nullptr;
+    if (jDoneCb && !callback) return UV_ENOMEM;
+    uint8_t pubkey[32]{};
+    hyperdht_keypair_t kp{};
     env->GetByteArrayRegion(jpubkey, 0, 32, (jbyte*)pubkey);
-    hyperdht_keypair_t kp;
     env->GetByteArrayRegion(jpk, 0, 32, (jbyte*)kp.public_key);
     env->GetByteArrayRegion(jsk, 0, 64, (jbyte*)kp.secret_key);
-    auto* ctx = new DoneCtx{env->NewGlobalRef(jDoneCb)};
-    int rc = hyperdht_unannounce((hyperdht_t*)h, pubkey, &kp, jni_done_cb, ctx);
+    auto* ctx = callback ? new DoneCtx{callback} : nullptr;
+    if (env->ExceptionCheck()) {
+        hyperdht_keypair_zero(&kp);
+        env->DeleteGlobalRef(callback);
+        delete ctx;
+        return -1;
+    }
+    int rc = hyperdht_unannounce((hyperdht_t*)h, pubkey, &kp, ctx ? jni_done_cb : nullptr, ctx);
     hyperdht_keypair_zero(&kp);  // C10
-    if (rc != 0) { env->DeleteGlobalRef(ctx->callback); delete ctx; }
+    if (rc != 0 && ctx) { env->DeleteGlobalRef(callback); delete ctx; }
     return rc;
 }
 

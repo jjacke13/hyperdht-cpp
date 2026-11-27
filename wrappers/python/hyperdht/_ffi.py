@@ -353,6 +353,11 @@ lib.hyperdht_find_peer.argtypes = [
     PEER_CB, DONE_CB, ctypes.c_void_p]
 lib.hyperdht_find_peer.restype = ctypes.c_int
 
+lib.hyperdht_find_peer_target.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),
+    PEER_CB, DONE_CB, ctypes.c_void_p]
+lib.hyperdht_find_peer_target.restype = ctypes.c_int
+
 lib.hyperdht_lookup.argtypes = [
     ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),
     PEER_CB, DONE_CB, ctypes.c_void_p]
@@ -384,6 +389,11 @@ lib.hyperdht_find_peer_ex.argtypes = [
     ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),
     PEER_CB, DONE_CB, ctypes.c_void_p]
 lib.hyperdht_find_peer_ex.restype = ctypes.c_void_p
+
+lib.hyperdht_find_peer_target_ex.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),
+    PEER_CB, DONE_CB, ctypes.c_void_p]
+lib.hyperdht_find_peer_target_ex.restype = ctypes.c_void_p
 
 lib.hyperdht_lookup_ex.argtypes = [
     ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),

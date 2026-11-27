@@ -725,6 +725,39 @@ class HyperDHT:
             raise RuntimeError("find_peer_ex failed")
         return Query(handle)
 
+    def find_peer_target(
+        self,
+        target: bytes,
+        on_reply: Callable | None = None,
+        on_done: Callable | None = None,
+    ) -> None:
+        """Find a peer using an already-computed 32-byte target."""
+        if len(target) != 32:
+            raise ValueError("target must be 32 bytes")
+        t = (ctypes.c_uint8 * 32)(*target)
+        reply_cb, done_cb = self._make_query_cbs(on_reply, on_done)
+        rc = _lib.hyperdht_find_peer_target(
+            self._handle, t, reply_cb, done_cb, None)
+        if rc != 0:
+            raise RuntimeError(f"find_peer_target failed: {rc}")
+
+    def find_peer_target_ex(
+        self,
+        target: bytes,
+        on_reply: Callable | None = None,
+        on_done: Callable | None = None,
+    ) -> Query:
+        """Find a peer by exact target, returning a cancelable Query handle."""
+        if len(target) != 32:
+            raise ValueError("target must be 32 bytes")
+        t = (ctypes.c_uint8 * 32)(*target)
+        reply_cb, done_cb = self._make_query_cbs(on_reply, on_done)
+        handle = _lib.hyperdht_find_peer_target_ex(
+            self._handle, t, reply_cb, done_cb, None)
+        if not handle:
+            raise RuntimeError("find_peer_target_ex failed")
+        return Query(handle)
+
     def lookup(
         self,
         target: bytes,

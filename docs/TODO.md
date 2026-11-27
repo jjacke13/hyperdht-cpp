@@ -962,9 +962,9 @@ Loopback can't prove these; validate against a real NAT'd JS peer:
 - [x] **Already-hashed native findPeer target** — C++ find_peer_target
   matches JS findPeer(target, { hash: false }) (2026-11-07). Existing
   public-key methods keep their semantics. C find_peer_target and its
-  cancelable _ex now expose the exact-target operation (2026-11-13), sharing
-  legacy callback/error/cancel behavior. Higher-level wrapper methods and
-  other target/query controls remain separate work.
+  cancelable _ex expose the exact-target operation (2026-11-13). Python
+  exposes both methods with the existing callbacks and query handle.
+  Kotlin and other query controls remain separate work.
 - [x] **`changeRemote`** — DONE this session (relay→direct upgrade port: libudx
   `udx_stream_change_remote` wrapped in `relay_upgrade::try_change_remote` +
   Duplex firewall tap + FFI). Covers the path-upgrade case; mid-connection NAT

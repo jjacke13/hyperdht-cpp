@@ -1525,6 +1525,24 @@ TEST(HyperDHT, RandomPunchIntervalAppliesToStats) {
     uv_loop_close(&loop);
 }
 
+TEST(HyperDHT, ZeroRandomPunchIntervalUsesDefaultCooldown) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    DhtOptions opts;
+    opts.random_punch_interval = 0;
+    HyperDHT dht(&loop, opts);
+
+    EXPECT_EQ(dht.random_punch_interval(), 20000u);
+    auto stats = dht.punch_stats();
+    stats.last_random_punch = 1000;
+    EXPECT_FALSE(stats.can_random_punch(20999));
+    EXPECT_TRUE(stats.can_random_punch(21000));
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
 TEST(HyperDHT, DeferRandomPunchSeedsLastPunch) {
     // With defer_random_punch=true, last_random_punch is seeded to
     // uv_now() at construction so the first random punch has to wait

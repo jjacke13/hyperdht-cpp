@@ -11,6 +11,9 @@ Last updated: 2026-11-11 (bootstrap sample bounds).
 
 ## Status snapshot
 
+- **Random NAT punch cooldown:** a zero interval selects the 20-second
+  default, matching JS. Explicit positive intervals still apply.
+
 - **Announcement bump cache:** per-topic bumps use the configured cache
   size and the existing announcement lifetime. Eviction uses native LRU.
 

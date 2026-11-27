@@ -135,10 +135,10 @@ struct DhtOptions {
                        const compact::Ipv4Address&)> filter_node;
 
     // Throttling for random-NAT holepunch attempts. JS defaults:
-    //   randomPunchInterval: 20000ms (min gap between random punches)
+    //   randomPunchInterval: 20000ms (zero also selects the default)
     //   deferRandomPunch: false (if true, initial last_random_punch = now,
     //                            so the first random punch is gated)
-    uint64_t random_punch_interval = 20000;
+    uint64_t random_punch_interval = holepunch::DEFAULT_RANDOM_PUNCH_INTERVAL_MS;
     bool defer_random_punch = false;
 
     // LRU storage cache tuning (JS: opts.maxSize, opts.maxAge).

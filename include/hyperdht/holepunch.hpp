@@ -269,6 +269,8 @@ void discover_pool_addresses(
 // Punch stats — shared counters for throttling (JS: dht._randomPunches, stats)
 // ---------------------------------------------------------------------------
 
+constexpr uint64_t DEFAULT_RANDOM_PUNCH_INTERVAL_MS = 20000;
+
 struct PunchStats {
     int random_punches = 0;          // Active random punch count
     uint64_t last_random_punch = 0;  // Timestamp of last random punch completion
@@ -276,7 +278,7 @@ struct PunchStats {
     int punches_random = 0;          // Total random punches attempted
     int punches_open = 0;            // Total OPEN-firewall direct connects (B2)
     int random_punch_limit = 1;      // Max concurrent random punches (JS default: 1)
-    uint64_t random_punch_interval = 20000;  // Min ms between random punches (JS: 20s)
+    uint64_t random_punch_interval = DEFAULT_RANDOM_PUNCH_INTERVAL_MS;
 
     // JS: roundPunch rate-limit check (connect.js:638-664)
     bool can_random_punch(uint64_t now) const {

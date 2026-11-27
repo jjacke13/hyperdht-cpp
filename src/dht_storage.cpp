@@ -233,12 +233,6 @@ void HyperDHT::ping(const compact::Ipv4Address& addr,
 std::shared_ptr<query::Query> HyperDHT::immutable_put(
     const std::vector<uint8_t>& value,
     ImmutablePutCallback on_done) {
-    // The native client API still rejects empty values until its read path
-    // and bindings can distinguish an empty result from a missing result.
-    if (value.empty()) {
-        DHT_LOG("  [dht] immutable_put: rejected (empty value)\n");
-        return nullptr;
-    }
     ensure_bound();
 
     // Target is BLAKE2b(value) — compute here so we can hand it to the caller.

@@ -31,7 +31,7 @@ int hyperdht_immutable_get(hyperdht_t* dht,
     dht->dht->immutable_get(t,
         // on_value — streaming per-reply
         [cb, userdata](const std::vector<uint8_t>& value) {
-            if (cb) cb(value.data(), value.size(), userdata);
+            if (cb && !value.empty()) cb(value.data(), value.size(), userdata);
         },
         // on_done — once at completion
         [done_cb, userdata](const hyperdht::HyperDHT::ImmutableGetResult& result) {
@@ -99,7 +99,7 @@ hyperdht_query_t* hyperdht_immutable_get_ex(hyperdht_t* dht,
     handle->state->q = dht->dht->immutable_get(t,
         [state, cb](const std::vector<uint8_t>& value) {
             if (!state->done_cb) return;  // detached via free
-            if (cb) cb(value.data(), value.size(), state->userdata);
+            if (cb && !value.empty()) cb(value.data(), value.size(), state->userdata);
         },
         [state](const hyperdht::HyperDHT::ImmutableGetResult& result) {
             state->done = true;

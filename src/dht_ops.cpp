@@ -432,7 +432,7 @@ std::shared_ptr<query::Query> immutable_get(rpc::RpcSocket& socket,
     // iterator, which destroys the query — index.js:275).
     auto q_weak = std::weak_ptr<query::Query>(q);
     q->on_reply([target, on_result, q_weak](const query::QueryReply& reply) {
-        if (!reply.value.has_value() || reply.value->empty()) return;
+        if (!reply.value.has_value()) return;
 
         std::array<uint8_t, 32> check{};
         crypto_generichash(check.data(), 32,

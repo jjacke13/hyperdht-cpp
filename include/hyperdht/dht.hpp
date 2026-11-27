@@ -756,8 +756,7 @@ public:
 
     // Immutable put: stores `value` at target = BLAKE2b(value).
     // JS: dht.immutablePut(value) → { hash, closestNodes }
-    // `on_done` fires after the commit phase completes. Returns nullptr if
-    // `value` is empty (current native client limitation).
+    // `on_done` fires after the commit phase completes. Empty values are valid.
     struct ImmutablePutResult {
         std::array<uint8_t, 32> hash{};
         std::vector<query::QueryReply> closest_nodes;

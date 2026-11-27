@@ -1057,20 +1057,64 @@ TEST(HyperDHT, ImmutablePutReturnsValidQuery) {
     uv_loop_close(&loop);
 }
 
-TEST(HyperDHT, ImmutablePutRejectsEmptyValue) {
-    // The native client still rejects empty values before starting the query.
+TEST(HyperDHT, EmptyImmutableValueRoundTrip) {
     uv_loop_t loop;
-    uv_loop_init(&loop);
-
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    rpc::RpcSocket store(&loop, routing::NodeId{});
+    ASSERT_EQ(store.bind(0), 0);
+    const auto addr = compact::Ipv4Address::from_string("127.0.0.1", store.port());
+    const auto id = rpc::compute_peer_id(addr);
+    make_persistent(store);
+    store.table().rebuild_with_id(id);
+    router::Router router;
+    auto handlers = std::make_unique<rpc::RpcHandlers>(store, &router);
+    handlers->install();
     HyperDHT dht(&loop);
+    ASSERT_EQ(dht.bind(), 0);
+    routing::Node node;
+    node.id = id;
+    node.host = "127.0.0.1";
+    node.port = addr.port;
+    ASSERT_TRUE(dht.socket().table().add(node));
 
-    auto q = dht.immutable_put({},
-        [](const HyperDHT::ImmutablePutResult&) {});
-    EXPECT_EQ(q, nullptr);
+    auto wait_for = [&](const auto& result) {
+        const auto deadline = uv_hrtime() + 2000000000ULL;
+        while (!result && uv_hrtime() < deadline) {
+            uv_run(&loop, UV_RUN_NOWAIT);
+            uv_sleep(1);
+        }
+    };
+    std::array<uint8_t, 32> target{};
+    const unsigned char empty = 0;
+    crypto_generichash(target.data(), target.size(), &empty, 0, nullptr, 0);
+    std::optional<HyperDHT::ImmutableGetResult> before;
+    auto lookup = dht.immutable_get(target, [&](const auto& result) { before = result; });
+    wait_for(before);
+    EXPECT_TRUE(before && before->error == query::QUERY_OK && !before->found);
+
+    std::optional<HyperDHT::ImmutablePutResult> put;
+    auto write = dht.immutable_put({}, [&](const auto& result) { put = result; });
+    EXPECT_NE(write, nullptr);
+    if (write) wait_for(put);
+    EXPECT_TRUE(put && put->error == query::QUERY_OK && put->hash == target);
+
+    std::optional<HyperDHT::ImmutableGetResult> after;
+    int values = 0;
+    auto read = dht.immutable_get(target,
+        [&](const auto& value) {
+            EXPECT_TRUE(value.empty());
+            ++values;
+        },
+        [&](const auto& result) { after = result; });
+    wait_for(after);
+    EXPECT_TRUE(after && after->error == query::QUERY_OK && after->found && after->value.empty());
+    EXPECT_EQ(values, 1);
 
     dht.destroy();
+    handlers.reset();
+    store.close();
     uv_run(&loop, UV_RUN_DEFAULT);
-    uv_loop_close(&loop);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
 TEST(HyperDHT, ImmutableGetReturnsValidQuery) {

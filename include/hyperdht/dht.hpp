@@ -147,17 +147,13 @@ struct DhtOptions {
     // Mutable + immutable caches each get `max_size/2` entries, matching
     // JS `hyperdht/index.js:610-615`.
     //
-    // `max_age_ms` (JS: opts.maxAge || 20*60*1000 = 20 min) governs the
-    // OTHER caches (router forwards, records, refreshes, bumps). It does
-    // NOT govern mutable/immutable storage — JS uses 48h there regardless
-    // of `maxAge` unless the caller explicitly overrides via `storage_ttl_ms`.
-    // JS parity: `mutables: { maxAge: opts.maxAge || 48h }`.
-    //
-    // Router forwards share these bounds; local Server listeners stay pinned.
-    // Set `storage_ttl_ms` to tune mutable/immutable TTL separately.
+    // `max_age_ms` controls forwarding and announcement cache lifetimes.
+    // Zero selects the 20-minute default, as in JS. Local listeners stay pinned.
+    // Mutable/immutable values use the separate native `storage_ttl_ms` option,
+    // which defaults to 48 hours. JS uses one maxAge option for both.
     static constexpr size_t DEFAULT_MAX_SIZE = 65536;
     size_t max_size = DEFAULT_MAX_SIZE;
-    uint64_t max_age_ms = 20 * 60 * 1000;
+    uint64_t max_age_ms = announce::DEFAULT_TTL_MS;
     uint64_t storage_ttl_ms = 48ULL * 60 * 60 * 1000;  // 48h (JS default)
 
     // Ephemeral mode (JS: opts.ephemeral). Ephemeral nodes hold no routing-table

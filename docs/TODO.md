@@ -11,6 +11,10 @@ Last updated: 2026-11-11 (bootstrap sample bounds).
 
 ## Status snapshot
 
+- **Zero cache age:** `DhtOptions::max_age_ms = 0` selects the 20-minute
+  default for forwards and announcements, matching JS `defaultCacheOpts`.
+  Native mutable and immutable storage uses its own `storage_ttl_ms` option.
+
 - **Zero cache size:** `DhtOptions::max_size = 0` selects the default of
   65,536 before sizing router, relay hint and persistent caches, matching JS
   `defaultCacheOpts`.

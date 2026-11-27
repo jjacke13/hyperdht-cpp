@@ -82,6 +82,7 @@ HyperDHT::HyperDHT(uv_loop_t* loop, DhtOptions opts)
     : loop_(loop),
       opts_([&opts] {
           if (opts.max_size == 0) opts.max_size = DhtOptions::DEFAULT_MAX_SIZE;
+          if (opts.max_age_ms == 0) opts.max_age_ms = announce::DEFAULT_TTL_MS;
           return std::move(opts);
       }()),
       router_(opts_.max_size, opts_.max_age_ms),

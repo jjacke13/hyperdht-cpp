@@ -1617,6 +1617,30 @@ TEST(HyperDHT, ZeroMaxSizeKeepsDefaultForwardCache) {
     EXPECT_EQ(uv_loop_close(&loop), 0);
 }
 
+TEST(HyperDHT, ZeroMaxAgeKeepsDefaultForwardLifetime) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    DhtOptions opts;
+    opts.max_age_ms = 0;
+    HyperDHT dht(&loop, opts);
+    const auto default_age = DhtOptions{}.max_age_ms;
+    EXPECT_EQ(dht.max_age_ms(), default_age);
+
+    announce::TargetKey target{};
+    router::ForwardEntry entry;
+    entry.relay = compact::Ipv4Address::from_string("192.0.2.1", 49737);
+    dht.router().set(target, std::move(entry));
+    const auto now = uv_hrtime() / 1000000;
+    dht.router().gc(now + 1);
+    EXPECT_EQ(dht.router().size(), 1u);
+    dht.router().gc(now + default_age + 1);
+    EXPECT_EQ(dht.router().size(), 0u);
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
 TEST(HyperDHT, ConnectionKeepAliveAccessor) {
     uv_loop_t loop;
     uv_loop_init(&loop);

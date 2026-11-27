@@ -79,10 +79,13 @@ std::optional<noise::PubKey> ConnectOptions::select_relay_through(
 // ---------------------------------------------------------------------------
 
 HyperDHT::HyperDHT(uv_loop_t* loop, DhtOptions opts)
-    : loop_(loop), opts_(std::move(opts)), router_(opts_.max_size, opts_.max_age_ms),
-      // JS: Math.min(opts.maxSize || defaultMaxSize, 512).
-      relay_address_cache_(opts_.max_size ? std::min(opts_.max_size, kMaxRelayAddressCache)
-                                         : kMaxRelayAddressCache) {
+    : loop_(loop),
+      opts_([&opts] {
+          if (opts.max_size == 0) opts.max_size = DhtOptions::DEFAULT_MAX_SIZE;
+          return std::move(opts);
+      }()),
+      router_(opts_.max_size, opts_.max_age_ms),
+      relay_address_cache_(std::min(opts_.max_size, kMaxRelayAddressCache)) {
 
     // Resolve the default keypair — JS `opts.keyPair || createKeyPair(opts.seed)`.
     // Priority:

@@ -143,7 +143,7 @@ struct DhtOptions {
 
     // LRU storage cache tuning (JS: opts.maxSize, opts.maxAge).
     //
-    // `max_size` (JS: opts.maxSize || 65536) is the overall cache budget.
+    // `max_size` is the overall cache budget. Zero selects the default, as in JS.
     // Mutable + immutable caches each get `max_size/2` entries, matching
     // JS `hyperdht/index.js:610-615`.
     //
@@ -155,7 +155,8 @@ struct DhtOptions {
     //
     // Router forwards share these bounds; local Server listeners stay pinned.
     // Set `storage_ttl_ms` to tune mutable/immutable TTL separately.
-    size_t max_size = 65536;
+    static constexpr size_t DEFAULT_MAX_SIZE = 65536;
+    size_t max_size = DEFAULT_MAX_SIZE;
     uint64_t max_age_ms = 20 * 60 * 1000;
     uint64_t storage_ttl_ms = 48ULL * 60 * 60 * 1000;  // 48h (JS default)
 

@@ -1596,6 +1596,27 @@ TEST(HyperDHT, MaxSizeAndMaxAgeAccessors) {
     uv_loop_close(&loop);
 }
 
+TEST(HyperDHT, ZeroMaxSizeKeepsDefaultForwardCache) {
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    DhtOptions opts;
+    opts.max_size = 0;
+    HyperDHT dht(&loop, opts);
+    EXPECT_EQ(dht.max_size(), DhtOptions{}.max_size);
+
+    announce::TargetKey target{};
+    router::ForwardEntry entry;
+    entry.relay = compact::Ipv4Address::from_string("192.0.2.1", 49737);
+    const auto relay = entry.relay;
+    dht.router().set(target, std::move(entry));
+    const auto* forward = dht.router().get(target);
+    EXPECT_TRUE(forward && forward->relay == relay);
+
+    dht.destroy();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    EXPECT_EQ(uv_loop_close(&loop), 0);
+}
+
 TEST(HyperDHT, ConnectionKeepAliveAccessor) {
     uv_loop_t loop;
     uv_loop_init(&loop);

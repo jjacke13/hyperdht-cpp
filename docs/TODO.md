@@ -11,6 +11,10 @@ Last updated: 2026-11-11 (bootstrap sample bounds).
 
 ## Status snapshot
 
+- **Zero cache size:** `DhtOptions::max_size = 0` selects the default of
+  65,536 before sizing router, relay hint and persistent caches, matching JS
+  `defaultCacheOpts`.
+
 - **2026-11-21 wakeup health recovery:** resetting offline/degraded health on
   wakeup now emits the health-change notification before the wakeup callback,
   matching JS health.reset(). Already-online resets remain silent.
